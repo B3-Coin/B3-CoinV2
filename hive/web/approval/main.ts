@@ -442,6 +442,38 @@ function showCheckpoint(c: CheckpointDraft): void {
     "The wallet is locked. It unlocks only to sign this request and locks again straight after.";
 }
 
+/** Whether approving moves value out of this wallet or its trading
+ *  balance: such requests get the red button, the rest the ordinary one. */
+function movesValue(r: Request): boolean {
+  switch (r.kind) {
+    case "pay":
+      return r.summary.outputs.some((o) => !o.change && !o.mine);
+    case "send_psbt":
+    case "trade_order":
+    case "trade_deposit":
+    case "trade_withdraw":
+    case "trade_payout":
+      return true;
+    default:
+      return false;
+  }
+}
+
+// As Qt's send confirmation, Approve is held back briefly when a request
+// appears, so a click or Enter meant for another window cannot approve it.
+const ARM_MS = 2000;
+let armedAt = 0;
+let armTimer: number | undefined;
+
+function arm(): void {
+  armedAt = Date.now() + ARM_MS;
+  el<HTMLButtonElement>("approve").disabled = true;
+  window.clearTimeout(armTimer);
+  armTimer = window.setTimeout(() => {
+    if (!deciding) el<HTMLButtonElement>("approve").disabled = false;
+  }, ARM_MS);
+}
+
 function show(draft: DraftView | null): void {
   el("empty").hidden = draft !== null;
   el("draft").hidden = draft === null;
@@ -459,6 +491,8 @@ function show(draft: DraftView | null): void {
   else if (r.kind === "trade_deposit" || r.kind === "trade_withdraw" || r.kind === "trade_payout") showFunding(r);
   else if (r.kind === "trade_checkpoint") showCheckpoint(r.checkpoint);
   else showAction(r);
+  el("approve").className = `btn ${movesValue(r) ? "btn-danger" : "btn-primary"}`;
+  arm();
   el("pass-field").hidden = !draft.locked;
   el<HTMLInputElement>("pass").value = "";
   // Start at the top, so the explanation is read before the passphrase
@@ -468,16 +502,19 @@ function show(draft: DraftView | null): void {
 }
 
 let current: DraftView | null = null;
+let deciding = false;
 
 function setBusy(busy: boolean): void {
-  el<HTMLButtonElement>("approve").disabled = busy;
+  deciding = busy;
+  el<HTMLButtonElement>("approve").disabled = busy || Date.now() < armedAt;
   el<HTMLButtonElement>("reject").disabled = busy;
 }
 
 // After a decision the core returns the next waiting draft, if any, and
 // closes this window itself when nothing is left.
 async function decide(approve: boolean): Promise<void> {
-  if (!current) return;
+  if (!current || deciding) return;
+  if (approve && (Date.now() < armedAt || el("approve").hidden)) return;
   setBusy(true);
   try {
     const passphrase = approve && current.locked ? el<HTMLInputElement>("pass").value : null;
@@ -496,5 +533,12 @@ async function decide(approve: boolean): Promise<void> {
 
 el("approve").addEventListener("click", () => decide(true));
 el("reject").addEventListener("click", () => decide(false));
+// Enter in the passphrase field approves, as it would in a form.
+el("pass").addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && el<HTMLInputElement>("pass").value) {
+    e.preventDefault();
+    void decide(true);
+  }
+});
 current = await invoke<DraftView | null>("approval_pending");
 show(current);
