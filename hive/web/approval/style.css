@@ -11,4 +11,5 @@
    long address or id wraps under its label; the value keeps its width. */
 .approval .drow .dkey { flex: 1 1 auto; min-width: 0; }
 .approval .drow .dval { flex: 0 0 auto; max-width: 65%; }
+.approval .dhint { display: block; margin-top: 2px; font-size: var(--text-xs); font-weight: 400; color: var(--text-muted); }
 .approval .addr-line { display: block; margin-top: 2px; font-family: var(--font-mono); font-size: var(--text-xs); word-break: break-all; color: var(--text); }

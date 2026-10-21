@@ -140,6 +140,16 @@ function row(key: string, value: string, address?: string, amount = true): HTMLE
   return drow;
 }
 
+/** A row with a line under its label saying what the term means. */
+function explained(key: string, value: string, hint: string): HTMLElement {
+  const r = row(key, value, undefined, false);
+  const line = document.createElement("span");
+  line.className = "dhint";
+  line.textContent = hint;
+  r.querySelector(".dkey")?.append(line);
+  return r;
+}
+
 const walletName = (w: string): string => (w === "" ? "the default wallet" : `wallet ${w}`);
 
 function showPay(s: Summary): void {
@@ -286,8 +296,12 @@ function marketRows(d: { chain: string; market_id: string; base_asset_id: string
   return [
     row("Market", shorten(d.market_id, 10, 6), d.market_id, false),
     row("Token", shorten(d.base_asset_id, 10, 6), d.base_asset_id, false),
-    row("Account sequence", String(d.sequence), undefined, false),
-    row("Verified by", d.remote ? "Trading endpoint" : "This node's engine", undefined, false),
+    explained("Account sequence", String(d.sequence), "Each signed request counts up, so none can be replayed."),
+    explained(
+      "Verified by",
+      d.remote ? "Trading endpoint" : "This node's engine",
+      d.remote ? "A remote service you trust checked the market data." : "Your own node checked the market data.",
+    ),
     row("Network", d.chain, undefined, false),
   ];
 }
@@ -395,8 +409,12 @@ function showFunding(r: Extract<Request, { kind: "trade_deposit" | "trade_withdr
       row("Pay to", w.mine ? "This wallet" : "Another wallet", w.destination, false),
       asset,
       ...market,
-      row("Account sequence", String(w.sequence), undefined, false),
-      row("Verified by", w.remote ? "Trading endpoint" : "This node's engine", undefined, false),
+      explained("Account sequence", String(w.sequence), "Each signed request counts up, so none can be replayed."),
+      explained(
+        "Verified by",
+        w.remote ? "Trading endpoint" : "This node's engine",
+        w.remote ? "A remote service you trust checked the market data." : "Your own node checked the market data.",
+      ),
     );
     el("approve").textContent = "Request withdrawal";
   } else {
@@ -412,7 +430,7 @@ function showFunding(r: Extract<Request, { kind: "trade_deposit" | "trade_withdr
       row("Pay to", p.mine ? "This wallet" : "Another wallet", p.destination, false),
       asset,
       ...market,
-      row("Certified in entry", String(p.sequence), undefined, false),
+      explained("Certified in entry", String(p.sequence), "The market log entry whose certificate fixed this payout."),
       row("Payout id", shorten(p.effect_id, 10, 6), p.effect_id, false),
     );
     el("approve").textContent = "Publish payout";

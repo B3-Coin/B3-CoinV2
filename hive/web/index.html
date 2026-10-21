@@ -640,6 +640,28 @@
                 </div>
               </div>
               <div class="tr-source t-xs muted" id="tr-source"></div>
+              <details class="disc disc--boxed tr-glossary" id="tr-glossary">
+                <summary>
+                  <svg class="i-sm caret" aria-hidden="true"><use href="/icons.svg#i-chevron-right" /></svg>
+                  <span>What these words mean</span>
+                </summary>
+                <dl class="disc-body tr-terms t-sm">
+                  <dt>Auction</dt>
+                  <dd>Orders are not matched one by one. Each round collects the standing orders and clears them all at one price.</dd>
+                  <dt>Microblock</dt>
+                  <dd>One numbered entry in a market's log, holding one auction's result. Its number orders events; it carries no certified time.</dd>
+                  <dt>Certified</dt>
+                  <dd>Signed by enough of the market's validators (the quorum). Only certified results move funds.</dd>
+                  <dt>Seats / quorum</dt>
+                  <dd>How many validators the market has, and how many must sign a result.</dd>
+                  <dt>Account sequence (Seq.)</dt>
+                  <dd>A counter in each request this wallet signs, so no request can be replayed or reordered.</dd>
+                  <dt>Verified by</dt>
+                  <dd>Who checked the market data before you signed: your own node's engine, or a remote trading endpoint you trust to report it.</dd>
+                  <dt>Payout</dt>
+                  <dd>A certified withdrawal, paid to its address by a B3 transaction this wallet publishes.</dd>
+                </dl>
+              </details>
             </div>
             <div class="tr-grid" id="tr-body" hidden>
               <section class="card tr-book-card" aria-label="Order book">
@@ -725,7 +747,7 @@
                         <tbody id="tr-requests-rows"></tbody>
                       </table>
                     </div>
-                    <p class="card-pad t-sm muted" id="tr-requests-note">Orders and cancellations this wallet signed in this market, from your node's own record. Accepted means queued; certified means a quorum certified the result, which may or may not include a fill.</p>
+                    <p class="card-pad t-sm muted" id="tr-requests-note">Orders and cancellations this wallet signed in this market, from your node's own record. Accepted means queued; certified means a quorum certified the result, which may or may not include a fill. Seq. is the account sequence the request was signed with.</p>
                   </div>
                   <div id="tr-funds" role="tabpanel" aria-labelledby="tr-tab-funds" hidden>
                     <div class="card-pad tr-funding">
