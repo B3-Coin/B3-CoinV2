@@ -113,6 +113,7 @@ std::string_view ToString(SlotPhase phase);
  * INVALID_INPUT for an unregistered kind.
  */
 Result<SlotPhase> PhaseOf(const ActionV2& action);
+Result<SlotPhase> PhaseOf(const ActionV2& action, const ProfileParams& profile);
 
 /** The arrival_rank (engine/book.h) of an order that starts resting in the
  * slot at `height`, in `phase` (POST_ONLY or REST), at canonical `rank`:
@@ -211,7 +212,7 @@ struct SlotInputs {
 };
 
 //! The decoded payload of an action kind the outline executes.
-using ActionPayload = std::variant<PlacePayload, CancelPayload, TransferPayload>;
+using ActionPayload = std::variant<PlacePayload, CancelPayload, TransferPayload, WithdrawPayload>;
 
 //! One validated original: the verified action, its decoded payload and its phase.
 struct SlotAction {

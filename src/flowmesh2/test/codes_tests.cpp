@@ -35,6 +35,8 @@ const std::vector<Pin> PINNED_OUTCOME_CODES{
     {6, "CANCELLED", false},
     {7, "TRANSFERRED", false},
     {8, "FEES_DISTRIBUTED", false},
+    {9, "WITHDRAWAL_PENDING", false},
+    {10, "WITHDRAWAL_PAID", false},
     {64, "REJ_INSUFFICIENT_AVAILABLE", true},
     {65, "REJ_UNKNOWN_MARKET", true},
     {66, "REJ_UNKNOWN_ORDER", true},

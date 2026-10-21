@@ -3,6 +3,7 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <flowmesh2/net/seat_mesh.h>
+#include <flowmesh2/agreement/control_messages.h>
 
 #include <utility>
 
@@ -64,8 +65,9 @@ Result<void> SeatMesh::Send(uint32_t seat, Lane lane, std::span<const unsigned c
     if (lane == Lane::CRITICAL || lane == Lane::PROPOSAL) {
         const std::optional<agreement::MessageType> type{EnvelopeType(bytes)};
         if (type == agreement::MessageType::VOTE) return Error{ErrorCode::INVALID_INPUT, MESH_VOTE_NOT_TYPED};
+        if (type == agreement::MessageType::CONTROL_REPORT || type == agreement::MessageType::CONTROL_NEW_VIEW) return Error{ErrorCode::INVALID_INPUT, MESH_CONTROL_NOT_TYPED};
         const bool fits{lane == Lane::PROPOSAL
-                            ? type == agreement::MessageType::PROPOSAL
+                            ? (type == agreement::MessageType::PROPOSAL || type == agreement::MessageType::CERTIFIED_PROPOSAL || type == agreement::MessageType::OFFER)
                             : (type == agreement::MessageType::VIEW_CHANGE || type == agreement::MessageType::NEW_VIEW ||
                                type == agreement::MessageType::EVIDENCE)};
         if (!fits) return Error{ErrorCode::INVALID_INPUT, MESH_LANE_CONTENT};
@@ -77,11 +79,41 @@ Result<void> SeatMesh::Send(uint32_t seat, std::span<const unsigned char> messag
 {
     const std::optional<agreement::MessageType> type{EnvelopeType(message)};
     if (type == agreement::MessageType::VOTE) return Error{ErrorCode::INVALID_INPUT, MESH_VOTE_NOT_TYPED};
-    if (type == agreement::MessageType::PROPOSAL) return Send(seat, Lane::PROPOSAL, message);
+    if (type == agreement::MessageType::CONTROL_REPORT || type == agreement::MessageType::CONTROL_NEW_VIEW) return Error{ErrorCode::INVALID_INPUT, MESH_CONTROL_NOT_TYPED};
+    if (type == agreement::MessageType::PROPOSAL || type == agreement::MessageType::CERTIFIED_PROPOSAL || type == agreement::MessageType::OFFER) return Send(seat, Lane::PROPOSAL, message);
     if (type == agreement::MessageType::VIEW_CHANGE || type == agreement::MessageType::NEW_VIEW || type == agreement::MessageType::EVIDENCE) {
         return Send(seat, Lane::CRITICAL, message);
     }
     return Error{ErrorCode::INVALID_INPUT, MESH_LANE_CONTENT};
+}
+
+Result<void> SeatMesh::SendDurableVote(uint32_t seat, const agreement::OutboundVote& vote, const uint256& header_hash,
+                                       std::span<const unsigned char> /*message*/)
+{
+    return SendVote(seat, vote, header_hash);
+}
+
+Result<void> SeatMesh::SendDurableControl(uint32_t seat, const agreement::OutboundControl& control,
+                                         std::span<const unsigned char> bytes)
+{
+    if (auto route{CheckRoute(seat, Lane::CRITICAL, bytes.size())}; !route.has_value()) return route.error();
+    if (control.Key().seat != m_config.self_seat || control.Key().profile_hash != ProfileHash(m_config.profile)) {
+        return Error{ErrorCode::VERIFY_FAILED, "MESH_CONTROL_CONFIGURATION"};
+    }
+    auto message{agreement::DecodeMessage(bytes, m_config.profile)};
+    if (!message.has_value()) return message.error();
+    Result<storage::ControlIntentRecord> intent{Error{ErrorCode::INVALID_INPUT, MESH_CONTROL_NOT_TYPED}};
+    storage::VoteSignature signature{};
+    if (const auto* report{std::get_if<agreement::ControlReport>(&*message)}) {
+        intent = agreement::ControlIntent(*report, m_config.profile); signature = report->signature;
+    } else if (const auto* view{std::get_if<agreement::ControlNewView>(&*message)}) {
+        intent = agreement::ControlIntent(*view, m_config.profile); signature = view->signature;
+    }
+    if (!intent.has_value()) return intent.error();
+    if (intent->key != control.Key() || intent->Digest() != control.Digest() || signature != control.Signature()) {
+        return Error{ErrorCode::VERIFY_FAILED, "MESH_CONTROL_TOKEN_MISMATCH"};
+    }
+    return Transmit(seat, Lane::CRITICAL, bytes);
 }
 
 } // namespace flowmesh2::net

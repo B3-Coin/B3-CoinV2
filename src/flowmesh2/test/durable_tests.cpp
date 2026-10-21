@@ -47,6 +47,8 @@ constexpr bool Unforgeable()
            !std::is_convertible_v<uint64_t, Token>;
 }
 
+static_assert(Unforgeable<DurableControlIntent>());
+static_assert(Unforgeable<DurableSignedControl>());
 static_assert(Unforgeable<DurableIntent>());
 static_assert(Unforgeable<DurableSignedVote>());
 static_assert(Unforgeable<DurableDecision>());
@@ -69,6 +71,8 @@ constexpr bool PendingUnforgeable()
     return !std::is_default_constructible_v<P> && std::is_copy_constructible_v<P> &&
            !std::is_constructible_v<P, uint64_t, uint64_t, const typename P::Ref&>;
 }
+static_assert(PendingUnforgeable<PendingControlIntent>());
+static_assert(PendingUnforgeable<PendingSignedControl>());
 static_assert(PendingUnforgeable<PendingProposal>());
 static_assert(PendingUnforgeable<PendingIntent>());
 static_assert(PendingUnforgeable<PendingSignedVote>());

@@ -24,6 +24,10 @@ bool IsKnown(MessageType type)
     case MessageType::VIEW_CHANGE:
     case MessageType::NEW_VIEW:
     case MessageType::EVIDENCE:
+    case MessageType::CERTIFIED_PROPOSAL:
+    case MessageType::CONTROL_REPORT:
+    case MessageType::CONTROL_NEW_VIEW:
+    case MessageType::OFFER:
         return true;
     }
     return false;
@@ -47,6 +51,10 @@ std::string_view ToString(MessageType type)
     case MessageType::VIEW_CHANGE: return "VIEW_CHANGE";
     case MessageType::NEW_VIEW: return "NEW_VIEW";
     case MessageType::EVIDENCE: return "EVIDENCE";
+    case MessageType::CERTIFIED_PROPOSAL: return "CERTIFIED_PROPOSAL";
+    case MessageType::CONTROL_REPORT: return "CONTROL_REPORT";
+    case MessageType::CONTROL_NEW_VIEW: return "CONTROL_NEW_VIEW";
+    case MessageType::OFFER: return "OFFER";
     }
     return "UNKNOWN";
 }
@@ -78,6 +86,14 @@ MessageType TypeOf(const Message& message)
                 return MessageType::VIEW_CHANGE;
             } else if constexpr (std::is_same_v<T, NewView>) {
                 return MessageType::NEW_VIEW;
+            } else if constexpr (std::is_same_v<T, CertifiedProposal>) {
+                return MessageType::CERTIFIED_PROPOSAL;
+            } else if constexpr (std::is_same_v<T, ControlReport>) {
+                return MessageType::CONTROL_REPORT;
+            } else if constexpr (std::is_same_v<T, ControlNewView>) {
+                return MessageType::CONTROL_NEW_VIEW;
+            } else if constexpr (std::is_same_v<T, OfferedProposal>) {
+                return MessageType::OFFER;
             } else {
                 static_assert(std::is_same_v<T, Evidence>, "every Message alternative has a type");
                 return MessageType::EVIDENCE;
@@ -99,6 +115,8 @@ constexpr size_t VOTE_MAX_BYTES{VOTE_FIXED_BYTES + 1 + MAX_VOTE_INCLUSION_IDS * 
 constexpr size_t VIEW_CHANGE_MAX_BYTES{8 + 8 + 8 + 4 + 1 + 8 + 3 + CERT_MAX + SIG_BYTES};
 constexpr size_t NEW_VIEW_MAX_BYTES{8 + 8 + 8 + 4 + 32 + 3 + MAX_NEW_VIEW_REPORTS * (3 + VIEW_CHANGE_MAX_BYTES) + SIG_BYTES};
 constexpr size_t CERTIFIED_HEADER_MAX_BYTES{SLOT_HEADER_BYTES + 3 + CERT_MAX};
+constexpr size_t CONTROL_REPORT_MAX_BYTES{storage::CONTROL_KEY_BYTES + 8 + 1 + 8 + CERTIFIED_HEADER_MAX_BYTES + 1 + CERTIFIED_HEADER_MAX_BYTES + SIG_BYTES};
+constexpr size_t CONTROL_NEW_VIEW_MAX_BYTES{storage::CONTROL_KEY_BYTES + 32 + 1 + MAX_CONTROL_REPORTS * (3 + CONTROL_REPORT_MAX_BYTES) + SIG_BYTES};
 constexpr size_t EVIDENCE_MAX_BYTES{1 + std::max(2 * (3 + VOTE_MAX_BYTES), 2 * CERTIFIED_HEADER_MAX_BYTES)};
 static_assert(CERT_MAX <= 0xffff && VIEW_CHANGE_MAX_BYTES <= 0xffff && VOTE_MAX_BYTES <= 0xffff,
               "every nested length fits a 3-byte CompactSize");
@@ -117,6 +135,10 @@ size_t MaxPayloadBytes(MessageType type, const ProfileParams& profile)
     case MessageType::VIEW_CHANGE: return VIEW_CHANGE_MAX_BYTES;
     case MessageType::NEW_VIEW: return NEW_VIEW_MAX_BYTES;
     case MessageType::EVIDENCE: return EVIDENCE_MAX_BYTES;
+    case MessageType::CERTIFIED_PROPOSAL: return 3 + CERT_MAX + ProposalMaxBytes(profile);
+    case MessageType::CONTROL_REPORT: return CONTROL_REPORT_MAX_BYTES;
+    case MessageType::CONTROL_NEW_VIEW: return CONTROL_NEW_VIEW_MAX_BYTES + 1 + 5 + ProposalMaxBytes(profile);
+    case MessageType::OFFER: return ProposalMaxBytes(profile);
     }
     return 0;
 }
@@ -206,6 +228,42 @@ void EncodePayload(std::vector<unsigned char>& out, const Evidence& e)
         EncodeCertifiedHeader(out, cc.second);
     }
 }
+
+void EncodePayload(std::vector<unsigned char>& out, const CertifiedProposal& final)
+{
+    PutLengthPrefixed(out, final.certificate.Encode());
+    EncodePayload(out, final.proposal);
+}
+
+void EncodePayload(std::vector<unsigned char>& out, const ControlReport& report)
+{
+    Put(out, report.key, report.prepared_watermark, static_cast<uint8_t>(report.prepared ? 1 : 0));
+    if (report.prepared) {
+        Put(out, report.prepared->view);
+        EncodeCertifiedHeader(out, CertifiedHeader{report.prepared->header, report.prepared->certificate});
+    }
+    Put(out, static_cast<uint8_t>(report.decision ? 1 : 0));
+    if (report.decision) EncodeCertifiedHeader(out, *report.decision);
+    PutBytes(out, report.signature);
+}
+void EncodePayload(std::vector<unsigned char>& out, const ControlNewView& view)
+{
+    Put(out, view.key, view.selected);
+    PutCompactSize(out, view.reports.size());
+    for (const auto& report : view.reports) {
+        std::vector<unsigned char> bytes;
+        EncodePayload(bytes, report);
+        PutLengthPrefixed(out, bytes);
+    }
+    Put(out, static_cast<uint8_t>(view.selected_proposal ? 1 : 0));
+    if (view.selected_proposal) {
+        std::vector<unsigned char> body;
+        EncodePayload(body, *view.selected_proposal);
+        PutLengthPrefixed(out, body);
+    }
+    PutBytes(out, view.signature);
+}
+void EncodePayload(std::vector<unsigned char>& out, const OfferedProposal& offer) { EncodePayload(out, offer.proposal); }
 
 // ---- decoding ------------------------------------------------------------
 
@@ -385,6 +443,38 @@ Evidence DecodeEvidence(Parser& parser)
     return Evidence{std::move(cc)};
 }
 
+ControlReport DecodeControlReport(Parser& parser)
+{
+    ControlReport report;
+    report.key = parser.Read<storage::ControlKey>();
+    report.prepared_watermark = parser.Read<uint64_t>();
+    const auto has_prepared{parser.Read<uint8_t>()};
+    if (has_prepared > 1) throw std::ios_base::failure("control prepared flag");
+    if (has_prepared) {
+        const auto view{parser.Read<uint64_t>()};
+        auto certified{DecodeCertifiedHeader(parser)};
+        report.prepared = ControlPrepared{view, std::move(certified.header), std::move(certified.cert)};
+    }
+    const auto has_decision{parser.Read<uint8_t>()};
+    if (has_decision > 1) throw std::ios_base::failure("control decision flag");
+    if (has_decision) report.decision = DecodeCertifiedHeader(parser);
+    report.signature = ReadSignature(parser);
+    return report;
+}
+ControlNewView DecodeControlNewView(Parser& parser, const ProfileParams& profile)
+{
+    ControlNewView view;
+    view.key = parser.Read<storage::ControlKey>();
+    view.selected = parser.Read<uint256>();
+    const auto count{parser.Count(MAX_CONTROL_REPORTS)};
+    for (uint64_t i{0}; i < count; ++i) view.reports.push_back(DecodeNested(parser, CONTROL_REPORT_MAX_BYTES, DecodeControlReport));
+    const auto has_body{parser.Read<uint8_t>()};
+    if (has_body > 1) throw std::ios_base::failure("control selected proposal flag");
+    if (has_body) view.selected_proposal = DecodeNested(parser, ProposalMaxBytes(profile), [&](Parser& inner) { return DecodeProposal(inner, profile); });
+    view.signature = ReadSignature(parser);
+    return view;
+}
+
 Message DecodePayload(MessageType type, Parser& parser, const ProfileParams& profile)
 {
     switch (type) {
@@ -393,6 +483,13 @@ Message DecodePayload(MessageType type, Parser& parser, const ProfileParams& pro
     case MessageType::VIEW_CHANGE: return DecodeViewChange(parser);
     case MessageType::NEW_VIEW: return DecodeNewView(parser);
     case MessageType::EVIDENCE: return DecodeEvidence(parser);
+    case MessageType::CONTROL_REPORT: return DecodeControlReport(parser);
+    case MessageType::CONTROL_NEW_VIEW: return DecodeControlNewView(parser, profile);
+    case MessageType::OFFER: return OfferedProposal{DecodeProposal(parser, profile)};
+    case MessageType::CERTIFIED_PROPOSAL: {
+        SlotCertificate certificate{ReadCertificate(parser)};
+        return CertifiedProposal{DecodeProposal(parser, profile), std::move(certificate)};
+    }
     }
     throw std::ios_base::failure("unknown message type"); // unreachable: the type was checked
 }
@@ -405,7 +502,7 @@ size_t MaxMessageBytes(const ProfileParams& profile)
 {
     size_t longest{0};
     for (const MessageType type : {MessageType::PROPOSAL, MessageType::VOTE, MessageType::VIEW_CHANGE, MessageType::NEW_VIEW,
-                                   MessageType::EVIDENCE}) {
+                                   MessageType::EVIDENCE, MessageType::CERTIFIED_PROPOSAL, MessageType::CONTROL_REPORT, MessageType::CONTROL_NEW_VIEW, MessageType::OFFER}) {
         longest = std::max(longest, MaxPayloadBytes(type, profile));
     }
     return 2 + longest;
@@ -452,7 +549,10 @@ Result<void> CheckProposal(const Proposal& proposal)
     if (proposal.epoch != header.authority_epoch) return Invalid(PROPOSAL_EPOCH);
     if (proposal.parent_cert.has_value() != !header.parent_cert_hash.IsNull()) return Invalid(PROPOSAL_PARENT_CERT);
     if (proposal.parent_cert.has_value() &&
-        (proposal.parent_cert->header_hash != header.parent_hash || proposal.parent_cert->Hash() != header.parent_cert_hash)) {
+        (proposal.parent_cert->header_hash != header.parent_hash ||
+         ((header.commitment_version == COMMITMENT_VERSION_WITHDRAWALS || header.commitment_version == COMMITMENT_VERSION_VIEW_BOUND)
+              ? header.parent_cert_hash != header.parent_hash
+              : proposal.parent_cert->Hash() != header.parent_cert_hash))) {
         return Invalid(PROPOSAL_PARENT_CERT);
     }
     if (!storage::BodyMatchesHeader(header, proposal.body)) return Invalid(PROPOSAL_BODY);

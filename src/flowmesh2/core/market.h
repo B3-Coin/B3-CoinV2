@@ -7,6 +7,7 @@
 
 #include <flowmesh2/core/amount.h>
 #include <flowmesh2/core/ids.h>
+#include <flowmesh2/core/params.h>
 #include <flowmesh2/core/result.h>
 #include <serialize.h>
 
@@ -50,6 +51,15 @@ struct MarketDescriptor {
  * [1, MAX_ATOMS].
  */
 Result<void> ValidateMarket(const MarketDescriptor& market);
+
+inline constexpr std::string_view STABLE_QUOTE_REQUIRED{"market quote is not the profile's exact stable fee AssetId"};
+
+/** Validate(profile), structural ValidateMarket, then enforce the profile's
+ * fee policy. Encoding-2 stable-Q admits only quote == stable_fee_asset;
+ * legacy profiles retain their original quote-asset semantics. The pure
+ * shared rule is used by market creation, execution and engine-off verification.
+ */
+Result<void> ValidateMarketForProfile(const MarketDescriptor& market, const ProfileParams& profile);
 
 //! lots * base_atoms_per_lot; INVALID_INPUT for an invalid market.
 Result<Atoms> BaseAtoms(const MarketDescriptor& market, uint64_t lots);

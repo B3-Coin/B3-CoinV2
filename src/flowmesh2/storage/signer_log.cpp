@@ -81,14 +81,91 @@ Result<SignedVoteRecord> SignedVoteRecord::Decode(std::span<const unsigned char>
 
 Result<SignerLog> SignerLog::Create(Journal& journal)
 {
+    return CreateImpl(journal, nullptr);
+}
+
+Result<SignerLog> SignerLog::Create(Journal& journal, const ProfileParams& profile)
+{
+    return CreateImpl(journal, &profile);
+}
+
+Result<SignerLog> SignerLog::CreateImpl(Journal& journal, const ProfileParams* profile)
+{
     if (journal.Role() != JournalRole::SIGNER) return Error{ErrorCode::ORDER_VIOLATION, LOG_ROLE};
     const JournalStatus status{journal.Status()};
     if (status.fatal) return Error{ErrorCode::FENCED, JOURNAL_FENCED};
-    if (status.appended_seq != 0) {
-        // The equivocation index of a journal with history must be rebuilt first: recovery.
-        return NotImplemented("M4-STO-01"); // TODO(rebirth:M4-STO-01)
+    if (status.appended_seq != status.durable_seq) return Error{ErrorCode::ORDER_VIOLATION, LOG_PENDING_RECORDS};
+    if (profile) {
+        if (Result<void> valid{Validate(*profile)}; !valid.has_value()) return valid.error();
     }
-    return Ok(SignerLog{journal});
+    if (status.durable_seq == 0) return Ok(SignerLog{journal});
+    if (!profile) return Error{ErrorCode::INVALID_INPUT, LOG_REPLAY_PROFILE_REQUIRED};
+    Result<std::vector<JournalRecord>> records{journal.ReadAll()};
+    if (!records.has_value()) return records.error();
+    if (records->size() != status.durable_seq) return Error{ErrorCode::ORDER_VIOLATION, LOG_REPLAY_SEQUENCE};
+
+    SignerLog log{journal};
+    uint64_t expected_seq{0};
+    for (const JournalRecord& record : *records) {
+        if (record.seq != ++expected_seq) return Error{ErrorCode::ORDER_VIOLATION, LOG_REPLAY_SEQUENCE};
+        switch (record.type) {
+        case RecordType::ACCEPTED_PROPOSAL: {
+            Result<AcceptedProposalRecord> accepted{AcceptedProposalRecord::Decode(record.payload, *profile)};
+            if (!accepted.has_value()) return accepted.error();
+            const SlotHeaderV2& header{accepted->header};
+            if (header.authority_epoch != accepted->key.epoch || header.height != accepted->key.slot) {
+                return Error{ErrorCode::INVALID_INPUT, PROPOSAL_KEY_MISMATCH};
+            }
+            if (!BodyMatchesHeader(header, accepted->body)) return Error{ErrorCode::VERIFY_FAILED, BODY_HEADER_MISMATCH};
+            const auto [it, inserted]{log.m_proposals.emplace(
+                accepted->key, ProposalEntry{header.Hash(), header.domain, VersionedCommitDigest(header, accepted->key.view), record.seq})};
+            if (!inserted && it->second.header_hash != header.Hash()) return Error{ErrorCode::EQUIVOCATION_REFUSED, PROPOSAL_CONFLICT};
+            break;
+        }
+        case RecordType::INTENT: {
+            Result<IntentRecord> intent{IntentRecord::Decode(record.payload)};
+            if (!intent.has_value()) return intent.error();
+            const auto proposal{log.m_proposals.find(intent->key.Proposal())};
+            if (proposal == log.m_proposals.end() || proposal->second.seq != intent->proposal_seq ||
+                intent->proposal_seq >= record.seq || intent->key.domain != proposal->second.domain) {
+                return Error{ErrorCode::INVALID_INPUT, INTENT_PROPOSAL_MISMATCH};
+            }
+            if (intent->key.phase == VotePhase::COMMIT && intent->digest != proposal->second.commit_digest) {
+                return Error{ErrorCode::INVALID_INPUT, INTENT_DIGEST_MISMATCH};
+            }
+            const auto [it, inserted]{log.m_votes.emplace(intent->key, VoteEntry{intent->digest, record.seq, std::nullopt, 0})};
+            if (!inserted && it->second.digest != intent->digest) return Error{ErrorCode::EQUIVOCATION_REFUSED, VOTE_EQUIVOCATION};
+            break;
+        }
+        case RecordType::SIGNED_VOTE: {
+            Result<SignedVoteRecord> vote{SignedVoteRecord::Decode(record.payload)};
+            if (!vote.has_value()) return vote.error();
+            const auto it{log.m_votes.find(vote->key)};
+            if (it == log.m_votes.end() || it->second.intent_seq != vote->intent_seq ||
+                vote->intent_seq >= record.seq || it->second.digest != vote->digest) {
+                return Error{ErrorCode::VERIFY_FAILED, INTENT_UNKNOWN};
+            }
+            VoteEntry& entry{it->second};
+            if (entry.signature) {
+                if (*entry.signature != vote->signature) return Error{ErrorCode::EQUIVOCATION_REFUSED, SIGNED_VOTE_CONFLICT};
+            } else {
+                entry.signature = vote->signature;
+                entry.signed_seq = record.seq;
+            }
+            break;
+        }
+        case RecordType::VIEW_STATE:
+        case RecordType::NEW_VIEW_ACCEPTED:
+            return NotImplemented("M4-STO-07"); // TODO(rebirth:M4-STO-07)
+        default:
+            if (!IsKnown(record.type)) return Error{ErrorCode::DECODE, RECORD_TYPE};
+            return Error{ErrorCode::ORDER_VIOLATION, RECORD_ROLE};
+        }
+    }
+    const JournalStatus after{journal.Status()};
+    if (after.fatal) return Error{ErrorCode::FENCED, JOURNAL_FENCED};
+    if (!(after == status)) return Error{ErrorCode::ORDER_VIOLATION, LOG_REPLAY_CHANGED};
+    return Ok(std::move(log));
 }
 
 Result<PendingProposal> SignerLog::AppendAcceptedProposal(const ProposalKey& key, const SlotHeaderV2& header, const SlotBody& body)
@@ -107,7 +184,7 @@ Result<PendingProposal> SignerLog::AppendAcceptedProposal(const ProposalKey& key
     const std::vector<unsigned char> payload{AcceptedProposalRecord{key, header, body}.Encode()};
     Result<uint64_t> seq{m_journal->Append(RecordType::ACCEPTED_PROPOSAL, payload)};
     if (!seq.has_value()) return seq.error();
-    m_proposals.emplace(key, ProposalEntry{header_hash, header.domain, header.CommitDigest(), *seq});
+    m_proposals.emplace(key, ProposalEntry{header_hash, header.domain, VersionedCommitDigest(header, key.view), *seq});
     return Ok(PendingProposal{m_journal->InstanceId(), *seq, ref});
 }
 
@@ -171,6 +248,37 @@ Result<PendingSignedVote> SignerLog::AppendSignedFolded(const VoteKey& /*key*/, 
                                                         const PendingProposal& /*proposal*/, const VoteSignature& /*signature*/)
 {
     return NotImplemented("M4-STO-05"); // TODO(rebirth:M4-STO-05)
+}
+
+std::optional<PendingSignedVote> SignerLog::SignedAt(const VoteKey& key) const
+{
+    const auto it{m_votes.find(key)};
+    if (it == m_votes.end() || !it->second.signature) return std::nullopt;
+    return PendingSignedVote{JournalInstance(), it->second.signed_seq, SignedVoteRef{key, it->second.digest, *it->second.signature}};
+}
+
+Result<std::optional<AcceptedProposalRecord>> SignerLog::AcceptedAt(const ProposalKey& key, const ProfileParams& profile) const
+{
+    if (IsFatal()) return Error{ErrorCode::FENCED, JOURNAL_FENCED};
+    auto records{m_journal->ReadAll()};
+    if (!records.has_value()) return records.error();
+    for (const auto& record : *records) {
+        if (record.type != RecordType::ACCEPTED_PROPOSAL) continue;
+        auto proposal{AcceptedProposalRecord::Decode(record.payload, profile)};
+        if (!proposal.has_value()) return proposal.error();
+        if (proposal->key == key) return Ok(std::optional{std::move(*proposal)});
+    }
+    return Ok(std::optional<AcceptedProposalRecord>{});
+}
+
+std::vector<uint64_t> SignerLog::DurableAcceptedViewsAt(uint64_t epoch, uint64_t slot) const
+{
+    std::vector<uint64_t> views;
+    const auto durable{m_journal->DurableSeq()};
+    for (const auto& [key, entry] : m_proposals) {
+        if (key.epoch == epoch && key.slot == slot && entry.seq <= durable) views.push_back(key.view);
+    }
+    return views;
 }
 
 Result<uint64_t> SignerLog::AppendViewState(const ViewStateRecord& /*record*/)

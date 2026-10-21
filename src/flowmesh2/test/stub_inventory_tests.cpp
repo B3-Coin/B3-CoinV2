@@ -239,7 +239,7 @@ void CheckOneStub(std::string_view case_name)
 //! body that follows the macro is the probe. See the file comment.
 #define FM2_STUB_CASE(case_ident, task_literal)                                                       \
     static flowmesh2::test::StubObservation case_ident##_probe();                                     \
-    static const flowmesh2::test::StubRegistrar case_ident##_registrar{task_literal, #case_ident,     \
+    static const flowmesh2::test::StubRegistrar case_ident##_registrar{flowmesh2::TaskId{task_literal}, #case_ident,     \
                                                                        &case_ident##_probe};          \
     BOOST_AUTO_TEST_CASE(case_ident) { flowmesh2::test::CheckOneStub(#case_ident); }                  \
     static flowmesh2::test::StubObservation case_ident##_probe()
@@ -425,8 +425,8 @@ FM2_STUB_CASE(M8_BRG_02, "M8-BRG-02")
 {
     // The payout fact's codec (R4) and the bridge's withdrawal packet (R13).
     bridge::BridgeManagerV2 manager;
-    return FirstDeviation("M8-BRG-02", {FactStubProbe(PayoutConfirmedFact{}, "M8-BRG-02"),
-                                        Observe(manager.BuildWithdrawalPacket(bridge::WithdrawalRequest{}))});
+    // The payout fact codec is real; production packet export is still gated.
+    return Observe(manager.BuildWithdrawalPacket(bridge::WithdrawalRequest{}));
 }
 
 FM2_STUB_CASE(M8_EXIT_01, "M8-EXIT-01")
@@ -509,23 +509,6 @@ FM2_STUB_CASE(M9_FUT_04, "M9-FUT-04")
 
 // ---- Slice R8: storage/file_journal ----
 
-FM2_STUB_CASE(M4_STO_01, "M4-STO-01")
-{
-    // Reopening a journal and reading it back from disk.
-    const TestDir dir{"stub_m4_sto_01"};
-    auto journal{storage::FileJournal::CreateNew(dir.path, storage::JournalRole::SIGNER, 1, storage::SEGMENT_PAGE_BYTES).value()};
-    // And the logs over a journal that already has records (index rebuild).
-    auto signer{NewMemoryJournal(storage::JournalRole::SIGNER, 2)};
-    auto commit{NewMemoryJournal(storage::JournalRole::COMMIT, 3)};
-    if (!signer->Append(storage::RecordType::INTENT, Bytes("history")).has_value() ||
-        !commit->Append(storage::RecordType::DECISION, Bytes("history")).has_value()) {
-        return StubObservation{true, std::nullopt}; // the probe's own setup failed: report it as a deviation
-    }
-    return FirstDeviation("M4-STO-01", {Observe(storage::FileJournal::OpenExisting(dir.path, storage::JournalRole::SIGNER, 1)),
-                                        Observe(journal->ReadAll()), Observe(storage::SignerLog::Create(*signer)),
-                                        Observe(storage::CommitLog::Create(*commit))});
-}
-
 FM2_STUB_CASE(M4_STO_06, "M4-STO-06")
 {
     // Rollover itself, and an append that no longer fits in the segment.
@@ -559,17 +542,15 @@ FM2_STUB_CASE(M4_STO_03, "M4-STO-03")
 FM2_STUB_CASE(M4_STO_07, "M4-STO-07")
 {
     // VIEW_STATE and NEW_VIEW_ACCEPTED in the signer log, PREPARED_QC in the
-    // commit log, and the replay of a PREPARED_QC record (R9).
+    // legacy commit-log entry point. Certified prepared replay is implemented.
     auto signer_journal{NewMemoryJournal(storage::JournalRole::SIGNER, 1)};
     auto commit_journal{NewMemoryJournal(storage::JournalRole::COMMIT, 2)};
     storage::SignerLog signer{storage::SignerLog::Create(*signer_journal).value()};
     storage::CommitLog commit{storage::CommitLog::Create(*commit_journal).value()};
     HeartbeatOwner heartbeat{MakeHeartbeatOwner()};
-    const std::vector<storage::JournalRecord> prepared{{1, storage::RecordType::PREPARED_QC, {}, uint256{}}};
     return FirstDeviation("M4-STO-07", {Observe(signer.AppendViewState(storage::ViewStateRecord{0, 1})),
                                         Observe(signer.AppendNewViewAccepted(storage::NewViewAcceptedRecord{0, 1, Bytes("nv")})),
-                                        Observe(commit.AppendPreparedQc(storage::PreparedQcRecord{0, 1, 1, uint256::ONE, Bytes("qc")})),
-                                        Observe(state::ReplayDecisions(*heartbeat.owner->Head(), prepared))});
+                                        Observe(commit.AppendPreparedQc(storage::PreparedQcRecord{0, 1, 1, uint256::ONE, Bytes("qc")}))});
 }
 
 // ---- Slice R9: the state owner ----
@@ -715,9 +696,16 @@ FM2_STUB_CASE(M4_SIM_01, "M4-SIM-01")
                                         Observe(sim::SimCluster::Create(4, sim::SimNodeConfig{}, trace))});
 }
 
-FM2_STUB_CASE(M4_NET_01, "M4-NET-01")
+// Retain the inventoried case name as a real boundary regression. Socket,
+// session authentication and lane isolation live in tcp_mesh_tests.
+BOOST_AUTO_TEST_CASE(M4_NET_01)
 {
-    return Observe(net::TcpSeatMesh::Create(net::TcpMeshConfig{TestMeshConfig(0, 4), net::DEFAULT_SEAT_MESH_PORT, {}}));
+    net::TcpMeshConfig config;
+    config.mesh = TestMeshConfig(0, 4);
+    config.network_magic = {0xfa, 0xbf, 0xb5, 0xda};
+    const auto mesh{net::TcpSeatMesh::Create(config)};
+    BOOST_REQUIRE(!mesh.has_value());
+    BOOST_CHECK(mesh.error().code == ErrorCode::INVALID_INPUT);
 }
 
 FM2_STUB_CASE(M4_NET_02, "M4-NET-02")

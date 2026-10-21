@@ -18,6 +18,10 @@
 #include <boost/test/included/unit_test.hpp>
 
 #include <key.h>
+#include <util/translation.h>
+
+// This headless executable uses untranslated messages.
+const TranslateFn G_TRANSLATION_FUN{nullptr};
 
 namespace {
 struct Fm2EccFixture {

@@ -4,6 +4,7 @@
 
 #include <flowmesh2/ledger/ledger.h>
 
+#include <algorithm>
 #include <utility>
 #include <vector>
 
@@ -165,7 +166,33 @@ Result<AccountLeafV0> LedgerState::Leaf(const AccountId& account) const
 
 Result<void> LedgerState::CheckConservation() const
 {
-    return ledger::CheckConservation(m_accounts, m_totals, m_profile.max_open_orders_per_account);
+    const Result<void> balanced{ledger::CheckConservation(m_accounts, m_totals, m_profile.max_open_orders_per_account)};
+    if (!balanced.has_value()) return balanced.error();
+    std::map<AssetId, std::pair<Atoms, Atoms>> obligations;
+    std::set<Outpoint> paid_events;
+    size_t pending_count{0};
+    for (const auto& [id, record] : m_withdrawals) {
+        if (!m_profile.withdrawals_enabled || !m_profile.stable_fee_asset || record.asset != *m_profile.stable_fee_asset ||
+            id != record.id || !record.IsCanonical() || !HasAccount(record.account) || IsProtocolAccount(record.account) ||
+            record.fee != m_profile.withdrawal_fee_atoms) return Error{ErrorCode::INVARIANT, "noncanonical withdrawal obligation"};
+        auto& [pending, effects]{obligations[record.asset]};
+        Atoms& total{record.paid ? effects : pending};
+        const Result<Atoms> sum{AddAtoms(total, record.amount)};
+        if (!sum.has_value()) return Error{ErrorCode::INVARIANT, "withdrawal obligations exceed atom range"};
+        total = *sum;
+        if (record.paid) {
+            if (!paid_events.insert(record.payout_event).second) return Error{ErrorCode::INVARIANT, "payout event reused"};
+        } else if (++pending_count > MAX_PENDING_WITHDRAWALS) return Error{ErrorCode::INVARIANT, "pending withdrawal cap"};
+    }
+    for (const auto& [asset, totals] : m_totals) {
+        const auto it{obligations.find(asset)};
+        const auto sums{it == obligations.end() ? std::pair<Atoms, Atoms>{0, 0} : it->second};
+        if (totals.pending != sums.first || totals.effects != sums.second) return Error{ErrorCode::INVARIANT, "withdrawal totals differ from records"};
+    }
+    for (const auto& [asset, sums] : obligations) {
+        if (!m_totals.contains(asset)) return Error{ErrorCode::INVARIANT, "withdrawal asset without totals"};
+    }
+    return Ok();
 }
 
 Result<void> LedgerState::CreditDeposit(const DepositFact& fact)
@@ -331,8 +358,87 @@ Result<void> LedgerState::RemoveOpenOrder(const AccountId& account)
     return Ok();
 }
 
+Result<OutcomeCode> LedgerState::RequestWithdrawal(const ActionId& id, const AccountId& account,
+                                                    const WithdrawPayload& withdrawal, uint64_t slot)
+{
+    if (!m_profile.withdrawals_enabled) return Unsupported("M2-LED-05"); // TODO(rebirth:M2-LED-05) legacy profile withdrawals stay disabled.
+    if (!HasAccount(account) || IsProtocolAccount(account)) return UnknownAccount();
+    if (!m_profile.stable_fee_asset || withdrawal.asset != *m_profile.stable_fee_asset ||
+        id.id.IsNull() || slot == 0 || withdrawal.amount <= 0 || !InAtomRange(withdrawal.amount) ||
+        withdrawal.destination_script.size() != 20 ||
+        std::all_of(withdrawal.destination_script.begin(), withdrawal.destination_script.end(), [](unsigned char b) { return b == 0; })) {
+        return Ok(OutcomeCode::REJ_BAD_PARAMS);
+    }
+    WithdrawalRecord record;
+    record.id = id;
+    record.account = account;
+    record.asset = withdrawal.asset;
+    record.amount = withdrawal.amount;
+    record.fee = m_profile.withdrawal_fee_atoms;
+    std::copy(withdrawal.destination_script.begin(), withdrawal.destination_script.end(), record.recipient.begin());
+    record.slot = slot;
+    const auto existing{m_withdrawals.find(id)};
+    if (existing != m_withdrawals.end()) {
+        const WithdrawalRecord& before{existing->second};
+        if (before.account != record.account || before.asset != record.asset || before.amount != record.amount ||
+            before.fee != record.fee || before.recipient != record.recipient || before.slot != record.slot) {
+            return Error{ErrorCode::EQUIVOCATION_REFUSED, "withdrawal identity reused"};
+        }
+        return Ok(OutcomeCode::WITHDRAWAL_PENDING);
+    }
+    size_t pending_count{0};
+    for (const auto& [key, obligation] : m_withdrawals) if (!obligation.paid) ++pending_count;
+    if (pending_count >= MAX_PENDING_WITHDRAWALS) return Ok(OutcomeCode::REJ_BAD_PARAMS);
+    const Result<Atoms> debit{AddAtoms(withdrawal.amount, record.fee)};
+    if (!debit.has_value()) return Ok(OutcomeCode::REJ_BAD_PARAMS);
+    AccountState* owner{FindMutable(account)};
+    const Balance before{owner->BalanceOf(withdrawal.asset)};
+    if (before.available < *debit) return Ok(OutcomeCode::REJ_INSUFFICIENT_AVAILABLE);
+    AssetTotals totals{TotalsOf(withdrawal.asset)};
+    const Result<Atoms> pending{AddAtoms(totals.pending, withdrawal.amount)};
+    const Result<Atoms> fees{AddAtoms(totals.fees_held, record.fee)};
+    if (!pending.has_value()) return pending.error();
+    if (!fees.has_value()) return fees.error();
+    // Stage the only new node before mutating existing balances/totals.
+    m_withdrawals.emplace(id, record);
+    PutBalance(*owner, withdrawal.asset, Balance{before.available - *debit, before.reserved});
+    totals.pending = *pending;
+    totals.fees_held = *fees;
+    PutTotals(withdrawal.asset, totals);
+    return Ok(OutcomeCode::WITHDRAWAL_PENDING);
+}
+
+Result<void> LedgerState::ConfirmWithdrawal(const PayoutConfirmedFact& payout)
+{
+    if (!m_profile.withdrawals_enabled) return Unsupported("M8-BRG-02"); // TODO(rebirth:M8-BRG-02) legacy profile payout route stays disabled.
+    if (!payout.IsCanonical()) return Error{ErrorCode::INVALID_INPUT, "noncanonical payout confirmation"};
+    const auto found{m_withdrawals.find(payout.withdrawal)};
+    if (found == m_withdrawals.end()) return Error{ErrorCode::VERIFY_FAILED, "payout obligation unknown"};
+    WithdrawalRecord& record{found->second};
+    if (record.account != payout.account || record.asset != payout.asset || record.amount != payout.amount ||
+        record.recipient != payout.recipient) return Error{ErrorCode::VERIFY_FAILED, "payout obligation mismatch"};
+    if (record.paid) {
+        if (record.payout_event == payout.payout_event) return Ok();
+        return Error{ErrorCode::VERIFY_FAILED, "withdrawal already paid by another event"};
+    }
+    for (const auto& [id, other] : m_withdrawals) {
+        if (other.paid && other.payout_event == payout.payout_event) return Error{ErrorCode::VERIFY_FAILED, "payout event reused"};
+    }
+    AssetTotals totals{TotalsOf(record.asset)};
+    if (totals.pending < record.amount) return Error{ErrorCode::INVARIANT, "payout exceeds pending total"};
+    const Result<Atoms> effects{AddAtoms(totals.effects, record.amount)};
+    if (!effects.has_value()) return effects.error();
+    totals.pending -= record.amount;
+    totals.effects = *effects;
+    PutTotals(record.asset, totals);
+    record.paid = true;
+    record.payout_event = payout.payout_event;
+    return Ok();
+}
+
 Result<void> LedgerState::RequestWithdrawal(const AccountId&, const WithdrawPayload&)
 {
+    if (m_profile.withdrawals_enabled) return Error{ErrorCode::INVALID_INPUT, "authenticated withdrawal identity and slot required"};
     return NotImplemented("M2-LED-05"); // TODO(rebirth:M2-LED-05)
 }
 

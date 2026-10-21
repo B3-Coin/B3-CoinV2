@@ -84,6 +84,14 @@ struct AccountWitnessV0 {
  */
 Result<AccountWitnessV0> ProveAccountV0(const LedgerState& ledger, const AccountId& account);
 
+//! A canonical withdrawal record and inclusion proof under the v2 sixth root.
+struct WithdrawalWitness {
+    WithdrawalRecord record;
+    MerkleProof proof;
+};
+//! INVALID_INPUT for a disabled profile or absent claim. No absence proof.
+Result<WithdrawalWitness> ProveWithdrawal(const LedgerState& ledger, const ActionId& id);
+
 // ---- Stubs -------------------------------------------------------------------
 
 //! Commitment v1: per-component sparse Merkle trees (commitment_version = 1).

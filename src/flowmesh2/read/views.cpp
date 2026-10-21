@@ -28,6 +28,14 @@ Result<CertifiedEnvelope> CertifiedEnvelope::Decode(std::span<const unsigned cha
         reader >> envelope.cert.header_hash;
         ReadCappedVector(reader, envelope.cert.bitmap, MAX_BITMAP_BYTES);
         reader >> envelope.cert.aggregate;
+        // A certified v3 head carries its COMMIT view after the aggregate.
+        // Keep the legacy envelope framing exact: v0/v2 accept no extension.
+        if (envelope.header.commitment_version == COMMITMENT_VERSION_VIEW_BOUND) {
+            if (reader.size() != sizeof(uint64_t)) throw std::ios_base::failure("view-bound envelope requires its certificate view");
+            uint64_t view{0};
+            reader >> view;
+            envelope.cert.view = view;
+        }
         return envelope;
     });
 }

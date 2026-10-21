@@ -355,7 +355,7 @@ BOOST_AUTO_TEST_CASE(flowmesh_release_regtest_schedule_is_complete_and_isolated)
     // The ordinary modern-regtest configuration remains untouched and has no
     // synthetic rights, feature heights, or treasury destination.
     CChainParams::RegTestOptions plain_options;
-    plain_options.b3_modern.emplace();
+    plain_options.b3_modern.emplace(CChainParams::B3ModernRegTestOptions{});
     const auto plain_params{CChainParams::RegTest(plain_options)};
     const Consensus::Params& plain{plain_params->GetConsensus()};
     BOOST_CHECK(!plain.fn_genesis_required);

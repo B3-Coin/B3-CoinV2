@@ -10,7 +10,7 @@
 namespace flowmesh2 {
 namespace {
 
-constexpr std::array<CodeInfo<OutcomeCode>, 22> OUTCOME_CODES{{
+constexpr std::array<CodeInfo<OutcomeCode>, 24> OUTCOME_CODES{{
     {OutcomeCode::DEPOSIT_CREDITED, "DEPOSIT_CREDITED", false},
     {OutcomeCode::RESTING, "RESTING", false},
     {OutcomeCode::FILLED, "FILLED", false},
@@ -19,6 +19,8 @@ constexpr std::array<CodeInfo<OutcomeCode>, 22> OUTCOME_CODES{{
     {OutcomeCode::CANCELLED, "CANCELLED", false},
     {OutcomeCode::TRANSFERRED, "TRANSFERRED", false},
     {OutcomeCode::FEES_DISTRIBUTED, "FEES_DISTRIBUTED", false},
+    {OutcomeCode::WITHDRAWAL_PENDING, "WITHDRAWAL_PENDING", false},
+    {OutcomeCode::WITHDRAWAL_PAID, "WITHDRAWAL_PAID", false},
     {OutcomeCode::REJ_INSUFFICIENT_AVAILABLE, "REJ_INSUFFICIENT_AVAILABLE", true},
     {OutcomeCode::REJ_UNKNOWN_MARKET, "REJ_UNKNOWN_MARKET", true},
     {OutcomeCode::REJ_UNKNOWN_ORDER, "REJ_UNKNOWN_ORDER", true},

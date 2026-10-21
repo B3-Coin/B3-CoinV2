@@ -91,7 +91,7 @@ COutPoint Outpoint(const unsigned char tag, const uint32_t n)
 class FixedAnchors final : public flowmesh::AnchorPolicy
 {
 public:
-    AnchorRef current{7, uint256{"00000000000000000000000000000000000000000000000000000000000000aa"}};
+    AnchorRef current{7, uint256{uint8_t{0xaa}}};
     bool accept_all{true};
     bool still_canonical{true};
     //! Simulates the owner-configured burial/finality requirement: an

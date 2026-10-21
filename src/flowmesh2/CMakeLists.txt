@@ -109,11 +109,13 @@ if(BUILD_FLOWMESH2)
     admission/admission.cpp
     admission/budget.cpp
     admission/pool.cpp
+    agreement/control_messages.cpp
     agreement/evidence.cpp
     agreement/inclusion.cpp
     agreement/leader.cpp
     agreement/messages.cpp
     agreement/pbft.cpp
+    agreement/regtest_pbft.cpp
     agreement/restart_fence.cpp
     bridge/bridge_manager.cpp
     bridge/checkpoint.cpp
@@ -137,13 +139,13 @@ if(BUILD_FLOWMESH2)
     net/seat_mesh.cpp
     net/sentry.cpp
     net/short_id.cpp
-    net/tcp_mesh.cpp
     read/read_service.cpp
     read/views.cpp
     state/candidate.cpp
     state/replay.cpp
     state/state_owner.cpp
     storage/commit_log.cpp
+    storage/control_log.cpp
     storage/file_journal.cpp
     storage/journal.cpp
     storage/journal_commit.cpp
@@ -163,6 +165,12 @@ if(BUILD_FLOWMESH2)
       flowmesh2_foundations
       fm2_types
   )
+
+  # Authenticated socket/crypto boundary. The deterministic core and pure
+  # verifier retain their existing link isolation from bitcoin_common.
+  add_library(fm2_transport STATIC net/tcp_mesh.cpp ${PROJECT_SOURCE_DIR}/src/bip324.cpp)
+  target_link_libraries(fm2_transport PRIVATE core_interface fm2_warnings
+    PUBLIC fm2_core bitcoin_common)
 
   # verify/ (slice R11): b3verify, the engine-off client verifier
   # (certificates, outcomes, account leaves, fills, balance transitions and
@@ -240,10 +248,19 @@ if(BUILD_FLOWMESH2)
   set_target_properties(fm2_sim_cli PROPERTIES OUTPUT_NAME fm2-sim)
   target_link_libraries(fm2_sim_cli PRIVATE core_interface fm2_warnings fm2_simlib)
 
+  # Explicit local-only four-seat operator worker. Never linked into b3coind.
+  if(UNIX)
+    add_executable(fm2_regtest_node dev/regtest_operator.cpp dev/regtest_node_main.cpp)
+    set_target_properties(fm2_regtest_node PROPERTIES OUTPUT_NAME fm2-regtest-node)
+    target_link_libraries(fm2_regtest_node PRIVATE core_interface fm2_warnings
+      fm2_dev fm2_core fm2_verify fm2_transport bitcoin_common bitcoin_clientversion univalue secp256k1)
+  endif()
+
   # Boost.Test suite of the outline. Every case is listed in test/INVENTORY.txt.
   add_executable(test_flowmesh2
     test/main.cpp
     test/account_leaf_tests.cpp
+    test/bip324_overlay_context_tests.cpp
     test/admission_precedence_tests.cpp
     test/admission_tests.cpp
     test/action_tests.cpp
@@ -260,6 +277,8 @@ if(BUILD_FLOWMESH2)
     test/codec_tests.cpp
     test/codes_tests.cpp
     test/commit_log_tests.cpp
+    test/control_log_tests.cpp
+    test/control_messages_tests.cpp
     test/commitment_tests.cpp
     test/dev_certifier_tests.cpp
     test/durable_tests.cpp
@@ -285,6 +304,7 @@ if(BUILD_FLOWMESH2)
     test/nonce_window_tests.cpp
     test/outcome_tests.cpp
     test/params_tests.cpp
+    test/pbft_view_change_tests.cpp
     test/pool_tests.cpp
     test/read_tests.cpp
     test/record_tests.cpp
@@ -301,6 +321,7 @@ if(BUILD_FLOWMESH2)
     test/slot_tests.cpp
     test/state_owner_tests.cpp
     test/state_root_tests.cpp
+    test/tcp_mesh_tests.cpp
     test/stub_inventory_tests.cpp
     test/validate_slot_tests.cpp
     test/verify_tests.cpp
@@ -311,6 +332,7 @@ if(BUILD_FLOWMESH2)
     core_interface
     fm2_warnings
     fm2_simlib
+    fm2_transport
     fm2_dev
     fm2_core
     fm2_verify

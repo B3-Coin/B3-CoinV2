@@ -23,6 +23,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <set>
 #include <string>
@@ -78,6 +79,14 @@ void FundAll(SlotFixture& fx, Atoms amount = 1'000'000'000'000)
         }
     }
     fx.Apply(fx.Inputs(facts, {}));
+}
+
+SourceRangeFact NetworkSource(SlotFixture& fx, uint64_t previous_height = 10, uint64_t to_height = 11)
+{
+    SourceRangeFact source{FactCursor{fx.anchor_height, fx.next_fact_index++}, fx.domain, 31337,
+                           previous_height, LabelHash("source/previous"), to_height, LabelHash("source/to"), 2};
+    if (previous_height == to_height) source.to_hash = source.previous_hash;
+    return source;
 }
 
 } // namespace
@@ -624,6 +633,257 @@ BOOST_AUTO_TEST_CASE(futures_phase_is_a_no_op_while_disabled)
     enabled.futures_enabled = true;
     RequireStub(RunFuturesPhase(state, enabled), "M9-FUT-04");
     BOOST_CHECK(state == fx.state);
+}
+
+BOOST_AUTO_TEST_CASE(stable_q_two_markets_charge_and_distribute_only_q)
+{
+    SlotFixture fx{StableQRegtestProfile(ChainType::REGTEST).value()};
+    FundAll(fx);
+    const auto ask1{fx.Place("bob", 1, MarketM1(), Side::SELL, TimeInForce::GTC, 1'001, 5)};
+    const auto ask2{fx.Place("bob", 2, MarketM2(), Side::SELL, TimeInForce::GTC, 1'000, 2)};
+    fx.Apply(fx.Inputs({}, {ask1, ask2}));
+    const auto first1{fx.Place("alice", 1, MarketM1(), Side::BUY, TimeInForce::IOC, 1'001, 2)};
+    const auto first2{fx.Place("alice", 2, MarketM2(), Side::BUY, TimeInForce::IOC, 1'000, 2)};
+    const SlotResult first{fx.Apply(fx.Inputs({}, {first1, first2}))};
+    Atoms fees{0};
+    size_t fee_outcomes{0};
+    for (const OutcomeV2& outcome : first.outcomes) {
+        for (const Fill& fill : outcome.fills) fees += fill.seller_fee;
+        if (outcome.code != OutcomeCode::FEES_DISTRIBUTED) continue;
+        ++fee_outcomes;
+        BOOST_CHECK(outcome.subject == RUSD.id);
+        for (const BalanceDelta& delta : outcome.deltas) {
+            BOOST_CHECK(delta.asset == RUSD);
+            BOOST_CHECK(delta.available_delta > 0 && delta.reserved_delta == 0);
+        }
+    }
+    BOOST_CHECK_EQUAL(fees, 3);
+    BOOST_CHECK_EQUAL(fee_outcomes, 1U);
+    const AccountId seat_pool{SeatPoolAccount(fx.profile)};
+    const AccountId treasury{TreasuryAccount(fx.profile)};
+    BOOST_CHECK_EQUAL(fx.state.ledger.BalanceOf(seat_pool, RUSD).available, 2);
+    BOOST_CHECK_EQUAL(fx.state.ledger.BalanceOf(treasury, RUSD).available, 1);
+    for (const AssetId& asset : {B3, TOK}) {
+        BOOST_CHECK(fx.state.ledger.BalanceOf(seat_pool, asset).IsZero());
+        BOOST_CHECK(fx.state.ledger.BalanceOf(treasury, asset).IsZero());
+    }
+    RequireOk(fx.state.ledger.CheckConservation(), "stable-Q two-market conservation");
+    // The remainder of the first order costs no second ceiling atom:
+    // ceil(5005 * 100 / 1e6) - ceil(2002 * 100 / 1e6) == 0.
+    const auto rest{fx.Place("alice", 3, MarketM1(), Side::BUY, TimeInForce::IOC, 1'001, 3)};
+    const SlotResult second{fx.Apply(fx.Inputs({}, {rest}))};
+    const OutcomeV2& taken{Outcome(second, rest, fx)};
+    BOOST_REQUIRE_EQUAL(taken.fills.size(), 1U);
+    BOOST_CHECK_EQUAL(taken.fills.front().seller_fee, 0);
+    RequireOk(fx.state.ledger.CheckConservation(), "stable-Q partial-fill conservation");
+    for (const OutcomeV2& outcome : second.outcomes) BOOST_CHECK(outcome.code != OutcomeCode::FEES_DISTRIBUTED);
+}
+
+BOOST_AUTO_TEST_CASE(stable_q_rejects_native_quote_at_creation_and_execution)
+{
+    const ProfileParams profile{StableQRegtestProfile(ChainType::REGTEST).value()};
+    const std::vector<MarketDescriptor> bad{MarketM1(), MarketM3()};
+    const auto genesis{EngineState::Genesis(profile, bad)};
+    BOOST_REQUIRE(!genesis.has_value());
+    BOOST_CHECK_EQUAL(genesis.error().detail, STABLE_QUOTE_REQUIRED);
+    SlotFixture fx{profile};
+    const SlotInputs inputs{fx.Inputs({}, {})};
+    const auto valid{fx.Validate(inputs)};
+    RequireOk(valid, "validate before incompatible state replacement");
+    // Direct callers have access to value-type state; all application paths
+    // must reject an incompatible book even when no order would touch it.
+    const auto books{BookSet::Create(bad)};
+    RequireOk(books, "structurally valid generic books");
+    fx.state.books = *books;
+    const auto rejected{fx.Validate(inputs)};
+    BOOST_REQUIRE(!rejected.has_value());
+    BOOST_CHECK_EQUAL(rejected.error().detail, STABLE_QUOTE_REQUIRED);
+    const auto engine{Engine::Create(profile)};
+    RequireOk(engine, "stable-Q engine");
+    const auto applied{engine->ApplySlot(fx.Head(), *valid)};
+    BOOST_REQUIRE(!applied.has_value());
+    BOOST_CHECK_EQUAL(applied.error().detail, STABLE_QUOTE_REQUIRED);
+}
+
+
+BOOST_AUTO_TEST_CASE(stable_q_trade_withdraw_and_paid_effect_roundtrip)
+{
+    SlotFixture fx{StableQRegtestProfile(ChainType::REGTEST).value()};
+    const auto alice{KeyAccount("alice")};
+    const auto bob{KeyAccount("bob")};
+    fx.Apply(fx.Inputs({fx.DepositBytes(alice, RUSD, 20'000, "stable/alice"),
+                        fx.DepositBytes(bob, B3, 2'000'000, "stable/bob")}, {}));
+    const auto maker{fx.Place("bob", 1, MarketM1(), Side::SELL, TimeInForce::GTC, 100, 1)};
+    fx.Apply(fx.Inputs({}, {maker}));
+    const auto taker{fx.Place("alice", 1, MarketM1(), Side::BUY, TimeInForce::IOC, 100, 1)};
+    const auto traded{fx.Apply(fx.Inputs({}, {taker}))};
+    BOOST_CHECK(Outcome(traded, taker, fx).code == OutcomeCode::FILLED);
+    BOOST_CHECK_EQUAL(Outcome(traded, taker, fx).fills.front().seller_fee, 1);
+    BOOST_CHECK(fx.BalanceOf("alice", RUSD) == (ledger::Balance{19'900, 0}));
+
+    const WithdrawPayload request{RUSD, 5'000, std::vector<unsigned char>(20, 0x42)};
+    const auto action{fx.Sign(fx.Unsigned("alice", 2, ActionKind::WITHDRAW, EncodePayload(request).value()), "alice")};
+    const ActionId id{ActionV2::Decode(action, fx.profile)->Id()};
+    const auto withdrawn{fx.Apply(fx.Inputs({}, {action}))};
+    BOOST_CHECK(OutcomeOf(withdrawn, id.id).code == OutcomeCode::WITHDRAWAL_PENDING);
+    BOOST_CHECK(DeltasOf(OutcomeOf(withdrawn, id.id)) == (Deltas{{{alice, RUSD}, {-6'000, 0}}}));
+    BOOST_CHECK(fx.BalanceOf("alice", RUSD) == (ledger::Balance{13'900, 0}));
+    BOOST_CHECK_EQUAL(fx.state.ledger.TotalsOf(RUSD).pending, 5'000);
+    BOOST_CHECK_EQUAL(fx.state.ledger.TotalsOf(RUSD).fees_held, 0);
+    BOOST_CHECK_EQUAL(fx.state.ledger.BalanceOf(SeatPoolAccount(fx.profile), RUSD).available +
+                      fx.state.ledger.BalanceOf(TreasuryAccount(fx.profile), RUSD).available, 1'001);
+    BOOST_CHECK_EQUAL(fx.header.commitment_version, COMMITMENT_VERSION_WITHDRAWALS);
+
+    PayoutConfirmedFact payout;
+    payout.cursor = {fx.anchor_height, fx.next_fact_index++};
+    payout.withdrawal = id;
+    payout.account = alice;
+    payout.asset = RUSD;
+    payout.amount = 5'000;
+    payout.recipient.fill(0x42);
+    payout.payout_event = TestOutpoint("stable/payout", 0);
+    payout.domain = fx.domain;
+    const auto paid_bytes{EncodeFact(Fact{payout}).value()};
+    const auto deposit{fx.DepositBytes(bob, RUSD, 7, "stable/late-deposit")};
+    const auto paid{fx.Apply(fx.Inputs({paid_bytes, deposit}, {}))};
+    BOOST_REQUIRE_EQUAL(paid.outcomes.size(), 2U);
+    BOOST_CHECK(paid.outcomes[0].subject == FactLeaf(paid_bytes));
+    BOOST_CHECK(paid.outcomes[0].code == OutcomeCode::WITHDRAWAL_PAID);
+    BOOST_CHECK(paid.outcomes[0].deltas.empty());
+    BOOST_CHECK(paid.outcomes[1].subject == FactLeaf(deposit));
+    BOOST_CHECK(paid.outcomes[1].code == OutcomeCode::DEPOSIT_CREDITED);
+    BOOST_CHECK_EQUAL(fx.state.ledger.TotalsOf(RUSD).pending, 0);
+    BOOST_CHECK_EQUAL(fx.state.ledger.TotalsOf(RUSD).effects, 5'000);
+    BOOST_CHECK(fx.state.ledger.Withdrawals().at(id).paid);
+    BOOST_CHECK(fx.BalanceOf("alice", RUSD) == (ledger::Balance{13'900, 0}));
+    payout.cursor = {fx.anchor_height, fx.next_fact_index++};
+    fx.Apply(fx.Inputs({EncodeFact(Fact{payout}).value()}, {}));
+    BOOST_CHECK_EQUAL(fx.state.ledger.TotalsOf(RUSD).effects, 5'000);
+    RequireOk(fx.state.CheckInvariants(), "stable roundtrip conservation");
+}
+
+BOOST_AUTO_TEST_CASE(stable_q_payout_binding_and_insufficient_withdraw_are_atomic)
+{
+    SlotFixture fx{StableQRegtestProfile(ChainType::REGTEST).value()};
+    fx.Apply(fx.Inputs({fx.DepositBytes(KeyAccount("alice"), RUSD, 10'000, "stable-negative/alice")}, {}));
+    const WithdrawPayload request{RUSD, 5'000, std::vector<unsigned char>(20, 0x43)};
+    const auto action{fx.Sign(fx.Unsigned("alice", 1, ActionKind::WITHDRAW, EncodePayload(request).value()), "alice")};
+    const auto id{ActionV2::Decode(action, fx.profile)->Id()};
+    PayoutConfirmedFact payout;
+    payout.cursor = {fx.anchor_height, fx.next_fact_index++};
+    payout.withdrawal = id;
+    payout.account = KeyAccount("alice");
+    payout.asset = RUSD;
+    payout.amount = 5'000;
+    payout.recipient.fill(0x43);
+    payout.payout_event = TestOutpoint("stable-negative/payout", 0);
+    payout.domain = fx.domain;
+    BOOST_CHECK(!fx.TryApply(fx.Inputs({EncodeFact(Fact{payout}).value()}, {action})).has_value());
+    --fx.next_fact_index; // refused same-slot fact did not advance the stream
+    fx.Apply(fx.Inputs({}, {action}));
+    ++fx.next_fact_index; // the payout now sits inside the next slot's range
+    const auto before{fx.header.Hash()};
+    for (int mutation = 0; mutation < 5; ++mutation) {
+        auto wrong{payout};
+        if (mutation == 0) wrong.domain = LabelHash("another-domain");
+        if (mutation == 1) wrong.recipient[0] ^= 1;
+        if (mutation == 2) wrong.amount += 1;
+        if (mutation == 3) wrong.account = KeyAccount("bob");
+        if (mutation == 4) wrong.withdrawal.id = LabelHash("unknown-claim");
+        BOOST_CHECK(!fx.TryApply(fx.Inputs({EncodeFact(Fact{wrong}).value()}, {})).has_value());
+        BOOST_CHECK(fx.header.Hash() == before);
+        BOOST_CHECK_EQUAL(fx.state.ledger.TotalsOf(RUSD).pending, 5'000);
+    }
+    const auto insufficient{fx.Sign(fx.Unsigned("alice", 2, ActionKind::WITHDRAW, EncodePayload(request).value()), "alice")};
+    const auto rejected{fx.Apply(fx.Inputs({}, {insufficient}))};
+    CheckRejected(Outcome(rejected, insufficient, fx), OutcomeCode::REJ_INSUFFICIENT_AVAILABLE, "withdraw amount plus stable fee");
+    BOOST_CHECK(fx.BalanceOf("alice", RUSD) == (ledger::Balance{4'000, 0}));
+    BOOST_CHECK(HasNonce(fx.UsedNonces("alice"), 2));
+    BOOST_CHECK_EQUAL(fx.state.ledger.Withdrawals().size(), 1U);
+    RequireOk(fx.state.CheckInvariants(), "refused withdrawals conserve funds");
+}
+
+BOOST_AUTO_TEST_CASE(network_source_range_is_committed_without_ledger_effect)
+{
+    SlotFixture fx{StableQNetworkRegtestProfile(ChainType::REGTEST).value()};
+    const auto before{fx.state.Commit().value().Root()};
+    const auto source{NetworkSource(fx, 10, 10)};
+    const auto first{fx.Apply(fx.Inputs({EncodeFact(source).value()}, {}))};
+    BOOST_CHECK(first.outcomes.empty());
+    BOOST_CHECK(first.roots.Root() == before);
+    BOOST_CHECK(fx.header.facts_root != SlotBody{}.FactsRoot());
+    BOOST_CHECK(fx.header.facts_to == (FactCursor{fx.anchor_height, 1}));
+    BOOST_CHECK_EQUAL(fx.header.outcome_count, 0U);
+    const auto deposit{fx.DepositBytes(KeyAccount("alice"), RUSD, 5'000, "source/alice")};
+    const auto next{NetworkSource(fx)};
+    const auto applied{fx.Apply(fx.Inputs({deposit, EncodeFact(next).value()}, {}))};
+    BOOST_REQUIRE_EQUAL(applied.outcomes.size(), 1U);
+    BOOST_CHECK(applied.outcomes.front().code == OutcomeCode::DEPOSIT_CREDITED);
+    BOOST_CHECK(applied.outcomes.front().subject == FactLeaf(deposit));
+    BOOST_CHECK(fx.BalanceOf("alice", RUSD) == (ledger::Balance{5'000, 0}));
+    BOOST_CHECK_EQUAL(fx.state.ledger.TotalsOf(RUSD).effects, 0);
+    RequireOk(fx.state.CheckInvariants(), "source boundary has no financial effect");
+}
+
+BOOST_AUTO_TEST_CASE(network_source_range_refusals_are_atomic)
+{
+    SlotFixture fx{StableQNetworkRegtestProfile(ChainType::REGTEST).value()};
+    const auto deposit{fx.DepositBytes(KeyAccount("alice"), RUSD, 5'000, "source/negative")};
+    const auto source{NetworkSource(fx)};
+    const auto valid{fx.Inputs({deposit, EncodeFact(source).value()}, {})};
+    const auto parent_hash{fx.header.Hash()}, parent_state{fx.state.Commit().value().Root()};
+    BOOST_REQUIRE(fx.TryApply(valid).has_value());
+    for (int mutation{0}; mutation < 8; ++mutation) {
+        auto wrong{valid}; auto marker{source};
+        if (mutation == 0) wrong.body.facts.pop_back();
+        if (mutation == 1) {
+            auto duplicate{source}; ++duplicate.cursor.index;
+            wrong.body.facts.push_back(EncodeFact(duplicate).value());
+            ++wrong.facts_to.index;
+        }
+        if (mutation == 2) std::swap(wrong.body.facts[0], wrong.body.facts[1]);
+        if (mutation == 3) marker.domain = LabelHash("source/wrong-domain");
+        if (mutation == 4) marker.chain_id = 1;
+        if (mutation == 5) marker.confirmations = 1;
+        if (mutation == 6) ++wrong.facts_to.index;
+        if (mutation == 7) { ++marker.cursor.height; ++wrong.facts_to.height; }
+        if (mutation >= 3) wrong.body.facts.back() = EncodeFact(marker).value();
+        BOOST_CHECK_MESSAGE(!fx.TryApply(wrong).has_value(), "source-range mutation " << mutation << " was accepted");
+        BOOST_CHECK(fx.header.Hash() == parent_hash);
+        BOOST_CHECK(fx.state.Commit().value().Root() == parent_state);
+        BOOST_CHECK(fx.BalanceOf("alice", RUSD) == (ledger::Balance{0, 0}));
+    }
+    auto empty{valid}; empty.body.facts.clear();
+    BOOST_CHECK(!fx.TryApply(empty).has_value());
+}
+
+BOOST_AUTO_TEST_CASE(legacy_profiles_refuse_source_range_fact)
+{
+    for (const auto& profile : {RegtestProfile(), StableQRegtestProfile(ChainType::REGTEST).value(),
+                               StableQViewRegtestProfile(ChainType::REGTEST).value()}) {
+        SlotFixture fx{profile};
+        const auto source{NetworkSource(fx)};
+        const auto before{fx.state.Commit().value().Root()};
+        BOOST_CHECK(!fx.TryApply(fx.Inputs({EncodeFact(source).value()}, {})).has_value());
+        BOOST_CHECK(fx.state.Commit().value().Root() == before);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(network_source_boundaries_distinguish_identical_empty_event_sets)
+{
+    SlotFixture fx{StableQNetworkRegtestProfile(ChainType::REGTEST).value()};
+    const auto first{NetworkSource(fx)};
+    auto second{first}; ++second.to_height; second.to_hash = LabelHash("source/later-empty-block");
+    const auto a{fx.Inputs({EncodeFact(first).value()}, {})};
+    const auto b{fx.Inputs({EncodeFact(second).value()}, {})};
+    const auto ar{fx.TryApply(a)}, br{fx.TryApply(b)};
+    BOOST_REQUIRE(ar.has_value() && br.has_value());
+    BOOST_CHECK(ar->roots.Root() == br->roots.Root());
+    BOOST_CHECK(ar->outcomes.empty() && br->outcomes.empty());
+    BOOST_CHECK(a.body.FactsRoot() != b.body.FactsRoot());
+    auto left{fx}; auto right{fx};
+    left.Advance(a, *ar); right.Advance(b, *br);
+    BOOST_CHECK(left.header.Hash() != right.header.Hash());
 }
 
 BOOST_AUTO_TEST_SUITE_END()

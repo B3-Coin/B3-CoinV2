@@ -64,6 +64,8 @@ public:
     virtual void OnSigned(uint64_t slot, uint64_t view, const uint256& digest) = 0;
 };
 
+class ControlLog;
+
 class SeatSigner
 {
 public:
@@ -73,6 +75,7 @@ public:
      * destroy a log a signer uses; SimNode and AgreementRig keep it fixed).
      */
     static Result<SeatSigner> FromIKM(std::span<const unsigned char> ikm, const SignerLog& log);
+    static Result<SeatSigner> FromIKM(std::span<const unsigned char> ikm, const SignerLog& log, const ControlLog& control_log);
 
     SeatSigner(SeatSigner&&) noexcept;
     SeatSigner& operator=(SeatSigner&&) noexcept;
@@ -86,6 +89,13 @@ public:
 
     //! The only BLS vote signing path; see the file comment.
     Result<VoteSignature> Sign(const DurableIntent& intent) const;
+    Result<VoteSignature> SignControl(const DurableControlIntent& intent) const;
+    Result<DurableSignedControl> SignControlAndPersist(const DurableControlIntent& intent, ControlLog& log) const;
+    bool BoundToControlLog(const ControlLog& log) const { return m_control_log == &log; }
+
+    //! Consensus entry point: no raw signature escapes before SIGNED_VOTE,
+    //! its barrier and Confirm. The log must be this signer's bound log.
+    Result<DurableSignedVote> SignAndPersist(const DurableIntent& intent, SignerLog& log) const;
 
     //! Report every successful Sign to `observer` (nullptr: none). The observer must outlive the signer.
     void SetSignObserver(SignObserver* observer) { m_observer = observer; }
@@ -96,6 +106,7 @@ private:
 
     std::unique_ptr<const Key> m_key;
     const SignerLog* m_log;
+    const ControlLog* m_control_log{nullptr};
     SignObserver* m_observer{nullptr};
 };
 

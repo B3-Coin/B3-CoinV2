@@ -1,0 +1,61 @@
+B3 regtest implementation contract — owner instruction 18 October 2026
+
+Authorized source is /home/josh/B3-rebirth on rebirth, restored from the Mac
+handoff to this Windows laptop. The owner's later explicit instruction to
+build the missing parts here supersedes the old Mac-path/FlowMesh-branch lock
+and outline-only scope. Work remains local and unpushed; the preserved Windows
+checkout, historical B3 ledger, mainnet parameters and live funds are untouched.
+This record reconciles that development scope; it grants no production release.
+
+Target: actual test-custody deposit -> authenticated credit -> two shared-spot
+markets -> stable fees -> authorized withdrawal -> actual EVM payout -> replay
+and reserve/liability reconciliation. Real B3 regtest and local EVM processes,
+actual cryptography and durable file journals are required. Static test rosters
+and synthetic test assets are explicit local inputs, never mainnet defaults.
+
+First versioned test profile: fm2-regtest-stable-q/1. Q is the exact Tagged
+TEST_ASSET("rUSD") AssetId and has six decimal places in the custody adapter.
+Only Q-quoted markets are admitted in this slice. Trading uses the existing
+test-only seller 100 ppm cumulative-ceiling fee and 80/20 protocol split.
+The test-only fixed withdrawal service fee is 1,000 raw Q units. Only Q may
+exit through the first custody route; the destination is an exact nonzero
+20-byte EVM address. These are provisional regtest economics and scope bounds.
+Wider asset-to-asset markets, futures and their separate-Q fee rules remain
+required by the full-product handoff; this slice does not remove that scope.
+
+All service fees are debited in Q. Operators sponsor necessary local B3/EVM
+native costs, never requiring a trader to acquire B3 for these service actions.
+Real production gas sponsorship/economics remain a later qualified design.
+
+Local custody chain id is 31337, with an unforked loopback Anvil instance and
+synthetic six-decimal token. A new local-only vault binds its token, instance,
+chain and operator roster. No deployed USDT vault or production token is reused.
+The original Hyperliquid Arbitrum-USDC experience is a product reference; its
+unlicensed source is not copied and no deployed Hyperliquid behavior is claimed.
+
+Four equal-weight independent operators require three valid signatures. A
+certificate never lowers quorum when operators are unavailable. Each operator
+must validate deposit receipts/ancestry and execute proposed actions itself;
+the coordinator cannot manufacture credits, signatures or withdrawals. Durable
+intent precedes signing, exact signed votes precede publication, and decision
+and application barriers precede confirmed client results. Full view-change,
+partition, restart and adversarial campaigns remain release gates, regardless
+of happy-path round-trip success. No one-seat dev certifier or MemoryJournal
+counts as the complete-system gate.
+
+The withdrawal lifecycle is available -> pending -> confirmed external effect.
+The action identity binds its account, asset, amount and recipient. Pending
+obligations and payout nullifiers are committed and replayed. Duplicate actions,
+facts, certificates and relays cannot create a second economic effect. Failed
+external transfers keep an unpaid claim recoverable. Custody reserve and ledger
+deposits/effects/pending/protocol fees reconcile per AssetId.
+
+Reopening corrupted/torn journals fails closed without truncation or key reset.
+Coherently rolled-back backups cannot be detected solely from local checksums;
+no such recovery claim is made. Existing signer history is never erased to pass.
+
+Speed is measured from client send through durable quorum commit and independent
+verification, with workload and p50/p95/p99 reported. The 200 ms local reference
+is a target, not an already achieved result. Bridge waiting is reported separately.
+No mainnet work, activation, assets, custody roster or deployment is selected
+until all required regtest/review gates pass and a separate release is authorized.

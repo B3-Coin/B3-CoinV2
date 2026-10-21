@@ -18,6 +18,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <utility>
 #include <vector>
 
 using namespace flowmesh2;
@@ -51,7 +52,131 @@ BOOST_AUTO_TEST_CASE(create_checks_role_fence_and_history)
     RequireRefusal(CommitLog::Create(*fatal), ErrorCode::FENCED, JOURNAL_FENCED, "fatal journal");
     auto used{NewMemoryJournal(JournalRole::COMMIT, 3)};
     RequireStorageOk(used->Append(RecordType::DECISION, Bytes("history")), "append");
-    RequireStub(CommitLog::Create(*used), "M4-STO-01");
+    RequireRefusal(CommitLog::Create(*used), ErrorCode::ORDER_VIOLATION, LOG_PENDING_RECORDS, "pending history");
+    RequireRefusal(CommitLog::Create(*used, Profile()), ErrorCode::ORDER_VIOLATION, LOG_PENDING_RECORDS, "pending replay");
+    RequireStorageOk(used->Barrier(), "make malformed history durable");
+    RequireRefusal(CommitLog::Create(*used), ErrorCode::INVALID_INPUT, LOG_REPLAY_PROFILE_REQUIRED, "history needs decoding profile");
+    RequireCode(CommitLog::Create(*used, Profile()), ErrorCode::DECODE, "malformed durable history");
+}
+
+BOOST_AUTO_TEST_CASE(recovery_restores_decisions_applied_order_and_original_tokens)
+{
+    OwnerFixture f{30};
+    state::Candidate candidate{f.Preview(f.Inputs(FundingFacts(f.actions), {}))};
+    const SlotHeaderV2 header{candidate.Header()};
+    const SlotCertificate cert{TestCertificate(header, 1)};
+    const SlotBody body{candidate.Body()};
+    const PendingDecision pending{f.log.AppendDecision(header, cert, body).value()};
+    RequireStorageOk(f.log.Barrier(), "durable first decision");
+    const DurableDecision decision{f.log.Confirm(pending).value()};
+    const state::AppliedSlot applied{f.owner->Apply(std::move(candidate), decision, f.authority).value()};
+    const PendingApplied applied_pending{f.log.AppendApplied(applied.receipt).value()};
+    RequireStorageOk(f.log.Barrier(), "durable first applied");
+    f.Sync();
+    state::Candidate next{f.Preview(f.Inputs({}, {}))};
+    const SlotHeaderV2 next_header{next.Header()};
+    const SlotBody next_body{next.Body()};
+    const DurableDecision next_decision{f.Decide(next)};
+    const state::AppliedSlot next_applied{f.owner->Apply(std::move(next), next_decision, f.authority).value()};
+    const auto before{f.journal->DurableImage()};
+    const JournalStatus before_status{f.journal->Status()};
+
+    Result<CommitLog> created{CommitLog::Create(*f.journal, Profile())};
+    RequireStorageOk(created, "rebuild commit indexes");
+    CommitLog restored{std::move(created).value()};
+    SlotCertificate other_cert{cert};
+    other_cert.aggregate.fill(2);
+    BOOST_CHECK(restored.AppendDecision(header, other_cert, body).value() == pending);
+    BOOST_CHECK(restored.Confirm(pending).value().Binding() == decision.Binding());
+    BOOST_CHECK(restored.AppendApplied(applied.receipt).value() == applied_pending);
+    BOOST_CHECK(restored.DecisionAt(next_header.height) == std::optional<DecisionRef>{next_decision.Binding()});
+    BOOST_CHECK(f.journal->DurableImage() == before);
+    BOOST_CHECK(f.journal->Status() == before_status);
+    SlotHeaderV2 conflicting{next_header};
+    conflicting.state_root = LabelHash("other-decided-root");
+    RequireRefusal(restored.AppendDecision(conflicting, TestCertificate(conflicting), next_body),
+                   ErrorCode::EQUIVOCATION_REFUSED, DECISION_CONFLICT, "decision without APPLIED still reserves slot");
+    const PendingApplied recovered_next{restored.AppendApplied(next_applied.receipt).value()};
+    BOOST_CHECK_EQUAL(recovered_next.Seq(), before_status.appended_seq + 1);
+    RequireStorageOk(restored.Barrier(), "finish next APPLIED");
+    RequireStorageOk(restored.Confirm(recovered_next), "confirm recovered append");
+    CommitLog restored_again{CommitLog::Create(*f.journal, Profile()).value()};
+    BOOST_CHECK(restored_again.AppendApplied(next_applied.receipt).value() == recovered_next);
+}
+
+BOOST_AUTO_TEST_CASE(recovery_refuses_corrupt_decisions_and_application_history)
+{
+    const StorageSlot slot{MakeStorageSlot(1, 0, "recovery-corrupt")};
+    const auto decision{DecisionRecord{slot.header, slot.certificate, slot.body}.Encode()};
+    const AppliedRecord applied{1, slot.header.Hash(), slot.header.state_root};
+    uint64_t instance{40};
+    const auto refuses = [&](const std::vector<std::pair<RecordType, std::vector<unsigned char>>>& records,
+                             ErrorCode code, std::string_view detail) {
+        auto journal{NewMemoryJournal(JournalRole::COMMIT, instance++)};
+        for (const auto& [type, payload] : records) RequireStorageOk(journal->Append(type, payload), "raw corruption fixture");
+        RequireStorageOk(journal->Barrier(), "durable corruption fixture");
+        const auto before{journal->DurableImage()};
+        RequireRefusal(CommitLog::Create(*journal, Profile()), code, detail, "corrupt commit history");
+        BOOST_CHECK(journal->DurableImage() == before);
+    };
+    refuses({{RecordType::APPLIED, applied.Encode()}}, ErrorCode::VERIFY_FAILED, APPLIED_DECISION_UNKNOWN);
+    refuses({{RecordType::APPLIED, applied.Encode()}, {RecordType::DECISION, decision}},
+            ErrorCode::VERIFY_FAILED, APPLIED_DECISION_UNKNOWN);
+    AppliedRecord bad_root{applied};
+    bad_root.state_root = LabelHash("wrong-state-root");
+    refuses({{RecordType::DECISION, decision}, {RecordType::APPLIED, bad_root.Encode()}},
+            ErrorCode::VERIFY_FAILED, APPLIED_ROOT_MISMATCH);
+    AppliedRecord bad_hash{applied};
+    bad_hash.header_hash = LabelHash("wrong-header");
+    refuses({{RecordType::DECISION, decision}, {RecordType::APPLIED, bad_hash.Encode()}},
+            ErrorCode::VERIFY_FAILED, APPLIED_DECISION_UNKNOWN);
+    SlotCertificate bad_cert{slot.certificate};
+    bad_cert.header_hash = LabelHash("wrong-certified-header");
+    refuses({{RecordType::DECISION, DecisionRecord{slot.header, bad_cert, slot.body}.Encode()}},
+            ErrorCode::VERIFY_FAILED, DECISION_CERT_HEADER);
+    SlotBody bad_body{slot.body};
+    bad_body.originals.push_back(Bytes("extra"));
+    refuses({{RecordType::DECISION, DecisionRecord{slot.header, slot.certificate, bad_body}.Encode()}},
+            ErrorCode::VERIFY_FAILED, BODY_HEADER_MISMATCH);
+    const StorageSlot conflict{MakeStorageSlot(1, 0, "conflicting-decision")};
+    refuses({{RecordType::DECISION, decision},
+             {RecordType::DECISION, DecisionRecord{conflict.header, conflict.certificate, conflict.body}.Encode()}},
+            ErrorCode::EQUIVOCATION_REFUSED, DECISION_CONFLICT);
+    const StorageSlot second{MakeStorageSlot(2, 0, "second-slot")};
+    refuses({{RecordType::DECISION, DecisionRecord{second.header, second.certificate, second.body}.Encode()},
+             {RecordType::APPLIED, AppliedRecord{2, second.header.Hash(), second.header.state_root}.Encode()}},
+            ErrorCode::ORDER_VIOLATION, APPLIED_OUT_OF_ORDER);
+    const StorageSlot zero{MakeStorageSlot(0, 0, "zero-slot")};
+    refuses({{RecordType::DECISION, DecisionRecord{zero.header, zero.certificate, zero.body}.Encode()},
+             {RecordType::APPLIED, AppliedRecord{0, zero.header.Hash(), zero.header.state_root}.Encode()}},
+            ErrorCode::ORDER_VIOLATION, APPLIED_OUT_OF_ORDER);
+}
+
+BOOST_AUTO_TEST_CASE(recovery_keeps_first_certificate_and_refuses_unsupported_records)
+{
+    CommitFixture f{60};
+    const StorageSlot slot{MakeStorageSlot(1, 0, "duplicate-recovery")};
+    const PendingDecision first{f.log.AppendDecision(slot.header, slot.certificate, slot.body).value()};
+    RequireStorageOk(f.log.Barrier(), "durable first decision");
+    SlotCertificate other_cert{slot.certificate};
+    other_cert.aggregate.fill(3);
+    RequireStorageOk(f.journal->Append(RecordType::DECISION,
+        DecisionRecord{slot.header, other_cert, slot.body}.Encode()), "duplicate decision with other certificate");
+    const auto applied{AppliedRecord{1, slot.header.Hash(), slot.header.state_root}.Encode()};
+    RequireStorageOk(f.journal->Append(RecordType::APPLIED, applied), "first applied");
+    RequireStorageOk(f.journal->Append(RecordType::APPLIED, applied), "duplicate applied");
+    RequireStorageOk(f.journal->Barrier(), "durable duplicate history");
+    CommitLog restored{CommitLog::Create(*f.journal, Profile()).value()};
+    BOOST_CHECK(restored.AppendDecision(slot.header, other_cert, slot.body).value() == first);
+    BOOST_CHECK(restored.DecisionAt(1) == std::optional<DecisionRef>{first.Key()});
+    BOOST_CHECK_EQUAL(f.journal->Status().appended_seq, 4U);
+    for (const RecordType type : {RecordType::SNAPSHOT_MARK, RecordType::PREPARED_QC}) {
+        auto journal{NewMemoryJournal(JournalRole::COMMIT, 61 + static_cast<uint8_t>(type))};
+        RequireStorageOk(journal->Append(type, {}), "unsupported record");
+        RequireStorageOk(journal->Barrier(), "unsupported record durable");
+        if (type == RecordType::SNAPSHOT_MARK) RequireStub(CommitLog::Create(*journal, Profile()), "M4-STO-03");
+        else RequireCode(CommitLog::Create(*journal, Profile()), ErrorCode::DECODE, "malformed prepared record");
+    }
 }
 
 BOOST_AUTO_TEST_CASE(decision_then_applied)

@@ -59,6 +59,7 @@ inline constexpr std::string_view CERT_HEADER{"certificate names another header"
 inline constexpr std::string_view CERT_BITMAP{"bitmap is not a bitmap of the seat set"};
 inline constexpr std::string_view CERT_QUORUM{"fewer signers than the quorum"};
 inline constexpr std::string_view CERT_AGGREGATE{"aggregate is not a canonical G2 point"};
+inline constexpr std::string_view CERT_VIEW{"certificate view format differs from the header version"};
 inline constexpr std::string_view CERT_SIGNATURE{"aggregate does not verify over CommitDigest"};
 inline constexpr std::string_view OUTCOME_PROOF_SIZE{"proof is not over outcome_count leaves"};
 inline constexpr std::string_view OUTCOME_PROOF{"outcome is not under outcomes_root"};
@@ -68,6 +69,9 @@ inline constexpr std::string_view LEAF_STATE_ROOTS{"component roots do not give 
 inline constexpr std::string_view LEAF_NOT_CANONICAL{"account leaf is not canonical"};
 inline constexpr std::string_view LEAF_PROOF{"account leaf is not under the accounts root"};
 inline constexpr std::string_view FILL_MARKET{"fill names another market"};
+inline constexpr std::string_view FILL_FEE_ASSET{"market violates the profile's stable fee asset policy"};
+inline constexpr std::string_view FEE_OUTCOME_ASSET{"fee outcome names an asset other than the profile's stable Q"};
+inline constexpr std::string_view FEE_OUTCOME_DELTA{"stable fee distribution must credit positive available Q only"};
 inline constexpr std::string_view FILL_LOTS{"fill of zero lots"};
 inline constexpr std::string_view FILL_QUOTE{"quote_atoms is not lots x price x tick"};
 inline constexpr std::string_view FILL_FEE{"seller_fee is not the fee increment"};
@@ -89,7 +93,9 @@ inline constexpr std::string_view EXPIRED_NONCE_BELOW{"nonce is below a full win
  * 4. at least seats.Quorum() = floor(2k/3) + 1 signers (CERT_QUORUM)
  * 5. the aggregate decodes as a canonical G2 point    (CERT_AGGREGATE)
  * 6. bls::FastAggregateVerify of the marked seats' PoP-verified keys over
- *    header.CommitDigest()                            (CERT_SIGNATURE)
+ *    CertificateDigest(header, cert) (legacy or exact view-bound COMMIT).
+ *    Missing/unexpected view metadata is CERT_VIEW; a changed view invalidates
+ *    the BLS signature (CERT_SIGNATURE).
  * A certificate is not unique (O-4b): any quorum subset passes, so two
  * valid certificates of one header may differ.
  */
@@ -104,6 +110,16 @@ Result<void> VerifyCertificate(const SlotHeaderV2& header, const SlotCertificate
  */
 Result<void> VerifyOutcome(const SlotHeaderV2& header, const OutcomeV2& outcome, const MerkleProof& proof);
 
+/** Profile-bound outcome verification for new clients. In addition to the
+ * proof/canonical-form checks above, bind ProfileHash(profile) to the header.
+ * Under stable-Q, a FEES_DISTRIBUTED outcome must name Q and contain only
+ * positive available-Q credits with no reserved deltas. This checks fee asset
+ * policy, not the economic correctness of the certified fee total or recipients.
+ * Each fill still needs VerifyFill against its trusted market descriptor.
+ */
+Result<void> VerifyOutcome(const SlotHeaderV2& header, const OutcomeV2& outcome, const MerkleProof& proof,
+                           const ProfileParams& profile);
+
 /** `leaf` is the v0 account leaf of its account in the state `header`
  * commits to: Validate(profile) and ProfileHash(profile) ==
  * header.profile_hash (PROFILE_MISMATCH); roots.Root() == header.state_root
@@ -116,8 +132,17 @@ Result<void> VerifyOutcome(const SlotHeaderV2& header, const OutcomeV2& outcome,
 Result<void> VerifyAccountLeaf(const SlotHeaderV2& header, const AccountLeafV0& leaf, const StateRootsV0& roots,
                                const MerkleProof& proof, const ProfileParams& profile);
 
+//! Checks a v2 committed claim. Pair with VerifyCertificate and compare the
+//! verified record's id/payment fields to the client's requested withdrawal.
+//! This proves certified obligation/status, not external EVM payout finality.
+inline constexpr std::string_view WITHDRAWAL_POLICY{"withdrawal violates the profile or slot"};
+inline constexpr std::string_view WITHDRAWAL_PROOF{"withdrawal is not under the committed withdrawals root"};
+Result<void> VerifyWithdrawal(const SlotHeaderV2& header, const WithdrawalRecord& record, const StateRootsV0& roots,
+                              const MerkleProof& proof, const ProfileParams& profile);
+
 /** A fill's quote and seller fee, recomputed with the engine's own spec
  * functions: Validate(profile) (its errors, e.g. the PER_SIDE stub);
+ * shared market/profile policy (FILL_FEE_ASSET); then
  * fill.market == market.Id() (FILL_MARKET); lots > 0 (FILL_LOTS);
  * QuoteAtoms(market, lots, price_ticks) == quote_atoms (FILL_QUOTE; an
  * overflow fails the same way); SellerFeeIncrement(seller_quote_before,

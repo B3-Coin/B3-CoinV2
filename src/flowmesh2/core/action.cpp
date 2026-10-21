@@ -79,6 +79,11 @@ bool KindSupported(ActionKind kind)
     return kind == ActionKind::PLACE || kind == ActionKind::CANCEL || kind == ActionKind::TRANSFER;
 }
 
+bool KindSupported(ActionKind kind, const ProfileParams& profile)
+{
+    return KindSupported(kind) || (kind == ActionKind::WITHDRAW && profile.withdrawals_enabled);
+}
+
 namespace {
 
 Error InvalidPayload(const char* detail) { return Error{ErrorCode::INVALID_INPUT, detail}; }

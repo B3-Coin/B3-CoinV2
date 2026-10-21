@@ -57,32 +57,57 @@ TrafficClass InProcessApi::ClassOf(std::span<const unsigned char> frame) const
 
 Result<RequestId> InProcessApi::Enqueue(RequestKind kind, TrafficClass traffic, std::span<const unsigned char> body)
 {
+    if (m_lanes.Closed()) return Error{ErrorCode::FENCED, LANE_CLOSED};
+    // Check before adding the request-kind byte: no overflow or unbounded copy.
+    if (body.size() >= m_lanes.Limits().Of(Lane::ACTION).max_message_bytes) {
+        return Error{ErrorCode::OVERSIZE, LANE_MESSAGE_OVERSIZE};
+    }
+    // Construct the bounded payload before recording a request. A failed
+    // allocation here (or map insertion below) leaves no request behind.
+    std::vector<unsigned char> payload;
+    payload.reserve(body.size() + 1);
+    payload.push_back(static_cast<unsigned char>(kind));
+    payload.insert(payload.end(), body.begin(), body.end());
     const RequestId id{m_next_id.fetch_add(1)};
     {
         LOCK(m_mutex);
         if (!m_requests.emplace(id, Request{}).second) return Error{ErrorCode::INVARIANT, API_REQUEST_ID_REUSED};
     }
-    std::vector<unsigned char> payload;
-    payload.reserve(body.size() + 1);
-    payload.push_back(static_cast<unsigned char>(kind));
-    payload.insert(payload.end(), body.begin(), body.end());
-    const Result<void> pushed{m_lanes.TryPush(Lane::ACTION, traffic, ToMailboxId(id), payload)};
-    if (!pushed.has_value()) {
+    try {
+        const Result<void> pushed{m_lanes.TryPush(Lane::ACTION, traffic, ToMailboxId(id), payload)};
+        if (pushed.has_value()) return Ok(id);
         // Not queued: nothing of this request remains.
         LOCK(m_mutex);
         m_requests.erase(id);
         return pushed.error();
+    } catch (...) {
+        // LaneSet rolls back its own accounting if message allocation fails.
+        // Do not leave a request that can never be popped or answered.
+        LOCK(m_mutex);
+        m_requests.erase(id);
+        throw;
     }
-    return Ok(id);
 }
 
 Result<RequestId> InProcessApi::Submit(std::span<const unsigned char> frame)
 {
+    // Preserve the lane's closed-before-oversize refusal precedence.
+    if (m_lanes.Closed()) return Error{ErrorCode::FENCED, LANE_CLOSED};
+    // Refuse oversized input before ClassOf decodes it or Enqueue copies it.
+    if (frame.size() > ActionV2::MaxEncodedSize(m_profile) ||
+        frame.size() >= m_lanes.Limits().Of(Lane::ACTION).max_message_bytes) {
+        return Error{ErrorCode::OVERSIZE, LANE_MESSAGE_OVERSIZE};
+    }
     return Enqueue(RequestKind::SUBMIT_ACTION, ClassOf(frame), frame);
 }
 
 Result<RequestId> InProcessApi::SubmitStatus(const ActionV2& original)
 {
+    if (m_lanes.Closed()) return Error{ErrorCode::FENCED, LANE_CLOSED};
+    // Encode is deliberately total, including over-cap payloads; bound it first.
+    if (original.payload.size() > m_profile.max_action_payload_bytes) {
+        return Error{ErrorCode::OVERSIZE, LANE_MESSAGE_OVERSIZE};
+    }
     const std::vector<unsigned char> bytes{original.Encode()};
     return Enqueue(RequestKind::ACTION_STATUS, TrafficClass::STATUS, bytes);
 }

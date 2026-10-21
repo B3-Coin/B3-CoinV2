@@ -48,6 +48,8 @@ add_executable(test_bitcoin
   bridge_params_tests.cpp
   bridge_deposit_tests.cpp
   bridge_eth_light_client_tests.cpp
+  bridge_peer_light_client_tests.cpp
+  bridge_arbitrum_source_tests.cpp
   bridge_ethereum_calldata_tests.cpp
   bridge_exec_chain_tests.cpp
   bridge_forwarder_v2_tests.cpp

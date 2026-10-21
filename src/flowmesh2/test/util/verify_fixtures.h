@@ -57,14 +57,16 @@ namespace flowmesh2::test {
  */
 inline SlotCertificate SignCertificate(const SlotHeaderV2& header, const std::vector<std::string>& names,
                                        const std::vector<uint32_t>& signers,
-                                       const std::optional<std::vector<uint32_t>>& aggregate_of = std::nullopt)
+                                       const std::optional<std::vector<uint32_t>>& aggregate_of = std::nullopt,
+                                       uint64_t view = 0)
 {
     SlotCertificate cert;
     cert.header_hash = header.Hash();
     Result<std::vector<unsigned char>> bitmap{SlotCertificate::MakeBitmap(names.size(), signers)};
     RequireOk(bitmap, "MakeBitmap");
     cert.bitmap = std::move(bitmap).value();
-    const uint256 digest{header.CommitDigest()};
+    if (header.commitment_version == COMMITMENT_VERSION_VIEW_BOUND) cert.view = view;
+    const uint256 digest{VersionedCommitDigest(header, view)};
     std::vector<bls::Signature> signatures;
     for (const uint32_t index : aggregate_of.value_or(signers)) {
         BOOST_REQUIRE(index < names.size());

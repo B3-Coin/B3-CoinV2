@@ -37,6 +37,13 @@ void BIP324Cipher::Initialize(const EllSwiftPubKey& their_pubkey, bool initiator
                         Params().MessageStart());
 }
 
+void BIP324Cipher::InitializeForNetwork(
+    const EllSwiftPubKey& their_pubkey, bool initiator,
+    const MessageStartChars& message_start) noexcept
+{
+    InitializeWithMagic(their_pubkey, initiator, false, message_start);
+}
+
 void BIP324Cipher::InitializeForTesting(
     const EllSwiftPubKey& their_pubkey, bool initiator,
     const MessageStartChars& message_start, bool self_decrypt) noexcept

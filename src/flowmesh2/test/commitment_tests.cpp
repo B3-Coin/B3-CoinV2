@@ -413,4 +413,45 @@ BOOST_AUTO_TEST_CASE(trading_state_refuses_inconsistent_orders)
                  ErrorCode::INVALID_INPUT, "repeated order");
 }
 
+BOOST_AUTO_TEST_CASE(withdrawal_component_commits_recipient_and_completed_events)
+{
+    const auto profile{StableQRegtestProfile(ChainType::REGTEST).value()};
+    LedgerState first{EmptyLedger(profile)};
+    RequireOk(first.CreditDeposit(Deposit(ALICE, RUSD, 10'000, TestOutpoint("commit-withdraw-fund", 0))), "fund Q");
+    LedgerState second{first};
+    const ActionId id{LabelHash("commit-withdraw")};
+    WithdrawPayload request{RUSD, 3000, std::vector<unsigned char>(20, 0x42)};
+    RequireOk(first.RequestWithdrawal(id, ALICE, request, 1), "first withdrawal");
+    request.destination_script[0] ^= 1;
+    RequireOk(second.RequestWithdrawal(id, ALICE, request, 1), "other destination");
+    const auto a{Commit(first)}, b{Commit(second)};
+    BOOST_CHECK_EQUAL(a.version, COMMITMENT_VERSION_WITHDRAWALS);
+    BOOST_CHECK(a.accounts == b.accounts && a.totals == b.totals);
+    BOOST_CHECK(a.withdrawals != b.withdrawals);
+    BOOST_CHECK(a.Root() != b.Root());
+    PayoutConfirmedFact payout;
+    payout.withdrawal = id;
+    payout.account = ALICE;
+    payout.asset = RUSD;
+    payout.amount = 3000;
+    payout.recipient.fill(0x42);
+    payout.payout_event = TestOutpoint("commit-paid", 1);
+    payout.domain = LabelHash("commit-domain");
+    RequireOk(first.ConfirmWithdrawal(payout), "pay committed claim");
+    const auto paid{Commit(first)};
+    BOOST_CHECK(first.Withdrawals().contains(id));
+    BOOST_CHECK(paid.withdrawals != a.withdrawals);
+    BOOST_CHECK(paid.accounts == a.accounts);
+    RequireOk(first.CheckConservation(), "committed payout conservation");
+    LedgerState different_event{EmptyLedger(profile)};
+    RequireOk(different_event.CreditDeposit(Deposit(ALICE, RUSD, 10'000, TestOutpoint("commit-withdraw-fund", 0))), "same fund");
+    request.destination_script.assign(20, 0x42);
+    RequireOk(different_event.RequestWithdrawal(id, ALICE, request, 1), "same claim");
+    ++payout.payout_event.vout;
+    RequireOk(different_event.ConfirmWithdrawal(payout), "different event");
+    const auto another{Commit(different_event)};
+    BOOST_CHECK(paid.accounts == another.accounts && paid.totals == another.totals);
+    BOOST_CHECK(paid.withdrawals != another.withdrawals);
+    BOOST_CHECK(paid.Root() != another.Root());
+}
 BOOST_AUTO_TEST_SUITE_END()

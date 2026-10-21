@@ -62,8 +62,10 @@
  *   an applied slot is skipped; otherwise it must name the next slot after
  *   the committed head (slot 1 first, no slot skipped; ORDER_VIOLATION,
  *   REPLAY_APPLIED_OUT_OF_ORDER), which then becomes the committed head.
- * - SNAPSHOT_MARK: NotImplemented(M4-STO-03). PREPARED_QC:
- *   NotImplemented(M4-STO-07).
+ * - PREPARED_QC: exact full-value decode, binding and reexecution. It never
+ *   advances either head. Cryptographic authentication is the certified
+ *   StateOwner wrapper's responsibility (view0 only in this regtest slice).
+ * - SNAPSHOT_MARK: NotImplemented(M4-STO-03).
  * - Any other type: a signer-journal type is ORDER_VIOLATION
  *   (storage::RECORD_ROLE), an unregistered one DECODE (storage::RECORD_TYPE).
  *

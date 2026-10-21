@@ -6,6 +6,7 @@
 #define B3_FLOWMESH2_STORAGE_TOKENS_H
 
 #include <crypto/bls.h>
+#include <flowmesh2/storage/control_types.h>
 #include <flowmesh2/storage/record.h>
 #include <uint256.h>
 
@@ -53,6 +54,7 @@
 namespace flowmesh2::storage {
 
 class SignerLog;
+class ControlLog;
 class CommitLog;
 
 //! Vote phases. APPEND-ONLY.
@@ -119,6 +121,18 @@ struct VoteKey {
 
 inline constexpr size_t VOTE_KEY_BYTES{57};
 
+struct ControlRef {
+    ControlKey key;
+    uint256 digest;
+    friend bool operator==(const ControlRef&, const ControlRef&) = default;
+};
+struct SignedControlRef {
+    ControlKey key;
+    uint256 digest;
+    VoteSignature signature{};
+    friend bool operator==(const SignedControlRef&, const SignedControlRef&) = default;
+};
+
 struct ProposalRef {
     ProposalKey key;
     uint256 header_hash;
@@ -148,6 +162,10 @@ struct AppliedRef {
     friend bool operator==(const AppliedRef&, const AppliedRef&) = default;
 };
 
+constexpr uint64_t SlotOf(const ControlRef& r) { return r.key.slot; }
+constexpr uint64_t SlotOf(const SignedControlRef& r) { return r.key.slot; }
+constexpr const uint256& DigestOf(const ControlRef& r) { return r.digest; }
+constexpr const uint256& DigestOf(const SignedControlRef& r) { return r.digest; }
 constexpr uint64_t SlotOf(const ProposalRef& r) { return r.key.slot; }
 constexpr uint64_t SlotOf(const VoteRef& r) { return r.key.slot; }
 constexpr uint64_t SlotOf(const SignedVoteRef& r) { return r.key.slot; }
@@ -183,6 +201,11 @@ struct RecordRefOf<RecordType::APPLIED> {
     using type = AppliedRef;
 };
 
+template <>
+struct RecordRefOf<RecordType::CONTROL_INTENT> { using type = ControlRef; };
+template <>
+struct RecordRefOf<RecordType::SIGNED_CONTROL> { using type = SignedControlRef; };
+
 //! A record appended to a journal but not yet known to be durable.
 template <RecordType T>
 class Pending
@@ -201,6 +224,7 @@ public:
 
 private:
     friend class SignerLog;
+    friend class ControlLog;
     friend class CommitLog;
     Pending(uint64_t journal_instance, uint64_t seq, const Ref& key) : m_journal_instance{journal_instance}, m_seq{seq}, m_key{key} {}
 
@@ -209,6 +233,8 @@ private:
     Ref m_key;
 };
 
+using PendingControlIntent = Pending<RecordType::CONTROL_INTENT>;
+using PendingSignedControl = Pending<RecordType::SIGNED_CONTROL>;
 using PendingProposal = Pending<RecordType::ACCEPTED_PROPOSAL>;
 using PendingIntent = Pending<RecordType::INTENT>;
 using PendingSignedVote = Pending<RecordType::SIGNED_VOTE>;

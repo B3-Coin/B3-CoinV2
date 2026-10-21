@@ -40,9 +40,15 @@
  * The segment carries no header: role and instance are bound by the chain
  * (record.h), so whoever reopens a segment must know them.
  *
- * Stubs: OpenExisting and ReadAll (M4-STO-01: reopen, torn-tail handling,
- * key retirement on a gap or CRC break); Rollover (M4-STO-06). Until
- * M4-STO-01 lands the outline makes no crash-recovery claim for real files.
+ * OpenExisting accepts exactly this single-segment format, verifies the entire
+ * image and commits it before restoring the sequence, chain and byte boundary.
+ * Corruption, a gap or a nonzero torn tail is a refusal: no bytes are truncated,
+ * keys retired or files deleted. The operator must investigate such a refusal.
+ * An exclusive advisory lock prevents cooperating concurrent writers. Checksums
+ * cannot detect a coherently rolled-back backup, or bind an all-zero segment's
+ * role/instance; callers must retain the trusted store identity externally.
+ * ReadAll reads only the immutable prefix covered by a successful barrier.
+ * Rollover remains M4-STO-06; snapshot/state restoration is a separate layer.
  * POSIX only in practice: the Windows branches are not compiled on this host
  * (O-24 pattern).
  */
@@ -59,6 +65,10 @@ inline constexpr std::string_view JOURNAL_DIR_MISSING{"JOURNAL_DIR_MISSING"};
 inline constexpr std::string_view JOURNAL_SEGMENT_SIZE{"JOURNAL_SEGMENT_SIZE"};
 inline constexpr std::string_view JOURNAL_SEGMENT_CREATE{"JOURNAL_SEGMENT_CREATE"};
 inline constexpr std::string_view JOURNAL_SEGMENT_WRITE{"JOURNAL_SEGMENT_WRITE"};
+inline constexpr std::string_view JOURNAL_SEGMENT_OPEN{"JOURNAL_SEGMENT_OPEN"};
+inline constexpr std::string_view JOURNAL_SEGMENT_READ{"JOURNAL_SEGMENT_READ"};
+inline constexpr std::string_view JOURNAL_SEGMENT_LAYOUT{"JOURNAL_SEGMENT_LAYOUT"};
+inline constexpr std::string_view JOURNAL_SEGMENT_LOCKED{"JOURNAL_SEGMENT_LOCKED"};
 
 /** Replaces the JournalCommit call of Barrier. Production code never passes
  * one (CreateNew uses JournalCommit). It exists for fault injection in tests
@@ -81,9 +91,9 @@ public:
                                                                         SegmentCommitHook commit,
                                                                         BarrierObserver* observer = nullptr);
 
-    //! Reopen a journal after a restart. Stub: M4-STO-01.
+    //! Reopen a complete, valid single segment without repairing or deleting anything.
     static Result<std::unique_ptr<FileJournal>> OpenExisting(const fs::path& dir, JournalRole role, uint64_t instance_id);
-    //! Read the durable records back from disk. Stub: M4-STO-01.
+    //! Read the successfully barriered prefix back from disk.
     Result<std::vector<JournalRecord>> ReadAll() const override;
     //! Start the next segment. Stub: M4-STO-06.
     Result<void> Rollover();
@@ -93,7 +103,7 @@ public:
 
 private:
     FileJournal(JournalRole role, uint64_t instance_id, BarrierObserver* observer, fs::path segment_path, int fd,
-                uint64_t segment_bytes, SegmentCommitHook commit);
+                uint64_t segment_bytes, SegmentCommitHook commit, const ScanResult* recovered = nullptr);
 
     Result<void> AdmitAppend(uint64_t append_number, uint64_t offset, size_t size) const override;
     Result<void> Persist(uint64_t barrier_number, uint64_t offset, std::span<const unsigned char> bytes) override;

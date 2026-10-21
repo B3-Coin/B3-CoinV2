@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace flowmesh2;
@@ -76,7 +77,131 @@ BOOST_AUTO_TEST_CASE(create_checks_role_fence_and_history)
     RequireRefusal(SignerLog::Create(*fatal), ErrorCode::FENCED, JOURNAL_FENCED, "fatal journal");
     auto used{NewMemoryJournal(JournalRole::SIGNER, 3)};
     RequireStorageOk(used->Append(RecordType::INTENT, Bytes("history")), "append");
-    RequireStub(SignerLog::Create(*used), "M4-STO-01");
+    RequireRefusal(SignerLog::Create(*used), ErrorCode::ORDER_VIOLATION, LOG_PENDING_RECORDS, "pending history");
+    RequireRefusal(SignerLog::Create(*used, Profile()), ErrorCode::ORDER_VIOLATION, LOG_PENDING_RECORDS, "pending replay");
+    RequireStorageOk(used->Barrier(), "make malformed history durable");
+    RequireRefusal(SignerLog::Create(*used), ErrorCode::INVALID_INPUT, LOG_REPLAY_PROFILE_REQUIRED, "history needs decoding profile");
+    RequireCode(SignerLog::Create(*used, Profile()), ErrorCode::DECODE, "malformed durable history");
+}
+
+BOOST_AUTO_TEST_CASE(recovery_preserves_signed_and_unsigned_obligations)
+{
+    SignerFixture f{30};
+    const StorageSlot slot{MakeStorageSlot(4, 2, "recovered")};
+    const PendingProposal proposal{f.Accept(slot, 0)};
+    const PendingIntent pending{f.Intend(slot, 0, proposal)};
+    const DurableIntent intent{f.DurableIntentFor(pending)};
+    const VoteSignature sig{FakeSignature(0x41)};
+    const PendingSignedVote signed_pending{f.log.AppendSignedVote(intent, sig).value()};
+    RequireStorageOk(f.log.Barrier(), "make signature durable");
+    const VoteKey prepare{slot.header.domain, 2, 4, 0, VotePhase::PREPARE};
+    const uint256 prepare_digest{LabelHash("fm2/test/storage/unsigned-prepare")};
+    const PendingIntent unsigned_pending{f.log.AppendIntent(prepare, prepare_digest, proposal).value()};
+    RequireStorageOk(f.log.Barrier(), "make unsigned obligation durable");
+    const auto before{f.journal->DurableImage()};
+    const JournalStatus before_status{f.journal->Status()};
+
+    Result<SignerLog> created{SignerLog::Create(*f.journal, Profile())};
+    RequireStorageOk(created, "rebuild signer indexes");
+    SignerLog restored{std::move(created).value()};
+    BOOST_CHECK(restored.AppendAcceptedProposal(ProposalKey{2, 4, 0}, slot.header, slot.body).value() == proposal);
+    BOOST_CHECK(restored.AppendIntent(CommitVoteKey(slot.header, 0), slot.header.CommitDigest(), proposal).value() == pending);
+    BOOST_CHECK(restored.Knows(intent));
+    BOOST_CHECK(restored.AppendSignedVote(intent, sig).value() == signed_pending);
+    BOOST_CHECK(restored.Confirm(signed_pending).value().Binding() == (SignedVoteRef{CommitVoteKey(slot.header, 0), slot.header.CommitDigest(), sig}));
+    BOOST_CHECK(restored.AppendIntent(prepare, prepare_digest, proposal).value() == unsigned_pending);
+    RequireRefusal(restored.AppendIntent(prepare, LabelHash("other"), proposal), ErrorCode::EQUIVOCATION_REFUSED,
+                   VOTE_EQUIVOCATION, "unsigned reservation survives");
+    RequireRefusal(restored.AppendSignedVote(intent, FakeSignature(0x42)), ErrorCode::EQUIVOCATION_REFUSED,
+                   SIGNED_VOTE_CONFLICT, "exact signature survives");
+    const StorageSlot conflict{MakeStorageSlot(4, 2, "recovered-conflict")};
+    RequireRefusal(restored.AppendAcceptedProposal(ProposalKey{2, 4, 0}, conflict.header, conflict.body),
+                   ErrorCode::EQUIVOCATION_REFUSED, PROPOSAL_CONFLICT, "accepted proposal survives");
+    BOOST_CHECK(f.journal->DurableImage() == before);
+    BOOST_CHECK(f.journal->Status() == before_status);
+}
+
+BOOST_AUTO_TEST_CASE(recovery_refuses_corrupt_bindings_and_conflicts)
+{
+    const StorageSlot slot{MakeStorageSlot(1, 0, "recovery-corrupt")};
+    const ProposalKey proposal_key{0, 1, 0};
+    const VoteKey vote_key{CommitVoteKey(slot.header, 0)};
+    const auto accepted{AcceptedProposalRecord{proposal_key, slot.header, slot.body}.Encode()};
+    const auto intent{IntentRecord{vote_key, slot.header.CommitDigest(), 1}.Encode()};
+    uint64_t instance{40};
+    const auto refuses = [&](const std::vector<std::pair<RecordType, std::vector<unsigned char>>>& records,
+                             ErrorCode code, std::string_view detail) {
+        auto journal{NewMemoryJournal(JournalRole::SIGNER, instance++)};
+        for (const auto& [type, payload] : records) RequireStorageOk(journal->Append(type, payload), "raw corruption fixture");
+        RequireStorageOk(journal->Barrier(), "durable corruption fixture");
+        const auto before{journal->DurableImage()};
+        RequireRefusal(SignerLog::Create(*journal, Profile()), code, detail, "corrupt signer history");
+        BOOST_CHECK(journal->DurableImage() == before);
+    };
+    refuses({{RecordType::INTENT, intent}}, ErrorCode::INVALID_INPUT, INTENT_PROPOSAL_MISMATCH);
+    refuses({{RecordType::ACCEPTED_PROPOSAL, accepted},
+             {RecordType::INTENT, IntentRecord{vote_key, slot.header.CommitDigest(), 2}.Encode()}},
+            ErrorCode::INVALID_INPUT, INTENT_PROPOSAL_MISMATCH);
+    VoteKey wrong_domain{vote_key};
+    wrong_domain.domain = LabelHash("other-domain");
+    refuses({{RecordType::ACCEPTED_PROPOSAL, accepted},
+             {RecordType::INTENT, IntentRecord{wrong_domain, slot.header.CommitDigest(), 1}.Encode()}},
+            ErrorCode::INVALID_INPUT, INTENT_PROPOSAL_MISMATCH);
+    refuses({{RecordType::ACCEPTED_PROPOSAL, accepted},
+             {RecordType::INTENT, IntentRecord{vote_key, LabelHash("wrong-commit"), 1}.Encode()}},
+            ErrorCode::INVALID_INPUT, INTENT_DIGEST_MISMATCH);
+    refuses({{RecordType::ACCEPTED_PROPOSAL, accepted}, {RecordType::INTENT, intent},
+             {RecordType::SIGNED_VOTE, SignedVoteRecord{vote_key, slot.header.CommitDigest(), FakeSignature(1), 1}.Encode()}},
+            ErrorCode::VERIFY_FAILED, INTENT_UNKNOWN);
+    refuses({{RecordType::SIGNED_VOTE, SignedVoteRecord{vote_key, slot.header.CommitDigest(), FakeSignature(1), 2}.Encode()}},
+            ErrorCode::VERIFY_FAILED, INTENT_UNKNOWN);
+    const auto signed_vote{SignedVoteRecord{vote_key, slot.header.CommitDigest(), FakeSignature(1), 2}.Encode()};
+    refuses({{RecordType::ACCEPTED_PROPOSAL, accepted}, {RecordType::INTENT, intent}, {RecordType::SIGNED_VOTE, signed_vote},
+             {RecordType::SIGNED_VOTE, SignedVoteRecord{vote_key, slot.header.CommitDigest(), FakeSignature(2), 2}.Encode()}},
+            ErrorCode::EQUIVOCATION_REFUSED, SIGNED_VOTE_CONFLICT);
+    const StorageSlot conflict{MakeStorageSlot(1, 0, "conflicting-proposal")};
+    refuses({{RecordType::ACCEPTED_PROPOSAL, accepted},
+             {RecordType::ACCEPTED_PROPOSAL, AcceptedProposalRecord{proposal_key, conflict.header, conflict.body}.Encode()}},
+            ErrorCode::EQUIVOCATION_REFUSED, PROPOSAL_CONFLICT);
+    VoteKey prepare{vote_key};
+    prepare.phase = VotePhase::PREPARE;
+    refuses({{RecordType::ACCEPTED_PROPOSAL, accepted},
+             {RecordType::INTENT, IntentRecord{prepare, LabelHash("a"), 1}.Encode()},
+             {RecordType::INTENT, IntentRecord{prepare, LabelHash("b"), 1}.Encode()}},
+            ErrorCode::EQUIVOCATION_REFUSED, VOTE_EQUIVOCATION);
+    SlotBody wrong_body{slot.body};
+    wrong_body.originals.push_back(Bytes("extra"));
+    refuses({{RecordType::ACCEPTED_PROPOSAL, AcceptedProposalRecord{proposal_key, slot.header, wrong_body}.Encode()}},
+            ErrorCode::VERIFY_FAILED, BODY_HEADER_MISMATCH);
+}
+
+BOOST_AUTO_TEST_CASE(recovery_keeps_first_references_and_refuses_unsupported_records)
+{
+    SignerFixture f{60};
+    const StorageSlot slot{MakeStorageSlot(1, 0, "duplicate-recovery")};
+    const PendingProposal proposal{f.Accept(slot, 0)};
+    const PendingIntent pending{f.Intend(slot, 0, proposal)};
+    const DurableIntent intent{f.DurableIntentFor(pending)};
+    const VoteSignature signature{FakeSignature(7)};
+    const PendingSignedVote vote{f.log.AppendSignedVote(intent, signature).value()};
+    RequireStorageOk(f.log.Barrier(), "durable original vote");
+    RequireStorageOk(f.journal->Append(RecordType::ACCEPTED_PROPOSAL,
+        AcceptedProposalRecord{ProposalKey{0, 1, 0}, slot.header, slot.body}.Encode()), "duplicate proposal");
+    RequireStorageOk(f.journal->Append(RecordType::INTENT,
+        IntentRecord{CommitVoteKey(slot.header, 0), slot.header.CommitDigest(), proposal.Seq()}.Encode()), "duplicate intent");
+    RequireStorageOk(f.journal->Append(RecordType::SIGNED_VOTE,
+        SignedVoteRecord{CommitVoteKey(slot.header, 0), slot.header.CommitDigest(), signature, pending.Seq()}.Encode()), "duplicate vote");
+    RequireStorageOk(f.journal->Barrier(), "durable duplicate records");
+    SignerLog restored{SignerLog::Create(*f.journal, Profile()).value()};
+    BOOST_CHECK(restored.AppendAcceptedProposal(ProposalKey{0, 1, 0}, slot.header, slot.body).value() == proposal);
+    BOOST_CHECK(restored.AppendIntent(CommitVoteKey(slot.header, 0), slot.header.CommitDigest(), proposal).value() == pending);
+    BOOST_CHECK(restored.AppendSignedVote(intent, signature).value() == vote);
+    for (const RecordType type : {RecordType::VIEW_STATE, RecordType::NEW_VIEW_ACCEPTED}) {
+        auto journal{NewMemoryJournal(JournalRole::SIGNER, 61 + static_cast<uint8_t>(type))};
+        RequireStorageOk(journal->Append(type, {}), "unsupported record");
+        RequireStorageOk(journal->Barrier(), "unsupported record durable");
+        RequireStub(SignerLog::Create(*journal, Profile()), "M4-STO-07");
+    }
 }
 
 BOOST_AUTO_TEST_CASE(strict_order_writes_the_expected_records)

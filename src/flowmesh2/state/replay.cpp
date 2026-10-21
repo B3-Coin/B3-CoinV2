@@ -92,9 +92,28 @@ Result<ReplayResult> ReplayDecisions(const HeadView& genesis, std::span<const st
         case storage::RecordType::SNAPSHOT_MARK:
             // Snapshot boundaries: the mark record, its snapshot and a replay that starts there.
             return NotImplemented("M4-STO-03"); // TODO(rebirth:M4-STO-03)
-        case storage::RecordType::PREPARED_QC:
-            // Durable PBFT view state in the commit journal.
-            return NotImplemented("M4-STO-07"); // TODO(rebirth:M4-STO-07)
+        case storage::RecordType::PREPARED_QC: {
+            // A preparation never advances the committed or decided head.
+            // RestoreVerifiedGenesis authenticates the actual PREPARE quorum.
+            const auto prepared{storage::PreparedQcRecord::Decode(record.payload, profile)};
+            if (!prepared.has_value()) return prepared.error();
+            const auto& header{prepared->header};
+            if (prepared->slot == 0 || prepared->slot != header.height || prepared->epoch != header.authority_epoch ||
+                prepared->header_hash != header.Hash() || !storage::BodyMatchesHeader(header, prepared->body)) {
+                return Error{ErrorCode::VERIFY_FAILED, "prepared record differs from its value"};
+            }
+            const auto certificate{SlotCertificate::Decode(prepared->qc)};
+            if (!certificate.has_value()) return certificate.error();
+            if (certificate->header_hash != header.Hash()) return Error{ErrorCode::VERIFY_FAILED, "prepared proof names another value"};
+            if (header.height <= head.Header().height) {
+                if (slots[header.height - 1].header != header) return Error{ErrorCode::EQUIVOCATION_REFUSED, "prepared record conflicts with decision"};
+            } else {
+                if (header.height - 1 != head.Header().height) return Order(REPLAY_DECISION_GAP);
+                const auto candidate{ReexecuteOn(engine, head, header, prepared->body)};
+                if (!candidate.has_value()) return candidate.error();
+            }
+            break;
+        }
         default:
             if (!storage::IsKnown(record.type)) return Error{ErrorCode::DECODE, storage::RECORD_TYPE};
             return Order(storage::RECORD_ROLE);

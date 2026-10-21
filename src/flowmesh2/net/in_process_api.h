@@ -49,8 +49,12 @@
  * WITHOUT any lock (SUBMIT_ACTION: Admission::Admit, A0..A10;
  * ACTION_STATUS: GetAction; HEALTH: the counters), then stores the reply
  * and marks it REPLIED. TakeReply hands it out once and forgets the
- * request. So every RequestId gets exactly one reply, and the memory this
- * API holds is bounded by the ACTION lane's limits plus max_replies.
+ * request. So every completed request gets exactly one reply. Retained
+ * queued/replied state is bounded by the ACTION lane's limits plus max_replies.
+ * Each in-flight call may also hold a bounded temporary or a request being
+ * enqueued; transports must bound concurrent callers. Submission allocation
+ * failure leaves no request or lane reservation. Pump/Answer allocation failure
+ * recovery is not provided by this in-process adapter.
  *
  * Request states (RequestState, append-only): QUEUED (in the lane),
  * PROCESSING (popped, being answered), REPLIED (waiting for TakeReply).

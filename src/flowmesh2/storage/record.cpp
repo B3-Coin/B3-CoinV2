@@ -17,7 +17,7 @@ namespace flowmesh2::storage {
 
 namespace {
 
-constexpr std::array<RecordTypeInfo, 9> RECORD_TYPES{{
+constexpr std::array<RecordTypeInfo, 11> RECORD_TYPES{{
     {RecordType::INTENT, "INTENT"},
     {RecordType::SIGNED_VOTE, "SIGNED_VOTE"},
     {RecordType::DECISION, "DECISION"},
@@ -27,6 +27,8 @@ constexpr std::array<RecordTypeInfo, 9> RECORD_TYPES{{
     {RecordType::VIEW_STATE, "VIEW_STATE"},
     {RecordType::NEW_VIEW_ACCEPTED, "NEW_VIEW_ACCEPTED"},
     {RecordType::PREPARED_QC, "PREPARED_QC"},
+    {RecordType::CONTROL_INTENT, "CONTROL_INTENT"},
+    {RecordType::SIGNED_CONTROL, "SIGNED_CONTROL"},
 }};
 
 bool AllZero(std::span<const unsigned char> bytes)
@@ -67,7 +69,8 @@ bool RoleAccepts(JournalRole role, RecordType type)
     switch (role) {
     case JournalRole::SIGNER:
         return type == RecordType::INTENT || type == RecordType::SIGNED_VOTE || type == RecordType::ACCEPTED_PROPOSAL ||
-               type == RecordType::VIEW_STATE || type == RecordType::NEW_VIEW_ACCEPTED;
+               type == RecordType::VIEW_STATE || type == RecordType::NEW_VIEW_ACCEPTED ||
+               type == RecordType::CONTROL_INTENT || type == RecordType::SIGNED_CONTROL;
     case JournalRole::COMMIT:
         return type == RecordType::DECISION || type == RecordType::APPLIED || type == RecordType::SNAPSHOT_MARK ||
                type == RecordType::PREPARED_QC;

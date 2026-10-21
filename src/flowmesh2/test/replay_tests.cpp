@@ -263,7 +263,7 @@ BOOST_AUTO_TEST_CASE(replay_of_snapshot_and_view_records_is_a_stub)
     RequireStub(state::ReplayDecisions(fx.genesis, snapshot), "M4-STO-03");
     Records prepared{fx.records};
     prepared.push_back(storage::JournalRecord{prepared.size() + 1, storage::RecordType::PREPARED_QC, {}, uint256{}});
-    RequireStub(state::ReplayDecisions(fx.genesis, prepared), "M4-STO-07");
+    RequireError(state::ReplayDecisions(fx.genesis, prepared), ErrorCode::DECODE, "truncated prepared value");
 }
 
 BOOST_AUTO_TEST_SUITE_END()

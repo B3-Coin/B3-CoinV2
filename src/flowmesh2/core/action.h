@@ -120,6 +120,8 @@ std::string_view ToString(TimeInForce tif);
 
 //! True for the kinds the outline executes: PLACE, CANCEL and TRANSFER.
 bool KindSupported(ActionKind kind);
+//! Versioned runtime policy; legacy profile remains unchanged.
+bool KindSupported(ActionKind kind, const ProfileParams& profile);
 
 namespace detail {
 template <class Enum>

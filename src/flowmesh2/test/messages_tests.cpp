@@ -198,6 +198,10 @@ BOOST_AUTO_TEST_CASE(registries_pinned)
     BOOST_CHECK_EQUAL(static_cast<int>(MessageType::VIEW_CHANGE), 3);
     BOOST_CHECK_EQUAL(static_cast<int>(MessageType::NEW_VIEW), 4);
     BOOST_CHECK_EQUAL(static_cast<int>(MessageType::EVIDENCE), 5);
+    BOOST_CHECK_EQUAL(static_cast<int>(MessageType::CERTIFIED_PROPOSAL), 6);
+    BOOST_CHECK_EQUAL(static_cast<int>(MessageType::CONTROL_REPORT), 7);
+    BOOST_CHECK_EQUAL(static_cast<int>(MessageType::CONTROL_NEW_VIEW), 8);
+    BOOST_CHECK_EQUAL(static_cast<int>(MessageType::OFFER), 9);
     BOOST_CHECK_EQUAL(ToString(MessageType::PROPOSAL), "PROPOSAL");
     BOOST_CHECK_EQUAL(ToString(MessageType::VOTE), "VOTE");
     BOOST_CHECK_EQUAL(ToString(MessageType::VIEW_CHANGE), "VIEW_CHANGE");
@@ -207,7 +211,7 @@ BOOST_AUTO_TEST_CASE(registries_pinned)
     BOOST_CHECK_EQUAL(static_cast<int>(EvidenceKind::CONFLICTING_CERTIFICATES), 2);
     BOOST_CHECK_EQUAL(ToString(EvidenceKind::DOUBLE_VOTE), "DOUBLE_VOTE");
     BOOST_CHECK_EQUAL(ToString(EvidenceKind::CONFLICTING_CERTIFICATES), "CONFLICTING_CERTIFICATES");
-    for (int value : {0, 6, 255}) {
+    for (int value : {0, 10, 255}) {
         BOOST_CHECK(!IsKnown(static_cast<MessageType>(value)));
         BOOST_CHECK_EQUAL(ToString(static_cast<MessageType>(value)), "UNKNOWN");
     }
@@ -350,7 +354,7 @@ BOOST_AUTO_TEST_CASE(decode_refuses_malformed_bytes)
         std::vector<unsigned char> b{vote};
         b[0] = 2;
         RequireRefusal(DecodeMessage(b, RegtestProfile()), ErrorCode::DECODE, MESSAGE_VERSION_UNKNOWN, "version 2");
-        for (unsigned char type : {0, 6, 255}) {
+        for (unsigned char type : {0, 10, 255}) {
             b = vote;
             b[1] = type;
             RequireRefusal(DecodeMessage(b, RegtestProfile()), ErrorCode::DECODE, MESSAGE_TYPE_UNKNOWN, "unknown type");

@@ -76,7 +76,8 @@ struct CertifiedEnvelope {
 
     //! header.Encode() || cert.Encode(). Total.
     std::vector<unsigned char> Encode() const;
-    /** Exact decode: OVERSIZE above MAX_ENCODED_BYTES or for a bitmap above
+    /** Exact decode: v0/v2 certificates have no extension; v3 requires its
+     * eight-byte COMMIT view. OVERSIZE above MAX_ENCODED_BYTES or for a bitmap above
      * its cap, DECODE for a malformed header or certificate or trailing
      * bytes. Pure codec: whether the certificate names the header and is
      * valid is b3verify's question (VerifyCertificate).

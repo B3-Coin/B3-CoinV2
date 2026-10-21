@@ -180,12 +180,20 @@ Result<void> LaneSet::TryPush(Lane lane, TrafficClass traffic, const uint256& re
         a.bytes += bytes;
     }
 
-    MailboxMessage message;
-    message.request_id = request_id;
-    message.payload.reserve(bytes + 1);
-    message.payload.push_back(static_cast<unsigned char>(traffic));
-    message.payload.insert(message.payload.end(), payload.begin(), payload.end());
-    const MailboxPushResult pushed{m_mailboxes[index]->TryPush(std::move(message))};
+    MailboxPushResult pushed{MailboxPushResult::FULL};
+    try {
+        MailboxMessage message;
+        message.request_id = request_id;
+        message.payload.reserve(bytes + 1);
+        message.payload.push_back(static_cast<unsigned char>(traffic));
+        message.payload.insert(message.payload.end(), payload.begin(), payload.end());
+        // C1 stages its metadata node before mutating the mailbox; an
+        // exception means no message was queued, so release our reservation.
+        pushed = m_mailboxes[index]->TryPush(std::move(message));
+    } catch (...) {
+        Release(index, traffic, bytes);
+        throw;
+    }
     if (pushed == MailboxPushResult::ACCEPTED) return Ok();
 
     Release(index, traffic, bytes);
@@ -221,7 +229,10 @@ std::optional<LaneMessage> LaneSet::TryPop(Lane lane)
     message.request_id = popped->request_id;
     message.lane = lane;
     message.traffic = traffic;
-    message.payload.assign(popped->payload.begin() + 1, popped->payload.end());
+    // Strip the class byte in-place and transfer ownership. Copying here
+    // could allocate after the mailbox has already removed the message.
+    popped->payload.erase(popped->payload.begin());
+    message.payload = std::move(popped->payload);
     Release(index, traffic, message.payload.size());
     return message;
 }

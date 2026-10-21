@@ -59,6 +59,8 @@ enum class RecordType : uint8_t {
     VIEW_STATE = 7,        //!< signer: durable PBFT view state (M4-STO-07)
     NEW_VIEW_ACCEPTED = 8, //!< signer: an accepted new-view message (M4-STO-07)
     PREPARED_QC = 9,       //!< commit: a prepared quorum certificate (M4-STO-07)
+    CONTROL_INTENT = 10,   //!< control: immutable view/report intent, durable before signing
+    SIGNED_CONTROL = 11,   //!< control: exact signature, durable before publication
 };
 
 struct RecordTypeInfo {

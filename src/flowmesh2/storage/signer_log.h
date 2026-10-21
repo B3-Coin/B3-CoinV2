@@ -61,8 +61,10 @@
  *   verify the signature: SeatSigner made it, and peers verify it.
  * - Every Append and Confirm of a fatal journal is FENCED.
  * - Create needs a SIGNER journal (ORDER_VIOLATION, LOG_ROLE) that is not
- *   fatal (FENCED) and has no records yet. A journal with history needs its
- *   equivocation index rebuilt first: recovery, M4-STO-01.
+ *   fatal (FENCED), with no pending undurable records. Create(journal) is
+ *   fresh-only; Create(journal, profile) rebuilds the equivocation indexes
+ *   from durable history, preserving original record references/signatures.
+ *   It never signs, truncates records or clears an obligation.
  *
  * Record payloads (exact codecs; recovery in M4-STO-01 reads them):
  * - ACCEPTED_PROPOSAL: ProposalKey (u64 epoch | u64 slot | u64 view) |
@@ -143,6 +145,7 @@ class SignerLog
 {
 public:
     static Result<SignerLog> Create(Journal& journal);
+    static Result<SignerLog> Create(Journal& journal, const ProfileParams& profile);
 
     SignerLog(SignerLog&&) noexcept = default;
     SignerLog& operator=(SignerLog&&) noexcept = default;
@@ -164,6 +167,12 @@ public:
 
     //! True iff `intent` is an intent of this log: same instance, sequence number, key and digest.
     bool Knows(const DurableIntent& intent) const;
+    //! Exact durable retained data for restart/retransmission; never signs.
+    std::optional<PendingSignedVote> SignedAt(const VoteKey& key) const;
+    Result<std::optional<AcceptedProposalRecord>> AcceptedAt(const ProposalKey& key, const ProfileParams& profile) const;
+    //! Every ordinary intent/signed vote is bound to one accepted proposal.
+    //! Only views whose accepted record passed its barrier are returned.
+    std::vector<uint64_t> DurableAcceptedViewsAt(uint64_t epoch, uint64_t slot) const;
 
     //! Folded signing (sign, then one barrier). Stub: M4-STO-05.
     Result<PendingSignedVote> AppendSignedFolded(const VoteKey& key, const uint256& digest, const PendingProposal& proposal,
@@ -174,6 +183,7 @@ public:
     Result<uint64_t> AppendNewViewAccepted(const NewViewAcceptedRecord& record);
 
 private:
+    static Result<SignerLog> CreateImpl(Journal& journal, const ProfileParams* profile);
     explicit SignerLog(Journal& journal) : m_journal{&journal} {}
 
     struct ProposalEntry {

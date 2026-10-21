@@ -51,10 +51,10 @@ BOOST_AUTO_TEST_SUITE(facts_tests)
 BOOST_AUTO_TEST_CASE(kind_registry_pinned)
 {
     const std::vector<std::string> names{"UNKNOWN", "DEPOSIT", "SEAT_CHANGE", "LISTING", "CHECKPOINT_ACCEPTED",
-                                         "PAYOUT_CONFIRMED", "EXIT_NULLIFIER", "UNKNOWN"};
-    for (int v{0}; v <= 7; ++v) {
+                                         "PAYOUT_CONFIRMED", "EXIT_NULLIFIER", "SOURCE_RANGE", "UNKNOWN"};
+    for (int v{0}; v <= 8; ++v) {
         BOOST_CHECK_EQUAL(std::string{ToString(static_cast<FactKind>(v))}, names[v]);
-        BOOST_CHECK_EQUAL(IsKnown(static_cast<FactKind>(v)), v >= 1 && v <= 6);
+        BOOST_CHECK_EQUAL(IsKnown(static_cast<FactKind>(v)), v >= 1 && v <= 7);
     }
     const FactCursor at{7, 3};
     const std::vector<std::pair<Fact, FactKind>> kinds{
@@ -64,6 +64,7 @@ BOOST_AUTO_TEST_CASE(kind_registry_pinned)
         {CheckpointAcceptedFact{at}, FactKind::CHECKPOINT_ACCEPTED},
         {PayoutConfirmedFact{at}, FactKind::PAYOUT_CONFIRMED},
         {ExitNullifierFact{at}, FactKind::EXIT_NULLIFIER},
+        {SourceRangeFact{at}, FactKind::SOURCE_RANGE},
     };
     BOOST_CHECK_EQUAL(kinds.size(), std::variant_size_v<Fact>);
     for (const auto& [fact, kind] : kinds) {
@@ -95,7 +96,7 @@ BOOST_AUTO_TEST_CASE(deposit_round_trip_and_refusals)
     BOOST_REQUIRE(std::holds_alternative<DepositFact>(*decoded));
     BOOST_CHECK(std::get<DepositFact>(*decoded) == Sample());
 
-    for (const unsigned char kind : {0x00, 0x07, 0xff}) {
+    for (const unsigned char kind : {0x00, 0x08, 0xff}) {
         auto bad{bytes};
         bad[0] = kind;
         CheckError(DecodeFact(bad), ErrorCode::DECODE);
@@ -167,7 +168,7 @@ BOOST_AUTO_TEST_CASE(stub_facts_never_encode)
     const FactCursor at{1, 0};
     const std::vector<std::pair<Fact, std::string>> stubs{
         {SeatChangeFact{at}, "M7-SEAT-01"},       {ListingFact{at}, "M7-GOV-01"},
-        {CheckpointAcceptedFact{at}, "MB1-B3D-02"}, {PayoutConfirmedFact{at}, "M8-BRG-02"},
+        {CheckpointAcceptedFact{at}, "MB1-B3D-02"},
         {ExitNullifierFact{at}, "M8-EXIT-01"},
     };
     for (const auto& [fact, id] : stubs) {
@@ -186,4 +187,102 @@ BOOST_AUTO_TEST_CASE(stub_facts_never_encode)
     }
 }
 
+BOOST_AUTO_TEST_CASE(payout_confirmation_roundtrip_is_exact_and_binds_every_field)
+{
+    PayoutConfirmedFact fact;
+    fact.cursor = FactCursor{131, 2};
+    fact.withdrawal = ActionId{LabelHash("withdrawal")};
+    fact.account = AccountId{LabelHash("withdrawer")};
+    fact.asset = AssetId{LabelHash("synthetic-token")};
+    fact.amount = 1234;
+    fact.recipient.fill(0x42);
+    fact.payout_event = Outpoint{LabelHash("payout-tx"), 3};
+    fact.domain = LabelHash("custody-domain");
+    const auto bytes{EncodeFact(fact).value()};
+    BOOST_CHECK_EQUAL(bytes.size(), 201U);
+    BOOST_CHECK(std::get<PayoutConfirmedFact>(DecodeFact(bytes).value()) == fact);
+    BOOST_CHECK(FactLeaf(bytes) == FactId(fact).value());
+    auto short_bytes{bytes};
+    short_bytes.pop_back();
+    CheckError(DecodeFact(short_bytes), ErrorCode::DECODE);
+    auto trailing{bytes};
+    trailing.push_back(0);
+    CheckError(DecodeFact(trailing), ErrorCode::OVERSIZE);
+    const std::vector<std::function<void(PayoutConfirmedFact&)>> mutations{
+        [](auto& f) { ++f.cursor.height; }, [](auto& f) { ++f.cursor.index; },
+        [](auto& f) { Flip(f.withdrawal.id); }, [](auto& f) { Flip(f.account.id); },
+        [](auto& f) { Flip(f.asset.id); }, [](auto& f) { ++f.amount; },
+        [](auto& f) { f.recipient[0] ^= 1; }, [](auto& f) { Flip(f.payout_event.txid); },
+        [](auto& f) { ++f.payout_event.vout; }, [](auto& f) { Flip(f.domain); }};
+    std::set<uint256> ids{FactId(fact).value()};
+    for (const auto& mutate : mutations) {
+        auto changed{fact};
+        mutate(changed);
+        BOOST_CHECK(ids.insert(FactId(changed).value()).second);
+    }
+    for (int field{0}; field < 6; ++field) {
+        auto bad{fact};
+        if (field == 0) bad.amount = 0;
+        if (field == 1) bad.amount = -1;
+        if (field == 2) bad.recipient.fill(0);
+        if (field == 3) bad.withdrawal = ActionId{};
+        if (field == 4) bad.payout_event = Outpoint{};
+        if (field == 5) bad.domain = uint256{};
+        CheckError(EncodeFact(bad), ErrorCode::INVALID_INPUT);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(source_range_roundtrip_commits_every_boundary)
+{
+    SourceRangeFact source{FactCursor{130, 3}, LabelHash("source/domain"), 31337, 10,
+                           LabelHash("source/previous"), 11, LabelHash("source/to"), 2};
+    const auto bytes{EncodeFact(source).value()};
+    BOOST_CHECK_EQUAL(bytes.size(), 133U);
+    BOOST_CHECK_EQUAL(bytes.front(), 7U);
+    BOOST_CHECK(std::get<SourceRangeFact>(DecodeFact(bytes).value()) == source);
+    BOOST_CHECK(FactId(Fact{source}).value() == FactLeaf(bytes));
+    BOOST_CHECK_EQUAL(bytes[41], 0x69U); // chain31337 encoded little-endian at its fixed offset
+    BOOST_CHECK_EQUAL(bytes[42], 0x7aU);
+    const std::vector<std::function<void(SourceRangeFact&)>> mutations{
+        [](auto& f) { ++f.cursor.height; }, [](auto& f) { ++f.cursor.index; },
+        [](auto& f) { Flip(f.domain); }, [](auto& f) { ++f.chain_id; },
+        [](auto& f) { --f.previous_height; }, [](auto& f) { Flip(f.previous_hash); },
+        [](auto& f) { ++f.to_height; }, [](auto& f) { Flip(f.to_hash); }, [](auto& f) { ++f.confirmations; }};
+    std::set<uint256> ids{FactId(Fact{source}).value()};
+    for (const auto& mutate : mutations) {
+        auto changed{source}; mutate(changed);
+        BOOST_CHECK(ids.insert(FactId(Fact{changed}).value()).second);
+    }
+    auto short_bytes{bytes}; short_bytes.pop_back();
+    CheckError(DecodeFact(short_bytes), ErrorCode::DECODE);
+    auto trailing{bytes}; trailing.push_back(0);
+    CheckError(DecodeFact(trailing), ErrorCode::OVERSIZE);
+}
+
+BOOST_AUTO_TEST_CASE(source_range_refuses_ambiguous_or_noncanonical_boundaries)
+{
+    SourceRangeFact source{FactCursor{130, 0}, LabelHash("source/domain"), 31337, 10,
+                           LabelHash("source/previous"), 11, LabelHash("source/to"), 2};
+    const std::vector<std::function<void(SourceRangeFact&)>> mutations{
+        [](auto& f) { f.domain.SetNull(); }, [](auto& f) { f.chain_id = 0; },
+        [](auto& f) { f.previous_hash.SetNull(); }, [](auto& f) { f.to_hash.SetNull(); },
+        [](auto& f) { f.to_height = f.previous_height - 1; },
+        [](auto& f) { f.to_height = f.previous_height; }, [](auto& f) { f.confirmations = 0; }};
+    const auto encoded{EncodeFact(source).value()};
+    for (const auto& mutate : mutations) {
+        auto changed{source}; mutate(changed);
+        BOOST_CHECK(!changed.IsCanonical());
+        CheckError(EncodeFact(changed), ErrorCode::INVALID_INPUT);
+    }
+    // Equal endpoints are canonical only with exactly the same block hash.
+    source.to_height = source.previous_height; source.to_hash = source.previous_hash;
+    BOOST_CHECK(source.IsCanonical());
+    BOOST_CHECK(std::get<SourceRangeFact>(DecodeFact(EncodeFact(source).value()).value()) == source);
+    for (const size_t offset : {size_t{9}, size_t{41}, size_t{57}, size_t{97}, size_t{129}}) {
+        auto wrong{encoded};
+        const size_t count{offset == 41 ? 8U : offset == 129 ? 4U : 32U};
+        std::fill(wrong.begin() + offset, wrong.begin() + offset + count, 0);
+        CheckError(DecodeFact(wrong), ErrorCode::DECODE);
+    }
+}
 BOOST_AUTO_TEST_SUITE_END()

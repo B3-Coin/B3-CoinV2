@@ -87,11 +87,11 @@ BOOST_AUTO_TEST_CASE(role_mismatch_is_order_violation)
     auto signer{NewJournal(JournalRole::SIGNER, 1)};
     auto commit{NewJournal(JournalRole::COMMIT, 1)};
     for (RecordType type : {RecordType::DECISION, RecordType::APPLIED, RecordType::SNAPSHOT_MARK, RecordType::PREPARED_QC,
-                            RecordType{0}, RecordType{10}, RecordType{255}}) {
+                            RecordType{0}, RecordType{12}, RecordType{255}}) {
         RequireRefusal(signer->Append(type, Bytes("x")), ErrorCode::ORDER_VIOLATION, JOURNAL_ROLE_MISMATCH, "signer journal");
     }
     for (RecordType type : {RecordType::INTENT, RecordType::SIGNED_VOTE, RecordType::ACCEPTED_PROPOSAL, RecordType::VIEW_STATE,
-                            RecordType::NEW_VIEW_ACCEPTED, RecordType{0}, RecordType{10}}) {
+                            RecordType::NEW_VIEW_ACCEPTED, RecordType::CONTROL_INTENT, RecordType::SIGNED_CONTROL, RecordType{0}, RecordType{12}}) {
         RequireRefusal(commit->Append(type, Bytes("x")), ErrorCode::ORDER_VIOLATION, JOURNAL_ROLE_MISMATCH, "commit journal");
     }
     // A refused append consumes no sequence number and does not fence the journal.

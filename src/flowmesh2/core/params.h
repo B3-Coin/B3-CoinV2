@@ -5,12 +5,15 @@
 #ifndef B3_FLOWMESH2_CORE_PARAMS_H
 #define B3_FLOWMESH2_CORE_PARAMS_H
 
+#include <flowmesh2/core/amount.h>
+#include <flowmesh2/core/ids.h>
 #include <flowmesh2/core/result.h>
 #include <uint256.h>
 #include <util/chaintype.h>
 
 #include <array>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -38,6 +41,15 @@ namespace flowmesh2 {
 inline constexpr uint32_t FM_VERSION{1};
 //! Version byte that starts EncodeProfile's output.
 inline constexpr uint8_t PROFILE_ENCODING_VERSION{1};
+//! Encoding 2 appends stable-Q and withdrawal policy; encoding 1 stays frozen.
+inline constexpr uint8_t STABLE_Q_PROFILE_ENCODING_VERSION{2};
+inline constexpr std::string_view STABLE_Q_PROFILE_ID{"fm2-regtest-stable-q/1"};
+//! Encoding 3 explicitly requires view-bound certificates; encoding 1/2 stay frozen.
+inline constexpr uint8_t STABLE_Q_VIEW_PROFILE_ENCODING_VERSION{3};
+inline constexpr std::string_view STABLE_Q_VIEW_PROFILE_ID{"fm2-regtest-stable-q/2"};
+//! Encoding 4 commits every observed source range, including empty event batches.
+inline constexpr uint8_t STABLE_Q_NETWORK_PROFILE_ENCODING_VERSION{4};
+inline constexpr std::string_view STABLE_Q_NETWORK_PROFILE_ID{"fm2-regtest-stable-q/3"};
 //! Longest accepted profile_id, in bytes.
 inline constexpr size_t MAX_PROFILE_ID_BYTES{64};
 
@@ -110,6 +122,17 @@ struct ProfileParams {
     uint32_t pool_capacity{0};       //!< 4,096 admitted actions per node
     uint32_t outcome_index_slots{0}; //!< 1,024: >= max_delay_slots, so DUPLICATE stays definite
 
+    // Optional encoding-2 extension. Absent preserves every legacy byte.
+    // Present only for a versioned stable-Q profile and exactly RegtestQuoteAsset().
+    // This names synthetic regtest Q, never a production stablecoin.
+    std::optional<AssetId> stable_fee_asset;
+    bool withdrawals_enabled{false}; //!< encoding-2 REGTEST Q withdrawals only
+    Atoms withdrawal_fee_atoms{0};   //!< test-only Q charge; disabled implies zero
+    bool view_bound_commits{false};  //!< encoding 3 only; certificates bind the exact voting view
+    bool source_range_commitment{false}; //!< encoding 4: exactly one terminal SourceRangeFact per slot
+    uint64_t source_chain_id{0};           //!< /3 pins isolated EVM31337; legacy profiles require zero
+    uint32_t source_confirmations{0};      //!< /3 pins two regtest confirmations; no production finality claim
+
     friend bool operator==(const ProfileParams&, const ProfileParams&) = default;
 };
 
@@ -117,6 +140,25 @@ struct ProfileParams {
  * UNSUPPORTED_NETWORK for MAIN, TESTNET, TESTNET4 and SIGNET.
  */
 Result<ProfileParams> DevRegtestProfile(ChainType chain);
+
+//! Deterministic synthetic Q: Tagged(TEST_ASSET, raw UTF-8 "rUSD"). No backing claim.
+AssetId RegtestQuoteAsset();
+
+/** First stable-fee regtest slice. Every admitted market must quote exact Q.
+ * Keeps the old profile's unratified rate/incidence/caps as test parameters;
+ * a new profile id and encoding bind Q without reinterpreting old signatures
+ * or vectors. MAIN/TESTNET/TESTNET4/SIGNET are unsupported.
+ * Wider non-Q-quoted markets and futures remain separate product work.
+ */
+Result<ProfileParams> StableQRegtestProfile(ChainType chain);
+
+//! Separate prerelease profile: same Q policy, commitment 3 and view-bound certificates.
+//! Existing /1 profiles and saved journals retain their original rules and bytes.
+Result<ProfileParams> StableQViewRegtestProfile(ChainType chain);
+
+//! Authenticated-network prerelease profile: /2 rules plus a committed exact source range.
+//! Every earlier profile/signature/journal keeps its original encoding and rules.
+Result<ProfileParams> StableQNetworkRegtestProfile(ChainType chain);
 
 /** Checks a profile, in this order:
  * 1. chain is not REGTEST: UNSUPPORTED_NETWORK;
@@ -132,7 +174,15 @@ Result<ProfileParams> DevRegtestProfile(ChainType chain);
 Result<void> Validate(const ProfileParams& params);
 
 /** Canonical bytes of a profile: u8 PROFILE_ENCODING_VERSION, then every field
- * in declaration order. Strings are CompactSize-prefixed; the chain is its
+ * in original declaration order. If stable_fee_asset is present the first
+ * byte is STABLE_Q_PROFILE_ENCODING_VERSION. Append u8 Q-present, Q's raw
+ * AssetId if present, u8 withdrawals_enabled and i64 withdrawal_fee_atoms.
+ * view_bound_commits selects encoding 3 and appends its explicit u8 flag.
+ * Source policy selects encoding 4 and appends u8 source_range_commitment,
+ * u64 source_chain_id and u32 source_confirmations after the explicit view flag.
+ * Other non-default extensions use encoding 2; all extension defaults preserve
+ * exactly encoding 1 (including invalid profiles hashed for diagnostics).
+ * Strings are CompactSize-prefixed; the chain is its
  * ChainTypeToString name; integers are little-endian; bools and enums are u8.
  */
 std::vector<unsigned char> EncodeProfile(const ProfileParams& params);

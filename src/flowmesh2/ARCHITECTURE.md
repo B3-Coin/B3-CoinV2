@@ -80,6 +80,18 @@ per-market ledger and call it a V2 account.**
 
 ---
 
+## Owner implementation instruction — 2026-10-18
+
+The owner explicitly instructed completion of deposit, trading and withdrawal
+end to end on regtest, stable fees and measured Hyperliquid-like speed, allowing
+FlowMesh changes and prohibiting mainnet until everything passes. The active
+authorized source is `/home/josh/B3-rebirth` on `rebirth` on the Windows laptop.
+This supersedes the old Mac workspace lock and outline-only scope for local
+regtest development. Historical rules, production defaults, no-push and no-live-
+fund constraints remain. The concrete provisional slice and limits are recorded
+in `doc/design/b3-regtest-roundtrip-20261018.txt`. No milestone/release acceptance
+or production custody/economics follows from an implemented test profile.
+
 ## 0. Gates that are still open
 
 These gates come from the outline review. Each row says how the slices treat

@@ -312,4 +312,78 @@ BOOST_AUTO_TEST_CASE(resting_order_leaf_every_field_changes_the_value)
     BOOST_CHECK_EQUAL(values.size(), mutations.size() + 1);
 }
 
+BOOST_AUTO_TEST_CASE(withdrawal_records_bind_obligations_and_paid_nullifiers)
+{
+    WithdrawalRecord record;
+    record.id = ActionId{LabelHash("record-id")};
+    record.account = AccountId{LabelHash("record-owner")};
+    record.asset = TestAsset("rUSD");
+    record.amount = 5000;
+    record.fee = 1000;
+    record.recipient.fill(0x42);
+    record.slot = 7;
+    BOOST_REQUIRE(record.IsCanonical());
+    BOOST_CHECK_EQUAL(record.Encode().size(), 177U);
+    BOOST_CHECK(WithdrawalRecord::Decode(record.Encode()).value() == record);
+    const auto unpaid{record.LeafValue()};
+    record.paid = true;
+    BOOST_CHECK(!record.IsCanonical());
+    record.payout_event = Outpoint{LabelHash("record-paid-tx"), 1};
+    BOOST_REQUIRE(record.IsCanonical());
+    BOOST_CHECK(WithdrawalRecord::Decode(record.Encode()).value() == record);
+    BOOST_CHECK(record.LeafValue() != unpaid);
+    const auto paid{record.LeafValue()};
+    ++record.payout_event.vout;
+    BOOST_CHECK(record.LeafValue() != paid);
+    auto bad{record.Encode()};
+    bad[140] = 2; // paid is exactly one canonical byte
+    BOOST_CHECK(!WithdrawalRecord::Decode(bad).has_value());
+    bad = record.Encode();
+    bad.push_back(0);
+    BOOST_CHECK(!WithdrawalRecord::Decode(bad).has_value());
+}
+
+BOOST_AUTO_TEST_CASE(six_root_version_does_not_change_legacy_root_or_encoding)
+{
+    StateRootsV0 old{LabelledRoots()};
+    DataStream legacy;
+    legacy << old;
+    BOOST_CHECK_EQUAL(legacy.size(), 160U);
+    const auto old_root{old.Root()};
+    StateRootsV0 extended{old};
+    extended.version = COMMITMENT_VERSION_WITHDRAWALS;
+    extended.withdrawals = LabelHash("sixth-root");
+    BOOST_CHECK(extended.Root() != old_root);
+    auto changed{extended};
+    Flip(changed.withdrawals);
+    BOOST_CHECK(changed.Root() != extended.Root());
+    BOOST_CHECK(changed.accounts == extended.accounts && changed.totals == extended.totals);
+    DataStream truncated;
+    BOOST_CHECK_THROW(truncated << extended, std::ios_base::failure);
+    StateRootsV0 roundtrip;
+    legacy >> roundtrip;
+    BOOST_CHECK(roundtrip == old);
+    BOOST_CHECK(roundtrip.Root() == old_root);
+}
+
+BOOST_AUTO_TEST_CASE(view_bound_profile_versions_six_roots_without_reencoding_archives)
+{
+    BOOST_CHECK_EQUAL(ExpectedCommitmentVersion(DevRegtestProfile(ChainType::REGTEST).value()), COMMITMENT_VERSION_V0);
+    BOOST_CHECK_EQUAL(ExpectedCommitmentVersion(StableQRegtestProfile(ChainType::REGTEST).value()), COMMITMENT_VERSION_WITHDRAWALS);
+    BOOST_CHECK_EQUAL(ExpectedCommitmentVersion(StableQViewRegtestProfile(ChainType::REGTEST).value()), COMMITMENT_VERSION_VIEW_BOUND);
+    StateRootsV0 archived{LabelledRoots()};
+    archived.version = COMMITMENT_VERSION_WITHDRAWALS;
+    archived.withdrawals = LabelHash("view-bound-sixth-root");
+    const auto archived_hash{archived.Root()};
+    auto current{archived}; current.version = COMMITMENT_VERSION_VIEW_BOUND;
+    BOOST_CHECK(current.Root() != archived_hash);
+    auto changed{current}; Flip(changed.withdrawals);
+    BOOST_CHECK(changed.Root() != current.Root());
+    changed = current; Flip(changed.accounts);
+    BOOST_CHECK(changed.Root() != current.Root());
+    BOOST_CHECK(archived.Root() == archived_hash);
+    DataStream legacy_transport;
+    BOOST_CHECK_THROW(legacy_transport << current, std::ios_base::failure);
+}
+
 BOOST_AUTO_TEST_SUITE_END()

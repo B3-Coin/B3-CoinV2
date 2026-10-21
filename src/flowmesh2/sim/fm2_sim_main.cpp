@@ -21,6 +21,7 @@
 
 #include <flowmesh2/sim/scenario.h>
 #include <key.h>
+#include <util/translation.h>
 
 #include <charconv>
 #include <cstdint>
@@ -30,6 +31,9 @@
 #include <string_view>
 #include <system_error>
 #include <vector>
+
+// This headless executable uses untranslated messages.
+const TranslateFn G_TRANSLATION_FUN{nullptr};
 
 namespace {
 

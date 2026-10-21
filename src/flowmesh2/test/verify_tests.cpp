@@ -534,4 +534,176 @@ BOOST_AUTO_TEST_CASE(stubs_never_succeed)
     RequireStub(verify::VerifyAnchorProof(header, verify::AnchorProof{header.anchor, {}, {}}), "M7-ADP-02");
 }
 
+BOOST_AUTO_TEST_CASE(stable_q_verifier_enforces_market_and_fee_outcome_asset)
+{
+    const ProfileParams profile{StableQRegtestProfile(ChainType::REGTEST).value()};
+    Fill fill;
+    fill.market = MarketM1().Id();
+    fill.price_ticks = 1'001;
+    fill.lots = 2;
+    fill.quote_atoms = 2'002;
+    fill.seller_fee = 1;
+    RequireOk(verify::VerifyFill(fill, MarketM1(), profile), "stable-Q fill");
+    const MarketDescriptor native_quote{TestAsset("TOK"), AssetId::Native(), 1, 1};
+    fill.market = native_quote.Id();
+    RequireVerifyFailed(verify::VerifyFill(fill, native_quote, profile), verify::FILL_FEE_ASSET, "native quote fee refused");
+    RequireOk(verify::VerifyFill(fill, native_quote, RegtestProfile()), "legacy quote policy unchanged");
+
+    OutcomeV2 outcome;
+    outcome.source = OutcomeSource::SLOT;
+    outcome.code = OutcomeCode::FEES_DISTRIBUTED;
+    outcome.subject = RegtestQuoteAsset().id;
+    outcome.deltas = {{AccountId{}, RegtestQuoteAsset(), 3, 0}};
+    SlotHeaderV2 header;
+    header.profile_hash = ProfileHash(profile);
+    header.outcome_count = 1;
+    const auto check = [&](const OutcomeV2& value) {
+        const std::vector<uint256> leaves{value.LeafHash()};
+        header.outcomes_root = MerkleRoot(leaves);
+        const auto proof{MerkleProve(leaves, 0)};
+        RequireOk(proof, "fee outcome proof");
+        return verify::VerifyOutcome(header, value, *proof, profile);
+    };
+    RequireOk(check(outcome), "profile-bound Q fee outcome");
+    OutcomeV2 wrong{outcome};
+    wrong.subject = AssetId::Native().id;
+    RequireVerifyFailed(check(wrong), verify::FEE_OUTCOME_ASSET, "native fee subject refused even with a valid proof");
+    wrong = outcome;
+    wrong.deltas.front().asset = AssetId::Native();
+    RequireVerifyFailed(check(wrong), verify::FEE_OUTCOME_ASSET, "native fee delta refused even with a valid proof");
+    wrong = outcome;
+    wrong.deltas.front().available_delta = -3;
+    RequireVerifyFailed(check(wrong), verify::FEE_OUTCOME_DELTA, "negative fee credit refused");
+    const std::vector<uint256> leaves{outcome.LeafHash()};
+    header.outcomes_root = MerkleRoot(leaves);
+    header.profile_hash = ProfileHash(RegtestProfile());
+    const auto proof{MerkleProve(leaves, 0)};
+    RequireOk(proof, "profile mismatch proof");
+    RequireVerifyFailed(verify::VerifyOutcome(header, outcome, *proof, profile), verify::PROFILE_MISMATCH, "profile downgrade refused");
+}
+
+BOOST_AUTO_TEST_CASE(account_proof_binds_withdrawal_root_and_commitment_profile_version)
+{
+    const auto profile{StableQRegtestProfile(ChainType::REGTEST).value()};
+    SyntheticState state{{LeafOf("alice", 1000, {})}};
+    state.roots.version = COMMITMENT_VERSION_WITHDRAWALS;
+    state.roots.withdrawals = LabelHash("verified-withdrawals");
+    SlotHeaderV2 header;
+    header.profile_hash = ProfileHash(profile);
+    header.commitment_version = COMMITMENT_VERSION_WITHDRAWALS;
+    header.state_root = state.roots.Root();
+    const auto [leaf, proof]{state.Witness(KeyAccount("alice"))};
+    RequireOk(verify::VerifyAccountLeaf(header, leaf, state.roots, proof, profile), "v2 account proof");
+    auto changed{state.roots};
+    changed.withdrawals = LabelHash("other-withdrawals");
+    RequireVerifyFailed(verify::VerifyAccountLeaf(header, leaf, changed, proof, profile), verify::LEAF_STATE_ROOTS, "sixth root tamper");
+    changed = state.roots;
+    changed.version = COMMITMENT_VERSION_V0;
+    RequireVerifyFailed(verify::VerifyAccountLeaf(header, leaf, changed, proof, profile), verify::LEAF_STATE_ROOTS, "root version downgrade");
+    auto wrong_header{header};
+    wrong_header.commitment_version = COMMITMENT_VERSION_V0;
+    RequireVerifyFailed(verify::VerifyAccountLeaf(wrong_header, leaf, state.roots, proof, profile), verify::LEAF_STATE_ROOTS, "header version downgrade");
+}
+
+BOOST_AUTO_TEST_CASE(withdrawal_claim_proof_verifies_exact_terms_status_and_profile)
+{
+    SlotFixture fx{StableQRegtestProfile(ChainType::REGTEST).value()};
+    const auto alice{KeyAccount("alice")};
+    fx.Apply(fx.Inputs({fx.DepositBytes(alice, RegtestQuoteAsset(), 30'000, "proof/withdraw/fund")}, {}));
+    const WithdrawPayload payload{RegtestQuoteAsset(), 5'000, std::vector<unsigned char>(20, 0x46)};
+    const auto action{fx.Sign(fx.Unsigned("alice", 1, ActionKind::WITHDRAW, EncodePayload(payload).value()), "alice")};
+    const auto second{fx.Sign(fx.Unsigned("alice", 2, ActionKind::WITHDRAW, EncodePayload(payload).value()), "alice")};
+    fx.Apply(fx.Inputs({}, {action, second}));
+    const auto id{ActionV2::Decode(action, fx.profile)->Id()};
+    auto witness{ledger::ProveWithdrawal(fx.state.ledger, id)};
+    RequireOk(witness, "withdrawal witness");
+    auto roots{fx.state.Commit().value()};
+    RequireOk(verify::VerifyWithdrawal(fx.header, witness->record, roots, witness->proof, fx.profile), "pending claim inclusion");
+    BOOST_CHECK_EQUAL(witness->proof.size, 2U);
+    for (int mutation = 0; mutation < 7; ++mutation) {
+        auto wrong{witness->record};
+        if (mutation == 0) wrong.amount += 1;
+        if (mutation == 1) wrong.account = KeyAccount("bob");
+        if (mutation == 2) wrong.recipient[0] ^= 1;
+        if (mutation == 3) wrong.id.id = LabelHash("other-claim");
+        if (mutation == 4) wrong.fee += 1;
+        if (mutation == 5) wrong.asset = AssetId::Native();
+        if (mutation == 6) wrong.slot = fx.header.height + 1;
+        BOOST_CHECK(!verify::VerifyWithdrawal(fx.header, wrong, roots, witness->proof, fx.profile).has_value());
+    }
+    auto wrong_roots{roots};
+    wrong_roots.withdrawals = LabelHash("other-withdrawal-root");
+    RequireVerifyFailed(verify::VerifyWithdrawal(fx.header, witness->record, wrong_roots, witness->proof, fx.profile),
+                        verify::LEAF_STATE_ROOTS, "sixth root bound to certified state");
+    BOOST_CHECK(!ledger::ProveWithdrawal(fx.state.ledger, ActionId{LabelHash("absent")}).has_value());
+    BOOST_CHECK(!verify::VerifyWithdrawal(fx.header, witness->record, roots, witness->proof, RegtestProfile()).has_value());
+    PayoutConfirmedFact payout;
+    payout.cursor = {fx.anchor_height, fx.next_fact_index++};
+    payout.withdrawal = id;
+    payout.account = alice;
+    payout.asset = payload.asset;
+    payout.amount = payload.amount;
+    payout.recipient.fill(0x46);
+    payout.payout_event = TestOutpoint("proof/withdraw/payout", 0);
+    payout.domain = fx.domain;
+    fx.Apply(fx.Inputs({EncodeFact(Fact{payout}).value()}, {}));
+    const auto paid{ledger::ProveWithdrawal(fx.state.ledger, id).value()};
+    roots = fx.state.Commit().value();
+    BOOST_CHECK(paid.record.paid);
+    RequireOk(verify::VerifyWithdrawal(fx.header, paid.record, roots, paid.proof, fx.profile), "paid record retained and provable");
+    RequireVerifyFailed(verify::VerifyWithdrawal(fx.header, witness->record, roots, witness->proof, fx.profile),
+                        verify::WITHDRAWAL_PROOF, "old pending witness cannot prove current paid status");
+}
+
+
+BOOST_AUTO_TEST_CASE(view_bound_certificate_refuses_relabelled_and_mixed_view_shares)
+{
+    FourSeatHeader fixture;
+    auto header{fixture.header};
+    header.commitment_version = COMMITMENT_VERSION_VIEW_BOUND;
+    header.profile_hash = ProfileHash(StableQViewRegtestProfile(ChainType::REGTEST).value());
+    const auto good{SignCertificate(header, FOUR, {0, 1, 2}, std::nullopt, 7)};
+    RequireOk(verify::VerifyCertificate(header, good, fixture.seats), "actual same-view q3");
+    auto changed{good}; changed.view = 8;
+    RequireVerifyFailed(verify::VerifyCertificate(header, changed, fixture.seats), verify::CERT_SIGNATURE, "relabelled genuine COMMIT shares");
+    changed = good; changed.view.reset();
+    RequireVerifyFailed(verify::VerifyCertificate(header, changed, fixture.seats), verify::CERT_VIEW, "stripped voting view");
+    std::vector<bls::Signature> shares;
+    for (uint32_t seat : {0U, 1U, 2U}) {
+        const auto digest{VersionedCommitDigest(header, seat == 1 ? 8 : 7)};
+        shares.push_back(BlsKeyFromLabel(SeatLabel(FOUR[seat])).Sign(std::span<const unsigned char>{digest.begin(), digest.end()}));
+    }
+    changed = good; changed.aggregate = bls::AggregateSignatures(shares)->Compressed();
+    RequireVerifyFailed(verify::VerifyCertificate(header, changed, fixture.seats), verify::CERT_SIGNATURE, "partial COMMIT shares from separate views");
+    auto archived{fixture.header}; archived.commitment_version = COMMITMENT_VERSION_WITHDRAWALS;
+    const auto old_certificate{SignCertificate(archived, FOUR, {0, 1, 2})};
+    RequireOk(verify::VerifyCertificate(archived, old_certificate, fixture.seats), "archived view-free certificate remains valid");
+    changed = old_certificate; changed.view = 0;
+    RequireVerifyFailed(verify::VerifyCertificate(archived, changed, fixture.seats), verify::CERT_VIEW, "new metadata cannot reinterpret an old signature");
+}
+
+BOOST_AUTO_TEST_CASE(view_bound_account_and_withdrawal_proofs_require_profile_version_three)
+{
+    const auto profile{StableQViewRegtestProfile(ChainType::REGTEST).value()};
+    SyntheticState state{{LeafOf("alice", 1000, {})}};
+    state.roots.version = COMMITMENT_VERSION_VIEW_BOUND;
+    WithdrawalRecord record;
+    record.id = ActionId{LabelHash("view-profile/withdrawal")}; record.account = KeyAccount("alice");
+    record.asset = RegtestQuoteAsset(); record.amount = 5000; record.fee = profile.withdrawal_fee_atoms;
+    record.recipient.fill(0x42); record.slot = 3;
+    const std::vector<uint256> leaves{record.LeafValue()};
+    state.roots.withdrawals = MerkleRoot(leaves);
+    SlotHeaderV2 header; header.height = 4; header.profile_hash = ProfileHash(profile);
+    header.commitment_version = COMMITMENT_VERSION_VIEW_BOUND; header.state_root = state.roots.Root();
+    const auto [account, account_proof]{state.Witness(KeyAccount("alice"))};
+    RequireOk(verify::VerifyAccountLeaf(header, account, state.roots, account_proof, profile), "v3 account proof");
+    const auto proof{MerkleProve(leaves, 0).value()};
+    RequireOk(verify::VerifyWithdrawal(header, record, state.roots, proof, profile), "v3 committed obligation");
+    auto old_roots{state.roots}; old_roots.version = COMMITMENT_VERSION_WITHDRAWALS;
+    RequireVerifyFailed(verify::VerifyAccountLeaf(header, account, old_roots, account_proof, profile), verify::LEAF_STATE_ROOTS, "old root prefix refused");
+    RequireVerifyFailed(verify::VerifyWithdrawal(header, record, old_roots, proof, profile), verify::WITHDRAWAL_POLICY, "old withdrawal root version refused");
+    RequireVerifyFailed(verify::VerifyWithdrawal(header, record, state.roots, proof, StableQRegtestProfile(ChainType::REGTEST).value()),
+                        verify::PROFILE_MISMATCH, "archived profile cannot reinterpret current proof");
+}
+
 BOOST_AUTO_TEST_SUITE_END()

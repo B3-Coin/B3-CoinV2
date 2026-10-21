@@ -12,6 +12,7 @@
 #include <flowmesh2/core/seat_set.h>
 #include <flowmesh2/core/slot.h>
 #include <flowmesh2/storage/tokens.h>
+#include <flowmesh2/storage/control_types.h>
 #include <uint256.h>
 
 #include <array>
@@ -144,6 +145,10 @@ enum class MessageType : uint8_t {
     VIEW_CHANGE = 3,
     NEW_VIEW = 4,
     EVIDENCE = 5,
+    CERTIFIED_PROPOSAL = 6, //!< exact final certificate and its available proposal (regtest PBFT)
+    CONTROL_REPORT = 7,
+    CONTROL_NEW_VIEW = 8,
+    OFFER = 9,
 };
 
 //! Evidence kinds. APPEND-ONLY registry; zero is never a value.
@@ -246,7 +251,45 @@ struct Evidence {
     friend bool operator==(const Evidence&, const Evidence&) = default;
 };
 
-using Message = std::variant<Proposal, Vote, ViewChange, NewView, Evidence>;
+//! A transferable final proof. Its proposal supplies the exact executable body.
+struct CertifiedProposal {
+    Proposal proposal;
+    SlotCertificate certificate;
+    friend bool operator==(const CertifiedProposal&, const CertifiedProposal&) = default;
+};
+
+//! Complete transferable preparation header/proof; body is separately available.
+struct ControlPrepared {
+    uint64_t view{0};
+    SlotHeaderV2 header;
+    SlotCertificate certificate;
+    friend bool operator==(const ControlPrepared&, const ControlPrepared&) = default;
+};
+struct ControlReport {
+    storage::ControlKey key;
+    uint64_t prepared_watermark{0}; //!< local durable commit prefix at atomic view entry
+    std::optional<ControlPrepared> prepared;
+    std::optional<CertifiedHeader> decision;
+    storage::VoteSignature signature{};
+    friend bool operator==(const ControlReport&, const ControlReport&) = default;
+};
+inline constexpr size_t MAX_CONTROL_REPORTS{4}; //!< only the explicit four-seat regtest profile
+struct ControlNewView {
+    storage::ControlKey key;
+    uint256 selected;
+    std::vector<ControlReport> reports;
+    storage::VoteSignature signature{};
+    std::optional<Proposal> selected_proposal; //!< exact durable body; does not itself grant PREPARE permission
+    friend bool operator==(const ControlNewView&, const ControlNewView&) = default;
+};
+//! Non-voting body availability and pending-work signal. It grants no vote.
+struct OfferedProposal {
+    Proposal proposal;
+    friend bool operator==(const OfferedProposal&, const OfferedProposal&) = default;
+};
+
+using Message = std::variant<Proposal, Vote, ViewChange, NewView, Evidence, CertifiedProposal,
+                             ControlReport, ControlNewView, OfferedProposal>;
 
 MessageType TypeOf(const Message& message);
 

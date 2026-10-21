@@ -80,7 +80,7 @@ struct SlotFixture {
         RequireOk(roots, "genesis commit");
         const AuthorityVersion authority{0, LabelHash("fm2/test/seatset"), profile_hash};
         const Result<SlotHeaderV2> genesis{GenesisHeader(domain, authority, TestAnchor(anchor_height - 1),
-                                                         FactCursor{anchor_height, 0}, roots->Root())};
+                                                         FactCursor{anchor_height, 0}, roots->Root(), roots->version)};
         RequireOk(genesis, "genesis header");
         header = *genesis;
     }
@@ -217,6 +217,7 @@ struct SlotFixture {
         next.actions_root = inputs.body.ActionsRoot();
         next.outcomes_root = result.outcomes_root;
         next.state_root = result.roots.Root();
+        next.commitment_version = result.roots.version;
         next.action_count = static_cast<uint32_t>(inputs.body.originals.size());
         next.outcome_count = static_cast<uint32_t>(result.outcomes.size());
         header = next;

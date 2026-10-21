@@ -21,6 +21,7 @@
 #include <optional>
 #include <span>
 #include <string_view>
+#include <tuple>
 #include <vector>
 
 /** The commit log: decisions and applications (slice R8; ARCHITECTURE.md 7).
@@ -62,8 +63,10 @@
  *   slot, if any (used by the certifier before it signs, O-89).
  * - Every Append and Confirm of a fatal journal is FENCED.
  * - Create needs a COMMIT journal (ORDER_VIOLATION, LOG_ROLE) that is not
- *   fatal (FENCED) and has no records yet; rebuilding the decision index of
- *   a journal with history is recovery, M4-STO-01.
+ *   fatal (FENCED), with no pending undurable records. Create(journal) is
+ *   fresh-only; Create(journal, profile) rebuilds the indexes from durable
+ *   history using that profile's decoding bounds. Replay checks record
+ *   bindings, not agreement signatures or state execution.
  *
  * Record payloads (exact codecs, used by replay in R9):
  * - DECISION: header (366) | CompactSize(len) | certificate (len bytes) |
@@ -82,6 +85,10 @@ inline constexpr std::string_view DECISION_CONFLICT{"DECISION_CONFLICT"};       
 inline constexpr std::string_view APPLIED_DECISION_UNKNOWN{"APPLIED_DECISION_UNKNOWN"};   //!< (VERIFY_FAILED)
 inline constexpr std::string_view APPLIED_ROOT_MISMATCH{"APPLIED_ROOT_MISMATCH"};         //!< (VERIFY_FAILED)
 inline constexpr std::string_view APPLIED_OUT_OF_ORDER{"APPLIED_OUT_OF_ORDER"};           //!< (ORDER_VIOLATION)
+inline constexpr std::string_view LOG_PENDING_RECORDS{"LOG_PENDING_RECORDS"};           //!< (ORDER_VIOLATION)
+inline constexpr std::string_view LOG_REPLAY_PROFILE_REQUIRED{"LOG_REPLAY_PROFILE_REQUIRED"}; //!< (INVALID_INPUT)
+inline constexpr std::string_view LOG_REPLAY_SEQUENCE{"LOG_REPLAY_SEQUENCE"};           //!< (ORDER_VIOLATION)
+inline constexpr std::string_view LOG_REPLAY_CHANGED{"LOG_REPLAY_CHANGED"};             //!< (ORDER_VIOLATION)
 
 /** True iff `body` is the body of `header`: same actions_root, facts_root
  * and number of originals (action_count). The validity predicate (R7) and
@@ -122,12 +129,20 @@ struct PreparedQcRecord {
     uint64_t view{0};
     uint256 header_hash;
     std::vector<unsigned char> qc;
+    SlotHeaderV2 header;
+    SlotBody body;
+
+    std::vector<unsigned char> Encode() const;
+    static size_t MaxEncodedSize(const ProfileParams& profile);
+    static Result<PreparedQcRecord> Decode(std::span<const unsigned char> bytes, const ProfileParams& profile);
+    friend bool operator==(const PreparedQcRecord&, const PreparedQcRecord&) = default;
 };
 
 class CommitLog
 {
 public:
     static Result<CommitLog> Create(Journal& journal);
+    static Result<CommitLog> Create(Journal& journal, const ProfileParams& profile);
 
     CommitLog(CommitLog&&) noexcept = default;
     CommitLog& operator=(CommitLog&&) noexcept = default;
@@ -136,6 +151,7 @@ public:
 
     uint64_t JournalInstance() const { return m_journal->InstanceId(); }
     bool IsFatal() const { return m_journal->IsFatal(); }
+    uint64_t DurableSeq() const { return m_journal->DurableSeq(); }
 
     Result<PendingDecision> AppendDecision(const SlotHeaderV2& header, const SlotCertificate& certificate, const SlotBody& body);
     Result<PendingApplied> AppendApplied(const ApplyReceipt& receipt);
@@ -156,7 +172,16 @@ public:
     //! Durable PBFT view state. Stub: M4-STO-07.
     Result<uint64_t> AppendPreparedQc(const PreparedQcRecord& record);
 
+    //! Already cryptographically checked by agreement; durable before a COMMIT intent.
+    //! The log checks exact canonical certificate/header binding and retains the
+    //! first proof for each (epoch, slot, view). Signature checking is the caller's.
+    Result<uint64_t> RecordVerifiedPreparedQc(const PreparedQcRecord& record);
+    std::optional<PreparedQcRecord> PreparedAt(uint64_t epoch, uint64_t slot, uint64_t view) const;
+    std::optional<uint64_t> HighestDurablePreparedViewAt(uint64_t epoch, uint64_t slot) const;
+    std::optional<PreparedQcRecord> HighestPreparedAt(uint64_t epoch, uint64_t slot, uint64_t before_view, uint64_t watermark) const;
+
 private:
+    static Result<CommitLog> CreateImpl(Journal& journal, const ProfileParams* profile);
     explicit CommitLog(Journal& journal) : m_journal{&journal} {}
 
     struct DecisionEntry {
@@ -168,6 +193,7 @@ private:
     };
 
     Journal* m_journal;
+    std::map<std::tuple<uint64_t, uint64_t, uint64_t>, std::pair<PreparedQcRecord, uint64_t>> m_prepared;
     std::map<uint64_t, DecisionEntry> m_decisions; //!< by slot
     uint64_t m_last_applied_slot{0};               //!< 0 before the first application (the genesis height)
 };

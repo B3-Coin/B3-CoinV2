@@ -144,8 +144,11 @@ BOOST_AUTO_TEST_CASE(append_barrier_and_scan_reproduce_records)
     }
     BOOST_CHECK(std::equal(expected.begin(), expected.end(), image.begin()));
     BOOST_CHECK_EQUAL(observer.events.size(), 7U);
-    // Reading back from disk is M4-STO-01.
-    RequireStub(journal.ReadAll(), "M4-STO-01");
+    const auto read_back{journal.ReadAll()};
+    RequireStorageOk(read_back, "read durable records");
+    BOOST_CHECK(*read_back == scan->records);
+    BOOST_CHECK_EQUAL(journal.Append(RecordType::INTENT, Bytes("not-yet-durable")).value(), 4U);
+    BOOST_CHECK(journal.ReadAll().value() == scan->records);
 }
 
 BOOST_AUTO_TEST_CASE(commit_failure_on_closed_fd_is_sticky)
@@ -211,15 +214,126 @@ BOOST_AUTO_TEST_CASE(full_segment_is_refused_without_fencing)
     RequireStub(journal->Rollover(), "M4-STO-06");
 }
 
-BOOST_AUTO_TEST_CASE(open_existing_is_not_implemented)
+BOOST_AUTO_TEST_CASE(reopen_preserves_history_and_continues_sequence)
 {
     const TestDir root{"open_existing"};
+    std::vector<JournalRecord> first;
     {
         auto journal{MustCreate(root.path, JournalRole::SIGNER, 8)};
         BOOST_CHECK_EQUAL(journal->Append(RecordType::INTENT, Bytes("i")).value(), 1U);
         BOOST_CHECK_EQUAL(journal->Barrier().value(), 1U);
+        first = journal->ReadAll().value();
+        BOOST_CHECK_EQUAL(journal->Append(RecordType::SIGNED_VOTE, Bytes("lost-unbarriered")).value(), 2U);
+        BOOST_CHECK(journal->ReadAll().value() == first);
+        RequireRefusal(FileJournal::OpenExisting(root.path, JournalRole::SIGNER, 8), ErrorCode::STORAGE_FATAL,
+                       JOURNAL_SEGMENT_LOCKED, "concurrent open");
     }
-    RequireStub(FileJournal::OpenExisting(root.path, JournalRole::SIGNER, 8), "M4-STO-01");
+    auto opened{FileJournal::OpenExisting(root.path, JournalRole::SIGNER, 8)};
+    RequireStorageOk(opened, "reopen");
+    BOOST_CHECK((*opened)->Status() == (JournalStatus{1, 1, false}));
+    BOOST_CHECK((*opened)->ReadAll().value() == first);
+    BOOST_CHECK_EQUAL((*opened)->Append(RecordType::SIGNED_VOTE, Bytes("v")).value(), 2U);
+    BOOST_CHECK((*opened)->ReadAll().value() == first);
+    BOOST_CHECK_EQUAL((*opened)->Barrier().value(), 2U);
+    auto second{(*opened)->ReadAll().value()};
+    BOOST_REQUIRE_EQUAL(second.size(), 2U);
+    BOOST_CHECK(second[0] == first[0]);
+    BOOST_CHECK(second[1].payload == Bytes("v"));
+    opened->reset();
+    auto again{FileJournal::OpenExisting(root.path, JournalRole::SIGNER, 8)};
+    RequireStorageOk(again, "second reopen");
+    BOOST_CHECK((*again)->Status() == (JournalStatus{2, 2, false}));
+    BOOST_CHECK((*again)->ReadAll().value() == second);
+    BOOST_CHECK_EQUAL((*again)->Append(RecordType::INTENT, Bytes("next")).value(), 3U);
+    BOOST_CHECK_EQUAL((*again)->Barrier().value(), 3U);
+    // Reopening a completely full segment restores the end boundary too.
+    const fs::path full{root.Sub("full")};
+    {
+        auto journal{MustCreate(full, JournalRole::COMMIT, 9, SEGMENT_PAGE_BYTES)};
+        BOOST_CHECK_EQUAL(journal->Append(RecordType::DECISION, std::vector<unsigned char>(SEGMENT_PAGE_BYTES - RECORD_OVERHEAD_BYTES, 0xAB)).value(), 1U);
+        BOOST_CHECK_EQUAL(journal->Barrier().value(), 1U);
+    }
+    auto full_open{FileJournal::OpenExisting(full, JournalRole::COMMIT, 9)};
+    RequireStorageOk(full_open, "full segment reopen");
+    RequireStub((*full_open)->Append(RecordType::APPLIED, {}), "M4-STO-06");
+    BOOST_CHECK((*full_open)->Status() == (JournalStatus{1, 1, false}));
+}
+
+BOOST_AUTO_TEST_CASE(reopen_refuses_corruption_gaps_and_torn_tails_without_repair)
+{
+    const TestDir root{"corrupt_reopen"};
+    const fs::path original{root.Sub("original")};
+    fs::path segment;
+    {
+        auto journal{MustCreate(original, JournalRole::SIGNER, 23)};
+        segment = journal->SegmentPath();
+        BOOST_CHECK_EQUAL(journal->Append(RecordType::INTENT, Bytes("one")).value(), 1U);
+        BOOST_CHECK_EQUAL(journal->Append(RecordType::SIGNED_VOTE, Bytes("two")).value(), 2U);
+        BOOST_CHECK_EQUAL(journal->Append(RecordType::INTENT, Bytes("three")).value(), 3U);
+        BOOST_CHECK_EQUAL(journal->Barrier().value(), 3U);
+    }
+    const auto image{ReadFile(segment)};
+    auto refuse = [&](std::string_view name, const std::vector<unsigned char>& bad) {
+        const fs::path dir{root.Sub(name)};
+        const fs::path file{dir / fs::u8path(FIRST_SEGMENT_NAME)};
+        WriteFile(file, bad);
+        const auto result{FileJournal::OpenExisting(dir, JournalRole::SIGNER, 23)};
+        BOOST_CHECK(!result.has_value());
+        BOOST_CHECK(ReadFile(file) == bad);
+        BOOST_CHECK_EQUAL(std::distance(fs::directory_iterator{dir}, fs::directory_iterator{}), 1);
+    };
+    auto bad{image};
+    bad[RECORD_HEADER_BYTES] ^= 1;
+    refuse("crc", bad);
+    bad = image;
+    bad.back() = 1;
+    refuse("nonzero_tail", bad);
+    const size_t first_bytes{RECORD_OVERHEAD_BYTES + 3};
+    const size_t second_bytes{RECORD_OVERHEAD_BYTES + 3};
+    bad.assign(image.size(), 0);
+    std::copy_n(image.begin(), first_bytes, bad.begin());
+    // Remove the second record while keeping the third's original valid CRC.
+    std::copy_n(image.begin() + first_bytes + second_bytes, RECORD_OVERHEAD_BYTES + 5, bad.begin() + first_bytes);
+    refuse("gap", bad);
+    bad.assign(image.size(), 0);
+    std::copy_n(image.begin(), first_bytes + RECORD_HEADER_BYTES + 1, bad.begin());
+    refuse("torn_last_record", bad);
+    refuse("short_segment", std::vector<unsigned char>(SEGMENT_PAGE_BYTES - 1, 0));
+    RequireRefusal(FileJournal::OpenExisting(original, JournalRole::SIGNER, 24), ErrorCode::VERIFY_FAILED, RECORD_CHAIN, "wrong instance");
+    RequireRefusal(FileJournal::OpenExisting(original, JournalRole::COMMIT, 23), ErrorCode::ORDER_VIOLATION, RECORD_ROLE, "wrong role");
+    BOOST_CHECK(ReadFile(segment) == image);
+    const fs::path extra{root.Sub("extra")};
+    WriteFile(extra / fs::u8path(FIRST_SEGMENT_NAME), image);
+    WriteFile(extra / fs::u8path("00000001.seg"), std::vector<unsigned char>(SEGMENT_PAGE_BYTES, 0));
+    RequireRefusal(FileJournal::OpenExisting(extra, JournalRole::SIGNER, 23), ErrorCode::INVALID_INPUT,
+                   JOURNAL_SEGMENT_LAYOUT, "unsupported extra segment");
+    const fs::path empty{root.Sub("empty")};
+    RequireRefusal(FileJournal::OpenExisting(empty, JournalRole::SIGNER, 23), ErrorCode::INVALID_INPUT,
+                   JOURNAL_SEGMENT_LAYOUT, "missing segment");
+}
+
+BOOST_AUTO_TEST_CASE(read_excludes_failed_barrier_and_detects_lost_durable_prefix)
+{
+    const TestDir root{"durable_prefix"};
+    const fs::path failed{root.Sub("failed")};
+    {
+        auto journal{MustCreate(failed, JournalRole::COMMIT, 31, SMALL_SEGMENT, &CommitOnClosedFd)};
+        BOOST_CHECK_EQUAL(journal->Append(RecordType::DECISION, Bytes("written-but-unacknowledged")).value(), 1U);
+        RequireCode(journal->Barrier(), ErrorCode::STORAGE_FATAL, "failed barrier");
+        const auto records{journal->ReadAll()};
+        RequireStorageOk(records, "last durable prefix after failure");
+        BOOST_CHECK(records->empty());
+    }
+    // A complete record from the failed acknowledgement is reconciled by a
+    // new real strict commit on reopen, never silently overwritten.
+    auto reopened{FileJournal::OpenExisting(failed, JournalRole::COMMIT, 31)};
+    RequireStorageOk(reopened, "reconcile complete unacknowledged record");
+    BOOST_CHECK((*reopened)->Status() == (JournalStatus{1, 1, false}));
+    BOOST_CHECK_EQUAL((*reopened)->ReadAll().value().size(), 1U);
+    // Simulate external damage to an acknowledged byte range. Reading must
+    // refuse rather than accepting a shorter all-zero history.
+    WriteFile((*reopened)->SegmentPath(), std::vector<unsigned char>(SMALL_SEGMENT, 0));
+    RequireRefusal((*reopened)->ReadAll(), ErrorCode::VERIFY_FAILED, RECORD_TAIL, "zeroed durable prefix");
 }
 
 BOOST_AUTO_TEST_SUITE_END()

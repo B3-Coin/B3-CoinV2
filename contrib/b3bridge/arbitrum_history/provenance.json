@@ -1,0 +1,55 @@
+{
+  "format": "b3-arbitrum-history-provenance/1",
+  "review_date": "2026-10-19",
+  "mainnet_enabled": false,
+  "writes_enabled": false,
+  "arbitrum_authority": false,
+  "no_rpc_end_to_end_qualified": false,
+  "upstream_nitro": {
+    "repository": "https://github.com/OffchainLabs/nitro",
+    "release": "v3.12.1",
+    "commit": "70fa99a6e711f09eedd96a907290c3df0f3bcf7d",
+    "release_url": "https://github.com/OffchainLabs/nitro/releases/tag/v3.12.1",
+    "reviewed_files": [
+      "broadcastclient/backfill.go",
+      "broadcaster/message/message.go",
+      "arbos/arbostypes/incomingmessage.go",
+      "arbnode/sequencer_inbox.go",
+      "arbstate/inbox.go"
+    ],
+    "backlog_routes": ["/feed/v1/info", "/feed/v1/chunk/<aligned-sequence>"],
+    "backlog_scope": "Unconfirmed sequencer feed only; no L2 state, receipts, canonical history completeness or execution proof"
+  },
+  "prior_ethereum_peer_backend": {
+    "repository": "https://github.com/status-im/nimbus-eth2",
+    "release": "v26.10.1",
+    "commit": "963756c91c19b7824cea57e7aab5857ce2c776c7",
+    "reviewed_files": ["beacon_chain/sync/sync_protocol.nim", "beacon_chain/sync/sync_overseer2.nim"],
+    "scope": "Maintained Ethereum consensus ReqResp; Fulu column acquisition/reconstruction is not implemented by this raw store"
+  },
+  "primary_documentation": [
+    "https://docs.arbitrum.io/run-a-node/data-availability",
+    "https://docs.arbitrum.io/run-a-node/sequencer/read-sequencer-feed",
+    "https://docs.arbitrum.io/how-arbitrum-works/inside-arbitrum-nitro",
+    "https://docs.arbitrum.io/run-a-node/start-here",
+    "https://docs.arbitrum.io/run-a-node/assign-node-roles",
+    "https://docs.arbitrum.io/run-a-node/nitro/nitro-database-snapshots",
+    "https://docs.arbitrum.io/run-a-node/more-types/run-archive-node",
+    "https://docs.arbitrum.io/run-a-node/beacon-nodes-historical-blobs",
+    "https://github.com/ethereum/consensus-specs/blob/v1.6.0/specs/fulu/p2p-interface.md"
+  ],
+  "b3_raw_object_exchange": {
+    "path": "/b3/history/v1/objects/sha256/<digest>",
+    "existing_nitro_peer_protocol": false,
+    "qualified_public_server": false,
+    "producer_provenance_verified": false,
+    "scope": "Explicitly B3-specific untrusted content availability; native verification remains mandatory"
+  },
+  "external_requirements": [
+    "Live raw witness producer or maintained local Nitro replay; no qualified public sparse raw-witness archive established",
+    "Reviewed deployed rollup/proxy/storage policy, ETH authority and native operator handoff remain independently gated",
+    "An authenticated starting state and complete L1 batch/delayed-inbox availability are required for Nitro execution replay",
+    "Historical Fulu data columns require maintained recovery and KZG verification; old blob-sidecar requests are insufficient",
+    "A self-hosted EL+CL+Nitro archive is one resource-heavy option, not a universal lower bound for future proof services"
+  ]
+}

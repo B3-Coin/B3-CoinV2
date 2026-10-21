@@ -62,6 +62,47 @@ Result<ProfileParams> DevRegtestProfile(ChainType chain)
     return Ok(std::move(params));
 }
 
+AssetId RegtestQuoteAsset()
+{
+    constexpr std::string_view label{"rUSD"};
+    return AssetId{Tagged(HashTag::TEST_ASSET,
+                          std::span{reinterpret_cast<const unsigned char*>(label.data()), label.size()})};
+}
+
+Result<ProfileParams> StableQRegtestProfile(ChainType chain)
+{
+    Result<ProfileParams> legacy{DevRegtestProfile(chain)};
+    if (!legacy.has_value()) return legacy.error();
+    ProfileParams params{std::move(legacy).value()};
+    params.profile_id = STABLE_Q_PROFILE_ID;
+    params.stable_fee_asset = RegtestQuoteAsset();
+    params.withdrawals_enabled = true;
+    params.withdrawal_fee_atoms = 1'000; // explicit REGTEST-only fixture, not production economics
+    return Ok(std::move(params));
+}
+
+Result<ProfileParams> StableQViewRegtestProfile(ChainType chain)
+{
+    auto legacy{StableQRegtestProfile(chain)};
+    if (!legacy.has_value()) return legacy.error();
+    ProfileParams params{std::move(*legacy)};
+    params.profile_id = STABLE_Q_VIEW_PROFILE_ID;
+    params.view_bound_commits = true;
+    return Ok(std::move(params));
+}
+
+Result<ProfileParams> StableQNetworkRegtestProfile(ChainType chain)
+{
+    auto legacy{StableQViewRegtestProfile(chain)};
+    if (!legacy.has_value()) return legacy.error();
+    ProfileParams params{std::move(*legacy)};
+    params.profile_id = STABLE_Q_NETWORK_PROFILE_ID;
+    params.source_range_commitment = true;
+    params.source_chain_id = 31337;
+    params.source_confirmations = 2;
+    return Ok(std::move(params));
+}
+
 Result<void> Validate(const ProfileParams& params)
 {
     if (params.chain != ChainType::REGTEST) {
@@ -72,6 +113,27 @@ Result<void> Validate(const ProfileParams& params)
         return Invalid("profile_id empty or longer than 64 bytes");
     }
     if (params.fm_version != FM_VERSION) return Invalid("unknown fm_version");
+    const bool source_profile{params.profile_id == STABLE_Q_NETWORK_PROFILE_ID};
+    if (source_profile) {
+        if (!params.source_range_commitment || params.source_chain_id != 31337 || params.source_confirmations != 2) {
+            return Invalid("network source-range profile must pin chain31337 and two isolated confirmations");
+        }
+    } else if (params.source_range_commitment || params.source_chain_id != 0 || params.source_confirmations != 0) {
+        return Invalid("source-range commitment policy requires the versioned network profile");
+    }
+    if (params.profile_id == STABLE_Q_PROFILE_ID || params.profile_id == STABLE_Q_VIEW_PROFILE_ID || source_profile) {
+        if (params.view_bound_commits != (params.profile_id != STABLE_Q_PROFILE_ID)) {
+            return Invalid("view-bound commit policy differs from its versioned stable-Q profile");
+        }
+        if (!params.stable_fee_asset || *params.stable_fee_asset != RegtestQuoteAsset()) {
+            return Invalid("stable-Q profile must pin the exact synthetic rUSD AssetId");
+        }
+        if (!InAtomRange(params.withdrawal_fee_atoms) || (!params.withdrawals_enabled && params.withdrawal_fee_atoms != 0)) {
+            return Invalid("withdrawal fee outside atom range or nonzero while disabled");
+        }
+    } else if (params.stable_fee_asset.has_value() || params.withdrawals_enabled || params.withdrawal_fee_atoms != 0 || params.view_bound_commits) {
+        return Invalid("stable fee and withdrawal policy require the versioned stable-Q profile");
+    }
     if (!IsKnownMatching(params.matching)) return Invalid("unknown matching profile");
     if (!IsKnownIncidence(params.fee_incidence)) return Invalid("unknown fee incidence");
     if (!IsKnownSignerMode(params.signer_mode)) return Invalid("unknown signer mode");
@@ -121,7 +183,11 @@ std::vector<unsigned char> EncodeProfile(const ProfileParams& params)
 {
     std::vector<unsigned char> out;
     VectorWriter writer{out, 0};
-    writer << PROFILE_ENCODING_VERSION;
+    const bool source_extended{params.source_range_commitment || params.source_chain_id != 0 || params.source_confirmations != 0};
+    const bool extended{params.stable_fee_asset.has_value() || params.withdrawals_enabled || params.withdrawal_fee_atoms != 0 || params.view_bound_commits || source_extended};
+    writer << (source_extended ? STABLE_Q_NETWORK_PROFILE_ENCODING_VERSION :
+               params.view_bound_commits ? STABLE_Q_VIEW_PROFILE_ENCODING_VERSION :
+               extended ? STABLE_Q_PROFILE_ENCODING_VERSION : PROFILE_ENCODING_VERSION);
     writer << params.profile_id;
     writer << params.fm_version;
     writer << ChainTypeToString(params.chain);
@@ -143,6 +209,17 @@ std::vector<unsigned char> EncodeProfile(const ProfileParams& params)
     writer << static_cast<uint8_t>(params.signer_mode);
     writer << params.pool_capacity;
     writer << params.outcome_index_slots;
+    if (extended) {
+        writer << static_cast<uint8_t>(params.stable_fee_asset.has_value() ? 1 : 0);
+        if (params.stable_fee_asset.has_value()) writer << *params.stable_fee_asset;
+        writer << static_cast<uint8_t>(params.withdrawals_enabled ? 1 : 0);
+        writer << params.withdrawal_fee_atoms;
+    }
+    if (params.view_bound_commits || source_extended) writer << static_cast<uint8_t>(params.view_bound_commits ? 1 : 0);
+    if (source_extended) {
+        writer << static_cast<uint8_t>(params.source_range_commitment ? 1 : 0);
+        writer << params.source_chain_id << params.source_confirmations;
+    }
     return out;
 }
 

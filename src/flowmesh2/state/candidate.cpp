@@ -109,7 +109,10 @@ Result<Candidate> BuildCandidate(const engine::Engine& engine, const HeadView& p
     header.authority_epoch = inputs.authority.epoch;
     header.height = slot->Height();
     header.parent_hash = parent.HeaderHash();
-    header.parent_cert_hash = parent.CertHash();
+    // Version 2 commits to the certified value, independent of which valid
+    // quorum subset supplied the proof. Legacy version 0 keeps its exact bytes.
+    header.parent_cert_hash = (head.commitment_version == COMMITMENT_VERSION_WITHDRAWALS || head.commitment_version == COMMITMENT_VERSION_VIEW_BOUND) && !parent.CertHash().IsNull()
+                                  ? parent.HeaderHash() : parent.CertHash();
     header.anchor = inputs.anchor;
     header.facts_from = inputs.facts_from;
     header.facts_to = inputs.facts_to;
@@ -120,7 +123,7 @@ Result<Candidate> BuildCandidate(const engine::Engine& engine, const HeadView& p
     header.state_root = result.roots.Root();
     header.action_count = static_cast<uint32_t>(body.originals.size());
     header.outcome_count = static_cast<uint32_t>(result.outcomes.size());
-    header.commitment_version = COMMITMENT_VERSION_V0;
+    header.commitment_version = ExpectedCommitmentVersion(parent.State().engine.ledger.Profile());
 
     auto next{std::make_shared<const CoreState>(CoreState{std::move(result.state), parent.State().seat_set_root})};
     return Ok(Candidate{std::move(header), std::move(result.outcomes), std::move(outcome_leaves), std::move(action_leaves),
@@ -155,7 +158,7 @@ Result<HeadView> GenesisHead(const ProfileParams& profile, std::span<const Marke
     if (!state.has_value()) return state.error();
     const Result<StateRootsV0> roots{state->engine.Commit()};
     if (!roots.has_value()) return roots.error();
-    const Result<SlotHeaderV2> header{GenesisHeader(domain, authority, anchor, facts_start, roots->Root())};
+    const Result<SlotHeaderV2> header{GenesisHeader(domain, authority, anchor, facts_start, roots->Root(), roots->version)};
     if (!header.has_value()) return header.error();
     return HeadView::Make(*header, uint256{}, std::make_shared<const CoreState>(std::move(state).value()));
 }

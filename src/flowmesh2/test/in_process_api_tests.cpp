@@ -325,8 +325,10 @@ BOOST_AUTO_TEST_CASE(busy_leaves_no_queued_copy)
     const Result<RequestId> big{r.api->Submit(oversized)};
     BOOST_REQUIRE(!big.has_value());
     BOOST_CHECK(big.error().code == ErrorCode::OVERSIZE);
+    BOOST_CHECK_EQUAL(big.error().detail, net::LANE_MESSAGE_OVERSIZE);
     BOOST_CHECK(r.lanes->Stats(net::Lane::ACTION) == lane_before);
-    // Draining gives exactly the 9 queued requests (ids 1..9; the refused attempts consumed ids 10..15 but queued nothing).
+    BOOST_CHECK_EQUAL(r.api->OpenRequests(), open_before);
+    // Draining gives exactly the 9 queued requests (ids 1..9; refused attempts queued nothing).
     const Result<net::PumpReport> pumped{r.api->Pump(100)};
     RequireOk(pumped, "Pump");
     BOOST_CHECK_EQUAL(pumped->answered, 9U);
@@ -347,6 +349,69 @@ BOOST_AUTO_TEST_CASE(busy_leaves_no_queued_copy)
     BOOST_REQUIRE(!closed.has_value());
     BOOST_CHECK(closed.error().code == ErrorCode::FENCED);
     BOOST_CHECK_EQUAL(r.api->OpenRequests(), 0U);
+
+    // Closed wins over size even when the early size check can reject input.
+    const Result<RequestId> closed_oversize{r.api->Submit(oversized)};
+    BOOST_REQUIRE(!closed_oversize.has_value());
+    BOOST_CHECK(closed_oversize.error().code == ErrorCode::FENCED);
+    BOOST_CHECK_EQUAL(closed_oversize.error().detail, net::LANE_CLOSED);
+    ActionV2 closed_status;
+    closed_status.payload.resize(r.profile.max_action_payload_bytes + 1);
+    const Result<RequestId> closed_status_result{r.api->SubmitStatus(closed_status)};
+    BOOST_REQUIRE(!closed_status_result.has_value());
+    BOOST_CHECK(closed_status_result.error().code == ErrorCode::FENCED);
+    BOOST_CHECK_EQUAL(r.api->OpenRequests(), 0U);
+
+    // The largest decodable envelope fits exactly, including the request-kind
+    // byte; semantic/signature refusal is an admission reply, not a lost request.
+    ApiRig boundary{TestCertificates(10)};
+    ActionV2 maximum;
+    maximum.payload.resize(boundary.profile.max_action_payload_bytes, 0xab);
+    const Frame at_limit{maximum.Encode()};
+    BOOST_REQUIRE_EQUAL(at_limit.size(), ActionV2::MaxEncodedSize(boundary.profile));
+    RequireOk(ActionV2::Decode(at_limit, boundary.profile), "maximum envelope decodes");
+    const RequestId maximum_id{boundary.Submit(at_limit)};
+    BOOST_CHECK_EQUAL(maximum_id.value, 1U);
+    BOOST_CHECK(boundary.api->State(maximum_id) == net::RequestState::QUEUED);
+    BOOST_CHECK_EQUAL(boundary.lanes->Stats(net::Lane::ACTION).payload_bytes, at_limit.size() + 1);
+    BOOST_CHECK_EQUAL(boundary.api->OpenRequests(), 1U);
+    BOOST_CHECK(boundary.Reply(maximum_id).id == maximum_id);
+    BOOST_CHECK(!boundary.api->TakeReply(maximum_id).has_value());
+    BOOST_CHECK(!boundary.api->State(maximum_id).has_value());
+    BOOST_CHECK(boundary.lanes->Stats(net::Lane::ACTION) == net::LaneStats{});
+
+    // Size refusals allocate no request identity or queued state, even when a
+    // custom lane is larger than the protocol's action cap.
+    Frame above_limit{at_limit};
+    above_limit.push_back(0);
+    const auto check_oversize = [&](const Result<RequestId>& result) {
+        BOOST_REQUIRE(!result.has_value());
+        BOOST_CHECK(result.error().code == ErrorCode::OVERSIZE);
+        BOOST_CHECK_EQUAL(result.error().detail, net::LANE_MESSAGE_OVERSIZE);
+        BOOST_CHECK_EQUAL(boundary.api->OpenRequests(), 0U);
+        BOOST_CHECK(boundary.lanes->Stats(net::Lane::ACTION) == net::LaneStats{});
+        BOOST_CHECK_EQUAL(boundary.lanes->MailboxStatsOf(net::Lane::ACTION).messages, 0U);
+        BOOST_CHECK_EQUAL(boundary.lanes->MailboxStatsOf(net::Lane::ACTION).payload_bytes, 0U);
+    };
+    check_oversize(boundary.api->Submit(above_limit));
+    maximum.payload.push_back(0);
+    check_oversize(boundary.api->SubmitStatus(maximum));
+    net::LaneSetLimits larger_limits{ApiLaneLimits(10, boundary.profile)};
+    larger_limits.Of(net::Lane::ACTION) = LaneLimitsOf(10, 2 * at_limit.size());
+    auto large_lanes{NewLaneSet(larger_limits)};
+    Result<std::unique_ptr<net::InProcessApi>> larger{net::InProcessApi::Create(
+        boundary.profile, *large_lanes, *boundary.admission, *boundary.pool, *boundary.read, net::ApiLimits{4})};
+    RequireOk(larger, "API with a larger lane");
+    const Result<RequestId> still_over_cap{(*larger)->Submit(above_limit)};
+    BOOST_REQUIRE(!still_over_cap.has_value());
+    BOOST_CHECK(still_over_cap.error().code == ErrorCode::OVERSIZE);
+    BOOST_CHECK_EQUAL((*larger)->OpenRequests(), 0U);
+    BOOST_CHECK(large_lanes->Stats(net::Lane::ACTION) == net::LaneStats{});
+    const Result<RequestId> after_refusals{boundary.api->SubmitHealth()};
+    RequireOk(after_refusals, "health after size refusals");
+    BOOST_CHECK_EQUAL(after_refusals->value, maximum_id.value + 1);
+    BOOST_CHECK(std::holds_alternative<net::HealthReply>(boundary.Reply(*after_refusals).body));
+    BOOST_CHECK_EQUAL(boundary.api->OpenRequests(), 0U);
 }
 
 BOOST_AUTO_TEST_CASE(replies_full_stops_the_pump_and_keeps_requests_queued)

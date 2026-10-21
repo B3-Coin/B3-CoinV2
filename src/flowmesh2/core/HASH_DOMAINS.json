@@ -1,0 +1,151 @@
+{
+  "format": "fm2-hash-domains/1",
+  "prefix": "B3/FM2/",
+  "tags": [
+    {
+      "id": 1,
+      "name": "DOMAIN",
+      "text": "B3/FM2/DOMAIN"
+    },
+    {
+      "id": 2,
+      "name": "ACCOUNT",
+      "text": "B3/FM2/ACCOUNT"
+    },
+    {
+      "id": 3,
+      "name": "ACTION",
+      "text": "B3/FM2/ACTION"
+    },
+    {
+      "id": 4,
+      "name": "ACTION_LEAF",
+      "text": "B3/FM2/ACTION_LEAF"
+    },
+    {
+      "id": 5,
+      "name": "BODY",
+      "text": "B3/FM2/BODY"
+    },
+    {
+      "id": 6,
+      "name": "FACT",
+      "text": "B3/FM2/FACT"
+    },
+    {
+      "id": 7,
+      "name": "FACTS",
+      "text": "B3/FM2/FACTS"
+    },
+    {
+      "id": 8,
+      "name": "MARKET",
+      "text": "B3/FM2/MARKET"
+    },
+    {
+      "id": 9,
+      "name": "ORDER",
+      "text": "B3/FM2/ORDER"
+    },
+    {
+      "id": 10,
+      "name": "SLOT",
+      "text": "B3/FM2/SLOT"
+    },
+    {
+      "id": 11,
+      "name": "COMMIT",
+      "text": "B3/FM2/COMMIT"
+    },
+    {
+      "id": 12,
+      "name": "PREPARE",
+      "text": "B3/FM2/PREPARE"
+    },
+    {
+      "id": 13,
+      "name": "CERT",
+      "text": "B3/FM2/CERT"
+    },
+    {
+      "id": 14,
+      "name": "OUTCOME",
+      "text": "B3/FM2/OUTCOME"
+    },
+    {
+      "id": 15,
+      "name": "SEATSET",
+      "text": "B3/FM2/SEATSET"
+    },
+    {
+      "id": 16,
+      "name": "PROFILE",
+      "text": "B3/FM2/PROFILE"
+    },
+    {
+      "id": 17,
+      "name": "STATE",
+      "text": "B3/FM2/STATE"
+    },
+    {
+      "id": 18,
+      "name": "STATE_ACCOUNTS",
+      "text": "B3/FM2/STATE_ACCOUNTS"
+    },
+    {
+      "id": 19,
+      "name": "STATE_ORDERS",
+      "text": "B3/FM2/STATE_ORDERS"
+    },
+    {
+      "id": 20,
+      "name": "STATE_MARKETS",
+      "text": "B3/FM2/STATE_MARKETS"
+    },
+    {
+      "id": 21,
+      "name": "STATE_NULLIFIERS",
+      "text": "B3/FM2/STATE_NULLIFIERS"
+    },
+    {
+      "id": 22,
+      "name": "STATE_TOTALS",
+      "text": "B3/FM2/STATE_TOTALS"
+    },
+    {
+      "id": 23,
+      "name": "MERKLE_LEAF",
+      "text": "B3/FM2/MERKLE_LEAF"
+    },
+    {
+      "id": 24,
+      "name": "MERKLE_NODE",
+      "text": "B3/FM2/MERKLE_NODE"
+    },
+    {
+      "id": 25,
+      "name": "MERKLE_EMPTY",
+      "text": "B3/FM2/MERKLE_EMPTY"
+    },
+    {
+      "id": 26,
+      "name": "MERKLE_ROOT",
+      "text": "B3/FM2/MERKLE_ROOT"
+    },
+    {
+      "id": 27,
+      "name": "PROTOCOL_ACCOUNT",
+      "text": "B3/FM2/PROTOCOL_ACCOUNT"
+    },
+    {
+      "id": 28,
+      "name": "JOURNAL",
+      "text": "B3/FM2/JOURNAL"
+    },
+    {
+      "id": 29,
+      "name": "TEST_ASSET",
+      "text": "B3/FM2/TEST_ASSET"
+    }
+  ]
+}

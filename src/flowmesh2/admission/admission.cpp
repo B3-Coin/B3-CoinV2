@@ -32,6 +32,20 @@ Result<void> KindAdmissible(ActionKind kind)
     return Error{ErrorCode::INVALID_INPUT, ADMISSION_KIND_UNREGISTERED};
 }
 
+Result<void> KindAdmissible(ActionKind kind, const ProfileParams& profile)
+{
+    if (kind == ActionKind::WITHDRAW && profile.withdrawals_enabled) return Ok();
+    return KindAdmissible(kind);
+}
+
+bool PayloadAdmissible(const ActionV2& action, const ProfileParams& profile)
+{
+    if (action.kind == ActionKind::WITHDRAW && profile.withdrawals_enabled) {
+        return action.Withdraw().has_value() && engine::PhaseOf(action, profile).has_value();
+    }
+    return PayloadAdmissible(action);
+}
+
 bool PayloadAdmissible(const ActionV2& action)
 {
     bool decodes{false};
@@ -207,11 +221,11 @@ Result<AdmissionReply> Admission::Evaluate(std::span<const unsigned char> frame,
         return Ok(Reply(AdmissionCode::MALFORMED, REASON_FRAME_MALFORMED));
     }
     if (action.domain != m_domain) return Ok(Reply(AdmissionCode::WRONG_DOMAIN, REASON_WRONG_DOMAIN));
-    if (const Result<void> kind{KindAdmissible(action.kind)}; !kind.has_value()) {
+    if (const Result<void> kind{KindAdmissible(action.kind, m_profile)}; !kind.has_value()) {
         // TODO(rebirth:M2-LED-05) TODO(rebirth:M3-ENG-09) TODO(rebirth:M2-LED-06) each task makes its kind admissible.
         return Ok(Reply(AdmissionCode::UNSUPPORTED_KIND, kind.error().detail));
     }
-    if (!PayloadAdmissible(action)) return Ok(Reply(AdmissionCode::MALFORMED, REASON_PAYLOAD_MALFORMED));
+    if (!PayloadAdmissible(action, m_profile)) return Ok(Reply(AdmissionCode::MALFORMED, REASON_PAYLOAD_MALFORMED));
     const ActionId id{action.Id()};
     const AccountId account_id{action.Account()};
     AdmissionReply reply;

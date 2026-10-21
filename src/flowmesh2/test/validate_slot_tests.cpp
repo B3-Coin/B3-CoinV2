@@ -211,8 +211,10 @@ BOOST_AUTO_TEST_CASE(facts_must_decode_and_stub_kinds_propagate_their_ids)
                                                   std::vector<unsigned char>{}}) {
         RequireRefusal(fx.Validate(fx.Inputs({bad}, {})), SLOT_FACT_MALFORMED, "malformed fact");
     }
+    // Payout is a real codec now; a one-byte payout is malformed.
+    RequireRefusal(fx.Validate(fx.Inputs({{5}}, {})), SLOT_FACT_MALFORMED, "truncated payout");
     const std::vector<std::pair<uint8_t, std::string>> stubs{
-        {2, "M7-SEAT-01"}, {3, "M7-GOV-01"}, {4, "MB1-B3D-02"}, {5, "M8-BRG-02"}, {6, "M8-EXIT-01"}};
+        {2, "M7-SEAT-01"}, {3, "M7-GOV-01"}, {4, "MB1-B3D-02"}, {6, "M8-EXIT-01"}};
     for (const auto& [kind, task] : stubs) RequireStub(fx.Validate(fx.Inputs({{kind}}, {})), task);
 }
 

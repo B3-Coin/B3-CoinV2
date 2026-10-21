@@ -50,6 +50,9 @@ namespace flowmesh2 {
 
 inline constexpr uint8_t SLOT_HEADER_VERSION{1};
 inline constexpr uint8_t COMMITMENT_VERSION_V0{0};
+//! Sorted six-root commitment; v1 remains reserved for the separate SMT design.
+inline constexpr uint8_t COMMITMENT_VERSION_WITHDRAWALS{2};
+inline constexpr uint8_t COMMITMENT_VERSION_VIEW_BOUND{3};
 inline constexpr size_t SLOT_HEADER_BYTES{366};
 
 struct SlotHeaderV2 {
@@ -74,7 +77,8 @@ struct SlotHeaderV2 {
 
     //! Tagged(SLOT, Encode()): identity and parent link.
     uint256 Hash() const;
-    //! Tagged(COMMIT, Encode()): the message the seats sign.
+    //! Frozen Tagged(COMMIT, Encode()) for versions 0/2. Version 3 callers
+    //! must use VersionedCommitDigest(header, view), below.
     uint256 CommitDigest() const;
     //! {authority_epoch, seat_set_root, profile_hash}.
     AuthorityVersion Authority() const;
@@ -100,11 +104,19 @@ struct SlotHeaderV2 {
         s >> domain >> profile_hash >> authority_epoch >> height >> parent_hash >> parent_cert_hash >> anchor >>
             facts_from >> facts_to >> seat_set_root >> facts_root >> actions_root >> outcomes_root >> state_root >>
             action_count >> outcome_count >> commitment_version;
-        if (commitment_version != COMMITMENT_VERSION_V0) {
+        if (commitment_version != COMMITMENT_VERSION_V0 && commitment_version != COMMITMENT_VERSION_WITHDRAWALS &&
+            commitment_version != COMMITMENT_VERSION_VIEW_BOUND) {
             throw std::ios_base::failure("unknown SlotHeaderV2 commitment_version");
         }
     }
 };
+
+/** COMMIT signing message. Versions 0/2 preserve the frozen view-free digest.
+ * Version 3 signs Tagged(COMMIT, u8{3} || full header || u64 view). The header
+ * identity remains view-independent so prepared values carry across views.
+ * Unknown commitment versions throw; decoded headers are already checked.
+ */
+uint256 VersionedCommitDigest(const SlotHeaderV2& header, uint64_t view);
 
 /** The height-0 header of a FlowMesh instance: no parent (zero hashes), the
  * empty fact range [facts_start, facts_start), empty facts, actions and
@@ -113,7 +125,8 @@ struct SlotHeaderV2 {
  * root or state root.
  */
 Result<SlotHeaderV2> GenesisHeader(const uint256& domain, const AuthorityVersion& authority, const Anchor& anchor,
-                                   const FactCursor& facts_start, const uint256& genesis_state_root);
+                                   const FactCursor& facts_start, const uint256& genesis_state_root,
+                                   uint8_t commitment_version = COMMITMENT_VERSION_V0);
 
 } // namespace flowmesh2
 

@@ -11,9 +11,11 @@
 #include <flowmesh2/engine/engine.h>
 #include <flowmesh2/state/candidate.h>
 #include <flowmesh2/state/state_owner.h>
+#include <flowmesh2/agreement/pbft.h>
 #include <flowmesh2/storage/commit_log.h>
 #include <flowmesh2/storage/journal.h>
 #include <flowmesh2/test/util/state_fixtures.h>
+#include <flowmesh2/test/util/verify_fixtures.h>
 
 #include <atomic>
 #include <cstddef>
@@ -75,6 +77,48 @@ state::HeadView DoctoredGenesis(const std::function<void(ledger::LedgerState&)>&
     const SlotHeaderV2 header{
         GenesisHeader(TestDomain(), TestAuthority(profile), TestAnchor(129), FactCursor{130, 0}, state.engine.Commit().value().Root()).value()};
     return state::HeadView::Make(header, uint256{}, std::make_shared<const state::CoreState>(std::move(state))).value();
+}
+
+//! Real four-seat BLS history; no fake aggregate is accepted by restoration.
+struct CertifiedHistory {
+    const std::vector<std::string> names{"restart0", "restart1", "restart2", "restart3"};
+    SeatSet seats{TestSeats(names)};
+    ProfileParams profile{RegtestProfile()};
+    AuthorityVersion authority{0, seats.Root(), ProfileHash(profile)};
+    state::HeadView genesis{state::GenesisHead(profile, std::vector<MarketDescriptor>{MarketM1(), MarketM2()},
+                                              TestDomain(), authority, TestAnchor(129), FactCursor{130, 0}).value()};
+    std::unique_ptr<storage::MemoryJournal> journal{NewCommitJournal(701)};
+    storage::CommitLog log{storage::CommitLog::Create(*journal).value()};
+    std::unique_ptr<state::StateOwner> live{state::StateOwner::Create(profile, genesis, journal->InstanceId()).value()};
+
+    void Next(bool applied)
+    {
+        state::Candidate candidate{live->Preview(state::ParentRef::Committed(*live->Head()), Heartbeat(*live->Head(), authority)).value()};
+        const SlotCertificate cert{SignCertificate(candidate.Header(), names, {0, 1, 2})};
+        const auto pending{log.AppendDecision(candidate.Header(), cert, candidate.Body()).value()};
+        RequireOk(log.Barrier(), "certified decision barrier");
+        const auto token{log.Confirm(pending).value()};
+        if (!applied) return;
+        const auto installed{live->Apply(std::move(candidate), token, authority).value()};
+        RequireOk(log.AppendApplied(installed.receipt), "certified application");
+        RequireOk(log.Barrier(), "certified application barrier");
+    }
+
+    std::unique_ptr<state::StateOwner> Fresh() const
+    {
+        return state::StateOwner::Create(profile, genesis, journal->InstanceId()).value();
+    }
+};
+
+//! Recompute only the public integrity chain, allowing tests to show that
+//! cryptographic certificate/authority checks reject internally consistent bytes.
+void Rechain(std::vector<storage::JournalRecord>& records, uint64_t instance)
+{
+    uint256 previous{storage::JournalGenesisChain(storage::JournalRole::COMMIT, instance)};
+    for (auto& record : records) {
+        previous = storage::NextChain(previous, record.type, record.payload);
+        record.chain = previous;
+    }
 }
 
 } // namespace
@@ -493,6 +537,311 @@ BOOST_AUTO_TEST_CASE(readers_see_one_coherent_head_while_apply_runs)
     BOOST_CHECK_EQUAL(problems.load(), 0U);
     BOOST_CHECK(previews.load() >= 30U);
     CheckWalkingSkeletonFinalState(f.Head()->State(), run);
+}
+
+BOOST_AUTO_TEST_CASE(certified_genesis_replay_installs_only_applied_and_resumes_decided_tail)
+{
+    CertifiedHistory history;
+    history.Next(true);
+    const auto committed{history.live->Head()};
+    history.Next(false);
+    const auto records{history.journal->ReadAll().value()};
+    BOOST_REQUIRE_EQUAL(records.size(), 3U);
+    auto restored{history.Fresh()};
+    const auto result{restored->RestoreVerifiedGenesis(history.genesis, records, history.seats)};
+    RequireOk(result, "certified restart");
+    BOOST_CHECK_EQUAL(restored->Head()->Header().height, 1U);
+    BOOST_CHECK(restored->Head()->Header() == committed->Header());
+    BOOST_CHECK(restored->Head()->State() == committed->State());
+    BOOST_CHECK(restored->Head()->CertHash() == committed->CertHash());
+    BOOST_CHECK_EQUAL(result->head.Header().height, 1U);
+    BOOST_CHECK_EQUAL(result->decided_head.Header().height, 2U);
+    BOOST_REQUIRE_EQUAL(result->slots.size(), 2U);
+    BOOST_CHECK(result->slots[0].applied_seq.has_value());
+    BOOST_CHECK(!result->slots[1].applied_seq.has_value());
+    // The same certified tail completes through the real recovered log and
+    // check-3 ApplyReceipt path, without a forged APPLIED marker.
+    storage::CommitLog recovered{storage::CommitLog::Create(*history.journal, history.profile).value()};
+    const auto decision{storage::DecisionRecord::Decode(records.back().payload, history.profile).value()};
+    state::Candidate candidate{restored->Reexecute(decision.header, decision.body).value()};
+    const auto pending{recovered.AppendDecision(decision.header, decision.certificate, decision.body).value()};
+    const auto token{recovered.Confirm(pending).value()};
+    const auto applied{restored->Apply(std::move(candidate), token, history.authority).value()};
+    const auto marker{recovered.AppendApplied(applied.receipt).value()};
+    RequireOk(recovered.Barrier(), "recovered applied barrier");
+    RequireOk(recovered.Confirm(marker), "durable recovered applied");
+    BOOST_CHECK_EQUAL(restored->Head()->Header().height, 2U);
+    auto restarted_again{history.Fresh()};
+    const auto complete{restarted_again->RestoreVerifiedGenesis(history.genesis, history.journal->ReadAll().value(), history.seats)};
+    RequireOk(complete, "second certified restart");
+    BOOST_CHECK(complete->head.Header() == complete->decided_head.Header());
+    BOOST_CHECK(restarted_again->Head()->Header() == restored->Head()->Header());
+}
+
+BOOST_AUTO_TEST_CASE(certified_replay_checks_every_certificate_authority_body_and_chain)
+{
+    CertifiedHistory history;
+    history.Next(true);
+    const auto original{history.journal->ReadAll().value()};
+    const auto decision{storage::DecisionRecord::Decode(original.front().payload, history.profile).value()};
+    const auto refuse = [&](const std::vector<storage::JournalRecord>& records, ErrorCode code, std::string_view detail) {
+        auto owner{history.Fresh()};
+        const auto before{owner->Head()};
+        RequireFailure(owner->RestoreVerifiedGenesis(history.genesis, records, history.seats), code, detail, "corrupt certified restart");
+        BOOST_CHECK(owner->Head() == before);
+    };
+    const std::vector<std::function<void(storage::DecisionRecord&)>> certificate_faults{
+        [](auto& d) { d.certificate.aggregate.fill(0); },
+        [](auto& d) { d.certificate.header_hash = Flipped(d.certificate.header_hash); },
+        [](auto& d) { d.certificate.bitmap = {0}; },
+        [](auto& d) { d.certificate.bitmap = {0x80}; },
+        [](auto& d) { d.certificate.bitmap.clear(); },
+        [&](auto& d) { d.certificate = SignCertificate(d.header, history.names, {0, 1}); },
+        [&](auto& d) {
+            SlotHeaderV2 other{d.header};
+            other.state_root = Flipped(other.state_root);
+            d.certificate = SignCertificate(other, history.names, {0, 1, 2});
+            d.certificate.header_hash = d.header.Hash();
+        }};
+    for (const auto& fault : certificate_faults) {
+        auto changed{decision};
+        fault(changed);
+        auto records{original};
+        records[0].payload = changed.Encode();
+        Rechain(records, history.journal->InstanceId());
+        refuse(records, ErrorCode::VERIFY_FAILED, state::RESTORE_CERTIFICATE);
+    }
+    for (int field{0}; field < 4; ++field) {
+        auto changed{decision};
+        if (field == 0) changed.header.domain = Flipped(changed.header.domain);
+        if (field == 1) changed.header.profile_hash = Flipped(changed.header.profile_hash);
+        if (field == 2) changed.header.authority_epoch = 1;
+        if (field == 3) changed.header.seat_set_root = Flipped(changed.header.seat_set_root);
+        changed.certificate = SignCertificate(changed.header, history.names, {0, 1, 2});
+        auto records{original};
+        records[0].payload = changed.Encode();
+        Rechain(records, history.journal->InstanceId());
+        refuse(records, ErrorCode::VERIFY_FAILED, state::RESTORE_AUTHORITY);
+    }
+    auto changed{decision};
+    changed.header.commitment_version = COMMITMENT_VERSION_WITHDRAWALS;
+    changed.certificate = SignCertificate(changed.header, history.names, {0, 1, 2});
+    auto records{original};
+    records[0].payload = changed.Encode();
+    Rechain(records, history.journal->InstanceId());
+    refuse(records, ErrorCode::VERIFY_FAILED, state::OWNER_COMMITMENT_VERSION);
+    // Invalid duplicate records cannot hide behind the first valid decision.
+    for (bool bad_body : {false, true}) {
+        records = original;
+        changed = decision;
+        if (bad_body) changed.body.originals.push_back({1});
+        else changed.certificate.aggregate.fill(0);
+        records.push_back(storage::JournalRecord{3, storage::RecordType::DECISION, changed.Encode(), {}});
+        Rechain(records, history.journal->InstanceId());
+        refuse(records, ErrorCode::VERIFY_FAILED, bad_body ? storage::BODY_HEADER_MISMATCH : state::RESTORE_CERTIFICATE);
+    }
+    records = original;
+    Rechain(records, history.journal->InstanceId() + 1);
+    refuse(records, ErrorCode::VERIFY_FAILED, state::RESTORE_RECORD_CHAIN);
+    records = original;
+    records.front().seq = 2;
+    refuse(records, ErrorCode::ORDER_VIOLATION, state::REPLAY_SEQ);
+    records = original;
+    auto applied{storage::AppliedRecord::Decode(records[1].payload).value()};
+    applied.state_root = Flipped(applied.state_root);
+    records[1].payload = applied.Encode();
+    Rechain(records, history.journal->InstanceId());
+    refuse(records, ErrorCode::VERIFY_FAILED, state::REPLAY_APPLIED_MISMATCH);
+    // A valid alternative quorum certificate is a valid duplicate; the
+    // first certificate/hash and state remain authoritative.
+    changed = decision;
+    changed.certificate = SignCertificate(changed.header, history.names, {1, 2, 3});
+    records = original;
+    records.push_back(storage::JournalRecord{3, storage::RecordType::DECISION, changed.Encode(), {}});
+    Rechain(records, history.journal->InstanceId());
+    auto owner{history.Fresh()};
+    const auto duplicate{owner->RestoreVerifiedGenesis(history.genesis, records, history.seats)};
+    RequireOk(duplicate, "valid duplicate certificate");
+    BOOST_CHECK_EQUAL(duplicate->duplicate_decisions, 1U);
+    BOOST_CHECK(owner->Head()->CertHash() == decision.certificate.Hash());
+}
+
+BOOST_AUTO_TEST_CASE(certified_restore_requires_exact_configured_genesis_and_refuses_live_rollback)
+{
+    CertifiedHistory history;
+    history.Next(true);
+    const auto records{history.journal->ReadAll().value()};
+    const auto live_before{history.live->Head()};
+    RequireFailure(history.live->RestoreVerifiedGenesis(history.genesis, records, history.seats),
+                   ErrorCode::STALE_PARENT, state::PARENT_NOT_HEAD, "no live rollback");
+    BOOST_CHECK(history.live->Head() == live_before);
+    auto owner{history.Fresh()};
+    const auto before{owner->Head()};
+    auto changed_header{history.genesis.Header()};
+    changed_header.anchor.hash = Flipped(changed_header.anchor.hash);
+    const auto changed{state::HeadView::Make(changed_header, {}, history.genesis.StatePtr()).value()};
+    RequireFailure(owner->RestoreVerifiedGenesis(changed, records, history.seats), ErrorCode::VERIFY_FAILED,
+                   state::RESTORE_BASE_MISMATCH, "another genesis header");
+    const auto other_seats{TestSeats({"other0", "other1", "other2", "other3"})};
+    RequireFailure(owner->RestoreVerifiedGenesis(history.genesis, records, other_seats), ErrorCode::VERIFY_FAILED,
+                   state::RESTORE_AUTHORITY, "untrusted roster");
+    BOOST_CHECK(owner->Head() == before);
+    // An unapplied-only journal restores genesis and returns the fenced tail.
+    CertifiedHistory unsigned_application;
+    unsigned_application.Next(false);
+    auto no_applied{unsigned_application.Fresh()};
+    const auto tail{no_applied->RestoreVerifiedGenesis(unsigned_application.genesis,
+                      unsigned_application.journal->ReadAll().value(), unsigned_application.seats)};
+    RequireOk(tail, "unapplied-only certified tail");
+    BOOST_CHECK_EQUAL(no_applied->Head()->Header().height, 0U);
+    BOOST_CHECK_EQUAL(tail->decided_head.Header().height, 1U);
+    // The explicit static-authority path refuses an otherwise valid epoch1 base.
+    auto next_authority{history.authority};
+    next_authority.epoch = 1;
+    const auto next_genesis{state::GenesisHead(history.profile, std::vector<MarketDescriptor>{MarketM1(), MarketM2()},
+        TestDomain(), next_authority, TestAnchor(129), FactCursor{130, 0}).value()};
+    auto next_owner{state::StateOwner::Create(history.profile, next_genesis, 701).value()};
+    RequireFailure(next_owner->RestoreVerifiedGenesis(next_genesis, {}, history.seats), ErrorCode::VERIFY_FAILED,
+                   state::RESTORE_AUTHORITY, "unsupported changing/static epoch");
+}
+
+BOOST_AUTO_TEST_CASE(owner_creation_checks_commitment_version_and_restore_cas_cannot_overwrite_apply)
+{
+    for (const auto& profile : {RegtestProfile(), StableQRegtestProfile(ChainType::REGTEST).value()}) {
+        const auto genesis{TestGenesisHead(profile)};
+        auto header{genesis.Header()};
+        header.commitment_version = profile.withdrawals_enabled ? COMMITMENT_VERSION_V0 : COMMITMENT_VERSION_WITHDRAWALS;
+        const auto wrong{state::HeadView::Make(header, {}, genesis.StatePtr()).value()};
+        RequireFailure(state::StateOwner::Create(profile, wrong, 701), ErrorCode::VERIFY_FAILED,
+                       state::OWNER_COMMITMENT_VERSION, "mislabeled genesis commitment");
+    }
+    CertifiedHistory history;
+    history.Next(true);
+    const auto records{history.journal->ReadAll().value()};
+    const auto decision{storage::DecisionRecord::Decode(records[0].payload, history.profile).value()};
+    auto owner{history.Fresh()};
+    state::Candidate candidate{owner->Reexecute(decision.header, decision.body).value()};
+    const auto pending{history.log.AppendDecision(decision.header, decision.certificate, decision.body).value()};
+    const auto token{history.log.Confirm(pending).value()};
+    std::atomic<bool> start{false};
+    bool restored{false}, restore_stale{false};
+    std::thread restart{[&] {
+        while (!start.load()) std::this_thread::yield();
+        const auto result{owner->RestoreVerifiedGenesis(history.genesis, records, history.seats)};
+        restored = result.has_value();
+        restore_stale = !result.has_value() && result.error().code == ErrorCode::STALE_PARENT;
+    }};
+    start = true;
+    const auto applied{owner->Apply(std::move(candidate), token, history.authority)};
+    restart.join();
+    BOOST_CHECK(restored != applied.has_value());
+    BOOST_CHECK(restored || restore_stale);
+    if (!applied.has_value()) BOOST_CHECK(applied.error().code == ErrorCode::STALE_PARENT);
+    BOOST_CHECK(owner->Head()->Header() == history.live->Head()->Header());
+    BOOST_CHECK(owner->Head()->CertHash() == history.live->Head()->CertHash());
+    BOOST_CHECK(owner->Head()->State() == history.live->Head()->State());
+}
+
+
+BOOST_AUTO_TEST_CASE(certified_replay_authenticates_prepared_only_crash_tail_without_applying)
+{
+    CertifiedHistory history;
+    const auto candidate{history.live->Preview(state::ParentRef::Committed(*history.live->Head()),
+                                               Heartbeat(*history.live->Head(), history.authority)).value()};
+    auto qc{SignCertificate(candidate.Header(), history.names, {0, 1, 2})};
+    const auto digest{agreement::PbftPrepareDigest(candidate.Header(), 0)};
+    std::vector<bls::Signature> signatures;
+    for (uint32_t i : {0U, 1U, 2U}) signatures.push_back(BlsKeyFromLabel(SeatLabel(history.names[i])).Sign(std::span{digest.begin(), digest.end()}));
+    qc.aggregate = bls::AggregateSignatures(signatures)->Compressed();
+    storage::PreparedQcRecord prepared{0, candidate.Header().height, 0, candidate.Header().Hash(), qc.Encode(), candidate.Header(), candidate.Body()};
+    RequireOk(history.log.RecordVerifiedPreparedQc(prepared), "prepared record");
+    RequireOk(history.log.Barrier(), "prepared barrier");
+    const auto records{history.journal->ReadAll().value()};
+    auto owner{history.Fresh()};
+    const auto replayed{owner->RestoreVerifiedGenesis(history.genesis, records, history.seats)};
+    RequireOk(replayed, "prepared-only restart");
+    BOOST_CHECK_EQUAL(owner->Head()->Header().height, 0U);
+    BOOST_CHECK_EQUAL(replayed->decided_head.Header().height, 0U);
+    BOOST_CHECK(replayed->slots.empty());
+    const auto recovered_log{storage::CommitLog::Create(*history.journal, history.profile)};
+    RequireOk(recovered_log, "prepared index recovery");
+    BOOST_CHECK(recovered_log->PreparedAt(0, 1, 0).has_value());
+    for (int mutation = 0; mutation < 5; ++mutation) {
+        auto wrong{prepared};
+        if (mutation == 0) { auto invalid{qc}; invalid.aggregate.fill(0); wrong.qc = invalid.Encode(); }
+        if (mutation == 1) wrong.body.originals.push_back({1});
+        if (mutation == 2) wrong.header_hash = LabelHash("another-prepared-header");
+        if (mutation == 3) wrong.view = 1;
+        if (mutation == 4) wrong.qc = SignCertificate(candidate.Header(), history.names, {0, 1, 2}).Encode();
+        auto damaged{records};
+        damaged.front().payload = wrong.Encode();
+        Rechain(damaged, history.journal->InstanceId());
+        auto fresh{history.Fresh()};
+        BOOST_CHECK(!fresh->RestoreVerifiedGenesis(history.genesis, damaged, history.seats).has_value());
+        BOOST_CHECK_EQUAL(fresh->Head()->Header().height, 0U);
+    }
+    // The same value later receives COMMIT and APPLIED; preparation is not
+    // replayed as an application and cannot double-count the slot.
+    history.Next(true);
+    auto committed{history.Fresh()};
+    const auto complete{committed->RestoreVerifiedGenesis(history.genesis, history.journal->ReadAll().value(), history.seats)};
+    RequireOk(complete, "prepared then committed restart");
+    BOOST_CHECK_EQUAL(committed->Head()->Header().height, 1U);
+    BOOST_CHECK_EQUAL(complete->slots.size(), 1U);
+}
+
+
+BOOST_AUTO_TEST_CASE(view_bound_certified_restore_verifies_nonzero_prepare_and_commit_view)
+{
+    const auto profile{StableQViewRegtestProfile(ChainType::REGTEST).value()};
+    const std::vector<std::string> names{"bound0", "bound1", "bound2", "bound3"};
+    const auto seats{TestSeats(names)};
+    const AuthorityVersion authority{0, seats.Root(), ProfileHash(profile)};
+    const auto genesis{state::GenesisHead(profile, std::vector<MarketDescriptor>{MarketM1(), MarketM2()},
+                                          TestDomain(), authority, TestAnchor(129), FactCursor{130, 0}).value()};
+    auto journal{NewCommitJournal(911)};
+    auto log{storage::CommitLog::Create(*journal, profile).value()};
+    auto owner{state::StateOwner::Create(profile, genesis, 911).value()};
+    auto candidate{owner->Preview(state::ParentRef::Committed(genesis), Heartbeat(genesis, authority)).value()};
+    BOOST_CHECK_EQUAL(candidate.Header().commitment_version, COMMITMENT_VERSION_VIEW_BOUND);
+    auto prepare{SignCertificate(candidate.Header(), names, {0, 1, 2}, std::nullopt, 7)};
+    const auto digest{agreement::PbftPrepareDigest(candidate.Header(), 7)};
+    std::vector<bls::Signature> signatures;
+    for (uint32_t i : {0U, 1U, 2U}) signatures.push_back(BlsKeyFromLabel(SeatLabel(names[i])).Sign(std::span{digest.begin(), digest.end()}));
+    prepare.aggregate = bls::AggregateSignatures(signatures)->Compressed();
+    RequireOk(log.RecordVerifiedPreparedQc({0, 1, 7, candidate.Header().Hash(), prepare.Encode(), candidate.Header(), candidate.Body()}), "view7 preparation");
+    RequireOk(log.Barrier(), "view7 prepared barrier");
+    const auto certificate{SignCertificate(candidate.Header(), names, {0, 1, 2}, std::nullopt, 7)};
+    const auto pending{log.AppendDecision(candidate.Header(), certificate, candidate.Body()).value()};
+    RequireOk(log.Barrier(), "view7 decision barrier");
+    const auto applied{owner->Apply(std::move(candidate), log.Confirm(pending).value(), authority).value()};
+    RequireOk(log.AppendApplied(applied.receipt), "view7 applied record");
+    RequireOk(log.Barrier(), "view7 applied barrier");
+    const auto records{journal->ReadAll().value()};
+    auto restored{state::StateOwner::Create(profile, genesis, 911).value()};
+    RequireOk(restored->RestoreVerifiedGenesis(genesis, records, seats), "view7 full certified restore");
+    BOOST_CHECK(restored->Head()->Header() == owner->Head()->Header());
+    BOOST_CHECK(restored->Head()->State() == owner->Head()->State());
+    for (int mutation = 0; mutation < 3; ++mutation) {
+        auto bad{records};
+        if (mutation == 0) {
+            auto decision{storage::DecisionRecord::Decode(bad[1].payload, profile).value()};
+            decision.certificate.view = 8;
+            bad[1].payload = decision.Encode();
+        } else if (mutation == 1) {
+            auto prepared{storage::PreparedQcRecord::Decode(bad[0].payload, profile).value()};
+            prepared.view = 8;
+            bad[0].payload = prepared.Encode();
+        } else {
+            auto decision{storage::DecisionRecord::Decode(bad[1].payload, profile).value()};
+            decision.certificate.view.reset();
+            bad[1].payload = decision.Encode();
+        }
+        Rechain(bad, 911);
+        auto fresh{state::StateOwner::Create(profile, genesis, 911).value()};
+        BOOST_CHECK(!fresh->RestoreVerifiedGenesis(genesis, bad, seats).has_value());
+        BOOST_CHECK_EQUAL(fresh->Head()->Header().height, 0U);
+    }
 }
 
 BOOST_AUTO_TEST_SUITE_END()

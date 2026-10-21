@@ -168,6 +168,84 @@ BOOST_AUTO_TEST_CASE(create_refusals_and_domain)
     BOOST_CHECK_EQUAL(stats.Count(static_cast<AdmissionCode>(0)), 0U);
 }
 
+BOOST_AUTO_TEST_CASE(view_bound_publication_admits_signed_withdrawal_and_returns_certified_duplicate)
+{
+    const auto take = []<class T>(Result<T> result) {
+        RequireOk(result, "view-bound admission fixture");
+        return std::move(result).value();
+    };
+    const ProfileParams profile{take(StableQViewRegtestProfile(ChainType::REGTEST))};
+    const AssetId quote{RegtestQuoteAsset()};
+    const std::vector<std::string> names{"s0", "s1", "s2", "s3"};
+    const SeatSet seats{TestSeats(names)};
+    const AuthorityVersion authority{0, seats.Root(), ProfileHash(profile)};
+    const std::vector<MarketDescriptor> markets{{TestAsset("TOKENA"), quote, 1, 1}};
+    SlotFixture actions{profile, markets};
+    const auto genesis{take(state::GenesisHead(profile, markets, TestDomain(), authority, TestAnchor(129), FactCursor{130, 0}))};
+    auto journal{NewCommitJournal(37)};
+    auto log{take(storage::CommitLog::Create(*journal, profile))};
+    auto owner{take(state::StateOwner::Create(profile, genesis, 37))};
+    auto service{NewReadService(TestReadLimits(8, profile), profile)};
+    auto pool{NewPool(PoolLimits::FromProfile(profile), profile, 0)};
+    TestBudget budget;
+    auto admission{NewAdmission(profile, *owner, *service, *pool, budget)};
+
+    const auto seal = [&](std::vector<Frame> facts, std::vector<Frame> originals, uint64_t view) {
+        state::SlotInputs inputs;
+        inputs.authority = authority;
+        inputs.anchor = TestAnchor(actions.anchor_height);
+        inputs.facts_from = owner->Head()->Header().facts_to;
+        inputs.facts_to = FactCursor{actions.anchor_height, actions.next_fact_index};
+        inputs.body.facts = std::move(facts); inputs.body.originals = std::move(originals);
+        auto candidate{take(owner->Preview(state::ParentRef::Committed(*owner->Head()), inputs))};
+        const auto cert{SignCertificate(candidate.Header(), names, {0, 1, 2}, std::nullopt, view)};
+        RequireOk(verify::VerifyCertificate(candidate.Header(), cert, seats), "real q3 certificate");
+        const auto body{candidate.Body()};
+        auto outcomes{candidate.Outcomes()};
+        const auto pending{take(log.AppendDecision(candidate.Header(), cert, body))};
+        RequireOk(log.Barrier(), "B-DECISION");
+        const auto decision{take(log.Confirm(pending))};
+        const auto installed{take(owner->Apply(std::move(candidate), decision, authority))};
+        const auto applied{take(log.AppendApplied(installed.receipt))};
+        RequireOk(log.Barrier(), "B-APPLIED");
+        const auto durable{take(log.Confirm(applied))};
+        RequireOk(service->Publish(durable, take(read::SlotView::Build(*installed.head, cert, outcomes))), "publish v3");
+        RequireOk(pool->OnCommitted(durable, *installed.head, outcomes, body), "pool follows v3");
+        actions.header = installed.head->Header(); actions.state = installed.head->State().engine;
+    };
+
+    seal({actions.DepositBytes(KeyAccount("alice"), quote, 10'000'000, "v3-read/deposit")}, {}, 0);
+    const auto funded{take(service->Account(KeyAccount("alice")))};
+    BOOST_REQUIRE(funded.witness.has_value());
+    BOOST_CHECK_EQUAL(funded.head.envelope.header.commitment_version, COMMITMENT_VERSION_VIEW_BOUND);
+    BOOST_REQUIRE(funded.head.envelope.cert.view.has_value());
+    BOOST_CHECK_EQUAL(*funded.head.envelope.cert.view, 0U);
+    RequireOk(verify::VerifyAccountLeaf(funded.head.envelope.header, funded.witness->leaf, funded.witness->roots,
+                                       funded.witness->proof, profile), "v3 funded account proof");
+    const std::vector<unsigned char> recipient(20, 0x51);
+    const auto payload{take(EncodePayload(WithdrawPayload{quote, 1'000'000, recipient}))};
+    const auto frame{actions.Sign(actions.Unsigned("alice", 1, ActionKind::WITHDRAW, payload), "alice")};
+    const auto admitted{take(admission->Admit(frame))};
+    RequireCode(admitted, AdmissionCode::ADMITTED, "signed withdrawal after v3 publication");
+    BOOST_CHECK_EQUAL(pool->Size(), 1U);
+    const auto taken{take(pool->TakeForSlot(2, profile.max_actions_per_slot))};
+    BOOST_REQUIRE_EQUAL(taken.originals.size(), 1U);
+    seal({}, taken.originals, 7);
+    const auto duplicate{take(admission->Admit(frame))};
+    RequireCode(duplicate, AdmissionCode::DUPLICATE, "included v3 withdrawal");
+    BOOST_REQUIRE(duplicate.outcome.has_value());
+    const auto& included{*duplicate.outcome};
+    BOOST_CHECK(included.outcome.outcome.code == OutcomeCode::WITHDRAWAL_PENDING);
+    BOOST_CHECK_EQUAL(actions.BalanceOf("alice", quote).available, 10'000'000 - 1'000'000 - profile.withdrawal_fee_atoms);
+    BOOST_REQUIRE(included.envelope.cert.view.has_value());
+    BOOST_CHECK_EQUAL(*included.envelope.cert.view, 7U);
+    RequireOk(verify::VerifyCertificate(included.envelope.header, included.envelope.cert, seats), "included v3 certificate");
+    RequireOk(verify::VerifyOutcome(included.envelope.header, included.outcome.outcome, included.outcome.proof), "included withdrawal proof");
+    BOOST_CHECK_EQUAL(pool->Size(), 0U);
+    BOOST_CHECK_EQUAL(admission->Stats().errors, 0U);
+    BOOST_CHECK_EQUAL(admission->Stats().sig_verifications, 1U);
+}
+
 BOOST_AUTO_TEST_CASE(window_refusal_without_overflow)
 {
     const ProfileParams profile{RegtestProfile()};

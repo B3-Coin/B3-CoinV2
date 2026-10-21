@@ -80,6 +80,18 @@ Result<StateRootsV0> CommitV0(const LedgerState& ledger, std::span<const MarketD
     for (const auto& [asset, asset_totals] : ledger.Totals()) totals.push_back(TotalsLeafV0{asset, asset_totals}.LeafValue());
     roots.totals = MerkleRoot(totals);
 
+    if (ledger.Profile().withdrawals_enabled) {
+        roots.version = ExpectedCommitmentVersion(ledger.Profile());
+        std::vector<uint256> withdrawals;
+        withdrawals.reserve(ledger.Withdrawals().size());
+        for (const auto& [id, record] : ledger.Withdrawals()) {
+            if (id != record.id || !record.IsCanonical()) return Error{ErrorCode::INVARIANT, "noncanonical withdrawal leaf"};
+            withdrawals.push_back(record.LeafValue());
+        }
+        roots.withdrawals = MerkleRoot(withdrawals);
+    } else if (!ledger.Withdrawals().empty()) {
+        return Error{ErrorCode::INVARIANT, "withdrawals in a legacy profile"};
+    }
     return Ok(roots);
 }
 
@@ -113,6 +125,23 @@ Result<AccountWitnessV0> ProveAccountV0(const LedgerState& ledger, const Account
     Result<MerkleProof> proof{MerkleProve(*values, index)};
     if (!proof.has_value()) return proof.error();
     return Ok(AccountWitnessV0{std::move(leaf).value(), std::move(proof).value()});
+}
+
+Result<WithdrawalWitness> ProveWithdrawal(const LedgerState& ledger, const ActionId& id)
+{
+    if (!ledger.Profile().withdrawals_enabled) return Error{ErrorCode::INVALID_INPUT, "withdrawal proofs disabled"};
+    const auto found{ledger.Withdrawals().find(id)};
+    if (found == ledger.Withdrawals().end()) return Error{ErrorCode::INVALID_INPUT, "unknown withdrawal"};
+    std::vector<uint256> leaves;
+    leaves.reserve(ledger.Withdrawals().size());
+    for (const auto& [key, record] : ledger.Withdrawals()) {
+        if (key != record.id || !record.IsCanonical()) return Error{ErrorCode::INVARIANT, "noncanonical withdrawal leaf"};
+        leaves.push_back(record.LeafValue());
+    }
+    const auto index{static_cast<uint64_t>(std::distance(ledger.Withdrawals().begin(), found))};
+    auto proof{MerkleProve(leaves, index)};
+    if (!proof.has_value()) return proof.error();
+    return Ok(WithdrawalWitness{found->second, std::move(proof).value()});
 }
 
 Result<uint256> CommitV1(const LedgerState&)

@@ -9,9 +9,11 @@
 #include <flowmesh2/core/body.h>
 #include <flowmesh2/core/params.h>
 #include <flowmesh2/core/result.h>
+#include <flowmesh2/core/seat_set.h>
 #include <flowmesh2/core/slot.h>
 #include <flowmesh2/engine/engine.h>
 #include <flowmesh2/state/candidate.h>
+#include <flowmesh2/state/replay.h>
 #include <flowmesh2/storage/durable.h>
 #include <flowmesh2/storage/record.h>
 #include <sync.h>
@@ -96,6 +98,12 @@ inline constexpr std::string_view OWNER_STATE_ROOT_MISMATCH{"initial header does
 inline constexpr std::string_view DECISION_OTHER_HEADER{"decision token for another header"};                 //!< (VERIFY_FAILED)
 inline constexpr std::string_view AUTHORITY_SUPERSEDED{"candidate authority is not the current authority"};   //!< (AUTHORITY_CHANGED)
 
+inline constexpr std::string_view OWNER_COMMITMENT_VERSION{"head commitment version differs from its profile"}; //!< (VERIFY_FAILED)
+inline constexpr std::string_view RESTORE_BASE_MISMATCH{"restore base differs from configured genesis"}; //!< (VERIFY_FAILED)
+inline constexpr std::string_view RESTORE_AUTHORITY{"restore requires the configured static epoch-zero authority"}; //!< (VERIFY_FAILED)
+inline constexpr std::string_view RESTORE_CERTIFICATE{"restore decision certificate does not verify"}; //!< (VERIFY_FAILED)
+inline constexpr std::string_view RESTORE_RECORD_CHAIN{"restore commit-journal chain does not match this instance"}; //!< (VERIFY_FAILED)
+
 //! What a successful Apply gives: the new head, and the receipt CommitLog::AppendApplied requires (O-92).
 struct AppliedSlot {
     std::shared_ptr<const HeadView> head;
@@ -131,11 +139,33 @@ public:
     //! Snapshot `base` plus the commit journal `records` after it. Stub: M4-STO-03.
     Result<void> Restore(const HeadView& base, std::span<const storage::JournalRecord> records) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
 
+    /** Certified genesis-only restart for the static REGTEST authority.
+     * `base` must equal this owner's configured genesis and the owner must
+     * still be there. `records` must be the whole durable Journal::ReadAll()
+     * result from this owner's COMMIT journal instance; the caller owns that
+     * durability precondition. A span/hash chain is not proof of a disk barrier
+     * and cannot detect a coherently rewritten/rolled-back store.
+     *
+     * Verifies the instance-bound chain and every DECISION's exact body,
+     * domain/profile/epoch/commitment version and real quorum BLS certificate,
+     * including duplicates, then executes ReplayDecisions outside the lock.
+     * CAS installs only its last APPLIED head. On refusal the head is unchanged.
+     * The returned decided tail is verified but UNAPPLIED: keep admission,
+     * publication and sealing fenced until the caller completes it through
+     * recovered CommitLog, Reexecute, Apply and APPLIED+Barrier. No log writes,
+     * signing, receipts or durable tokens are fabricated by restoration.
+     * This does not implement snapshots, changing rosters, view-change or
+     * rollback detection; the two-argument snapshot Restore remains a stub.
+     */
+    Result<ReplayResult> RestoreVerifiedGenesis(const HeadView& base, std::span<const storage::JournalRecord> records,
+                                               const SeatSet& seats) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+
 private:
     StateOwner(engine::Engine engine, std::shared_ptr<const HeadView> genesis, uint64_t commit_journal_instance);
 
     const engine::Engine m_engine;
     const uint64_t m_commit_journal_instance;
+    const std::shared_ptr<const HeadView> m_configured_genesis;
     mutable Mutex m_mutex;
     std::shared_ptr<const HeadView> m_head GUARDED_BY(m_mutex);
 };

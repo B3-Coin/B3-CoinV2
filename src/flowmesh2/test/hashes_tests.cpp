@@ -10,6 +10,7 @@
 #include <crypto/sha256.h>
 #include <flowmesh2/core/hashes.h>
 #include <uint256.h>
+#include <univalue.h>
 
 #include <cstddef>
 #include <cstdint>
@@ -181,6 +182,25 @@ BOOST_AUTO_TEST_CASE(tagged_matches_the_bip340_definition)
     uint256 value;
     value.data()[0] = 0x42;
     BOOST_CHECK(TaggedObject(HashTag::ACCOUNT, value) == Tagged(HashTag::ACCOUNT, std::span{value.data(), value.size()}));
+}
+
+BOOST_AUTO_TEST_CASE(public_adapter_catalog_matches_the_canonical_registry)
+{
+    std::ifstream file{std::filesystem::path{FM2_SOURCE_ROOT} / "src/flowmesh2/core/HASH_DOMAINS.json"};
+    BOOST_REQUIRE(file.is_open());
+    const std::string encoded{std::istreambuf_iterator<char>{file}, std::istreambuf_iterator<char>{}};
+    UniValue catalog;
+    BOOST_REQUIRE(catalog.read(encoded));
+    BOOST_REQUIRE_EQUAL(catalog["format"].get_str(), "fm2-hash-domains/1");
+    BOOST_CHECK_EQUAL(catalog["prefix"].get_str(), HASH_TAG_PREFIX);
+    const auto registry{HashTagRegistry()};
+    const auto& rows{catalog["tags"].get_array()};
+    BOOST_REQUIRE_EQUAL(rows.size(), registry.size());
+    for (size_t i{0}; i < registry.size(); ++i) {
+        BOOST_CHECK_EQUAL(rows[i]["id"].getInt<int>(), static_cast<int>(registry[i].tag));
+        BOOST_CHECK_EQUAL(rows[i]["name"].get_str(), registry[i].name);
+        BOOST_CHECK_EQUAL(rows[i]["text"].get_str(), registry[i].text);
+    }
 }
 
 BOOST_AUTO_TEST_CASE(no_collision_with_repository_tags)

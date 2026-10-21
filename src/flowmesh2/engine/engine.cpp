@@ -154,6 +154,12 @@ Result<SlotPhase> PhaseOf(const ActionV2& action)
     return Invalid("unregistered action kind");
 }
 
+Result<SlotPhase> PhaseOf(const ActionV2& action, const ProfileParams& profile)
+{
+    if (action.kind == ActionKind::WITHDRAW && profile.withdrawals_enabled) return Ok(SlotPhase::ACCOUNT);
+    return PhaseOf(action);
+}
+
 Result<uint64_t> ArrivalRank(uint64_t height, SlotPhase phase, uint64_t rank, uint32_t max_actions_per_slot)
 {
     if (phase != SlotPhase::POST_ONLY && phase != SlotPhase::REST) return Invalid("arrival rank outside phases 4 and 6");
@@ -176,6 +182,9 @@ Result<EngineState> EngineState::Genesis(const ProfileParams& profile, std::span
 {
     Result<ledger::LedgerState> ledger{ledger::LedgerState::Create(profile)};
     if (!ledger.has_value()) return ledger.error();
+    for (const MarketDescriptor& market : markets) {
+        if (const Result<void> policy{ValidateMarketForProfile(market, profile)}; !policy.has_value()) return policy.error();
+    }
     Result<BookSet> books{BookSet::Create(markets)};
     if (!books.has_value()) return books.error();
     return Ok(EngineState{std::move(ledger).value(), std::move(books).value()});
@@ -272,7 +281,7 @@ ValidatedSlot::ValidatedSlot(uint256 parent_hash, uint64_t height, SlotInputs in
 namespace {
 
 //! The payload of a supported kind, decoded; nullopt if it does not decode.
-std::optional<ActionPayload> DecodePayload(const ActionV2& action)
+std::optional<ActionPayload> DecodePayload(const ActionV2& action, const ProfileParams& profile)
 {
     switch (action.kind) {
     case ActionKind::PLACE: {
@@ -290,8 +299,13 @@ std::optional<ActionPayload> DecodePayload(const ActionV2& action)
         if (!transfer.has_value()) return std::nullopt;
         return ActionPayload{std::move(transfer).value()};
     }
+    case ActionKind::WITHDRAW: {
+        if (!profile.withdrawals_enabled) return std::nullopt;
+        Result<WithdrawPayload> withdrawal{action.Withdraw()};
+        if (!withdrawal.has_value()) return std::nullopt;
+        return ActionPayload{std::move(withdrawal).value()};
+    }
     case ActionKind::CANCEL_ALL:
-    case ActionKind::WITHDRAW:
     case ActionKind::SPOT_TO_FUTURES:
     case ActionKind::FUTURES_TO_SPOT:
         break;
@@ -319,6 +333,13 @@ Result<ValidatedSlot> ValidateSlotInputs(const HeadView& parent, const SlotInput
     if (inputs.profile_hash != profile_hash || head.profile_hash != profile_hash || !(ledger.Profile() == profile)) {
         return Invalid(SLOT_PROFILE_MISMATCH);
     }
+    // A caller cannot smuggle an incompatible book into an otherwise valid
+    // stable-Q parent. Check every market, including a slot with no fills.
+    for (const auto& entry : parent.State().books.Books()) {
+        if (const Result<void> policy{ValidateMarketForProfile(entry.second.Market(), profile)}; !policy.has_value()) return policy.error();
+    }
+    const uint8_t expected_commitment{ExpectedCommitmentVersion(profile)};
+    if (head.commitment_version != expected_commitment) return Invalid("parent commitment version differs from profile");
     // 2-3. Domain and height.
     if (inputs.domain != head.domain) return Invalid(SLOT_DOMAIN_MISMATCH);
     if (head.height == std::numeric_limits<uint64_t>::max()) return Invalid(SLOT_HEIGHT_EXHAUSTED);
@@ -353,6 +374,7 @@ Result<ValidatedSlot> ValidateSlotInputs(const HeadView& parent, const SlotInput
     fact_ids.reserve(body.facts.size());
     std::set<Outpoint> outpoints;
     std::optional<FactCursor> previous;
+    bool source_range_seen{false};
     for (const auto& bytes : body.facts) {
         const Result<Fact> fact{DecodeFact(bytes)};
         if (!fact.has_value()) {
@@ -361,20 +383,40 @@ Result<ValidatedSlot> ValidateSlotInputs(const HeadView& parent, const SlotInput
             if (code == ErrorCode::NOT_IMPLEMENTED || code == ErrorCode::UNSUPPORTED) return fact.error();
             return Invalid(SLOT_FACT_MALFORMED);
         }
-        const DepositFact* deposit{std::get_if<DepositFact>(&*fact)};
-        if (deposit == nullptr) return Invalid(SLOT_FACT_KIND); // each fact task adds its engine branch
-        if (deposit->cursor < inputs.facts_from || !(deposit->cursor < inputs.facts_to) ||
-            (previous.has_value() && !(*previous < deposit->cursor))) {
-            return Invalid(SLOT_FACT_CURSOR);
+        const FactCursor cursor{CursorOf(*fact)};
+        if (cursor < inputs.facts_from || !(cursor < inputs.facts_to) ||
+            (previous.has_value() && !(*previous < cursor))) return Invalid(SLOT_FACT_CURSOR);
+        previous = cursor;
+        if (const auto* deposit{std::get_if<DepositFact>(&*fact)}) {
+            if (deposit->amount <= 0 || ledger.IsProtocolAccount(deposit->account) || ledger.Credited(deposit->outpoint) ||
+                !outpoints.insert(deposit->outpoint).second) return Invalid(SLOT_DEPOSIT_REFUSED);
+            deposits.push_back(*deposit);
+        } else if (const auto* payout{std::get_if<PayoutConfirmedFact>(&*fact)}; payout && profile.withdrawals_enabled) {
+            const auto claim{ledger.Withdrawals().find(payout->withdrawal)};
+            if (claim == ledger.Withdrawals().end() || claim->second.slot >= height || payout->domain != inputs.domain ||
+                claim->second.account != payout->account || claim->second.asset != payout->asset ||
+                claim->second.amount != payout->amount || claim->second.recipient != payout->recipient ||
+                (claim->second.paid && claim->second.payout_event != payout->payout_event) ||
+                !outpoints.insert(payout->payout_event).second) return Invalid("payout does not match a committed withdrawal");
+            for (const auto& [id, prior] : ledger.Withdrawals()) {
+                if (prior.paid && prior.payout_event == payout->payout_event && id != payout->withdrawal) {
+                    return Invalid("payout event already settles another withdrawal");
+                }
+            }
+        } else if (const auto* source{std::get_if<SourceRangeFact>(&*fact)}) {
+            if (!profile.source_range_commitment || source_range_seen || &bytes != &body.facts.back() ||
+                source->domain != inputs.domain || source->chain_id != profile.source_chain_id ||
+                source->confirmations != profile.source_confirmations || source->cursor.height != inputs.facts_to.height ||
+                uint64_t{source->cursor.index} + 1 != inputs.facts_to.index) {
+                return Invalid("source range commitment is duplicated, misplaced or differs from its pinned profile/domain/cursor");
+            }
+            source_range_seen = true;
+        } else {
+            return Invalid(SLOT_FACT_KIND);
         }
-        previous = deposit->cursor;
-        if (deposit->amount <= 0 || ledger.IsProtocolAccount(deposit->account) || ledger.Credited(deposit->outpoint) ||
-            !outpoints.insert(deposit->outpoint).second) {
-            return Invalid(SLOT_DEPOSIT_REFUSED);
-        }
-        deposits.push_back(*deposit);
         fact_ids.push_back(FactLeaf(bytes));
     }
+    if (profile.source_range_commitment && !source_range_seen) return Invalid("network slot lacks its terminal source range commitment");
 
     // 8. Originals, every check before the signature.
     std::vector<CheckedOriginal> checked;
@@ -387,10 +429,10 @@ Result<ValidatedSlot> ValidateSlotInputs(const HeadView& parent, const SlotInput
         if (!decoded.has_value()) return Invalid(SLOT_ACTION_MALFORMED);
         ActionV2 action{std::move(decoded).value()};
         if (action.domain != inputs.domain) return Invalid(SLOT_ACTION_DOMAIN);
-        if (!KindSupported(action.kind)) return Invalid(SLOT_ACTION_KIND);
-        std::optional<ActionPayload> payload{DecodePayload(action)};
+        if (!KindSupported(action.kind, profile)) return Invalid(SLOT_ACTION_KIND);
+        std::optional<ActionPayload> payload{DecodePayload(action, profile)};
         if (!payload.has_value()) return Invalid(SLOT_ACTION_PAYLOAD);
-        const Result<SlotPhase> phase{PhaseOf(action)};
+        const Result<SlotPhase> phase{PhaseOf(action, profile)};
         if (!phase.has_value()) return Invalid(SLOT_ACTION_PAYLOAD);
         if (!action.MaxDelayValid(profile) || !InExpiryWindow(action.ref_slot, action.max_delay, height)) {
             return Invalid(SLOT_ACTION_WINDOW);
@@ -548,20 +590,32 @@ private:
     // Phase 1.
     Result<void> Deposits()
     {
-        for (size_t i{0}; i < m_slot.Deposits().size(); ++i) {
-            const DepositFact& deposit{m_slot.Deposits()[i]};
-            const Result<void> credited{Ledger().CreditDeposit(deposit)};
-            if (!credited.has_value()) return credited.error();
-            DeltaSet deltas;
-            const Result<void> added{deltas.Add(deposit.account, deposit.asset, deposit.amount, 0)};
-            if (!added.has_value()) return added.error();
+        // Preserve exact fact order and FactId association for mixed deposits/payouts.
+        const auto& facts{m_slot.Inputs().body.facts};
+        for (size_t i{0}; i < facts.size(); ++i) {
+            const Result<Fact> decoded{DecodeFact(facts[i])};
+            if (!decoded.has_value()) return decoded.error();
+            if (std::holds_alternative<SourceRangeFact>(*decoded)) continue; // authenticated boundary only: no ledger effect/outcome
             OutcomeV2 outcome;
             outcome.source = OutcomeSource::FACT;
             outcome.subject = m_slot.FactIds()[i];
-            outcome.account = deposit.account;
-            outcome.nonce = 0;
-            outcome.code = OutcomeCode::DEPOSIT_CREDITED;
-            outcome.deltas = deltas.Sorted();
+            if (const auto* deposit{std::get_if<DepositFact>(&*decoded)}) {
+                const Result<void> credited{Ledger().CreditDeposit(*deposit)};
+                if (!credited.has_value()) return credited.error();
+                DeltaSet deltas;
+                const Result<void> added{deltas.Add(deposit->account, deposit->asset, deposit->amount, 0)};
+                if (!added.has_value()) return added.error();
+                outcome.account = deposit->account;
+                outcome.code = OutcomeCode::DEPOSIT_CREDITED;
+                outcome.deltas = deltas.Sorted();
+            } else {
+                const auto* payout{std::get_if<PayoutConfirmedFact>(&*decoded)};
+                if (!payout) return Broken("validated fact of unsupported kind");
+                const Result<void> confirmed{Ledger().ConfirmWithdrawal(*payout)};
+                if (!confirmed.has_value()) return confirmed.error();
+                outcome.account = payout->account;
+                outcome.code = OutcomeCode::WITHDRAWAL_PAID;
+            }
             m_fact_outcomes.push_back(std::move(outcome));
         }
         return Ok();
@@ -573,6 +627,24 @@ private:
         for (size_t rank{0}; rank < Count(); ++rank) {
             const SlotAction& a{At(rank)};
             if (a.phase != SlotPhase::ACCOUNT) continue;
+            if (a.action.Action().kind == ActionKind::WITHDRAW) {
+                const WithdrawPayload& withdrawal{std::get<WithdrawPayload>(a.payload)};
+                const bool known{Ledger().Withdrawals().contains(a.action.Id())};
+                const Result<OutcomeCode> code{Ledger().RequestWithdrawal(a.action.Id(), a.action.Account(), withdrawal, m_slot.Height())};
+                if (!code.has_value()) return code.error();
+                ActionRecord& record{m_records[rank]};
+                record.code = *code;
+                if (*code == OutcomeCode::WITHDRAWAL_PENDING && !known) {
+                    const Result<Atoms> debit{AddAtoms(withdrawal.amount, m_profile.withdrawal_fee_atoms)};
+                    if (!debit.has_value()) return debit.error();
+                    const Result<void> delta{record.deltas.Add(a.action.Account(), withdrawal.asset, -*debit, 0)};
+                    if (!delta.has_value()) return delta.error();
+                    const Result<Atoms> fees{AddAtoms(m_fees[withdrawal.asset], m_profile.withdrawal_fee_atoms)};
+                    if (!fees.has_value()) return fees.error();
+                    m_fees[withdrawal.asset] = *fees;
+                }
+                continue;
+            }
             const TransferPayload& t{std::get<TransferPayload>(a.payload)};
             const Result<OutcomeCode> code{Ledger().Transfer(a.action.Account(), t.to, t.asset, t.amount)};
             if (!code.has_value()) return code.error();
@@ -973,6 +1045,11 @@ Result<SlotResult> Engine::ApplySlot(const HeadView& parent, const ValidatedSlot
     if (slot.ParentHash() != parent.HeaderHash()) return Error{ErrorCode::STALE_PARENT, "slot validated against another parent"};
     if (slot.Inputs().profile_hash != ProfileHash(m_profile) || !(parent.State().ledger.Profile() == m_profile)) {
         return Invalid("slot or parent under another profile");
+    }
+    // Recheck at application: ValidatedSlot's parent hash binds the header,
+    // but a direct caller may have replaced the value-type parent books.
+    for (const auto& entry : parent.State().books.Books()) {
+        if (const Result<void> policy{ValidateMarketForProfile(entry.second.Market(), m_profile)}; !policy.has_value()) return policy.error();
     }
     for (const auto& [asset, totals] : parent.State().ledger.Totals()) {
         if (totals.fees_held != 0) return Broken("parent holds undistributed fees");

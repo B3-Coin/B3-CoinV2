@@ -106,7 +106,7 @@ Result<void> DevSingleSeatCertifier::Propose(const state::Candidate& candidate, 
     Result<DurableDecision> durable_decision{m_commit_log.Confirm(*decision)};
     if (!durable_decision.has_value()) return durable_decision.error();
 
-    m_decision.emplace(agreement::Decision{std::move(durable_decision).value(), std::move(certificate), candidate.Body()});
+    m_decision.emplace(agreement::Decision{std::move(durable_decision).value(), std::move(certificate), candidate.Body(), header});
     return Ok();
 }
 

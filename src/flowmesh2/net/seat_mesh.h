@@ -83,6 +83,7 @@ inline constexpr std::string_view MESH_SEAT_RANGE{"seat index outside the mesh"}
 inline constexpr std::string_view MESH_SELF{"a seat does not send to itself"};                                    //!< (INVALID_INPUT)
 inline constexpr std::string_view MESH_FRAME_OVERSIZE{"frame above the mesh's max_frame_bytes"};                  //!< (OVERSIZE)
 inline constexpr std::string_view MESH_VOTE_NOT_TYPED{"a vote leaves only through SendVote"};                      //!< (INVALID_INPUT)
+inline constexpr std::string_view MESH_CONTROL_NOT_TYPED{"a control signature leaves only through SendDurableControl"}; //!< (INVALID_INPUT)
 inline constexpr std::string_view MESH_LANE_CONTENT{"the frame is not a message of its lane"};                    //!< (INVALID_INPUT)
 
 struct MeshConfig {
@@ -117,6 +118,10 @@ public:
     Result<void> Send(uint32_t seat, Lane lane, std::span<const unsigned char> bytes);
     //! agreement::MessageSink: an encoded agreement message, routed by its type; a VOTE is refused.
     Result<void> Send(uint32_t seat, std::span<const unsigned char> message) final;
+    Result<void> SendDurableVote(uint32_t seat, const agreement::OutboundVote& vote, const uint256& header_hash,
+                                 std::span<const unsigned char> message) final;
+    Result<void> SendDurableControl(uint32_t seat, const agreement::OutboundControl& control,
+                                    std::span<const unsigned char> message) final;
 
     //! The next frame received from another seat; nullopt when none is waiting.
     virtual Result<std::optional<InboundFrame>> Poll() = 0;

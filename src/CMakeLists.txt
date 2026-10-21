@@ -554,6 +554,20 @@ if(B3_BRIDGE_TOOLS)
       univalue
   )
 
+  # Read-only peer proof verifier. Never linked into the node.
+  add_executable(b3-bridge-peercheck bridge/peercheck.cpp)
+  target_link_libraries(b3-bridge-peercheck
+    PRIVATE
+      core_interface
+      b3_blst
+      bitcoin_consensus
+      bitcoin_common
+      bitcoin_util
+      bitcoin_crypto
+      secp256k1
+      univalue
+  )
+
   # Offline, deterministic 3-of-4 BLS bootstrap proof/calldata builder for
   # B3FinalityVerifier.initialize. Public manifests and signatures only.
   add_executable(b3-bridge-bootstrap-proof bridge/bootstrap_proof.cpp)

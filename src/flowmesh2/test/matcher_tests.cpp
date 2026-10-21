@@ -735,4 +735,27 @@ BOOST_AUTO_TEST_CASE(residual_cross_detection)
     BOOST_CHECK(fx.book == before);
 }
 
+BOOST_AUTO_TEST_CASE(stable_q_refuses_a_native_quote_sweep_without_changes)
+{
+    const ProfileParams profile{StableQRegtestProfile(ChainType::REGTEST).value()};
+    EngineFixture fx{MarketDescriptor{TestAsset("TOK"), AssetId::Native(), 1, 1}, profile};
+    const auto before{fx.ledger.CheckConservation()};
+    RequireOk(before, "empty stable-Q ledger");
+    std::vector<Taker> takers;
+    SlotFillBudget budget;
+    const auto swept{SweepA2(fx.book, fx.ledger, takers, profile, budget)};
+    BOOST_REQUIRE(!swept.has_value());
+    BOOST_CHECK_EQUAL(swept.error().detail, STABLE_QUOTE_REQUIRED);
+    BOOST_CHECK_EQUAL(budget.remaining, 0U);
+    BOOST_CHECK(fx.book.Orders().empty());
+    RequireOk(fx.ledger.CheckConservation(), "refused stable-Q sweep conservation");
+    // A direct caller cannot downgrade a stable-Q ledger by supplying the
+    // legacy profile, even though that profile would allow this quote asset.
+    const auto downgraded{SweepA2(fx.book, fx.ledger, takers, RegtestProfile(), budget)};
+    BOOST_REQUIRE(!downgraded.has_value());
+    BOOST_CHECK_EQUAL(downgraded.error().detail, "matcher profile differs from ledger profile");
+    BOOST_CHECK_EQUAL(budget.remaining, 0U);
+    BOOST_CHECK(fx.book.Orders().empty());
+}
+
 BOOST_AUTO_TEST_SUITE_END()

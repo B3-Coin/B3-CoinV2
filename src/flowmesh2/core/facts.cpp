@@ -23,6 +23,7 @@ bool IsKnown(FactKind kind)
     case FactKind::CHECKPOINT_ACCEPTED:
     case FactKind::PAYOUT_CONFIRMED:
     case FactKind::EXIT_NULLIFIER:
+    case FactKind::SOURCE_RANGE:
         return true;
     }
     return false;
@@ -37,6 +38,7 @@ std::string_view ToString(FactKind kind)
     case FactKind::CHECKPOINT_ACCEPTED: return "CHECKPOINT_ACCEPTED";
     case FactKind::PAYOUT_CONFIRMED: return "PAYOUT_CONFIRMED";
     case FactKind::EXIT_NULLIFIER: return "EXIT_NULLIFIER";
+    case FactKind::SOURCE_RANGE: return "SOURCE_RANGE";
     }
     return "UNKNOWN";
 }
@@ -56,9 +58,11 @@ FactKind KindOf(const Fact& fact)
                 return FactKind::CHECKPOINT_ACCEPTED;
             } else if constexpr (std::is_same_v<T, PayoutConfirmedFact>) {
                 return FactKind::PAYOUT_CONFIRMED;
-            } else {
-                static_assert(std::is_same_v<T, ExitNullifierFact>, "every Fact alternative has a kind");
+            } else if constexpr (std::is_same_v<T, ExitNullifierFact>) {
                 return FactKind::EXIT_NULLIFIER;
+            } else {
+                static_assert(std::is_same_v<T, SourceRangeFact>, "every Fact alternative has a kind");
+                return FactKind::SOURCE_RANGE;
             }
         },
         fact);
@@ -98,14 +102,40 @@ Result<std::vector<unsigned char>> EncodeFact(const CheckpointAcceptedFact&)
     return NotImplemented("MB1-B3D-02"); // TODO(rebirth:MB1-B3D-02) checkpoint acceptance fact fields and codec
 }
 
-Result<std::vector<unsigned char>> EncodeFact(const PayoutConfirmedFact&)
+bool PayoutConfirmedFact::IsCanonical() const
 {
-    return NotImplemented("M8-BRG-02"); // TODO(rebirth:M8-BRG-02) payout confirmation fact fields and codec
+    return !withdrawal.id.IsNull() && !account.id.IsNull() && !asset.IsNative() && amount > 0 && InAtomRange(amount) &&
+           std::any_of(recipient.begin(), recipient.end(), [](unsigned char b) { return b != 0; }) &&
+           !payout_event.txid.IsNull() && !domain.IsNull();
+}
+
+Result<std::vector<unsigned char>> EncodeFact(const PayoutConfirmedFact& fact)
+{
+    if (!fact.IsCanonical()) return Error{ErrorCode::INVALID_INPUT, "noncanonical payout confirmation"};
+    std::vector<unsigned char> out;
+    VectorWriter writer{out, 0};
+    writer << static_cast<uint8_t>(FactKind::PAYOUT_CONFIRMED) << fact;
+    return Ok(std::move(out));
 }
 
 Result<std::vector<unsigned char>> EncodeFact(const ExitNullifierFact&)
 {
     return NotImplemented("M8-EXIT-01"); // TODO(rebirth:M8-EXIT-01) forced-exit nullifier fact fields and codec
+}
+
+bool SourceRangeFact::IsCanonical() const
+{
+    return !domain.IsNull() && chain_id != 0 && !previous_hash.IsNull() && !to_hash.IsNull() && confirmations != 0 &&
+           to_height >= previous_height && (to_height != previous_height || to_hash == previous_hash);
+}
+
+Result<std::vector<unsigned char>> EncodeFact(const SourceRangeFact& fact)
+{
+    if (!fact.IsCanonical()) return Error{ErrorCode::INVALID_INPUT, "noncanonical source range commitment"};
+    std::vector<unsigned char> out;
+    VectorWriter writer{out, 0};
+    writer << static_cast<uint8_t>(FactKind::SOURCE_RANGE) << fact;
+    return Ok(std::move(out));
 }
 
 Result<uint256> FactId(const Fact& fact)
@@ -132,10 +162,18 @@ Result<Fact> DecodeFact(std::span<const unsigned char> bytes)
         return NotImplemented("M7-GOV-01"); // TODO(rebirth:M7-GOV-01)
     case FactKind::CHECKPOINT_ACCEPTED:
         return NotImplemented("MB1-B3D-02"); // TODO(rebirth:MB1-B3D-02)
-    case FactKind::PAYOUT_CONFIRMED:
-        return NotImplemented("M8-BRG-02"); // TODO(rebirth:M8-BRG-02)
+    case FactKind::PAYOUT_CONFIRMED: {
+        auto payout{DecodeExact<PayoutConfirmedFact>(body, PayoutConfirmedFact::BODY_BYTES)};
+        if (!payout.has_value()) return payout.error();
+        return Ok(Fact{std::move(*payout)});
+    }
     case FactKind::EXIT_NULLIFIER:
         return NotImplemented("M8-EXIT-01"); // TODO(rebirth:M8-EXIT-01)
+    case FactKind::SOURCE_RANGE: {
+        auto source{DecodeExact<SourceRangeFact>(body, SourceRangeFact::BODY_BYTES)};
+        if (!source.has_value()) return source.error();
+        return Ok(Fact{std::move(*source)});
+    }
     }
     return Error{ErrorCode::DECODE, "unknown fact kind"};
 }

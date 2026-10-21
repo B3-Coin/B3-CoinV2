@@ -246,4 +246,18 @@ BOOST_AUTO_TEST_CASE(reexecute_on_checks_genesis_and_parent)
                    state::REEXECUTE_HEADER_MISMATCH, "another parent certificate");
 }
 
+
+BOOST_AUTO_TEST_CASE(version_two_parent_link_is_independent_of_certificate_subset)
+{
+    CandidateFixture fx{StableQRegtestProfile(ChainType::REGTEST).value()};
+    const auto first{fx.Build(fx.Inputs({}, {}))};
+    fx.Advance(first, LabelHash("certificate/subset/012"));
+    const auto second_a{fx.Build(fx.Inputs({}, {}))};
+    BOOST_CHECK(second_a.Header().parent_cert_hash == first.Header().Hash());
+    fx.Advance(first, LabelHash("certificate/subset/123"));
+    const auto second_b{fx.Build(fx.Inputs({}, {}))};
+    BOOST_CHECK(second_a.Header() == second_b.Header());
+    RequireOk(state::ReexecuteOn(fx.engine, fx.head, second_a.Header(), second_a.Body()), "alternate valid proof encoding does not fork child");
+}
+
 BOOST_AUTO_TEST_SUITE_END()

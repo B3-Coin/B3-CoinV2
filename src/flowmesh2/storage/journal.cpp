@@ -9,8 +9,13 @@
 
 namespace flowmesh2::storage {
 
-Journal::Journal(ImplKey, JournalRole role, uint64_t instance_id, BarrierObserver* observer)
-    : m_role{role}, m_instance_id{instance_id}, m_observer{observer}, m_chain{JournalGenesisChain(role, instance_id)}
+Journal::Journal(ImplKey, JournalRole role, uint64_t instance_id, BarrierObserver* observer, const ScanResult* recovered)
+    : m_role{role}, m_instance_id{instance_id}, m_observer{observer},
+      m_chain{recovered == nullptr ? JournalGenesisChain(role, instance_id) : recovered->last_chain},
+      m_appended_seq{recovered == nullptr ? 0 : recovered->records.size()},
+      m_durable_seq{m_appended_seq},
+      m_durable_offset{recovered == nullptr ? 0 : recovered->end_offset},
+      m_unwritten_offset{m_durable_offset}
 {
 }
 
@@ -62,6 +67,7 @@ Result<uint64_t> Journal::Barrier()
         m_barrier_running = false;
         if (persisted.has_value()) {
             m_durable_seq = std::max(m_durable_seq, target);
+            m_durable_offset = offset + bytes.size();
         } else {
             m_fatal = true;
         }
@@ -69,6 +75,12 @@ Result<uint64_t> Journal::Barrier()
     if (m_observer != nullptr) m_observer->OnBarrierEnd(m_role, m_instance_id, target, persisted.has_value());
     if (!persisted.has_value()) return Error{ErrorCode::STORAGE_FATAL, persisted.error().detail};
     return Ok(target);
+}
+
+uint64_t Journal::DurableImageSize() const
+{
+    LOCK(m_mutex);
+    return m_durable_offset;
 }
 
 JournalStatus Journal::Status() const

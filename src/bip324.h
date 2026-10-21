@@ -66,6 +66,14 @@ public:
      */
     void Initialize(const EllSwiftPubKey& their_pubkey, bool initiator, bool self_decrypt = false) noexcept;
 
+    /** Initialize for a separately authenticated overlay with an explicit
+     * network context. Callers must pin that context and authenticate both
+     * peers against GetSessionID(); BIP324 encryption alone is not identity
+     * authentication. Does not read or select global chain parameters.
+     */
+    void InitializeForNetwork(const EllSwiftPubKey& their_pubkey, bool initiator,
+                              const MessageStartChars& message_start) noexcept;
+
     /** Initialize with explicit network magic for published interoperability
      * test vectors. Production callers must use Initialize(). */
     void InitializeForTesting(const EllSwiftPubKey& their_pubkey, bool initiator,

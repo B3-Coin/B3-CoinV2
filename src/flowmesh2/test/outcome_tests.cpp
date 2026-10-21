@@ -193,7 +193,7 @@ BOOST_AUTO_TEST_CASE(decode_refusals)
     for (const unsigned char source : {0x00, 0x04, 0xff}) {
         CheckError(OutcomeV2::Decode(PatchedSample(0, {source}), profile), ErrorCode::DECODE);
     }
-    for (const uint16_t code : {uint16_t{0}, uint16_t{9}, uint16_t{63}, uint16_t{77}, uint16_t{97}, uint16_t{0xffff}}) {
+    for (const uint16_t code : {uint16_t{0}, uint16_t{11}, uint16_t{63}, uint16_t{77}, uint16_t{97}, uint16_t{0xffff}}) {
         CheckError(OutcomeV2::Decode(PatchedSample(73, {static_cast<unsigned char>(code & 0xff),
                                                          static_cast<unsigned char>(code >> 8)}),
                                      profile),

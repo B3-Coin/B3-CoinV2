@@ -135,7 +135,7 @@ public:
     uint64_t DurableSeq() const EXCLUSIVE_LOCKS_REQUIRED(!m_mutex) { return Status().durable_seq; }
     bool IsFatal() const EXCLUSIVE_LOCKS_REQUIRED(!m_mutex) { return Status().fatal; }
 
-    //! The durable records, in order (FileJournal: stub M4-STO-01).
+    //! The durable records, in order; unbarriered appends are excluded.
     virtual Result<std::vector<JournalRecord>> ReadAll() const = 0;
 
     //! Mint the durability token of a pending record; see the file comment.
@@ -163,7 +163,11 @@ protected:
         friend class FileJournal;
     };
 
-    Journal(ImplKey, JournalRole role, uint64_t instance_id, BarrierObserver* observer);
+    //! `recovered` is a fully validated, committed image scanned by FileJournal before publication.
+    Journal(ImplKey, JournalRole role, uint64_t instance_id, BarrierObserver* observer, const ScanResult* recovered = nullptr);
+
+    //! Immutable byte prefix covered by a successfully completed barrier; no lock across I/O.
+    uint64_t DurableImageSize() const EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
 
     /** Called with the journal lock held, before a framed record of `size`
      * bytes is queued at byte `offset` of the journal image; `append_number`
@@ -192,6 +196,7 @@ private:
     uint256 m_chain GUARDED_BY(m_mutex);
     uint64_t m_appended_seq GUARDED_BY(m_mutex){0};
     uint64_t m_durable_seq GUARDED_BY(m_mutex){0};
+    uint64_t m_durable_offset GUARDED_BY(m_mutex){0};
     bool m_fatal GUARDED_BY(m_mutex){false};
     uint64_t m_append_calls GUARDED_BY(m_mutex){0};
     uint64_t m_barrier_calls GUARDED_BY(m_mutex){0};
