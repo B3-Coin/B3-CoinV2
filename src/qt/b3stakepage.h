@@ -65,6 +65,7 @@ private Q_SLOTS:
     void setValidatorStatus(const B3ValidatorStatus& status);
     void bindFinalityKey();
     void createStake();
+    void releaseStake();
     void toggleStaking();
     void toggleCorridorMining();
     void operationSucceeded(const QString& operation, const QVariantMap& details);
@@ -85,6 +86,8 @@ private:
     B3ValidatorStatus m_status;
     std::unique_ptr<TransactionFilterProxy> m_rewards_filter;
     bool m_operation_busy{false};
+    //! The user asked to stop staking once the release is submitted.
+    bool m_stop_after_release{false};
     bool m_stake_amount_initialized{false};
     QString m_validator_key_full;
     QString m_bls_key_full;
@@ -112,6 +115,7 @@ private:
     QPushButton* m_backup{nullptr};
     BitcoinAmountField* m_stake_amount{nullptr};
     QPushButton* m_create_stake{nullptr};
+    QPushButton* m_release_stake{nullptr};
     QPushButton* m_start_stop{nullptr};
     QLabel* m_staking_security_note{nullptr};
     QPushButton* m_corridor_mining{nullptr};

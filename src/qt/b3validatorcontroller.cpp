@@ -120,6 +120,18 @@ B3ValidatorStatus ParseStatus(const UniValue& staking, const UniValue* finality)
     status.active_stake = AmountField(staking, "active");
     status.pending_stake = AmountField(staking, "pending");
     status.unconfirmed_stake = AmountField(staking, "unconfirmed");
+    const UniValue& stakes{staking.find_value("stakes")};
+    if (stakes.isArray()) {
+        for (const UniValue& item : stakes.getValues()) {
+            if (!item.isObject()) continue;
+            B3StakeOutput stake;
+            stake.txid = StringField(item, "txid");
+            stake.vout = IntField<int>(item, "vout", -1);
+            stake.amount = AmountField(item, "amount");
+            stake.status = StringField(item, "status");
+            if (!stake.txid.isEmpty() && stake.vout >= 0) status.stakes.push_back(std::move(stake));
+        }
+    }
 
     const UniValue& loop{staking.find_value("staking")};
     if (loop.isObject()) {
@@ -361,6 +373,24 @@ void B3ValidatorController::createStake(const CAmount amount)
     UniValue params{UniValue::VARR};
     params.push_back(std::move(amount_value));
     executeUnlocked(QStringLiteral("create_stake"), "createstake", params);
+}
+
+void B3ValidatorController::releaseStakes(const QList<B3StakeOutput>& stakes)
+{
+    if (stakes.isEmpty()) {
+        Q_EMIT operationFailed(QStringLiteral("release_stake"), tr("Select at least one stake to release."));
+        return;
+    }
+    UniValue outpoints{UniValue::VARR};
+    for (const B3StakeOutput& stake : stakes) {
+        UniValue outpoint{UniValue::VOBJ};
+        outpoint.pushKV("txid", stake.txid.toStdString());
+        outpoint.pushKV("vout", stake.vout);
+        outpoints.push_back(std::move(outpoint));
+    }
+    UniValue params{UniValue::VARR};
+    params.push_back(std::move(outpoints));
+    executeUnlocked(QStringLiteral("release_stake"), "releasestake", params);
 }
 
 QString B3ValidatorController::FinalityStartError(const UniValue& finality)

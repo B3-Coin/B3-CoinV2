@@ -78,6 +78,7 @@ static const CRPCConvertParam vRPCConvertParams[] =
     { "burnasset", 1, "amount" },
     { "burnasset", 2, "options" },
     { "createstake", 0, "amount" },
+    { "releasestake", 0, "outpoints" },
     { "createfncoin", 0, "address", ParamFormat::STRING },
     { "createfncoin", 1, "options" },
     { "bindflowmeshseat", 0, "address", ParamFormat::STRING },

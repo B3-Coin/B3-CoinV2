@@ -24,6 +24,15 @@ class WalletModel;
  * the wallet-scoped getstakinginfo/getfinalityinfo backends; the Qt view never
  * guesses chain state or key state.
  */
+//! One unspent STAKE output of this wallet, as getstakinginfo lists it.
+struct B3StakeOutput {
+    QString txid;
+    int vout{-1};
+    CAmount amount{0};
+    //! UNCONFIRMED, PENDING or ACTIVE.
+    QString status;
+};
+
 struct B3ValidatorStatus {
     bool valid{false};
     QString refresh_error;
@@ -53,6 +62,7 @@ struct B3ValidatorStatus {
     CAmount active_stake{0};
     CAmount pending_stake{0};
     CAmount unconfirmed_stake{0};
+    QList<B3StakeOutput> stakes;
 
     bool staking_available{false};
     bool staking_running{false};
@@ -101,6 +111,8 @@ public Q_SLOTS:
 
     void bindFinalityKey();
     void createStake(CAmount amount);
+    //! Unstake: spend these STAKE outputs back to this wallet (releasestake).
+    void releaseStakes(const QList<B3StakeOutput>& stakes);
     void startStaking();
     void stopStaking();
 

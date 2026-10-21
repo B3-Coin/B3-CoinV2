@@ -32,7 +32,7 @@ void B3StakeSettingsTests::stakePageDisablesActionsWithoutWallet()
     QVERIFY(no_wallet->text().contains(QStringLiteral("wallet"), Qt::CaseInsensitive));
     QVERIFY(!no_wallet->isHidden());
 
-    for (const char* name : {"stakeBindFinality", "stakeCreate", "stakeStartStop",
+    for (const char* name : {"stakeBindFinality", "stakeCreate", "stakeRelease", "stakeStartStop",
                              "stakeCorridorMining", "stakeBackupWallet"}) {
         const auto* button = page.findChild<QPushButton*>(QLatin1String(name));
         QVERIFY2(button != nullptr, name);
