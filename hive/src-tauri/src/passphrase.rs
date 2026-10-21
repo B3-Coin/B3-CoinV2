@@ -30,6 +30,10 @@ pub struct Request {
     pub wallet: String,
 }
 
+/// The fewest characters a new passphrase may have. The window asks for
+/// ten or more random characters, or several words.
+pub const MIN_CHARS: usize = 10;
+
 /// A typed passphrase. Its bytes are overwritten when it is dropped, so the
 /// copies the core holds do not linger in freed memory. Copies made on the
 /// way to the node (the JSON request and its body) are not reached.
@@ -121,6 +125,11 @@ pub fn check_entry(kind: Kind, entry: &Entry) -> Result<(), String> {
     if *entry.new != *entry.repeat {
         return Err("The new passphrases do not match.".into());
     }
+    if entry.new.chars().count() < MIN_CHARS {
+        return Err(
+            "Use at least ten characters: ten or more random characters, or several words.".into(),
+        );
+    }
     // The node would cut a passphrase at a zero byte (Bitcoin Core #27067).
     if entry.new.contains('\0') || entry.old.contains('\0') {
         return Err("A passphrase cannot contain a zero byte.".into());
@@ -197,6 +206,10 @@ mod tests {
         )
         .is_err());
         assert!(check_entry(Kind::Change, &entry("o", "new secret", "new secret")).is_ok());
+        // Ten characters at least, counted as characters, not bytes.
+        assert!(check_entry(Kind::Encrypt, &entry("", "123456789", "123456789")).is_err());
+        assert!(check_entry(Kind::Encrypt, &entry("", "1234567890", "1234567890")).is_ok());
+        assert!(check_entry(Kind::Encrypt, &entry("", "ééééééééé", "ééééééééé")).is_err());
         assert!(check_entry(Kind::Stake, &entry("pw", "", "")).is_ok());
         assert!(check_entry(Kind::Stake, &entry("", "", "")).is_err());
     }

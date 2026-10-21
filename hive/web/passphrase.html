@@ -37,8 +37,10 @@
           </div>
           <div class="field" id="new-field">
             <label for="new">New passphrase</label>
-            <input class="input" type="password" id="new" autocomplete="off" spellcheck="false" />
-            <span class="help">Use ten or more random characters, or eight or more words.</span>
+            <input class="input" type="password" id="new" autocomplete="off" spellcheck="false" aria-describedby="new-help strength-text" />
+            <div class="strength" id="strength" aria-hidden="true"><span class="bar"></span><span class="bar"></span><span class="bar"></span><span class="bar"></span></div>
+            <span class="help" id="new-help">At least ten characters. Ten or more random characters, or eight or more words, are better.</span>
+            <span class="help" id="strength-text" aria-live="polite"></span>
           </div>
           <div class="field" id="repeat-field">
             <label for="repeat">Repeat the new passphrase</label>
