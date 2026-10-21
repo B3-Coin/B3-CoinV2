@@ -1,0 +1,21 @@
+{
+  "name": "b3-hive",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "test": "node --experimental-strip-types --test web/test/*.test.ts",
+    "tauri": "tauri",
+    "package": "tauri build --config src-tauri/tauri.bundle.json"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "2.12.4"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "2.12.3",
+    "typescript": "7.0.2",
+    "vite": "8.3.4"
+  }
+}

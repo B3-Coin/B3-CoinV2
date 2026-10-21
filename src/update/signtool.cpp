@@ -22,6 +22,7 @@
 #include <update/manifest.h>
 #include <util/fs_helpers.h>
 #include <util/strencodings.h>
+#include <util/translation.h>
 
 #include <cstdio>
 #include <fstream>
@@ -37,6 +38,8 @@
 #include <fcntl.h>
 #include <unistd.h>
 #endif
+
+const TranslateFn G_TRANSLATION_FUN{nullptr};
 
 namespace {
 

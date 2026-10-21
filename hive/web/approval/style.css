@@ -1,0 +1,15 @@
+/* The approval window is one confirmation dialog filling its own window:
+   the modal parts from components.css without the backdrop. */
+
+.approval { height: 100dvh; display: flex; flex-direction: column; background: var(--bg-card); }
+.approval-draft { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.approval .modal-head { padding-top: var(--space-5); }
+.approval .modal-body { overflow-y: auto; }
+.approval .empty { margin-block: auto; }
+
+/* Output lines: the amount on the right, the address under its label. A
+   long address or id wraps under its label; the value keeps its width. */
+.approval .drow .dkey { flex: 1 1 auto; min-width: 0; }
+.approval .drow .dval { flex: 0 0 auto; max-width: 65%; }
+.approval .dhint { display: block; margin-top: 2px; font-size: var(--text-xs); font-weight: 400; color: var(--text-muted); }
+.approval .addr-line { display: block; margin-top: 2px; font-family: var(--font-mono); font-size: var(--text-xs); word-break: break-all; color: var(--text); }

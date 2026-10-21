@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Approve – B3 Hive</title>
+    <link rel="stylesheet" href="./shared/css/hive.css" />
+    <link rel="stylesheet" href="./approval/style.css" />
+  </head>
+  <body>
+    <div class="approval">
+      <div class="empty" id="empty" hidden>
+        <div class="empty-icon"><svg class="i" aria-hidden="true"><use href="/icons.svg#i-check" /></svg></div>
+        <h3>Nothing to approve</h3>
+        <p>Payments, stakes and orders you prepare in B3 Hive wait here for your decision.</p>
+      </div>
+
+      <section class="approval-draft" id="draft" hidden>
+        <div class="modal-head">
+          <div>
+            <h2 id="title">Approve this payment?</h2>
+            <p class="sub" id="from"></p>
+          </div>
+        </div>
+        <div class="modal-body stack">
+          <div class="stack" id="action-body" hidden>
+            <p id="action-text"></p>
+            <div class="details" id="action-rows"></div>
+          </div>
+          <div class="stack" id="pay-body">
+          <p id="pay-text"></p>
+          <div class="details" id="outputs"></div>
+          <div class="details">
+            <div class="drow"><span class="dkey">Network fee</span><span class="dval amt" id="fee"></span></div>
+            <div class="drow" id="total-row"><span class="dkey strong">Total leaving this wallet</span><span class="dval amt strong" id="total"></span></div>
+          </div>
+          <details class="disc disc--boxed">
+            <summary>
+              <svg class="i-sm caret" aria-hidden="true"><use href="/icons.svg#i-chevron-right" /></svg>
+              <span>Transaction details</span>
+            </summary>
+            <div class="disc-body details">
+              <div class="drow"><span class="dkey">Network</span><span class="dval" id="chain"></span></div>
+              <div class="drow"><span class="dkey">Coins spent</span><span class="dval tnum" id="inputs"></span></div>
+              <div class="drow" id="signed-row" hidden><span class="dkey">Inputs signed</span><span class="dval tnum" id="signed"></span></div>
+            </div>
+          </details>
+          </div>
+          <div class="field" id="pass-field" hidden>
+            <label for="pass">Wallet passphrase</label>
+            <input class="input" type="password" id="pass" autocomplete="off" spellcheck="false" />
+            <span class="help" id="pass-help"></span>
+          </div>
+          <div class="banner banner-danger" id="error" role="alert" hidden></div>
+        </div>
+        <div class="modal-foot">
+          <button class="btn btn-secondary" id="reject" type="button">Reject</button>
+          <button class="btn btn-primary" id="approve" type="button">Send now</button>
+        </div>
+      </section>
+    </div>
+    <script type="module" src="./approval/main.ts"></script>
+  </body>
+</html>

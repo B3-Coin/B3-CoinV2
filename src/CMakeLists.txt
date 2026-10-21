@@ -537,6 +537,23 @@ if(B3_UPDATE_TOOLS)
   )
 endif()
 
+if(B3_HIVE_UPDATER)
+  # Update helper of the B3 Hive app: runs the update manager over a pipe to
+  # the app, which only carries bytes (update/pipe.h). Never part of the node.
+  add_executable(b3-hive-update update/hive_update.cpp)
+  target_link_libraries(b3-hive-update
+    PRIVATE
+      core_interface
+      b3_update
+      bitcoin_common
+      bitcoin_util
+      bitcoin_crypto
+      univalue
+      secp256k1
+  )
+  install_binary_component(b3-hive-update)
+endif()
+
 if(B3_BRIDGE_TOOLS)
   # Relayer verifier and canonical payload emitter over the same header-only
   # bridge codec/verification stack the tests use. Tooling only; never linked

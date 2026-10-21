@@ -214,6 +214,7 @@ option(BUILD_BENCH "Build bench_bitcoin executable." OFF)
 option(B3_FINALITY_BENCH "Build the B3 finality benchmark harness (timing of the consensus BLS wrapper and MPA codecs)." OFF)
 option(B3_BRIDGE_TOOLS "Build the B3 bridge proof/payload verifier and bootstrap-calldata tools (operator/test tooling only, never part of the node)." OFF)
 option(B3_UPDATE_TOOLS "Build the offline B3 Hive release-manifest signing tool (b3hive-sign; operator tooling, never part of the node)." OFF)
+option(B3_HIVE_UPDATER "Build b3-hive-update, the update helper bundled with the B3 Hive app (hive/)." OFF)
 
 # Production B3 Hive update-channel trust is a build input. Public keys and
 # endpoint metadata are compiled into the GUI; private signing keys must stay

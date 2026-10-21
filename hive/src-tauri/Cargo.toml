@@ -1,0 +1,34 @@
+[package]
+name = "b3-hive"
+version = "0.0.0"
+description = "B3 Hive desktop app: Tauri shell and trusted Rust core"
+edition = "2021"
+rust-version = "1.77.2"
+publish = false
+
+[lib]
+name = "b3_hive"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+# arbitrary_precision keeps node amounts as their exact decimal text.
+serde_json = { version = "1", features = ["arbitrary_precision"] }
+# Plain HTTP to 127.0.0.1 for the node; HTTPS (rustls, bundled webpki
+# roots) only for update fetches, whose bytes b3-hive-update verifies.
+ureq = { version = "3", default-features = false, features = ["json", "rustls"] }
+hmac = "0.12"
+sha2 = "0.10"
+getrandom = "0.3"
+base64 = "0.22"
+# Chain bootstraps from the explorer are tar.zst archives (bootstrap.rs).
+tar = { version = "0.4", default-features = false }
+zstd = { version = "0.13", default-features = false }
+# QR codes for Receive; only the module grid, drawn by the page.
+qrcode = { version = "0.14", default-features = false }
+# Native file pickers, opened by the core only (no capability gives the
+# pages the dialog): restore and legacy import need a path the node opens.
+tauri-plugin-dialog = "2"

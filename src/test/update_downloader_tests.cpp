@@ -275,4 +275,25 @@ BOOST_AUTO_TEST_CASE(manifest_fetch_bounds)
     }
 }
 
+BOOST_AUTO_TEST_CASE(exclusive_create_never_reuses_a_path)
+{
+    const fs::path dir{m_args.GetDataDirBase() / "updates_exclusive"};
+    fs::create_directories(dir);
+    const fs::path path{dir / "file.part"};
+    FILE* f{CreateExclusive(path)};
+    BOOST_REQUIRE(f);
+    BOOST_CHECK_EQUAL(std::fwrite("ab", 1, 2, f), 2U);
+    BOOST_CHECK_EQUAL(std::fclose(f), 0);
+    // A second create of the same path fails and leaves the file alone.
+    BOOST_CHECK(!CreateExclusive(path));
+    BOOST_CHECK_EQUAL(fs::file_size(path), 2U);
+#ifndef WIN32
+    // A planted symlink is not followed, even to a missing target.
+    const fs::path link{dir / "link.part"};
+    fs::create_symlink(dir / "target", link);
+    BOOST_CHECK(!CreateExclusive(link));
+    BOOST_CHECK(!fs::exists(dir / "target"));
+#endif
+}
+
 BOOST_AUTO_TEST_SUITE_END()

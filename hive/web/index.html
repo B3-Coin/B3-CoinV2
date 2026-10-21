@@ -1,0 +1,1357 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>B3 Hive</title>
+    <link rel="stylesheet" href="./shared/css/hive.css" />
+  </head>
+  <body>
+    <a class="skip-link" href="#page-title">Skip to the page</a>
+    <div class="app">
+      <aside class="rail">
+        <div class="rail-brand">
+          <svg class="i-lg" aria-hidden="true"><use href="/icons.svg#i-hex" /></svg>
+          <span class="brand-text">B3 Hive</span>
+        </div>
+        <nav class="rail-nav" id="rail-nav" aria-label="Main">
+          <div class="nav-group">
+            <button class="nav-item" type="button" data-view="home" aria-current="page">
+              <svg class="i" aria-hidden="true"><use href="/icons.svg#i-home" /></svg>
+              <span class="nav-text">Home</span>
+            </button>
+          </div>
+          <div class="nav-group">
+            <div class="nav-group-head">Money</div>
+            <button class="nav-item" type="button" data-view="send">
+              <svg class="i" aria-hidden="true"><use href="/icons.svg#i-arrow-up" /></svg>
+              <span class="nav-text">Send</span>
+            </button>
+            <button class="nav-item" type="button" data-view="receive">
+              <svg class="i" aria-hidden="true"><use href="/icons.svg#i-arrow-down" /></svg>
+              <span class="nav-text">Receive</span>
+            </button>
+            <button class="nav-item" type="button" data-view="activity">
+              <svg class="i" aria-hidden="true"><use href="/icons.svg#i-activity" /></svg>
+              <span class="nav-text">Activity</span>
+            </button>
+            <button class="nav-item" type="button" data-view="stake">
+              <svg class="i" aria-hidden="true"><use href="/icons.svg#i-layers" /></svg>
+              <span class="nav-text">Stake</span>
+            </button>
+            <button class="nav-item" type="button" data-view="trade">
+              <svg class="i" aria-hidden="true"><use href="/icons.svg#i-repeat" /></svg>
+              <span class="nav-text">Trade</span>
+            </button>
+            <button class="nav-item" type="button" data-view="book">
+              <svg class="i" aria-hidden="true"><use href="/icons.svg#i-book" /></svg>
+              <span class="nav-text">Address book</span>
+            </button>
+            <button class="nav-item" type="button" data-view="wallets">
+              <svg class="i" aria-hidden="true"><use href="/icons.svg#i-wallet" /></svg>
+              <span class="nav-text">Wallets</span>
+            </button>
+          </div>
+          <div class="nav-group">
+            <div class="nav-group-head">System</div>
+            <button class="nav-item" type="button" id="open-console">
+              <svg class="i" aria-hidden="true"><use href="/icons.svg#i-terminal" /></svg>
+              <span class="nav-text">Console</span>
+            </button>
+            <button class="nav-item" type="button" data-view="network">
+              <svg class="i" aria-hidden="true"><use href="/icons.svg#i-users" /></svg>
+              <span class="nav-text">Network</span>
+            </button>
+            <button class="nav-item" type="button" data-view="settings">
+              <svg class="i" aria-hidden="true"><use href="/icons.svg#i-settings" /></svg>
+              <span class="nav-text">Settings</span>
+            </button>
+            <button class="nav-item" type="button" data-view="updates">
+              <svg class="i" aria-hidden="true"><use href="/icons.svg#i-download" /></svg>
+              <span class="nav-text">Updates</span>
+            </button>
+          </div>
+        </nav>
+        <div class="rail-foot">
+          <div class="field wallet-pick" id="wallet-pick-field" hidden>
+            <label class="sr-only" for="wallet-pick">Wallet</label>
+            <select class="select select-sm" id="wallet-pick" title="The wallet these pages use"></select>
+          </div>
+          <div class="wallet-badge" id="node-badge" data-state="no-wallet">
+            <svg class="i-sm" aria-hidden="true"><use href="/icons.svg#i-server" /></svg>
+            <span class="grow" id="node-badge-text">Starting</span>
+          </div>
+          <div class="rail-foot-row">
+            <button class="btn btn-ghost btn-sm btn-icon" type="button" id="mask" aria-pressed="false" aria-label="Hide amounts" title="Hide amounts">
+              <svg class="i" aria-hidden="true"><use id="mask-icon" href="/icons.svg#i-eye" /></svg>
+            </button>
+            <button class="btn btn-ghost btn-sm btn-icon" type="button" id="theme" aria-label="Switch theme">
+              <svg class="i" aria-hidden="true"><use id="theme-icon" href="/icons.svg#i-sun" /></svg>
+            </button>
+          </div>
+        </div>
+      </aside>
+
+      <div class="main">
+        <header class="page-head">
+          <div>
+            <h1 class="page-title" id="page-title" tabindex="-1">Home</h1>
+            <p class="page-sub" id="page-sub">Your balance and your node</p>
+          </div>
+        </header>
+
+        <div class="backdrop" id="detail-backdrop" hidden>
+          <div class="modal modal--lg" role="dialog" aria-modal="true" aria-labelledby="detail-title">
+            <div class="modal-head">
+              <div>
+                <h2 id="detail-title"></h2>
+                <div class="sub" id="detail-sub"></div>
+              </div>
+              <button class="btn btn-ghost btn-icon" type="button" id="detail-close" aria-label="Close">
+                <svg class="i" aria-hidden="true"><use href="/icons.svg#i-close" /></svg>
+              </button>
+            </div>
+            <div class="modal-body">
+              <div class="details" id="detail-rows"></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="backdrop" id="pick-backdrop" hidden>
+          <div class="modal modal--lg pick" role="dialog" aria-modal="true" aria-labelledby="pick-title">
+            <div class="modal-head">
+              <div>
+                <h2 id="pick-title">Choose an address</h2>
+                <div class="sub" id="pick-sub"></div>
+              </div>
+              <button class="btn btn-ghost btn-icon" type="button" id="pick-close" aria-label="Close">
+                <svg class="i" aria-hidden="true"><use href="/icons.svg#i-close" /></svg>
+              </button>
+            </div>
+            <div class="modal-body stack">
+              <div class="tabs" role="tablist" aria-label="Addresses">
+                <button class="tab" type="button" role="tab" id="pick-tab-book" aria-selected="true">Contacts</button>
+                <button class="tab" type="button" role="tab" id="pick-tab-mine" aria-selected="false">My addresses</button>
+              </div>
+              <input class="input" id="pick-search" type="search" autocomplete="off" spellcheck="false" placeholder="Search by label or address" aria-label="Search addresses" />
+              <div class="pick-list" id="pick-list"></div>
+              <p class="empty empty--tight" id="pick-empty" hidden></p>
+            </div>
+          </div>
+        </div>
+
+        <div class="backdrop" id="confirm-backdrop" hidden>
+          <div class="modal" role="alertdialog" aria-modal="true" aria-labelledby="confirm-title" aria-describedby="confirm-text">
+            <div class="modal-head">
+              <h2 id="confirm-title"></h2>
+            </div>
+            <div class="modal-body stack" id="confirm-text"></div>
+            <div class="modal-foot">
+              <button class="btn btn-secondary" type="button" id="confirm-no">Cancel</button>
+              <button class="btn btn-primary" type="button" id="confirm-yes"></button>
+            </div>
+          </div>
+        </div>
+
+        <div class="banner banner-danger" id="lock-warning" role="alert" hidden>
+          <svg class="i" aria-hidden="true"><use href="/icons.svg#i-alert" /></svg>
+          <div class="banner-body">
+            <strong>The wallet could not be locked</strong>
+            <div class="t-sm" id="lock-warning-text">Your last action went through, but the wallet may still be unlocked for a short while.</div>
+            <button class="btn btn-secondary btn-sm mt-2" id="lock-warning-lock" type="button">Lock the wallet</button>
+          </div>
+        </div>
+
+        <main class="view view--flow" id="view-setup" hidden>
+          <div class="stack">
+            <p class="flow-sub">
+              This data folder has no B3 chain yet. Choose how your node gets it. Your wallets and
+              settings in the folder are not touched either way.
+            </p>
+            <div class="card">
+              <div class="card-pad details">
+                <div class="drow"><span class="dkey">Data folder</span><span class="dval is-mono" id="setup-datadir"></span></div>
+              </div>
+            </div>
+
+            <div class="stack" id="setup-choices">
+              <button class="choice" type="button" id="choose-bootstrap" aria-pressed="false" disabled>
+                <span class="choice-icon"><svg class="i" aria-hidden="true"><use href="/icons.svg#i-download" /></svg></span>
+                <span class="choice-body">
+                  <span class="row"><strong>Download a bootstrap</strong><span class="badge badge-accent">Faster</span></span>
+                  <span class="help" id="bootstrap-summary">Reading the explorer's list…</span>
+                  <span class="help">
+                    A copy of the chain from explorer.b3hive.io, checked against the SHA-256 the
+                    explorer publishes for it. You trust the explorer for this copy; your node
+                    checks every block that comes after it.
+                  </span>
+                </span>
+              </button>
+              <button class="choice" type="button" id="choose-sync" aria-pressed="false">
+                <span class="choice-icon"><svg class="i" aria-hidden="true"><use href="/icons.svg#i-users" /></svg></span>
+                <span class="choice-body">
+                  <strong>Sync from the network</strong>
+                  <span class="help">
+                    Your node downloads and checks every block from its peers. Trusts no one, but
+                    takes much longer.
+                  </span>
+                </span>
+              </button>
+              <button class="btn btn-primary btn-block" type="button" id="setup-go" disabled>Choose an option</button>
+            </div>
+
+            <div class="card" id="setup-progress" hidden>
+              <div class="card-head">
+                <h2 class="row"><svg class="i" aria-hidden="true"><use href="/icons.svg#i-download" /></svg>Installing the bootstrap</h2>
+                <span class="badge badge-info" id="setup-phase">Downloading</span>
+              </div>
+              <div class="card-pad">
+                <div class="progress"><div class="progress-bar" id="setup-bar"></div></div>
+                <p class="t-sm muted mt-2 tnum" id="setup-detail"></p>
+              </div>
+              <div class="card-foot">
+                <button class="btn btn-secondary" type="button" id="setup-cancel">Cancel</button>
+              </div>
+            </div>
+
+            <div class="banner" id="setup-result" role="status" hidden></div>
+          </div>
+        </main>
+
+        <main class="view" id="view-home">
+          <div class="stack">
+            <div class="banner banner-info" id="node-banner" role="status">
+              <span class="spinner" id="node-banner-spinner"></span>
+              <svg class="i" id="node-banner-icon" aria-hidden="true" hidden><use href="/icons.svg#i-alert-circle" /></svg>
+              <div class="banner-body">
+                <strong id="node-banner-title">Starting the node</strong>
+                <div class="t-sm" id="node-banner-detail"></div>
+                <div class="progress mt-2" id="node-banner-progress" hidden><div class="progress-bar" id="node-banner-bar"></div></div>
+                <div class="t-sm muted mt-1" id="node-banner-elapsed" hidden></div>
+                <button class="btn btn-secondary btn-sm mt-3" id="restart-node" type="button" hidden>
+                  <svg class="i-sm" aria-hidden="true"><use href="/icons.svg#i-refresh" /></svg><span>Start the node again</span>
+                </button>
+              </div>
+            </div>
+
+            <div class="banner banner-warning" id="node-warnings" role="status" hidden>
+              <svg class="i" aria-hidden="true"><use href="/icons.svg#i-alert" /></svg>
+              <div>
+                <strong>The node reports a warning</strong>
+                <div class="t-sm" id="node-warnings-text"></div>
+              </div>
+            </div>
+
+            <div class="home-grid">
+              <div class="card span-2" id="wallet" hidden>
+                <div class="hero">
+                  <div class="hero-figure">
+                    <span class="label">Spendable balance</span>
+                    <div id="spendable"></div>
+                    <div class="hero-chips">
+                      <span class="badge badge-info" id="pending-chip" hidden>
+                        <svg class="i-sm" aria-hidden="true"><use href="/icons.svg#i-clock" /></svg>
+                        <span id="pending"></span>
+                      </span>
+                      <span class="badge badge-neutral" id="immature-chip" hidden>
+                        <svg class="i-sm" aria-hidden="true"><use href="/icons.svg#i-clock" /></svg>
+                        <span id="immature"></span>
+                      </span>
+                      <span class="badge badge-neutral">
+                        <svg class="i-sm" aria-hidden="true"><use href="/icons.svg#i-wallet" /></svg>
+                        <span id="wallet-name"></span>
+                      </span>
+                      <span class="badge" id="security-chip">
+                        <svg class="i-sm" aria-hidden="true"><use id="security-icon" href="/icons.svg#i-lock" /></svg>
+                        <span id="security"></span>
+                      </span>
+                    </div>
+                    <p class="t-xs warn hero-stale" id="wallet-stale" role="status" hidden></p>
+                  </div>
+                  <div class="hero-actions">
+                    <button class="btn btn-primary" type="button" data-view="send">
+                      <svg class="i" aria-hidden="true"><use href="/icons.svg#i-arrow-up" /></svg><span>Send</span>
+                    </button>
+                    <button class="btn btn-secondary" type="button" id="fund" hidden>
+                      <svg class="i" aria-hidden="true"><use href="/icons.svg#i-plus" /></svg><span>Mine regtest blocks</span>
+                    </button>
+                  </div>
+                </div>
+              </div>
+
+              <div class="card span-2" id="no-wallet" hidden>
+                <div class="empty empty--tight">
+                  <div class="empty-icon"><svg class="i" aria-hidden="true"><use href="/icons.svg#i-wallet" /></svg></div>
+                  <h3>No wallet loaded</h3>
+                  <p>The node has not loaded a wallet. Open one from the wallets folder, or create one.</p>
+                  <button class="btn btn-secondary mt-2" type="button" data-view="wallets">Go to Wallets</button>
+                </div>
+              </div>
+
+              <div class="card" id="chain" hidden>
+                <div class="card-head">
+                  <h2 class="row"><svg class="i" aria-hidden="true"><use href="/icons.svg#i-server" /></svg>Node</h2>
+                  <span class="badge badge-success" id="sync-badge"><span class="dot"></span><span id="sync-badge-text">Running</span></span>
+                </div>
+                <div class="card-pad details">
+                  <div class="drow"><span class="dkey">Network</span><span class="dval" id="chain-name"></span></div>
+                  <div class="drow"><span class="dkey">Blocks</span><span class="dval tnum" id="chain-blocks"></span></div>
+                  <div class="drow"><span class="dkey">Best block</span><span class="dval is-mono" id="chain-best"></span></div>
+                  <div class="drow"><span class="dkey">Block time</span><span class="dval tnum" id="chain-time">—</span></div>
+                  <div class="drow"><span class="dkey">Peers</span><span class="dval tnum" id="chain-peers">—</span></div>
+                  <div class="drow"><span class="dkey">Waiting to confirm</span><span class="dval tnum" id="chain-mempool">—</span></div>
+                  <div id="sync" hidden>
+                    <div class="drow"><span class="dkey">Verified</span><span class="dval tnum" id="sync-percent"></span></div>
+                    <div class="progress mt-2"><div class="progress-bar" id="sync-bar"></div></div>
+                  </div>
+                </div>
+              </div>
+
+              <div class="card" id="era-card" hidden>
+                <div class="card-head">
+                  <h2 class="row"><svg class="i" aria-hidden="true"><use href="/icons.svg#i-layers" /></svg>Network era</h2>
+                  <span class="t-sm muted tnum" id="era-height"></span>
+                </div>
+                <div class="card-pad">
+                  <p><strong id="era-name"></strong></p>
+                  <p class="t-sm muted mt-2" id="era-detail"></p>
+                </div>
+              </div>
+
+              <div class="card" id="staking-card" hidden>
+                <div class="card-head">
+                  <h2 class="row"><svg class="i" aria-hidden="true"><use href="/icons.svg#i-spark" /></svg>Staking</h2>
+                  <span class="badge" id="staking-badge"></span>
+                </div>
+                <div class="card-pad">
+                  <ul class="plain-lines" id="staking-lines"></ul>
+                  <p class="t-sm muted mt-2">Start and stop staking, and make stakes, on the <a href="#" id="staking-go">Stake page</a>.</p>
+                </div>
+              </div>
+
+              <div class="card" id="recent" hidden>
+                <div class="card-head">
+                  <h2 class="row"><svg class="i" aria-hidden="true"><use href="/icons.svg#i-activity" /></svg>Recent activity</h2>
+                  <button class="btn btn-ghost btn-sm" type="button" data-view="activity">View all</button>
+                </div>
+                <div id="recent-list"></div>
+              </div>
+            </div>
+          </div>
+        </main>
+
+        <main class="view view--flow" id="view-send" hidden>
+          <form class="card" id="send" novalidate>
+            <div class="card-pad form-grid">
+              <div id="recipients"></div>
+              <button class="btn btn-ghost btn-sm send-add" type="button" id="send-add">
+                <svg class="i-sm" aria-hidden="true"><use href="/icons.svg#i-plus" /></svg>Pay someone else in the same transaction
+              </button>
+              <details class="disc disc--boxed" id="send-options">
+                <summary>
+                  <svg class="i-sm caret" aria-hidden="true"><use href="/icons.svg#i-chevron-right" /></svg>
+                  <span>Fee and coins</span>
+                </summary>
+                <div class="disc-body form-grid">
+                  <div class="field">
+                    <label for="send-fee">Fee rate</label>
+                    <div class="amount-field">
+                      <input class="input" id="send-fee" inputmode="decimal" autocomplete="off" placeholder="Automatic" />
+                      <span class="unit">B3/kvB</span>
+                    </div>
+                    <span class="help">B3 per 1000 virtual bytes. Leave empty to let the wallet choose.</span>
+                  </div>
+                  <label class="check">
+                    <input type="checkbox" id="send-cc" />
+                    <span class="check-body">
+                      <span>Choose which coins to spend</span>
+                      <span class="help">Only the chosen coins are spent; any change comes back to this wallet.</span>
+                    </span>
+                  </label>
+                  <div id="send-coins" hidden>
+                    <div class="stack" id="cc-tools" hidden>
+                      <p class="help" id="cc-help"></p>
+                      <div class="btn-row">
+                        <button class="btn btn-secondary btn-sm" type="button" id="cc-enough">Enough for the amount</button>
+                        <button class="btn btn-secondary btn-sm" type="button" id="cc-smallest">Smallest 50</button>
+                        <button class="btn btn-secondary btn-sm" type="button" id="cc-largest">Largest 50</button>
+                        <button class="btn btn-secondary btn-sm" type="button" id="cc-fit">As many as fit</button>
+                        <button class="btn btn-ghost btn-sm" type="button" id="cc-clear">Clear</button>
+                      </div>
+                      <input class="input" id="cc-search" type="search" autocomplete="off" spellcheck="false" placeholder="Search by address, label or amount" hidden />
+                    </div>
+                    <div class="row coin-sum"><span class="muted">Chosen</span><span id="send-coins-sum"></span></div>
+                    <p class="help" id="cc-size" hidden></p>
+                    <div class="coin-list" id="send-coin-list"></div>
+                    <p class="help mt-2" id="cc-more" hidden></p>
+                    <div class="empty empty--tight" id="send-coins-empty" hidden>No coins to spend yet.</div>
+                    <button class="btn btn-secondary btn-sm mt-3" type="button" id="cc-combine" disabled>Combine the chosen coins into one</button>
+                  </div>
+                </div>
+              </details>
+              <div class="callout callout-info">
+                <div class="callout-title">
+                  <svg class="i-sm" aria-hidden="true"><use href="/icons.svg#i-shield" /></svg>Nothing is sent yet
+                </div>
+                The payment opens in its own approval window with the exact amount, fee and
+                destination. It is sent only if you approve it there.
+              </div>
+            </div>
+            <div class="card-foot">
+              <button class="btn btn-primary btn-block" type="submit" id="send-submit">Review payment</button>
+            </div>
+          </form>
+          <div class="banner mt-4" id="send-result" role="status" hidden></div>
+          <datalist id="book-options"></datalist>
+
+          <div class="card mt-5" id="psbt">
+            <div class="card-head">
+              <h2 class="row"><svg class="i" aria-hidden="true"><use href="/icons.svg#i-key" /></svg>Partially signed transaction</h2>
+            </div>
+            <div class="card-pad form-grid">
+              <p class="t-sm muted">A PSBT made by another wallet or device. Read it here, sign the parts this wallet holds keys for, or broadcast it once every input is signed.</p>
+              <div class="field">
+                <label for="psbt-text">PSBT</label>
+                <textarea class="textarea mono" id="psbt-text" rows="4" spellcheck="false" autocomplete="off" placeholder="Paste a base64 PSBT"></textarea>
+              </div>
+              <div class="btn-row">
+                <button class="btn btn-secondary btn-sm" type="button" id="psbt-read">Read PSBT</button>
+                <button class="btn btn-secondary btn-sm" type="button" id="psbt-open">Open a PSBT file</button>
+                <input type="file" id="psbt-file" accept=".psbt,.txt,application/octet-stream,text/plain" hidden />
+              </div>
+              <div class="stack" id="psbt-view" hidden>
+                <div class="details" id="psbt-outputs"></div>
+                <div class="details" id="psbt-rows"></div>
+                <div class="btn-row">
+                  <button class="btn btn-primary btn-sm" type="button" id="psbt-sign">Sign with this wallet</button>
+                  <button class="btn btn-primary btn-sm" type="button" id="psbt-send">Broadcast</button>
+                  <button class="btn btn-secondary btn-sm" type="button" id="psbt-copy">Copy PSBT</button>
+                  <button class="btn btn-secondary btn-sm" type="button" id="psbt-save">Save PSBT file</button>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div class="banner mt-4" id="psbt-result" role="status" hidden></div>
+        </main>
+
+        <main class="view" id="view-receive" hidden>
+          <div class="banner banner-danger mb-4" id="rcv-result" role="alert" hidden></div>
+          <div class="rcv-grid">
+            <div class="card rcv-main">
+              <div class="card-head">
+                <h2 class="row"><svg class="i" aria-hidden="true"><use href="/icons.svg#i-qr" /></svg>Your address</h2>
+                <button class="btn btn-secondary btn-sm" type="button" id="rcv-new-open">
+                  <svg class="i-sm" aria-hidden="true"><use href="/icons.svg#i-plus" /></svg>New address
+                </button>
+              </div>
+              <form class="card-pad form-grid rcv-new" id="rcv-new" novalidate hidden>
+                <div class="field">
+                  <label for="rcv-label">What is it for?</label>
+                  <input class="input" id="rcv-label" autocomplete="off" maxlength="200" placeholder="Optional, e.g. Exchange withdrawals" />
+                  <span class="help">The label stays in your wallet, to recognise payments to this address.</span>
+                </div>
+                <div class="btn-row">
+                  <button class="btn btn-primary" type="submit" id="rcv-submit">Create address</button>
+                  <button class="btn btn-ghost" type="button" id="rcv-new-cancel">Cancel</button>
+                </div>
+              </form>
+
+              <div class="card-pad receive-request" id="rcv-show" hidden>
+                <svg class="qr" id="rcv-qr" role="img" aria-label="QR code of the payment link"></svg>
+                <p class="t-sm muted t-center" id="rcv-qr-note" hidden>This link is too long for a QR code. Shorten the message.</p>
+                <div class="rcv-id">
+                  <div class="row gap-2 rcv-label-row" id="rcv-label-row">
+                    <strong id="rcv-label-text"></strong>
+                    <button class="btn btn-ghost btn-icon btn-sm" type="button" id="rcv-rename" aria-label="Rename this address" title="Rename">
+                      <svg class="i-sm" aria-hidden="true"><use href="/icons.svg#i-pen" /></svg>
+                    </button>
+                  </div>
+                  <form class="row gap-2 rcv-label-row" id="rcv-rename-form" novalidate hidden>
+                    <input class="input" id="rcv-rename-input" autocomplete="off" maxlength="200" aria-label="Label" placeholder="Label" />
+                    <button class="btn btn-primary btn-sm" type="submit">Save</button>
+                    <button class="btn btn-ghost btn-sm" type="button" id="rcv-rename-cancel">Cancel</button>
+                  </form>
+                  <code class="rcv-addr" id="rcv-addr"></code>
+                  <p class="t-sm rcv-asked" id="rcv-asked" hidden></p>
+                </div>
+                <div class="btn-row rcv-actions">
+                  <button class="btn btn-primary" type="button" id="rcv-copy">
+                    <svg class="i-sm" aria-hidden="true"><use href="/icons.svg#i-copy" /></svg><span>Copy address</span>
+                  </button>
+                  <button class="btn btn-secondary" type="button" id="rcv-copy-link">
+                    <svg class="i-sm" aria-hidden="true"><use href="/icons.svg#i-copy" /></svg><span>Copy payment link</span>
+                  </button>
+                </div>
+                <p class="help t-center" id="rcv-new-hint">Anyone can pay you at this address. Sharing it is safe: it cannot be used to spend your coins.</p>
+                <p class="help t-center" id="rcv-used-note" hidden>This address has been paid before. You can reuse it, but a new address for each payer keeps your payments apart.</p>
+                <p class="help t-center" id="rcv-change-note" hidden>The wallet made this address for its own use: change from your payments, staking or FlowMesh. It works, but give out a receiving address instead.</p>
+                <details class="disc disc--boxed rcv-ask">
+                  <summary>
+                    <svg class="i-sm caret" aria-hidden="true"><use href="/icons.svg#i-chevron-right" /></svg>
+                    <span>Ask for a specific amount</span>
+                  </summary>
+                  <div class="disc-body form-grid">
+                    <div class="field">
+                      <label for="rcv-amount">Amount</label>
+                      <div class="amount-field">
+                        <input class="input" id="rcv-amount" inputmode="decimal" autocomplete="off" placeholder="Optional" />
+                        <span class="unit">B3</span>
+                      </div>
+                    </div>
+                    <div class="field">
+                      <label for="rcv-message">Message</label>
+                      <input class="input" id="rcv-message" autocomplete="off" maxlength="200" placeholder="Optional" />
+                      <span class="help">Both only go into the payment link and QR code. Nothing is stored or sent on the network.</span>
+                    </div>
+                  </div>
+                </details>
+              </div>
+
+              <div class="empty" id="rcv-none" hidden>
+                <h3>No address yet</h3>
+                <p>Create an address to get paid. It costs nothing.</p>
+                <button class="btn btn-primary" type="button" id="rcv-first">Create an address</button>
+              </div>
+            </div>
+
+            <div class="card">
+              <div class="card-head">
+                <h2 class="row"><svg class="i" aria-hidden="true"><use href="/icons.svg#i-book" /></svg>All your addresses</h2>
+                <span class="t-sm muted tnum" id="rcv-count"></span>
+              </div>
+              <div class="card-pad rcv-tools" id="rcv-tools" hidden>
+                <input class="input" id="rcv-search" type="search" autocomplete="off" spellcheck="false" placeholder="Search by label or address" aria-label="Search your addresses" />
+                <div class="rcv-filter" id="rcv-filter" role="group" aria-label="Show">
+                  <button class="chip" type="button" data-filter="all" aria-pressed="true">All</button>
+                  <button class="chip" type="button" data-filter="coins" aria-pressed="false">With coins</button>
+                  <button class="chip" type="button" data-filter="unused" aria-pressed="false">Unused</button>
+                </div>
+              </div>
+              <div id="rcv-list"></div>
+              <p class="empty empty--tight" id="rcv-empty" hidden></p>
+              <div class="card-pad t-xs muted">Click an address to show its QR code. Coins held in stakes are listed on Stake, not here.</div>
+            </div>
+          </div>
+        </main>
+
+        <main class="view view--pair" id="view-stake" hidden>
+          <div class="stack">
+            <div class="banner" id="stk-result" role="status" hidden></div>
+            <div class="grid stk-cols">
+              <div class="stack">
+                <div class="card">
+                  <div class="card-head">
+                    <h2 class="row"><svg class="i" aria-hidden="true"><use href="/icons.svg#i-spark" /></svg>Staking</h2>
+                    <span class="badge" id="stk-badge"></span>
+                  </div>
+                  <div class="card-pad">
+                    <p class="banner banner-warning" id="stk-stale" role="status" hidden></p>
+                    <p class="banner banner-info" id="stk-frozen" hidden>The network's set of block producers is frozen until an upcoming network upgrade. New stakes become active but make blocks only after it, and released stakes keep their place in the set until then.</p>
+                    <p class="t-sm muted" id="stk-state"></p>
+                    <ol class="checklist mt-2" id="stk-steps" aria-label="Steps to stake" hidden></ol>
+                    <div class="details mt-2" id="stk-rows"></div>
+                    <div class="row mt-2">
+                      <button class="btn btn-primary" type="button" id="stk-start">Start staking</button>
+                      <button class="btn btn-secondary" type="button" id="stk-stop">Stop staking</button>
+                    </div>
+                  </div>
+                </div>
+
+                <form class="card" id="stk-form" novalidate>
+                  <div class="card-head">
+                    <h2 class="row"><svg class="i" aria-hidden="true"><use href="/icons.svg#i-plus" /></svg>New stake</h2>
+                  </div>
+                  <div class="card-pad form-grid">
+                    <div class="field">
+                      <label for="stk-amount">Amount</label>
+                      <div class="amount-field">
+                        <input class="input" id="stk-amount" inputmode="decimal" autocomplete="off" placeholder="0.000000000" />
+                        <span class="unit">B3</span>
+                      </div>
+                      <span class="help" id="stk-min"></span>
+                    </div>
+                  </div>
+                  <div class="card-foot">
+                    <button class="btn btn-primary" type="submit" id="stk-review">Review stake</button>
+                  </div>
+                </form>
+              </div>
+
+              <div class="stack">
+                <div class="card">
+                  <div class="card-head">
+                    <h2 class="row"><svg class="i" aria-hidden="true"><use href="/icons.svg#i-layers" /></svg>Your stakes</h2>
+                    <span class="t-sm muted tnum" id="stk-count"></span>
+                  </div>
+                  <div class="card-pad details" id="stk-totals"></div>
+                  <div id="stk-list"></div>
+                  <div class="empty empty--tight" id="stk-empty" hidden>
+                    <p>No stakes yet. A stake locks B3 for this wallet's validator.</p>
+                  </div>
+                  <div class="card-foot" id="stk-release-all-row" hidden>
+                    <p class="t-sm muted">Releasing returns a stake to ordinary B3 in this wallet, less the network fee.</p>
+                    <button class="btn btn-secondary btn-sm" type="button" id="stk-release-all">Release all</button>
+                  </div>
+                </div>
+
+                <div class="card">
+                  <div class="card-head">
+                    <h2 class="row"><svg class="i" aria-hidden="true"><use href="/icons.svg#i-key" /></svg>Finality key</h2>
+                    <span class="badge" id="fin-badge"></span>
+                  </div>
+                  <div class="card-pad">
+                    <p class="t-sm muted" id="fin-text"></p>
+                    <div class="row mt-2">
+                      <button class="btn btn-secondary" type="button" id="fin-bind">Bind finality key</button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </main>
+
+        <main class="view view--data" id="view-trade" hidden>
+          <div class="stack tr-page">
+            <div class="banner banner-danger" id="tr-error" role="alert" hidden></div>
+            <div class="card" id="tr-empty" hidden>
+              <div class="empty">
+                <strong>No FlowMesh market is available</strong>
+                <p class="t-sm muted">Markets appear here once FlowMesh is active on the chain and a token/B3 market is established. This node also needs a trading endpoint, or its own FlowMesh engine.</p>
+              </div>
+            </div>
+            <div class="card tr-head" id="tr-head" hidden>
+              <div class="tr-ticker">
+                <div class="tr-pair">
+                  <label class="sr-only" for="tr-market">Market</label>
+                  <select class="select select-auto tr-market" id="tr-market"></select>
+                  <span class="badge" id="tr-state"></span>
+                  <span class="badge badge-warning" id="tr-test" hidden title="The issuer marked this token as an unbacked test asset">Test asset</span>
+                </div>
+                <div class="tr-lastbox" title="The last certified clearing price, in B3 per token">
+                  <strong class="tr-last tnum" id="tr-last">—</strong>
+                  <span class="tr-change tnum" id="tr-change" title="Change from the previous certified clearing"></span>
+                </div>
+                <div class="tr-stats">
+                  <div><span class="t-xs muted">Range</span><strong class="tnum" id="tr-range" title="Lowest and highest certified clearing in the retained history">—</strong></div>
+                  <div><span class="t-xs muted" title="What the next auction would do with the standing orders alone. Not certified; queued orders are not included.">Next auction</span><strong class="tnum" id="tr-next">—</strong></div>
+                  <div><span class="t-xs muted">Microblock</span><strong class="tnum" id="tr-seq">—</strong></div>
+                  <div><span class="t-xs muted" title="Validator seats and the signatures a certificate needs. Seats do not prove the validators are online.">Seats / quorum</span><strong class="tnum" id="tr-quorum">—</strong></div>
+                </div>
+              </div>
+              <div class="tr-source t-xs muted" id="tr-source"></div>
+              <details class="disc disc--boxed tr-glossary" id="tr-glossary">
+                <summary>
+                  <svg class="i-sm caret" aria-hidden="true"><use href="/icons.svg#i-chevron-right" /></svg>
+                  <span>What these words mean</span>
+                </summary>
+                <dl class="disc-body tr-terms t-sm">
+                  <dt>Auction</dt>
+                  <dd>Orders are not matched one by one. Each round collects the standing orders and clears them all at one price.</dd>
+                  <dt>Microblock</dt>
+                  <dd>One numbered entry in a market's log, holding one auction's result. Its number orders events; it carries no certified time.</dd>
+                  <dt>Certified</dt>
+                  <dd>Signed by enough of the market's validators (the quorum). Only certified results move funds.</dd>
+                  <dt>Seats / quorum</dt>
+                  <dd>How many validators the market has, and how many must sign a result.</dd>
+                  <dt>Account sequence (Seq.)</dt>
+                  <dd>A counter in each request this wallet signs, so no request can be replayed or reordered.</dd>
+                  <dt>Verified by</dt>
+                  <dd>Who checked the market data before you signed: your own node's engine, or a remote trading endpoint you trust to report it.</dd>
+                  <dt>Payout</dt>
+                  <dd>A certified withdrawal, paid to its address by a B3 transaction this wallet publishes.</dd>
+                </dl>
+              </details>
+            </div>
+            <div class="tr-grid" id="tr-body" hidden>
+              <section class="card tr-book-card" aria-label="Order book">
+                <div class="card-head tr-card-head">
+                  <h2 class="tr-h">Order book</h2>
+                  <span class="badge badge-warning" id="tr-book-stale" hidden title="No verified update for over 3 seconds">Stale</span>
+                  <div class="tr-seg" role="group" aria-label="Book sides">
+                    <button class="tr-seg-btn" type="button" id="tr-show-both" aria-pressed="true" title="Bids and asks"><span class="tr-ico tr-ico-both" aria-hidden="true"></span><span class="sr-only">Both sides</span></button>
+                    <button class="tr-seg-btn" type="button" id="tr-show-bids" aria-pressed="false" title="Bids only"><span class="tr-ico tr-ico-bids" aria-hidden="true"></span><span class="sr-only">Bids only</span></button>
+                    <button class="tr-seg-btn" type="button" id="tr-show-asks" aria-pressed="false" title="Asks only"><span class="tr-ico tr-ico-asks" aria-hidden="true"></span><span class="sr-only">Asks only</span></button>
+                  </div>
+                </div>
+                <div class="tr-book" id="tr-book" data-show="both">
+                  <div class="tr-book-row tr-book-labels t-xs muted"><span>Price (B3)</span><span class="num" id="tr-book-size">Size</span><span class="num">Total</span></div>
+                  <div class="tr-asks" id="tr-asks"></div>
+                  <div class="tr-mid">
+                    <strong class="tr-mid-last tnum" id="tr-mid-last">—</strong>
+                    <span class="t-xs muted tnum" id="tr-spread">—</span>
+                  </div>
+                  <div class="tr-bids" id="tr-bids"></div>
+                </div>
+                <p class="tr-note t-xs muted" id="tr-book-note">Levels of every verified standing order, computed by your node. Not certified; queued orders are not included. Choose a level to use its price; in the ticket, the arrow keys step a price or an amount.</p>
+              </section>
+
+              <section class="card tr-chart-card" aria-label="Chart">
+                  <div class="card-head tr-card-head">
+                    <div class="tr-texttabs" role="tablist" aria-label="Chart">
+                      <button class="tr-texttab" type="button" role="tab" id="tr-view-price" aria-selected="true">Price</button>
+                      <button class="tr-texttab" type="button" role="tab" id="tr-view-depth" aria-selected="false">Depth</button>
+                    </div>
+                    <span class="t-xs muted" id="tr-chart-caption" title="Each point is a certified auction that matched. Microblocks carry no execution time, so the axis is the microblock sequence.">Certified clearings by microblock</span>
+                  </div>
+                  <div class="tr-chart" id="tr-chart-box">
+                    <svg id="tr-chart" viewBox="0 0 600 260" preserveAspectRatio="none" role="img" aria-label="Clearing prices"></svg>
+                    <svg id="tr-depth" viewBox="0 0 600 260" preserveAspectRatio="none" role="img" aria-label="Book depth" hidden></svg>
+                    <span class="tr-axis tr-axis-top t-xs muted tnum" id="tr-chart-high"></span>
+                    <span class="tr-axis tr-axis-bottom t-xs muted tnum" id="tr-chart-low"></span>
+                    <span class="tr-lasttag tnum" id="tr-lasttag" hidden></span>
+                    <div class="tr-cross" id="tr-cross" hidden></div>
+                    <div class="tr-tip t-xs tnum" id="tr-tip" hidden></div>
+                    <p class="tr-chart-empty t-sm muted" id="tr-chart-empty">No auction has matched yet in the retained history.</p>
+                  </div>
+                  <div class="between t-xs muted tnum tr-chart-foot"><span id="tr-chart-first"></span><span id="tr-chart-mid"></span><span id="tr-chart-last"></span></div>
+                </section>
+
+                <section class="card tr-panel" aria-label="Orders, trades, requests and funds">
+                  <div class="card-head tr-card-head">
+                    <div class="tr-texttabs" role="tablist" aria-label="Orders and trades">
+                      <button class="tr-texttab" type="button" role="tab" id="tr-tab-orders" aria-selected="true" aria-controls="tr-orders">Open orders <span class="tr-count" id="tr-orders-count" hidden></span></button>
+                      <button class="tr-texttab" type="button" role="tab" id="tr-tab-trades" aria-selected="false" aria-controls="tr-trades">Trades</button>
+                      <button class="tr-texttab" type="button" role="tab" id="tr-tab-requests" aria-selected="false" aria-controls="tr-requests">Requests <span class="tr-count tr-count-warn" id="tr-requests-count" hidden></span></button>
+                      <button class="tr-texttab" type="button" role="tab" id="tr-tab-funds" aria-selected="false" aria-controls="tr-funds">Funds</button>
+                    </div>
+                  </div>
+                  <div id="tr-orders" role="tabpanel" aria-labelledby="tr-tab-orders">
+                    <div class="table-wrap">
+                      <table class="tbl tbl-compact">
+                        <thead><tr><th>Side</th><th class="num">Limit (B3)</th><th class="num">Remaining</th><th class="num">Filled</th><th class="num">Reserved</th></tr></thead>
+                        <tbody id="tr-orders-rows"></tbody>
+                      </table>
+                    </div>
+                    <div class="card-pad stack">
+                      <div class="btn-row" id="tr-cancels" hidden>
+                        <button class="btn btn-secondary btn-sm" type="button" id="tr-cancel-bid">Cancel buy order</button>
+                        <button class="btn btn-secondary btn-sm" type="button" id="tr-cancel-ask">Cancel sell order</button>
+                      </div>
+                      <p class="t-sm muted" id="tr-orders-note"></p>
+                    </div>
+                  </div>
+                  <div id="tr-trades" role="tabpanel" aria-labelledby="tr-tab-trades" hidden>
+                    <div class="table-wrap">
+                      <table class="tbl tbl-compact">
+                        <thead><tr><th class="num">Price (B3)</th><th class="num">Size</th><th class="num">Value (B3)</th><th title="When the serving node applied the auction, by its own clock. Microblocks carry no certified time.">Observed</th><th class="num" title="Your fill in this auction. A dash means unknown, not none.">Yours</th><th class="num">Microblock</th></tr></thead>
+                        <tbody id="tr-trades-rows"></tbody>
+                      </table>
+                    </div>
+                    <p class="card-pad t-sm muted" id="tr-trades-empty" hidden>No auction has matched in the retained history.</p>
+                  </div>
+                  <div id="tr-requests" role="tabpanel" aria-labelledby="tr-tab-requests" hidden>
+                    <div class="table-wrap">
+                      <table class="tbl tbl-compact">
+                        <thead><tr><th>Sent</th><th>Request</th><th class="num" title="The account sequence it was signed with">Seq.</th><th>Status</th><th>Outcome</th><th><span class="sr-only">Action</span></th></tr></thead>
+                        <tbody id="tr-requests-rows"></tbody>
+                      </table>
+                    </div>
+                    <p class="card-pad t-sm muted" id="tr-requests-note">Orders and cancellations this wallet signed in this market, from your node's own record. Accepted means queued; certified means a quorum certified the result, which may or may not include a fill. Seq. is the account sequence the request was signed with.</p>
+                  </div>
+                  <div id="tr-funds" role="tabpanel" aria-labelledby="tr-tab-funds" hidden>
+                    <div class="card-pad tr-funding">
+                      <div class="stack">
+                        <div class="tabs" role="tablist" aria-label="Move funds">
+                          <button class="tab" type="button" role="tab" id="tr-fund-in" aria-selected="true">Deposit</button>
+                          <button class="tab" type="button" role="tab" id="tr-fund-out" aria-selected="false">Withdraw</button>
+                        </div>
+                        <form class="stack" id="tr-fund-form" novalidate>
+                          <div class="field">
+                            <label for="tr-fund-asset">Asset</label>
+                            <select class="select" id="tr-fund-asset"><option value="b3">B3</option><option value="token" id="tr-fund-token">Token</option></select>
+                          </div>
+                          <div class="field">
+                            <label for="tr-fund-amount">Amount</label>
+                            <input class="input tnum" id="tr-fund-amount" aria-describedby="tr-fund-error" inputmode="decimal" autocomplete="off" spellcheck="false" />
+                          </div>
+                          <div class="field" id="tr-fund-to-field" hidden>
+                            <label for="tr-fund-to">Pay to</label>
+                            <div class="pick-field">
+                              <input class="input input-mono" id="tr-fund-to" placeholder="Empty: a new address here" autocomplete="off" spellcheck="false" />
+                              <button class="btn btn-secondary" type="button" id="tr-fund-pick" aria-label="Choose an address" title="Choose an address">
+                                <svg class="i-sm" aria-hidden="true"><use href="/icons.svg#i-book" /></svg>
+                              </button>
+                            </div>
+                          </div>
+                          <p class="t-xs muted" id="tr-fund-help"></p>
+                          <p class="t-sm tr-form-error" id="tr-fund-error" aria-live="polite" hidden></p>
+                          <div class="banner" id="tr-fund-result" role="status" hidden></div>
+                          <button class="btn btn-primary btn-block" type="submit" id="tr-fund-review">Review deposit</button>
+                          <p class="t-xs muted" id="tr-fund-gate" hidden></p>
+                        </form>
+                      </div>
+                      <div class="stack" id="tr-deposits" hidden>
+                        <h3 class="t-sm">Your deposits to this market</h3>
+                        <div class="details" id="tr-deposit-rows"></div>
+                        <p class="t-xs muted">A deposit counts once it has 31 confirmations and the market admits it. If admission is slow, ask again for the same deposit; do not deposit again.</p>
+                      </div>
+                      <div class="stack" id="tr-payouts" hidden>
+                        <h3 class="t-sm">Withdrawal payouts</h3>
+                        <div class="details" id="tr-payout-rows"></div>
+                        <form class="stack" id="tr-payout-ask" hidden>
+                          <label for="tr-payout-to">Address you withdrew to</label>
+                          <div class="pick-field">
+                            <input class="input input-mono" id="tr-payout-to" autocomplete="off" spellcheck="false" required />
+                            <button class="btn btn-secondary" type="button" id="tr-payout-pick" aria-label="Choose an address" title="Choose an address">
+                              <svg class="i-sm" aria-hidden="true"><use href="/icons.svg#i-book" /></svg>
+                            </button>
+                          </div>
+                          <div class="row gap-2">
+                            <button class="btn btn-primary btn-sm" type="submit">Review payout</button>
+                            <button class="btn btn-ghost btn-sm" type="button" id="tr-payout-cancel">Cancel</button>
+                          </div>
+                        </form>
+                        <p class="t-xs muted">A certified withdrawal is paid once its payout transaction is published, which is possible after the market's checkpoint for it confirms on the B3 chain. Anyone may publish a checkpoint; if none comes, publish it here. Only the address the withdrawal names can be paid, so publish your own payout. This wallet pays each network fee.</p>
+                      </div>
+                    </div>
+                  </div>
+                </section>
+
+              <div class="tr-side">
+                <section class="card tr-ticket" id="tr-ticket" data-side="bid" data-type="limit" aria-label="Place an order">
+                  <div class="tr-sides" role="tablist" aria-label="Order side">
+                    <button class="tr-side-btn tr-side-buy" type="button" role="tab" id="tr-buy" aria-selected="true">Buy</button>
+                    <button class="tr-side-btn tr-side-sell" type="button" role="tab" id="tr-sell" aria-selected="false">Sell</button>
+                  </div>
+                  <form class="tr-form" id="tr-form" novalidate>
+                    <div class="tr-texttabs tr-types" role="tablist" aria-label="Order type">
+                      <button class="tr-texttab" type="button" role="tab" id="tr-type-limit" aria-selected="true" title="One limit price">Limit</button>
+                      <button class="tr-texttab" type="button" role="tab" id="tr-type-ladder" aria-selected="false" title="Up to 4 prices in one order. It replaces this side, and its prices cannot be cancelled one by one.">Ladder</button>
+                    </div>
+                    <div class="tr-avbl t-xs"><span class="muted">Available</span><span class="tnum" id="tr-avbl">—</span></div>
+                    <div class="tr-steps">
+                      <div class="tr-step" id="tr-step-0">
+                        <div class="tr-in">
+                          <label class="tr-in-label" for="tr-price-0" data-tr-price>Price</label>
+                          <button class="tr-stepper" type="button" data-for="tr-price-0" data-dir="-1" tabindex="-1" aria-label="Lower price by one step">−</button>
+                          <input class="tr-in-field tnum" id="tr-price-0" aria-describedby="tr-form-error" inputmode="decimal" autocomplete="off" spellcheck="false" />
+                          <button class="tr-stepper" type="button" data-for="tr-price-0" data-dir="1" tabindex="-1" aria-label="Raise price by one step">+</button>
+                          <span class="tr-in-unit">B3</span>
+                        </div>
+                        <div class="tr-in">
+                          <label class="tr-in-label" for="tr-qty-0" data-tr-qty>Amount</label>
+                          <button class="tr-stepper" type="button" data-for="tr-qty-0" data-dir="-1" tabindex="-1" aria-label="Lower amount by one step">−</button>
+                          <input class="tr-in-field tnum" id="tr-qty-0" aria-describedby="tr-form-error" inputmode="decimal" autocomplete="off" spellcheck="false" />
+                          <button class="tr-stepper" type="button" data-for="tr-qty-0" data-dir="1" tabindex="-1" aria-label="Raise amount by one step">+</button>
+                          <span class="tr-in-unit" data-tr-unit>Token</span>
+                        </div>
+                      </div>
+                      <div class="tr-step" id="tr-step-1" hidden>
+                        <div class="tr-in"><label class="tr-in-label" for="tr-price-1" data-tr-price>Price 2</label><input class="tr-in-field tnum" id="tr-price-1" aria-describedby="tr-form-error" inputmode="decimal" autocomplete="off" spellcheck="false" /><span class="tr-in-unit">B3</span></div>
+                        <div class="tr-in"><label class="tr-in-label" for="tr-qty-1" data-tr-qty>Amount 2</label><input class="tr-in-field tnum" id="tr-qty-1" aria-describedby="tr-form-error" inputmode="decimal" autocomplete="off" spellcheck="false" /><span class="tr-in-unit" data-tr-unit>Token</span></div>
+                      </div>
+                      <div class="tr-step" id="tr-step-2" hidden>
+                        <div class="tr-in"><label class="tr-in-label" for="tr-price-2" data-tr-price>Price 3</label><input class="tr-in-field tnum" id="tr-price-2" aria-describedby="tr-form-error" inputmode="decimal" autocomplete="off" spellcheck="false" /><span class="tr-in-unit">B3</span></div>
+                        <div class="tr-in"><label class="tr-in-label" for="tr-qty-2" data-tr-qty>Amount 3</label><input class="tr-in-field tnum" id="tr-qty-2" aria-describedby="tr-form-error" inputmode="decimal" autocomplete="off" spellcheck="false" /><span class="tr-in-unit" data-tr-unit>Token</span></div>
+                      </div>
+                      <div class="tr-step" id="tr-step-3" hidden>
+                        <div class="tr-in"><label class="tr-in-label" for="tr-price-3" data-tr-price>Price 4</label><input class="tr-in-field tnum" id="tr-price-3" aria-describedby="tr-form-error" inputmode="decimal" autocomplete="off" spellcheck="false" /><span class="tr-in-unit">B3</span></div>
+                        <div class="tr-in"><label class="tr-in-label" for="tr-qty-3" data-tr-qty>Amount 4</label><input class="tr-in-field tnum" id="tr-qty-3" aria-describedby="tr-form-error" inputmode="decimal" autocomplete="off" spellcheck="false" /><span class="tr-in-unit" data-tr-unit>Token</span></div>
+                      </div>
+                    </div>
+                    <div class="tr-slider" id="tr-slider">
+                      <input type="range" id="tr-pct" min="0" max="100" step="1" value="0" aria-label="Share of what is available" />
+                      <div class="tr-marks" aria-hidden="true">
+                        <button type="button" tabindex="-1" data-pct="0"></button>
+                        <button type="button" tabindex="-1" data-pct="25"></button>
+                        <button type="button" tabindex="-1" data-pct="50"></button>
+                        <button type="button" tabindex="-1" data-pct="75"></button>
+                        <button type="button" tabindex="-1" data-pct="100"></button>
+                      </div>
+                      <output class="tr-pct-out t-xs tnum" id="tr-pct-out" for="tr-pct">0%</output>
+                    </div>
+                    <div class="tr-sum" id="tr-summary">
+                      <div class="tr-sum-row"><span class="muted" id="tr-total-label">Total</span><span class="tnum" id="tr-total">—</span></div>
+                      <div class="tr-sum-row" id="tr-replaces-row" hidden><span class="muted">Replaces</span><span class="tnum" id="tr-replaces"></span></div>
+                    </div>
+                    <p class="t-xs tr-form-error" id="tr-form-error" aria-live="polite" hidden></p>
+                    <button class="btn btn-block tr-go" type="submit" id="tr-review">Buy</button>
+                    <p class="t-xs muted tr-gate" id="tr-gate" hidden></p>
+                    <div class="banner tr-result" id="tr-result" role="status" hidden></div>
+                    <p class="t-xs muted tr-steps-help" id="tr-steps-help"></p>
+                  </form>
+                </section>
+
+                <section class="card tr-assets" aria-label="Trading balance">
+                  <div class="card-head tr-card-head">
+                    <h2 class="tr-h">Assets</h2>
+                    <span class="t-xs muted" title="FlowMesh holds this balance, not your wallet. The validators certify it, which is not the same as settled on the B3 chain.">Certified trading balance</span>
+                  </div>
+                  <div class="tr-asset-list" id="tr-balance">
+                    <div class="tr-asset">
+                      <span class="tr-asset-name">B3</span>
+                      <span class="tr-asset-free tnum" id="tr-b3-free">—</span>
+                      <span class="tr-asset-held t-xs muted"><span>In orders</span> <span class="tnum" id="tr-b3-held">—</span></span>
+                    </div>
+                    <div class="tr-asset">
+                      <span class="tr-asset-name" id="tr-base-free-label">Token</span>
+                      <span class="tr-asset-free tnum" id="tr-base-free">—</span>
+                      <span class="tr-asset-held t-xs muted"><span id="tr-base-held-label">In orders</span> <span class="tnum" id="tr-base-held">—</span></span>
+                    </div>
+                  </div>
+                  <p class="tr-note t-sm muted" id="tr-no-account" hidden>This wallet has no trading account in this market yet. The first deposit creates it.</p>
+                  <div class="tr-asset-actions">
+                    <button class="btn btn-secondary btn-sm" type="button" id="tr-go-deposit">Deposit</button>
+                    <button class="btn btn-secondary btn-sm" type="button" id="tr-go-withdraw">Withdraw</button>
+                  </div>
+                </section>
+              </div>
+            </div>
+          </div>
+        </main>
+
+        <main class="view view--flow" id="view-book" hidden>
+          <div class="stack">
+            <div class="banner" id="book-result" role="status" hidden></div>
+            <form class="card" id="book-form" novalidate>
+              <div class="card-head">
+                <h2 class="row"><svg class="i" aria-hidden="true"><use href="/icons.svg#i-plus" /></svg><span id="book-form-title">Save an address</span></h2>
+              </div>
+              <div class="card-pad form-grid">
+                <div class="field">
+                  <label for="book-address">Address</label>
+                  <input class="input input-mono" id="book-address" autocomplete="off" spellcheck="false" />
+                </div>
+                <div class="field">
+                  <label for="book-label">Label</label>
+                  <input class="input" id="book-label" autocomplete="off" maxlength="200" placeholder="Who or what it pays" />
+                  <span class="help">Saving an address that is already here renames it.</span>
+                </div>
+              </div>
+              <div class="card-foot row">
+                <button class="btn btn-primary" type="submit" id="book-save">Save</button>
+                <button class="btn btn-ghost" type="reset" id="book-clear">Clear</button>
+              </div>
+            </form>
+
+            <div class="card">
+              <div class="card-head">
+                <h2 class="row"><svg class="i" aria-hidden="true"><use href="/icons.svg#i-book" /></svg>Sending addresses</h2>
+                <span class="t-sm muted tnum" id="book-count"></span>
+              </div>
+              <div id="book-list"></div>
+              <div class="empty empty--tight" id="book-empty" hidden>
+                <p>No saved addresses yet. Addresses you label when sending are saved here too.</p>
+              </div>
+              <div class="card-pad t-sm muted">The node cannot remove saved addresses, so B3 Hive cannot either.</div>
+            </div>
+          </div>
+        </main>
+
+        <main class="view view--flow" id="view-wallets" hidden>
+          <div class="stack">
+            <div class="banner" id="wl-result" role="status" hidden></div>
+            <div class="banner banner-info" id="wl-scan" role="status" hidden>
+              <span class="spinner"></span>
+              <div class="banner-body">
+                <strong>Rescanning the chain for this wallet</strong>
+                <div class="t-sm" id="wl-scan-text"></div>
+                <div class="progress mt-2" id="wl-scan-progress" hidden><div class="progress-bar" id="wl-scan-bar"></div></div>
+              </div>
+            </div>
+            <div class="card">
+              <div class="card-head">
+                <h2 class="row"><svg class="i" aria-hidden="true"><use href="/icons.svg#i-wallet" /></svg>Loaded</h2>
+                <span class="t-sm muted">The pages use the wallet marked In use</span>
+              </div>
+              <div id="wl-loaded"></div>
+              <div class="empty empty--tight" id="wl-loaded-empty" hidden>
+                <p>No wallet is loaded. Open one below, or create one.</p>
+              </div>
+            </div>
+
+            <div class="card" id="wl-security-card" hidden>
+              <div class="card-head">
+                <h2 class="row"><svg class="i" aria-hidden="true"><use href="/icons.svg#i-lock" /></svg>Encryption</h2>
+                <span class="badge" id="wl-security"></span>
+              </div>
+              <div class="card-pad">
+                <p class="t-sm muted" id="wl-security-text"></p>
+                <div class="row mt-2">
+                  <button class="btn btn-primary" type="button" id="wl-encrypt">Encrypt wallet</button>
+                  <button class="btn btn-secondary" type="button" id="wl-change">Change passphrase</button>
+                  <button class="btn btn-secondary" type="button" id="wl-lock">Lock now</button>
+                </div>
+              </div>
+            </div>
+
+            <div class="card">
+              <div class="card-head">
+                <h2 class="row"><svg class="i" aria-hidden="true"><use href="/icons.svg#i-folder" /></svg>In the wallets folder</h2>
+              </div>
+              <div id="wl-available"></div>
+              <div class="empty empty--tight" id="wl-available-empty" hidden>
+                <p>Every wallet in the node's wallets folder is loaded.</p>
+              </div>
+            </div>
+
+            <form class="card" id="wl-create" novalidate>
+              <div class="card-head">
+                <h2 class="row"><svg class="i" aria-hidden="true"><use href="/icons.svg#i-plus" /></svg>Create a wallet</h2>
+              </div>
+              <div class="card-pad form-grid">
+                <div class="field">
+                  <label for="wl-name">Name</label>
+                  <input class="input" id="wl-name" autocomplete="off" spellcheck="false" maxlength="64" required />
+                  <span class="help">
+                    Letters, digits, spaces, dots, dashes and underscores. The wallet loads every time
+                    the node starts until you close it.
+                  </span>
+                </div>
+                <label class="check">
+                  <input type="checkbox" id="wl-create-encrypt" checked />
+                  <span class="check-body">
+                    <span>Encrypt it with a passphrase straight away</span>
+                    <span class="help">
+                      Recommended. Without a passphrase, anyone who can read the wallet file can spend
+                      from it. Back the wallet up afterwards, and keep the backup somewhere safe.
+                    </span>
+                  </span>
+                </label>
+              </div>
+              <div class="card-foot">
+                <button class="btn btn-primary" type="submit" id="wl-create-submit">Create wallet</button>
+              </div>
+            </form>
+
+            <div class="card">
+              <div class="card-head">
+                <h2 class="row"><svg class="i" aria-hidden="true"><use href="/icons.svg#i-download" /></svg>Back up</h2>
+              </div>
+              <div class="card-pad">
+                <p class="t-sm muted">
+                  Saves a copy of <strong id="wl-backup-name">the wallet in use</strong> to a new file you
+                  choose. The copy holds the wallet's keys: keep it away from cloud-synced and shared
+                  folders.
+                </p>
+                <div class="callout callout-warning mt-2" id="wl-backup-plain" hidden>
+                  <div class="callout-title">
+                    <svg class="i-sm" aria-hidden="true"><use href="/icons.svg#i-alert" /></svg>This backup is not encrypted
+                  </div>
+                  The wallet has no passphrase, so anyone who can read the backup can spend its coins.
+                  Encrypt the wallet first, or keep the file on encrypted storage.
+                </div>
+                <button class="btn btn-secondary mt-2" type="button" id="wl-backup">Back up wallet</button>
+              </div>
+            </div>
+
+            <form class="card" id="wl-restore" novalidate>
+              <div class="card-head">
+                <h2 class="row"><svg class="i" aria-hidden="true"><use href="/icons.svg#i-refresh" /></svg>Restore or recover</h2>
+              </div>
+              <div class="card-pad form-grid">
+                <div class="field">
+                  <label for="wl-restore-name">Name for the new wallet</label>
+                  <input class="input" id="wl-restore-name" autocomplete="off" spellcheck="false" maxlength="64" required />
+                  <span class="help">Same rules as above. The wallet becomes the one in use.</span>
+                </div>
+                <p class="t-sm muted">
+                  <strong>Restore from backup</strong> takes a wallet file saved by Back up, or by the
+                  B3 Qt wallet's Backup Wallet. <strong>Recover a legacy wallet</strong> takes the text
+                  file the old B3 wallet's <code>dumpwallet</code> command wrote. The node checks the whole
+                  file before it changes anything, then rescans the whole chain, which can take a long
+                  time.
+                </p>
+                <div class="callout callout-warning">
+                  <div class="callout-title">
+                    <svg class="i-sm" aria-hidden="true"><use href="/icons.svg#i-alert" /></svg>A dump file holds every key in plain text
+                  </div>
+                  Once the recovered wallet shows its coins, encrypt it, back it up, and delete the
+                  dump file.
+                </div>
+              </div>
+              <div class="card-foot row">
+                <button class="btn btn-secondary" type="button" id="wl-restore-backup">Restore from backup</button>
+                <button class="btn btn-secondary" type="button" id="wl-import-legacy">Recover a legacy wallet</button>
+              </div>
+            </form>
+          </div>
+        </main>
+
+        <main class="view" id="view-activity" hidden>
+          <div class="card">
+            <div class="card-pad filter-grid">
+              <div class="field">
+                <label for="act-kind">Type</label>
+                <select class="select" id="act-kind">
+                  <option value="all">All</option>
+                  <option value="received">Received with</option>
+                  <option value="sent">Sent to</option>
+                  <option value="mined">Mined</option>
+                  <option value="other">Other</option>
+                </select>
+              </div>
+              <div class="field">
+                <label for="act-date">Date</label>
+                <select class="select" id="act-date">
+                  <option value="all">All</option>
+                  <option value="today">Today</option>
+                  <option value="week">This week</option>
+                  <option value="month">This month</option>
+                  <option value="lastmonth">Last month</option>
+                  <option value="year">This year</option>
+                  <option value="range">Range…</option>
+                </select>
+              </div>
+              <div class="field">
+                <label for="act-search">Search</label>
+                <input class="input" id="act-search" autocomplete="off" spellcheck="false" placeholder="Address, label or transaction id" />
+              </div>
+              <div class="field">
+                <label for="act-min">Minimum amount</label>
+                <div class="amount-field">
+                  <input class="input" id="act-min" inputmode="decimal" autocomplete="off" placeholder="0" />
+                  <span class="unit">B3</span>
+                </div>
+              </div>
+              <div class="field" id="act-range" hidden>
+                <label for="act-from">From</label>
+                <input class="input" type="date" id="act-from" />
+              </div>
+              <div class="field" id="act-range-to" hidden>
+                <label for="act-to">To</label>
+                <input class="input" type="date" id="act-to" />
+              </div>
+            </div>
+          </div>
+
+          <div class="card mt-4">
+            <div class="card-head">
+              <h2 class="row"><svg class="i" aria-hidden="true"><use href="/icons.svg#i-list" /></svg>Transactions</h2>
+              <div class="row">
+                <span class="t-sm muted tnum" id="activity-count"></span>
+                <button class="btn btn-secondary btn-sm" type="button" id="activity-export">
+                  <svg class="i-sm" aria-hidden="true"><use href="/icons.svg#i-download" /></svg><span>Export CSV</span>
+                </button>
+              </div>
+            </div>
+            <div id="activity-list"></div>
+            <div class="card-foot" id="activity-more-row" hidden>
+              <button class="btn btn-secondary btn-block" type="button" id="activity-more">Show older</button>
+            </div>
+          </div>
+          <div class="banner mt-4" id="activity-result" role="status" hidden></div>
+
+        </main>
+
+        <main class="view" id="view-network" hidden>
+          <div class="stack">
+            <div class="card">
+              <div class="card-head">
+                <h2 class="row"><svg class="i" aria-hidden="true"><use href="/icons.svg#i-server" /></svg>This node</h2>
+                <span class="badge badge-neutral" id="net-state"></span>
+              </div>
+              <div class="card-pad details">
+                <div class="drow"><span class="dkey">Version</span><span class="dval is-mono" id="net-agent">—</span></div>
+                <div class="drow"><span class="dkey">Protocol</span><span class="dval tnum" id="net-protocol">—</span></div>
+                <div class="drow"><span class="dkey">Connections</span><span class="dval tnum" id="net-connections">—</span></div>
+                <div class="drow"><span class="dkey">Blocks / headers</span><span class="dval tnum" id="net-height">—</span></div>
+                <div class="drow"><span class="dkey">Size on disk</span><span class="dval tnum" id="net-disk">—</span></div>
+                <div class="drow"><span class="dkey">Started</span><span class="dval tnum" id="net-started">—</span></div>
+                <div class="drow"><span class="dkey">Local addresses</span><span class="dval is-mono" id="net-local">—</span></div>
+                <div class="drow"><span class="dkey">Traffic</span><span class="dval tnum" id="net-traffic">—</span></div>
+                <div class="drow"><span class="dkey">Memory pool</span><span class="dval tnum" id="net-mempool">—</span></div>
+                <div class="drow"><span class="dkey">Data folder</span><span class="dval is-mono wrap-any" id="net-datadir">—</span></div>
+                <div class="drow"><span class="dkey">Debug log</span><span class="dval is-mono wrap-any" id="net-debuglog">—</span></div>
+              </div>
+            </div>
+            <div class="card">
+              <div class="card-head">
+                <h2 class="row"><svg class="i" aria-hidden="true"><use href="/icons.svg#i-activity" /></svg>Traffic</h2>
+                <span class="t-sm muted tnum" id="traffic-rates"></span>
+              </div>
+              <div class="card-pad">
+                <svg class="traffic" id="traffic-graph" viewBox="0 0 600 160" preserveAspectRatio="none" role="img" aria-label="Network traffic over the last 10 minutes"></svg>
+                <div class="row t-sm muted mt-2 traffic-legend">
+                  <span class="row"><span class="swatch swatch-in"></span>Received</span>
+                  <span class="row"><span class="swatch swatch-out"></span>Sent</span>
+                  <span class="tnum" id="traffic-scale"></span>
+                </div>
+              </div>
+            </div>
+            <div class="card">
+              <div class="card-head">
+                <h2 class="row"><svg class="i" aria-hidden="true"><use href="/icons.svg#i-users" /></svg>Peers</h2>
+                <span class="t-sm muted tnum" id="peer-count"></span>
+              </div>
+              <div class="table-wrap" id="peer-table" hidden>
+                <table class="tbl">
+                  <thead>
+                    <tr>
+                      <th>Address</th>
+                      <th>Direction</th>
+                      <th>Version</th>
+                      <th class="num">Blocks</th>
+                      <th class="num">Ping</th>
+                      <th class="num">Sent / received</th>
+                      <th class="num">Connected</th>
+                    </tr>
+                  </thead>
+                  <tbody id="peer-rows"></tbody>
+                </table>
+              </div>
+              <div class="empty empty--tight" id="peer-empty">
+                <div class="empty-icon"><svg class="i" aria-hidden="true"><use href="/icons.svg#i-users" /></svg></div>
+                <h3>No peers</h3>
+                <p id="peer-empty-text">The node is not connected to anyone.</p>
+              </div>
+            </div>
+            <div class="card">
+              <div class="card-head">
+                <h2 class="row"><svg class="i" aria-hidden="true"><use href="/icons.svg#i-shield" /></svg>Banned peers</h2>
+                <span class="t-sm muted tnum" id="ban-count"></span>
+              </div>
+              <div class="table-wrap" id="ban-table" hidden>
+                <table class="tbl">
+                  <thead>
+                    <tr>
+                      <th>Address</th>
+                      <th class="num">Banned</th>
+                      <th class="num">Until</th>
+                    </tr>
+                  </thead>
+                  <tbody id="ban-rows"></tbody>
+                </table>
+              </div>
+              <div class="empty empty--tight" id="ban-empty">
+                <p>No peers are banned. The console's setban and clearbanned commands manage bans.</p>
+              </div>
+            </div>
+            <div class="banner" id="network-result" role="status" hidden></div>
+          </div>
+        </main>
+
+        <main class="view view--flow" id="view-settings" hidden>
+          <form class="stack" id="settings-form" novalidate>
+            <div class="card">
+              <div class="card-head">
+                <h2 class="row"><svg class="i" aria-hidden="true"><use href="/icons.svg#i-server" /></svg>Node</h2>
+              </div>
+              <div class="card-pad form-grid">
+                <div class="field">
+                  <label for="set-dbcache">Database cache</label>
+                  <div class="amount-field">
+                    <input class="input" id="set-dbcache" inputmode="numeric" autocomplete="off" placeholder="Default" />
+                    <span class="unit">MiB</span>
+                  </div>
+                  <span class="help">
+                    Leave empty for b3coind's default: 450 MiB, or 1,024 MiB on a 64-bit computer with
+                    at least 4 GB of memory.
+                  </span>
+                </div>
+                <div class="field">
+                  <label for="set-par">Script verification threads</label>
+                  <input class="input" id="set-par" inputmode="numeric" autocomplete="off" placeholder="Automatic" />
+                  <span class="help">
+                    Empty or 0 picks a number from your processor. A negative number leaves that many
+                    cores free. At most 15.
+                  </span>
+                </div>
+                <div class="field">
+                  <span class="field-label">Pruning</span>
+                  <span class="help">
+                    Not available. This B3 release keeps the whole chain for FlowMesh and the bridge, and
+                    b3coind will not start pruned.
+                  </span>
+                </div>
+              </div>
+            </div>
+
+            <div class="card">
+              <div class="card-head">
+                <h2 class="row"><svg class="i" aria-hidden="true"><use href="/icons.svg#i-users" /></svg>Network</h2>
+              </div>
+              <div class="card-pad">
+                <label class="check">
+                  <input type="checkbox" id="set-listen" />
+                  <span class="check-body">
+                    <span>Allow incoming connections</span>
+                    <span class="help">Other B3 nodes may connect to yours.</span>
+                  </span>
+                </label>
+                <label class="check">
+                  <input type="checkbox" id="set-natpmp" />
+                  <span class="check-body">
+                    <span>Open the port on your router</span>
+                    <span class="help">Asks the router with PCP or NAT-PMP. Not done while a proxy is used.</span>
+                  </span>
+                </label>
+                <label class="check">
+                  <input type="checkbox" id="set-proxy-use" />
+                  <span class="check-body">
+                    <span>Connect through a SOCKS5 proxy</span>
+                    <span class="help">For all peers, unless a separate Tor proxy is set below.</span>
+                  </span>
+                </label>
+                <div class="field" id="set-proxy-row">
+                  <label for="set-proxy">Proxy address</label>
+                  <input class="input input-mono" id="set-proxy" autocomplete="off" spellcheck="false" placeholder="127.0.0.1:9050" />
+                </div>
+                <label class="check mt-2">
+                  <input type="checkbox" id="set-onion-use" />
+                  <span class="check-body">
+                    <span>Use a separate SOCKS5 proxy for Tor onion services</span>
+                  </span>
+                </label>
+                <div class="field" id="set-onion-row">
+                  <label for="set-onion">Tor proxy address</label>
+                  <input class="input input-mono" id="set-onion" autocomplete="off" spellcheck="false" placeholder="127.0.0.1:9050" />
+                </div>
+              </div>
+            </div>
+
+            <div class="callout callout-info">
+              <div class="callout-title">
+                <svg class="i-sm" aria-hidden="true"><use href="/icons.svg#i-info" /></svg>Saving restarts the node
+              </div>
+              <span id="settings-note"></span>
+            </div>
+            <div class="row">
+              <button class="btn btn-primary" type="submit" id="settings-save">Save and restart</button>
+              <button class="btn btn-secondary" type="button" id="settings-defaults">Fill in the defaults</button>
+            </div>
+            <div class="banner" id="settings-result" role="status" hidden></div>
+          </form>
+        </main>
+
+        <main class="view view--flow" id="view-updates" hidden>
+          <div class="card">
+            <div class="card-head">
+              <h2 class="row"><svg class="i" aria-hidden="true"><use href="/icons.svg#i-shield" /></svg>B3 Hive releases</h2>
+              <span class="badge badge-neutral" id="update-state">Not checked</span>
+            </div>
+            <div class="card-pad details">
+              <div class="drow"><span class="dkey">Installed</span><span class="dval tnum" id="update-installed"></span></div>
+              <div id="update-offer" hidden>
+                <div class="drow"><span class="dkey">Available</span><span class="dval tnum" id="offer-version"></span></div>
+                <div class="drow"><span class="dkey">Size</span><span class="dval tnum" id="offer-size"></span></div>
+                <div class="drow"><span class="dkey">SHA-256</span><span class="dval is-mono" id="offer-sha"></span></div>
+                <div class="drow"><span class="dkey">From</span><span class="dval is-mono" id="offer-url"></span></div>
+              </div>
+              <div class="progress mt-3" id="update-progress" hidden><div class="progress-bar" id="update-progress-bar"></div></div>
+            </div>
+            <div class="card-foot btn-row">
+              <button class="btn btn-secondary" type="button" id="update-check">
+                <svg class="i" aria-hidden="true"><use href="/icons.svg#i-refresh" /></svg><span>Check for updates</span>
+              </button>
+              <button class="btn btn-primary" type="button" id="update-download" hidden>
+                <svg class="i" aria-hidden="true"><use href="/icons.svg#i-download" /></svg><span>Download and verify</span>
+              </button>
+            </div>
+          </div>
+          <div class="banner mt-4" id="update-result" role="status" hidden></div>
+          <div class="callout callout-info mt-4">
+            <div class="callout-title">
+              <svg class="i-sm" aria-hidden="true"><use href="/icons.svg#i-key" /></svg>Only signed releases
+            </div>
+            A release is offered only if enough of the pinned B3 release keys signed it, and a
+            download is kept only if its size and SHA-256 match what they signed. B3 Hive does not
+            install updates by itself yet: run the verified file yourself.
+          </div>
+        </main>
+      </div>
+    </div>
+    <script type="module" src="./src/main.ts"></script>
+  </body>
+</html>

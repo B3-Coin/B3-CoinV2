@@ -1,0 +1,64 @@
+/* The console window: a bar, the log and the prompt, on the design tokens. */
+
+.console {
+  height: 100dvh;
+  display: grid;
+  grid-template-rows: auto 1fr auto;
+}
+
+.console-bar {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: var(--space-3);
+  padding: var(--space-2) var(--space-4);
+  background: var(--bg-surface);
+  border-bottom: 1px solid var(--border);
+}
+.console-bar .select { min-width: 10rem; }
+
+#log {
+  overflow-y: auto;
+  padding: var(--space-3) var(--space-4);
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  line-height: 1.5;
+  background: var(--bg-input);
+}
+
+.entry { white-space: pre-wrap; overflow-wrap: anywhere; margin-bottom: var(--space-2); }
+.request { color: var(--accent-text); }
+.request::before { content: "> "; }
+.error { color: var(--danger); }
+.warning { color: var(--danger); font-weight: 650; }
+.note { color: var(--text-muted); }
+
+#prompt {
+  position: relative;
+  display: flex; align-items: center; gap: var(--space-2);
+  padding: var(--space-3) var(--space-4);
+  background: var(--bg-surface);
+  border-top: 1px solid var(--border);
+}
+.console-prompt { color: var(--accent); font-family: var(--font-mono); user-select: none; }
+#prompt .console-prompt { font-size: var(--text-md); }
+
+/* Opens upwards: the prompt sits at the bottom of the window. */
+#completions {
+  position: absolute;
+  left: calc(var(--space-4) + 1.25rem);
+  bottom: calc(100% - var(--space-2));
+  z-index: var(--z-200);
+  min-width: 18rem;
+  max-height: 16rem;
+  overflow-y: auto;
+  padding: var(--space-1) 0;
+  list-style: none;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  box-shadow: var(--shadow-lg);
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+}
+#completions li { padding: var(--space-1-5) var(--space-3); cursor: pointer; }
+#completions li[aria-selected="true"],
+#completions li:hover { background: var(--accent-bg); color: var(--accent-text); }

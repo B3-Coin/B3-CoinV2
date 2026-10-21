@@ -68,6 +68,19 @@ machine: Idle -> Checking -> UpdateAvailable -> Downloading -> Verified ->
 AwaitingShutdown -> Installing; every transition requiring approval is
 explicit). Qt glue under `src/qt/` renders the state machine only.
 
+The Tauri app under `hive/` has no Qt, so it runs the same manager in
+`b3-hive-update` (`src/update/hive_update.cpp`, built with
+`-DB3_HIVE_UPDATER=ON` and bundled as a sidecar). The app is only the
+transport. It speaks HTTPS (rustls) and follows no redirect on its own: it
+reports each redirect to the helper and waits for ALLOW or DENY. It streams
+bodies in bounded frames that the helper accepts or stops one by one
+(`pipe.{h,cpp}`; the protocol is in `pipe.h`). Every policy above therefore
+stays in `src/update/`. The rollback record is a small file with the Qt
+record format (`filestore.{h,cpp}`); a damaged record fails closed. Like Qt,
+the helper installs nothing. Release builds of the helper take
+`-C contrib/b3hive-release/stable-channel-v1.cmake` and accept no channel
+arguments.
+
 `contrib/b3hive-release/`: deterministic offline manifest generator/signer.
 Test keys are generated per-run and marked; no private key ever enters the
 tree, build, installer or server. Production URL + key set are release
