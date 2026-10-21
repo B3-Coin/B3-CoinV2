@@ -7,6 +7,7 @@
     <link rel="stylesheet" href="./shared/css/hive.css" />
   </head>
   <body>
+    <a class="skip-link" href="#page-title">Skip to the page</a>
     <div class="app">
       <aside class="rail">
         <div class="rail-brand">
@@ -94,7 +95,7 @@
       <div class="main">
         <header class="page-head">
           <div>
-            <h1 class="page-title" id="page-title">Home</h1>
+            <h1 class="page-title" id="page-title" tabindex="-1">Home</h1>
             <p class="page-sub" id="page-sub">Your balance and your node</p>
           </div>
         </header>
@@ -434,7 +435,7 @@
         </main>
 
         <main class="view" id="view-receive" hidden>
-          <div class="banner banner-danger mb-4" id="rcv-result" role="status" hidden></div>
+          <div class="banner banner-danger mb-4" id="rcv-result" role="alert" hidden></div>
           <div class="rcv-grid">
             <div class="card rcv-main">
               <div class="card-head">
@@ -612,7 +613,7 @@
 
         <main class="view view--data" id="view-trade" hidden>
           <div class="stack tr-page">
-            <div class="banner banner-danger" id="tr-error" role="status" hidden></div>
+            <div class="banner banner-danger" id="tr-error" role="alert" hidden></div>
             <div class="card" id="tr-empty" hidden>
               <div class="empty">
                 <strong>No FlowMesh market is available</strong>

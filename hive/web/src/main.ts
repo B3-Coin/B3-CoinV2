@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { amountNode, amountText, amountUnits, el, formatAmount, icon, initTheme, isMasked, setMasked, shorten, sumAmounts, toggleTheme, type Theme } from "../shared/ui";
+import { amountNode, amountText, amountUnits, bannerTone, el, formatAmount, icon, initTheme, isMasked, setMasked, shorten, sumAmounts, toggleTheme, type Theme } from "../shared/ui";
 import { startTrade, stopTrade, tradeMaskChanged, tradeWalletChanged, tradeDecided, type TradeResult } from "./trade";
 import { pickAddress, sortOwn } from "./picker";
 import { single } from "./single";
@@ -128,8 +128,11 @@ type DraftResult =
   | { outcome: "traded"; id: string };
 
 function showThemeIcon(theme: Theme): void {
-  // The button shows the theme it switches to.
+  // The button shows, and is named by, the theme it switches to.
+  const next = theme === "dark" ? "light" : "dark";
   el("theme-icon").setAttribute("href", `/icons.svg#i-${theme === "dark" ? "sun" : "moon"}`);
+  el("theme").setAttribute("aria-label", `Switch to the ${next} theme`);
+  el("theme").title = `Switch to the ${next} theme`;
 }
 showThemeIcon(await initTheme());
 
@@ -252,7 +255,7 @@ type Tone = "info" | "danger";
 function showBanner(tone: Tone, title: string, detail: string): void {
   const banner = el("node-banner");
   banner.hidden = false;
-  banner.className = `banner banner-${tone}`;
+  bannerTone(banner, tone);
   el("node-banner-spinner").hidden = tone !== "info";
   el("node-banner-icon").hidden = tone === "info";
   el("node-banner-title").textContent = title;
@@ -837,7 +840,7 @@ const walletName = (name: string) => (name === "" ? "Default wallet" : name);
 function walletsResult(tone: "success" | "danger" | "info" | "", text: string): void {
   const box = el("wl-result");
   box.hidden = !text;
-  box.className = `banner banner-${tone}`;
+  bannerTone(box, tone);
   box.textContent = text;
   if (text) box.scrollIntoView({ block: "nearest" });
 }
@@ -1364,7 +1367,7 @@ const refreshRecent = single(async (current) => {
 function activityResult(tone: "danger" | "success", text: string): void {
   const box = el("activity-result");
   box.hidden = !text;
-  box.className = `banner banner-${tone} mt-4`;
+  bannerTone(box, tone, "mt-4");
   box.textContent = text;
 }
 
@@ -1675,18 +1678,20 @@ function showPeer(p: Peer): void {
 function peerRow(p: Peer): HTMLTableRowElement {
   const tr = document.createElement("tr");
   tr.className = "clickable";
-  tr.tabIndex = 0;
   tr.title = "Show this peer's details";
+  // The whole row takes a click; the address is the button the keyboard
+  // and screen readers reach. Its click bubbles up to the row.
   tr.addEventListener("click", () => showPeer(p));
-  tr.addEventListener("keydown", (k) => {
-    if (k.key === "Enter" || k.key === " ") {
-      k.preventDefault();
-      showPeer(p);
-    }
-  });
+  const open = document.createElement("button");
+  open.type = "button";
+  open.className = "row-open";
+  open.textContent = p.address;
+  open.setAttribute("aria-label", `Details for peer ${p.address}`);
+  const address = cell("", "mono");
+  address.append(open);
   const direction = DIRECTION[p.connection_type] ?? (p.inbound ? "Inbound" : "Outbound");
   tr.append(
-    cell(p.address, "mono"),
+    address,
     cell(direction),
     cell(p.user_agent || "—", "mono", p.version ? `Protocol ${p.version}` : ""),
     cell(p.synced_blocks < 0 ? "—" : count(p.synced_blocks), "num"),
@@ -1700,7 +1705,7 @@ function peerRow(p: Peer): HTMLTableRowElement {
 function networkResult(text: string): void {
   const box = el("network-result");
   box.hidden = !text;
-  box.className = "banner banner-danger";
+  bannerTone(box, "danger");
   box.textContent = text;
 }
 
@@ -1847,7 +1852,7 @@ let setupLoaded = false;
 function setupResult(tone: "info" | "danger", text: string): void {
   const box = el("setup-result");
   box.hidden = !text;
-  box.className = `banner banner-${tone}`;
+  bannerTone(box, tone);
   box.textContent = text;
 }
 
@@ -1977,7 +1982,7 @@ let loadedSettings: NodeSettings | null = null;
 function settingsResult(tone: "success" | "danger", text: string): void {
   const box = el("settings-result");
   box.hidden = !text;
-  box.className = `banner banner-${tone}`;
+  bannerTone(box, tone);
   box.textContent = text;
 }
 
@@ -2133,7 +2138,7 @@ el("settings-defaults").addEventListener("click", () => {
 function sendResult(tone: "info" | "success" | "warning" | "danger", text: string): void {
   const box = el("send-result");
   box.hidden = false;
-  box.className = `banner banner-${tone} mt-4`;
+  bannerTone(box, tone, "mt-4");
   box.textContent = text;
   // With several recipients the form is long; keep the outcome in view.
   box.scrollIntoView({ block: "nearest" });
@@ -2162,7 +2167,7 @@ const psbtDrafts = new Set<string>();
 function psbtResult(tone: "info" | "success" | "warning" | "danger", text: string): void {
   const box = el("psbt-result");
   box.hidden = false;
-  box.className = `banner banner-${tone} mt-4`;
+  bannerTone(box, tone, "mt-4");
   box.textContent = text;
   box.scrollIntoView({ block: "nearest" });
 }
@@ -2447,7 +2452,7 @@ function renderSteps(steps: StakeStep[]): void {
 function stakeResult(tone: "success" | "warning" | "danger", text: string): void {
   const box = el("stk-result");
   box.hidden = false;
-  box.className = `banner banner-${tone}`;
+  bannerTone(box, tone);
   box.textContent = text;
   box.scrollIntoView({ block: "nearest" });
 }
@@ -2767,7 +2772,7 @@ let contacts: Contact[] = [];
 function bookResult(tone: "success" | "danger", text: string): void {
   const box = el("book-result");
   box.hidden = false;
-  box.className = `banner banner-${tone}`;
+  bannerTone(box, tone);
   box.textContent = text;
   box.scrollIntoView({ block: "nearest" });
 }
@@ -3320,7 +3325,7 @@ function megabytes(bytes: number): string {
 function updateResult(tone: "info" | "success" | "warning" | "danger", text: string): void {
   const box = el("update-result");
   box.hidden = !text;
-  box.className = `banner banner-${tone} mt-4`;
+  bannerTone(box, tone, "mt-4");
   box.textContent = text;
 }
 

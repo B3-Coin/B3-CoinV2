@@ -157,6 +157,13 @@ export function sumAmounts(values: string[]): string | null {
   return `${neg ? "-" : ""}${abs / 1_000_000_000n}.${frac}`;
 }
 
+/** Gives a result banner its tone. Failures are announced at once (role
+ *  alert), everything else politely (role status). */
+export function bannerTone(box: HTMLElement, tone: string, extra = ""): void {
+  box.className = ["banner", tone ? `banner-${tone}` : "", extra].filter(Boolean).join(" ");
+  box.setAttribute("role", tone === "danger" ? "alert" : "status");
+}
+
 /** First 8 … last 6 characters; the full value goes in a title. */
 export function shorten(text: string, head = 8, tail = 6): string {
   return text.length <= head + tail + 1 ? text : `${text.slice(0, head)}…${text.slice(-tail)}`;

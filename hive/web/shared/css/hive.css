@@ -185,6 +185,9 @@ ol.checklist { list-style: none; margin: 0; padding: 0; }
 @keyframes tr-flash { from { background: var(--accent-bg); } to { background: transparent; } }
 @media (prefers-reduced-motion: reduce) { .tr-flash { animation: none; } }
 button.tr-book-row { width: 100%; text-align: left; }
+/* A table row's own button: looks like the cell text it replaces. */
+.row-open { padding: 0; text-align: left; font: inherit; color: inherit; }
+.row-open:hover { text-decoration: underline; }
 .tr-book-row.tr-pick { cursor: pointer; }
 .tr-book-row.tr-pick:hover { background: var(--bg-subtle); }
 .tr-mid {

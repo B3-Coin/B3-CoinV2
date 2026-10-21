@@ -9,7 +9,7 @@
 // this page never signs.
 import { invoke } from "@tauri-apps/api/core";
 
-import { el, isMasked, shorten } from "../shared/ui";
+import { bannerTone, el, isMasked, shorten } from "../shared/ui";
 import { pickAddress } from "./picker";
 import {
   B3_DECIMALS,
@@ -1234,7 +1234,7 @@ function pickPrice(price: bigint): void {
 
 function showResult(kind: string, text: string): void {
   const banner = el("tr-result");
-  banner.className = kind ? `banner banner-${kind}` : "banner";
+  bannerTone(banner, kind);
   banner.textContent = text;
   banner.hidden = !text;
 }
@@ -1448,7 +1448,7 @@ function renderFunding(): void {
 
 function showFundResult(kind: string, text: string): void {
   const banner = el("tr-fund-result");
-  banner.className = kind ? `banner banner-${kind}` : "banner";
+  bannerTone(banner, kind);
   banner.textContent = text;
   banner.hidden = !text;
 }
