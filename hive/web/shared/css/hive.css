@@ -184,6 +184,7 @@ ol.checklist { list-style: none; margin: 0; padding: 0; }
 .tr-flash { animation: tr-flash 800ms ease-out; }
 @keyframes tr-flash { from { background: var(--accent-bg); } to { background: transparent; } }
 @media (prefers-reduced-motion: reduce) { .tr-flash { animation: none; } }
+button.tr-book-row { width: 100%; text-align: left; }
 .tr-book-row.tr-pick { cursor: pointer; }
 .tr-book-row.tr-pick:hover { background: var(--bg-subtle); }
 .tr-mid {
@@ -261,7 +262,7 @@ ol.checklist { list-style: none; margin: 0; padding: 0; }
 }
 .tr-in-unit { flex: none; font-size: var(--text-xs); color: var(--text-muted); white-space: nowrap; max-width: 9em; overflow: hidden; text-overflow: ellipsis; }
 .tr-stepper {
-  width: 22px; height: 22px; flex: none; display: grid; place-items: center;
+  width: 24px; height: 24px; flex: none; display: grid; place-items: center;
   border-radius: 5px; color: var(--text-muted); font-size: 15px; line-height: 1;
 }
 .tr-stepper:hover { background: var(--bg-card); color: var(--text); }

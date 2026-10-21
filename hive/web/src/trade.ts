@@ -585,7 +585,10 @@ function renderBook(): void {
     // A bid level is labelled by its lower edge, an ask by its upper: every
     // order in the level accepts that price.
     const price = side === "bids" ? level.low : level.high;
-    const div = document.createElement("div");
+    // A button, so the keyboard can take a level's price too.
+    const div = document.createElement("button");
+    div.type = "button";
+    div.dataset.level = `${side}:${price}`;
     div.className = `tr-book-row tr-${side === "asks" ? "ask" : "bid"}`;
     if (BigInt(level.own) > 0n) div.classList.add("tr-own");
     if (previous.size && !previous.has(price)) {
@@ -608,13 +611,20 @@ function renderBook(): void {
     const own = BigInt(level.own) > 0n ? `\nYours: ${formatQuantity(BigInt(level.own), u.decimals, places)}` : "";
     const range = level.low === level.high ? "" : `\nPrices ${formatPrice(BigInt(level.low), u)} to ${formatPrice(BigInt(level.high), u)}`;
     div.title = `${level.curves} order${level.curves === 1 ? "" : "s"}${range}${own}\nClick to use this price`;
+    div.setAttribute(
+      "aria-label",
+      `${side === "asks" ? "Ask" : "Bid"} ${formatPrice(BigInt(price), u)} B3, size ${formatQuantity(BigInt(level.size), u.decimals, places)}${own ? ", includes yours" : ""}. Use this price.`,
+    );
     div.classList.add("tr-pick");
     div.addEventListener("click", () => pickPrice(BigInt(price)));
     return div;
   };
+  // Redrawing must not take the keyboard focus off the level it was on.
+  const focused = (document.activeElement as HTMLElement | null)?.dataset.level;
   // Asks above the spread, best (lowest) nearest it.
   asks.replaceChildren(...[...askLevels].reverse().map((l) => row(l, "asks", shown.asks)));
   bids.replaceChildren(...bidLevels.map((l) => row(l, "bids", shown.bids)));
+  if (focused) el("tr-book").querySelector<HTMLElement>(`[data-level="${focused}"]`)?.focus();
   shown.asks = new Set(askLevels.map((l) => l.high));
   shown.bids = new Set(bidLevels.map((l) => l.low));
 
@@ -686,6 +696,7 @@ function renderPriceChart(): void {
   plotted = [];
   if (!u || !cleared.length) {
     chart.replaceChildren();
+    chart.setAttribute("aria-label", "Clearing prices: no auction has matched yet");
     clearChartLabels();
     return;
   }
@@ -751,6 +762,12 @@ function renderPriceChart(): void {
   el("tr-chart-first").textContent = `#${first}`;
   el("tr-chart-mid").textContent = `${cleared.length} clearing${cleared.length === 1 ? "" : "s"}`;
   el("tr-chart-last").textContent = `#${lastSeq}`;
+  // The pointer reads single points; this says the whole chart at once.
+  chart.setAttribute(
+    "aria-label",
+    `Clearing prices in B3: ${cleared.length} clearing${cleared.length === 1 ? "" : "s"} from microblock ${first} to ${lastSeq}, ` +
+      `last ${formatPrice(prices[prices.length - 1], u)}, high ${formatPrice(hi, u)}, low ${formatPrice(lo, u)}`,
+  );
 }
 
 function renderDepthChart(): void {
@@ -766,6 +783,7 @@ function renderDepthChart(): void {
   empty.hidden = !!u && (bids.length > 0 || asks.length > 0);
   if (!u || (!bids.length && !asks.length)) {
     chart.replaceChildren();
+    chart.setAttribute("aria-label", "Book depth: no standing orders");
     return;
   }
   const [W, H, pad] = [CHART_W, CHART_H, CHART_PAD];
@@ -773,6 +791,11 @@ function renderDepthChart(): void {
   // ask's upper. Levels come best first.
   const b = bids.map((l) => ({ p: BigInt(l.low), c: BigInt(l.cumulative) }));
   const a = asks.map((l) => ({ p: BigInt(l.high), c: BigInt(l.cumulative) }));
+  chart.setAttribute(
+    "aria-label",
+    `Book depth: ${b.length} bid level${b.length === 1 ? "" : "s"}${b.length ? `, best ${formatPrice(b[0].p, u)} B3` : ""}; ` +
+      `${a.length} ask level${a.length === 1 ? "" : "s"}${a.length ? `, best ${formatPrice(a[0].p, u)} B3` : ""}`,
+  );
   const all = [...b, ...a];
   let pLo = all.reduce((m, v) => (v.p < m ? v.p : m), all[0].p);
   let pHi = all.reduce((m, v) => (v.p > m ? v.p : m), all[0].p);
@@ -1951,6 +1974,15 @@ for (const [id, isLadder] of [
 }
 for (const button of document.querySelectorAll<HTMLElement>("#tr-ticket .tr-stepper")) {
   button.addEventListener("click", () => nudge(button.dataset.for!, Number(button.dataset.dir)));
+}
+// The arrow keys step a price or an amount, as the steppers do with a click.
+for (const input of document.querySelectorAll<HTMLInputElement>("#tr-ticket .tr-in-field")) {
+  input.setAttribute("aria-keyshortcuts", "ArrowUp ArrowDown");
+  input.addEventListener("keydown", (e) => {
+    if (e.key !== "ArrowUp" && e.key !== "ArrowDown") return;
+    e.preventDefault();
+    nudge(input.id, e.key === "ArrowUp" ? 1 : -1);
+  });
 }
 el("tr-pct").addEventListener("input", (e) => setShare(Number((e.target as HTMLInputElement).value)));
 for (const mark of document.querySelectorAll<HTMLElement>("#tr-slider [data-pct]")) {
