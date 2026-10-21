@@ -14,6 +14,14 @@ using Signed128 = __int128;
 using Unsigned128 = unsigned __int128;
 } // namespace util
 #else
+#ifdef _MSC_VER
+// MSVC's conforming preprocessor (/Zc:preprocessor) cannot paste Boost's sized
+// literal names (""_cppi ## 128). B3 uses no cpp_int literals, so skip that
+// header; the types and arithmetic are unchanged.
+#include <boost/multiprecision/cpp_int/cpp_int_config.hpp>
+#include <boost/multiprecision/cpp_int/value_pack.hpp>
+#define BOOST_MP_CPP_INT_LITERALS_HPP
+#endif
 #include <boost/multiprecision/cpp_int.hpp>
 
 namespace util {

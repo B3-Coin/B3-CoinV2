@@ -321,7 +321,13 @@ endif()
 # Both compute identical results; only speed differs. The selection is not a
 # user option because upstream does not support the pure-C path on
 # x86_64/aarch64 (its 64-bit-limb headers assume the assembly).
-if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|aarch64|arm64|ARM64)$")
+# MSVC cannot assemble the GNU-syntax file; on x86_64 it takes upstream's own
+# Windows path instead (build.bat): the same routines as MASM (build/win64),
+# assembled by ml64 with the same __BLST_PORTABLE__ define.
+if(MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
+  set(B3_BLST_NO_ASM OFF)
+  enable_language(ASM_MASM)
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|aarch64|arm64|ARM64)$")
   set(B3_BLST_NO_ASM OFF)
   enable_language(ASM)
 else()
@@ -574,6 +580,12 @@ endif()
 
 include(AddBoostIfNeeded)
 add_boost_if_needed()
+if(MSVC AND TARGET Boost::headers)
+  # MSVC has no __int128, so util/int128.h falls back to Boost.Multiprecision,
+  # and interfaces/chain.h carries it into nearly every target. vcpkg does not
+  # put Boost on the global include path the way depends does for MinGW.
+  target_link_libraries(core_interface INTERFACE Boost::headers)
+endif()
 
 if(BUILD_DAEMON OR BUILD_GUI OR BUILD_CLI OR BUILD_TESTS OR BUILD_BENCH OR BUILD_FUZZ_BINARY)
   # Shared headless/Qt FlowMesh trading HTTPS, independent of wallet/admin RPC.
