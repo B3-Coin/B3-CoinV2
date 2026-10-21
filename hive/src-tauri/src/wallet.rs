@@ -1000,6 +1000,111 @@ pub struct ActivityEntry {
     pub time: i64,
     pub address: String,
     pub label: String,
+    /// The node's b3 tag, such as flowmesh-withdrawal.
+    #[serde(skip)]
+    pub tag: String,
+    /// The node's b3_network_fee tag: the fee the wallet paid, positive.
+    #[serde(skip)]
+    pub network_fee: Option<String>,
+}
+
+/// The label the node gives a FlowMesh checkpoint's output to the wallet.
+const CHECKPOINT_LABEL: &str = "b3-flowmesh-checkpoint";
+
+/// Signed base units as 9-decimal B3 text.
+pub(crate) fn b3_text(units: i128) -> String {
+    let sign = if units < 0 { "-" } else { "" };
+    let units = units.unsigned_abs();
+    format!(
+        "{sign}{}.{:09}",
+        units / 1_000_000_000,
+        units % 1_000_000_000
+    )
+}
+
+/// A b3_network_fee tag as a fee the way the node prints one: negative.
+pub(crate) fn tagged_fee(text: &str) -> Option<String> {
+    crate::history::units(text)
+        .filter(|u| *u >= 0)
+        .map(|u| b3_text(-u))
+}
+
+/// What Activity calls a FlowMesh transaction the wallet left unlabelled.
+fn flowmesh_label(tag: &str) -> Option<&'static str> {
+    match tag {
+        "flowmesh-deposit" => Some("FlowMesh deposit"),
+        "flowmesh-withdrawal" => Some("FlowMesh payout"),
+        "flowmesh-deposit-sweep" => Some("FlowMesh deposit sweep"),
+        _ => None,
+    }
+}
+
+/// A vault transaction (a payout or a deposit sweep): it spends the market's
+/// vault, and the wallet only adds the fee input.
+pub(crate) fn vault_tx(tag: &str) -> bool {
+    tag == "flowmesh-withdrawal" || tag == "flowmesh-deposit-sweep"
+}
+
+/// FlowMesh transactions as what they did to this wallet. The node lists a
+/// vault transaction per output and counts the vault input it spends as the
+/// wallet's, so it shows the vault's outputs as sends and most of the vault
+/// as the "fee"; the fee the wallet paid is in b3_network_fee. A checkpoint
+/// pays dust back to the wallet, which lists as a send and a receive.
+pub(crate) fn settle_flowmesh(lines: Vec<ActivityEntry>) -> Vec<ActivityEntry> {
+    let mut out = Vec::with_capacity(lines.len());
+    let mut seen: Vec<&str> = Vec::new();
+    for line in &lines {
+        let payout = vault_tx(&line.tag);
+        let checkpoint = line.tag == "flowmesh-checkpoint" || line.label == CHECKPOINT_LABEL;
+        if !payout && !checkpoint {
+            let mut line = line.clone();
+            if line.label.is_empty() {
+                line.label = flowmesh_label(&line.tag).unwrap_or_default().into();
+            }
+            out.push(line);
+            continue;
+        }
+        if seen.contains(&line.txid.as_str()) {
+            continue;
+        }
+        seen.push(&line.txid);
+        let same = || lines.iter().filter(|l| l.txid == line.txid);
+        if payout {
+            let mut received: Vec<ActivityEntry> = same()
+                .filter(|l| l.category == "receive")
+                .cloned()
+                .collect();
+            if received.is_empty() {
+                // A sweep, or paid to another wallet: the fee only.
+                let to = same().find(|l| !l.address.is_empty()).unwrap_or(line);
+                received.push(ActivityEntry {
+                    category: "send".into(),
+                    amount: b3_text(0),
+                    address: to.address.clone(),
+                    label: to.label.clone(),
+                    ..line.clone()
+                });
+            }
+            let fee = line.network_fee.as_deref().and_then(tagged_fee);
+            for (i, mut r) in received.into_iter().enumerate() {
+                r.fee = if i == 0 { fee.clone() } else { None };
+                if r.label.is_empty() {
+                    r.label = flowmesh_label(&line.tag).unwrap_or_default().into();
+                }
+                out.push(r);
+            }
+        } else {
+            // The wallet paid the fee; the dust stays its own.
+            let send = same().find(|l| l.category == "send").unwrap_or(line);
+            out.push(ActivityEntry {
+                category: "send".into(),
+                amount: b3_text(0),
+                label: "FlowMesh checkpoint".into(),
+                ..send.clone()
+            });
+        }
+    }
+    out
 }
 
 /// Activity shows at most this many lines.
@@ -1013,7 +1118,11 @@ pub fn activity(client: &Client, wallet: &str, count: u64) -> Result<Vec<Activit
         .as_array()
         .ok_or_else(|| RpcError::BadReply("listtransactions did not return a list".into()))?;
     // The node lists oldest first.
-    list.iter().rev().map(parse_activity).collect()
+    list.iter()
+        .rev()
+        .map(parse_activity)
+        .collect::<Result<Vec<_>, _>>()
+        .map(settle_flowmesh)
 }
 
 pub(crate) fn parse_activity(t: &Value) -> Result<ActivityEntry, RpcError> {
@@ -1030,6 +1139,8 @@ pub(crate) fn parse_activity(t: &Value) -> Result<ActivityEntry, RpcError> {
         time: t["time"].as_i64().unwrap_or(0),
         address: text(&t["address"]),
         label: text(&t["label"]),
+        tag: text(&t["b3"]),
+        network_fee: t["b3_network_fee"].as_str().map(str::to_owned),
     })
 }
 

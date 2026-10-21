@@ -106,7 +106,11 @@ pub fn all(client: &Client, wallet: &str) -> Result<Vec<ActivityEntry>, RpcError
     let list = list
         .as_array()
         .ok_or_else(|| RpcError::BadReply("listtransactions did not return a list".into()))?;
-    list.iter().rev().map(wallet::parse_activity).collect()
+    list.iter()
+        .rev()
+        .map(wallet::parse_activity)
+        .collect::<Result<Vec<_>, _>>()
+        .map(wallet::settle_flowmesh)
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -245,6 +249,36 @@ pub fn parse_details(t: &Value) -> Result<Details, RpcError> {
             })
         })
         .collect::<Result<Vec<_>, RpcError>>()?;
+    if t["b3"].as_str().is_some_and(wallet::vault_tx) {
+        return Ok(payout_details(t, lines, details_of(t, Vec::new())?));
+    }
+    details_of(t, lines)
+}
+
+/// A payout or deposit sweep as what it did to this wallet (see
+/// wallet::settle_flowmesh): what it received, and the fee it paid. A payout
+/// to another wallet lists where it went.
+fn payout_details(t: &Value, lines: Vec<DetailLine>, mut d: Details) -> Details {
+    let received: Vec<DetailLine> = lines
+        .iter()
+        .filter(|l| l.category == "receive")
+        .cloned()
+        .collect();
+    d.amount = wallet::b3_text(received.iter().filter_map(|l| units(&l.amount)).sum());
+    d.fee = t["b3_network_fee"].as_str().and_then(wallet::tagged_fee);
+    d.lines = if received.is_empty() {
+        lines
+            .into_iter()
+            .filter(|l| !l.address.is_empty())
+            .collect()
+    } else {
+        received
+    };
+    d
+}
+
+fn details_of(t: &Value, lines: Vec<DetailLine>) -> Result<Details, RpcError> {
+    let text = |v: &Value| v.as_str().unwrap_or_default().to_owned();
     Ok(Details {
         txid: text(&t["txid"]),
         wtxid: text(&t["wtxid"]),
@@ -293,6 +327,8 @@ mod tests {
             time,
             address: address.into(),
             label: label.into(),
+            tag: String::new(),
+            network_fee: None,
         }
     }
 
@@ -401,5 +437,105 @@ mod tests {
         assert_eq!(d.comment, "rent");
         assert!(!is_txid("zz"));
         assert!(is_txid(&"Ab".repeat(32)));
+    }
+
+    /// Lines as the node lists a payout to this wallet and a checkpoint
+    /// (regtest), oldest first.
+    fn flowmesh_lines() -> Value {
+        let payout = |category: &str, amount: f64, fee: Value, address: Value, vout: u64| {
+            json!({"txid": "c6".repeat(32), "category": category, "amount": amount, "fee": fee,
+                   "address": address, "label": if address.is_null() { "" } else { "mine" },
+                   "vout": vout, "b3": "flowmesh-withdrawal", "b3_network_fee": "0.0003954",
+                   "time": 9, "confirmations": 1})
+        };
+        let checkpoint = |category: &str, amount: f64, fee: Value| {
+            json!({"txid": "a2".repeat(32), "category": category, "amount": amount, "fee": fee,
+                   "address": "mqv9", "label": "b3-flowmesh-checkpoint", "vout": 0,
+                   "time": 8, "confirmations": 2})
+        };
+        json!([
+            checkpoint("receive", 0.000000546, Value::Null),
+            checkpoint("send", -0.000000546, json!(-0.0036)),
+            payout("receive", 0.01, Value::Null, json!("mkyB"), 0),
+            payout("send", -0.99, json!(0.9996046), Value::Null, 1),
+            payout("send", -0.01, json!(0.9996046), json!("mkyB"), 0),
+        ])
+    }
+
+    #[test]
+    fn flowmesh_lines_show_what_they_did_to_the_wallet() {
+        let raw = flowmesh_lines();
+        let lines: Vec<ActivityEntry> = raw
+            .as_array()
+            .unwrap()
+            .iter()
+            .rev()
+            .map(|l| wallet::parse_activity(l).unwrap())
+            .collect();
+        let got = wallet::settle_flowmesh(lines);
+        assert_eq!(got.len(), 2);
+        // The payout: what the wallet received, and the fee it paid.
+        assert_eq!(got[0].category, "receive");
+        assert_eq!(got[0].amount, "0.01");
+        assert_eq!(got[0].fee.as_deref(), Some("-0.000395400"));
+        assert_eq!(got[0].label, "mine");
+        // The checkpoint: one line, its fee, nothing sent away.
+        assert_eq!(got[1].category, "send");
+        assert_eq!(got[1].amount, "0.000000000");
+        assert_eq!(got[1].fee.as_deref(), Some("-0.0036"));
+        assert_eq!(got[1].label, "FlowMesh checkpoint");
+
+        // Paid to another wallet: the fee only, and where it went.
+        let elsewhere: Vec<ActivityEntry> = raw.as_array().unwrap()[3..]
+            .iter()
+            .map(|l| wallet::parse_activity(l).unwrap())
+            .collect();
+        let got = wallet::settle_flowmesh(elsewhere);
+        assert_eq!(got.len(), 1);
+        assert_eq!(
+            (got[0].category.as_str(), got[0].amount.as_str()),
+            ("send", "0.000000000")
+        );
+        assert_eq!(
+            (got[0].address.as_str(), got[0].fee.as_deref()),
+            ("mkyB", Some("-0.000395400"))
+        );
+
+        // A deposit sweep this wallet published: the fee only. A deposit
+        // keeps the node's line and gets a name.
+        let sweep = json!({"txid": "b9".repeat(32), "category": "send", "amount": -1.0,
+                           "fee": 0.99999403, "vout": 0, "b3": "flowmesh-deposit-sweep",
+                           "b3_network_fee": "0.00000597"});
+        let deposit = json!({"txid": "8e".repeat(32), "category": "send", "amount": -1.0,
+                             "fee": -0.00000319, "vout": 0, "b3": "flowmesh-deposit"});
+        let got = wallet::settle_flowmesh(vec![
+            wallet::parse_activity(&sweep).unwrap(),
+            wallet::parse_activity(&deposit).unwrap(),
+        ]);
+        assert_eq!(
+            (got[0].amount.as_str(), got[0].fee.as_deref()),
+            ("0.000000000", Some("-0.000005970"))
+        );
+        assert_eq!(got[0].label, "FlowMesh deposit sweep");
+        assert_eq!(got[1].fee, wallet::parse_activity(&deposit).unwrap().fee);
+        assert_eq!(got[1].label, "FlowMesh deposit");
+    }
+
+    #[test]
+    fn payout_details_show_what_the_wallet_received() {
+        let d = parse_details(&json!({
+            "txid": "c6", "amount": -0.99, "fee": 0.9996046, "confirmations": 1,
+            "b3": "flowmesh-withdrawal", "b3_network_fee": "0.0003954",
+            "details": [
+                {"category": "send", "address": "mkyB", "amount": -0.01, "vout": 0},
+                {"category": "send", "amount": -0.99, "vout": 1},
+                {"category": "receive", "address": "mkyB", "amount": 0.01, "vout": 0},
+            ]
+        }))
+        .unwrap();
+        assert_eq!(d.amount, "0.010000000");
+        assert_eq!(d.fee.as_deref(), Some("-0.000395400"));
+        assert_eq!(d.lines.len(), 1);
+        assert_eq!(d.lines[0].category, "receive");
     }
 }
