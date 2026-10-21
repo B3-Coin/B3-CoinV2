@@ -19,7 +19,17 @@ namespace node {
 namespace {
 using namespace flowmesh;
 using Bytes = std::vector<unsigned char>;
-constexpr uint32_t MAX_VIEWS{128};
+// Views are a nonwrapping uint32 counter (V2 C4): an outage changes views
+// until a quorum returns, and only the top of that space is exhaustion.
+// Storage is bounded separately. A replica never signs below its durable
+// view, so records of abandoned views are not needed for vote safety; it
+// keeps the recent views, its newest COMMIT and the highest preparation.
+//! Abandoned views whose records, votes and reports are still retained.
+constexpr uint32_t RETAINED_VIEWS{4};
+//! Highest view, relative to the current one, whose messages are admitted.
+constexpr uint32_t MAX_VIEW_AHEAD{128};
+//! Authenticated proposal bodies kept in one durable slot (fetch sources).
+constexpr size_t MAX_RETAINED_PROPOSALS{128};
 constexpr size_t MAX_CANDIDATES{32};
 constexpr size_t MAX_RECORDS{16384};
 constexpr size_t MAX_SLOT_BYTES{128U * 1024U * 1024U};
@@ -119,7 +129,7 @@ struct Slot {
             Candidate candidate{GetBytes(s, FLOWMESH_V1_MAX_MICROBLOCK_BYTES), GetBytes(s, MAX_EVIDENCE_BYTES)};
             if (!candidates.emplace(hash, std::move(candidate)).second) throw std::ios_base::failure("duplicate agreement candidate");
         }
-        for (size_t i{0}, n{Count(s, MAX_VIEWS)}; i < n; ++i) {
+        for (size_t i{0}, n{Count(s, MAX_RETAINED_PROPOSALS)}; i < n; ++i) {
             uint32_t v; s >> v;
             if (!proposals.emplace(v, GetBytes(s, AGREEMENT_MAX_BYTES)).second) throw std::ios_base::failure("duplicate agreement proposal");
         }
@@ -204,6 +214,8 @@ struct FlowMeshAgreement::Impl {
     std::map<RecordKey, size_t> record_index;
     std::set<RecordKey> received;
     size_t received_bytes{0};
+    //! received_bytes by view, released when an abandoned view is pruned.
+    std::map<uint32_t, size_t> received_view_bytes;
     size_t retry_cursor{0};
     uint32_t proposal_retry_cursor{0};
     std::set<uint256> usable;
@@ -310,8 +322,7 @@ struct FlowMeshAgreement::Impl {
     bool ValidMessage(const AgreementMessage& message, const ActiveFnBlsSeatSet& authority,
                       const PreagreementContext& context, const bool unsigned_intent = false) const
     {
-        if (!SameContext(message.context, context) || message.view >= MAX_VIEWS ||
-            !EncodeAgreementMessage(message)) return false;
+        if (!SameContext(message.context, context) || !EncodeAgreementMessage(message)) return false;
         if (message.stage != AgreementStage::DECISION && message.seat_index >= authority.Size()) return false;
         if (message.stage != AgreementStage::DECISION && !unsigned_intent &&
             !CheckAgreementMessageSignature(message, authority)) return false;
@@ -331,7 +342,7 @@ struct FlowMeshAgreement::Impl {
     bool ValidateSlot(const Slot& candidate, const ActiveFnBlsSeatSet& authority, std::string& error) const
     {
         const auto& context{candidate.context.value};
-        if (!ContextValid(context, authority) || candidate.view >= MAX_VIEWS) { error = "invalid agreement context/view"; return false; }
+        if (!ContextValid(context, authority)) { error = "invalid agreement context/view"; return false; }
         if (!candidate.highest.empty()) {
             const auto highest{DecodePreagreementPrepared(candidate.highest)};
             if (!highest || highest->view > candidate.view ||
@@ -404,7 +415,7 @@ struct FlowMeshAgreement::Impl {
     {
         votes.clear(); reports.clear(); pending_proposals.clear(); pending_decision.reset();
         record_index.clear(); received.clear(); usable.clear(); preferred.reset(); required.reset();
-        received_bytes = 0; retry_cursor = 0; proposal_retry_cursor = 0;
+        received_bytes = 0; received_view_bytes.clear(); retry_cursor = 0; proposal_retry_cursor = 0;
     }
     void Track(const AgreementMessage& message)
     {
@@ -425,11 +436,14 @@ struct FlowMeshAgreement::Impl {
             const size_t bytes{EncodeAgreementMessage(message)->size()};
             if (bytes > MAX_SLOT_BYTES - received_bytes) throw std::runtime_error("agreement tracked proof resource limit");
             received_bytes += bytes;
+            received_view_bytes[message.view] += bytes;
             if (prepared) bucket.prepared = message.prepared;
             if (new_view) bucket.new_view = message.new_view;
             return;
         }
-        received_bytes += EncodeAgreementMessage(message)->size();
+        const size_t bytes{EncodeAgreementMessage(message)->size()};
+        received_bytes += bytes;
+        received_view_bytes[message.view] += bytes;
         if (received.size() > MAX_RECORDS || received_bytes > MAX_SLOT_BYTES) throw std::runtime_error("agreement tracked message resource limit");
         if (message.stage == AgreementStage::VIEW_CHANGE) {
             reports[message.view].emplace(message.seat_index,
@@ -504,6 +518,7 @@ struct FlowMeshAgreement::Impl {
         // its evidence becomes usable, without reopening that view's votes.
         if (proposal.view < slot.view && !slot.proposals.contains(proposal.view)) {
             slot.proposals.emplace(proposal.view, *EncodeAgreementMessage(proposal));
+            LimitRetainedProposals();
             MarkDirty("persist_old_proposal_deferred");
         }
         return true;
@@ -603,16 +618,88 @@ struct FlowMeshAgreement::Impl {
     {
         TraceSpan trace{*this, "move_view"};
         if (target <= slot.view) return true;
-        if (target >= MAX_VIEWS) throw std::runtime_error("agreement view resource limit reached");
         // Every earlier intent is completed before creating a view change.
         for (const auto& record : slot.records) {
             if (record.signed_bytes.empty()) return false;
         }
         slot.view = target;
         slot.changing = changing;
+        // Pruned and moved in one atomic slot write: a crash keeps either the
+        // old view with its records or the new view without the abandoned ones.
+        PruneAbandonedViews();
         Persist("persist_view");
         return true;
     }
+    //! First view whose records, votes and reports are still retained.
+    uint32_t RetainedFloor() const { return slot.view > RETAINED_VIEWS ? slot.view - RETAINED_VIEWS : 0; }
+    //! Views whose proposal must outlive pruning: the highest preparation
+    //! (the fetch source for its candidate) and the newest local COMMIT.
+    std::set<uint32_t> ProtectedViews(const std::optional<size_t> newest_commit) const
+    {
+        std::set<uint32_t> result;
+        if (const auto highest{Highest()}) result.insert(highest->view);
+        if (newest_commit) result.insert(DecodeAgreementMessage(slot.records[*newest_commit].intent)->view);
+        return result;
+    }
+    std::optional<size_t> NewestCommitRecord() const
+    {
+        // Records are appended in nondecreasing view order (Sign refuses a view
+        // below the durable one), so the last COMMIT is the newest.
+        for (size_t i{slot.records.size()}; i-- > 0;) {
+            if (DecodeAgreementMessage(slot.records[i].intent)->stage == AgreementStage::COMMIT) return i;
+        }
+        return std::nullopt;
+    }
+    void LimitRetainedProposals()
+    {
+        const auto keep{ProtectedViews(NewestCommitRecord())};
+        const uint32_t floor{RetainedFloor()};
+        for (auto it{slot.proposals.begin()}; slot.proposals.size() > MAX_RETAINED_PROPOSALS && it != slot.proposals.end();) {
+            if (it->first < floor && !keep.contains(it->first)) it = slot.proposals.erase(it);
+            else ++it;
+        }
+        if (slot.proposals.size() > MAX_RETAINED_PROPOSALS) throw std::runtime_error("agreement retained proposal resource limit");
+    }
+    void PruneAbandonedViews()
+    {
+        TraceSpan trace{*this, "prune_abandoned_views"};
+        const uint32_t floor{RetainedFloor()};
+        if (floor == 0) return;
+        // Durable records: an abandoned view can never be signed again, so
+        // only the newest COMMIT is kept. Restart validation then still
+        // proves every later view report carries at least its preparation.
+        const auto newest_commit{NewestCommitRecord()};
+        const auto keep{ProtectedViews(newest_commit)};
+        std::vector<SignedRecord> records;
+        for (size_t i{0}; i < slot.records.size(); ++i) {
+            if (i == newest_commit || DecodeAgreementMessage(slot.records[i].intent)->view >= floor) {
+                records.push_back(std::move(slot.records[i]));
+            }
+        }
+        slot.records = std::move(records);
+        record_index.clear();
+        for (size_t i{0}; i < slot.records.size(); ++i) {
+            record_index.emplace(Key(*DecodeAgreementMessage(slot.records[i].intent)), i);
+        }
+        LimitRetainedProposals();
+        // Memory: votes, reports and deduplication of abandoned views. A
+        // later copy of such a message only contributes its durable evidence.
+        std::erase_if(votes, [&](const auto& item) { return item.first.first < floor && !keep.contains(item.first.first); });
+        std::erase_if(reports, [&](const auto& item) { return item.first < floor; });
+        std::erase_if(received, [&](const RecordKey& key) { return std::get<1>(key) < floor; });
+        for (auto it{received_view_bytes.begin()}; it != received_view_bytes.end() && it->first < floor;) {
+            received_bytes -= it->second;
+            it = received_view_bytes.erase(it);
+        }
+        // Old proposals stay only while their candidate is still unknown here.
+        std::erase_if(pending_proposals, [&](const auto& item) {
+            return item.first < floor && !keep.contains(item.first) && slot.candidates.contains(item.second.candidate);
+        });
+        while (pending_proposals.size() > MAX_RETAINED_PROPOSALS && pending_proposals.begin()->first < floor) {
+            pending_proposals.erase(pending_proposals.begin());
+        }
+    }
+    bool BelowRetained(const uint32_t view) const { return view < RetainedFloor(); }
     void LearnPrepared(const PreagreementPreparedCertificate& prepared)
     {
         const auto highest{Highest()};
@@ -714,6 +801,7 @@ struct FlowMeshAgreement::Impl {
             if (RememberCandidate(proposal.entry_bytes, proposal.candidate)) {
                 if (!slot.proposals.contains(slot.view)) {
                     slot.proposals.emplace(slot.view, *EncodeAgreementMessage(proposal));
+                    LimitRetainedProposals();
                     slot.changing = false;
                     // No vote is signed against it unwritten: the first
                     // PREPARE below writes the whole slot, this proposal and
@@ -883,6 +971,20 @@ bool FlowMeshAgreement::Receive(const AgreementMessage& message, std::string& er
         if (!valid) { error = "invalid agreement message"; return s.FinishPublicCall(false); }
         if (message.stage == AgreementStage::DECISION) { s.SaveDecision(message); return s.FinishPublicCall(true); }
         if (s.IsDecided()) return s.FinishPublicCall(true);
+        // A bounded window ahead: farther messages are refused for now (the
+        // sender retransmits), so an authenticated peer cannot jump the
+        // counter or grow state with arbitrary views. Not a halt.
+        if (message.view > s.slot.view && message.view - s.slot.view > MAX_VIEW_AHEAD) {
+            error = "agreement view too far ahead"; return s.FinishPublicCall(false);
+        }
+        // A pruned, abandoned view no longer collects votes or reports. Its
+        // authenticated evidence still counts: a proposal can supply the
+        // candidate of a highest preparation, and a COMMIT carries one.
+        if (s.BelowRetained(message.view)) {
+            if (message.stage == AgreementStage::PROPOSAL) s.RememberProposalCandidate(message);
+            if (message.prepared && message.stage == AgreementStage::COMMIT) s.LearnPrepared(*message.prepared);
+            return s.FinishPublicCall(s.Pump());
+        }
         const bool fresh{!s.received.contains(Key(message))};
         bool enrichment{false};
         if (!fresh && message.stage == AgreementStage::COMMIT) {
@@ -928,7 +1030,11 @@ bool FlowMeshAgreement::Timeout(std::string& error)
     try {
         s.usable.clear();
         s.Pump();
-        if (!s.IsDecided() && s.MoveView(s.slot.view + 1, true)) s.Pump();
+        if (!s.IsDecided()) {
+            // Explicit unavailability at the top of the view space, never a wrap.
+            if (s.slot.view == std::numeric_limits<uint32_t>::max()) throw std::runtime_error("agreement view space exhausted");
+            if (s.MoveView(s.slot.view + 1, true)) s.Pump();
+        }
         return s.FinishPublicCall(true);
     } catch (const std::exception& e) { return s.Stop(std::string{"agreement timeout failure: "} + e.what(), error); }
 }

@@ -1261,4 +1261,126 @@ BOOST_AUTO_TEST_CASE(local_signature_callback_never_runs_before_signed_sync)
     }
 }
 
+// A replica without a quorum keeps changing views. Views are a wide,
+// nonwrapping counter (V2 C4): an outage must not exhaust them, and its
+// durable signing records must stay bounded however long it lasts.
+BOOST_AUTO_TEST_CASE(long_quorum_outage_keeps_changing_views_with_bounded_records)
+{
+    const AgreementFixture f;
+    std::vector<AgreementMessage> output;
+    bool available{true}; std::string error;
+    node::FlowMeshAgreement engine{DBParams{.path = fs::PathFromString("agreement-long-outage"),
+        .cache_bytes = 1 << 20, .memory_only = true}, f.Callbacks(1, output, available)};
+    BOOST_REQUIRE(engine.Open(f.context, f.seats, Filled(77), true, error));
+    BOOST_REQUIRE(engine.SubmitCandidate(f.a, error));
+    // One VIEW_CHANGE record per view: more views than the 16384-record
+    // journal budget, so only pruning abandoned views keeps this going.
+    constexpr uint32_t VIEWS{20000};
+    for (uint32_t i{0}; i < VIEWS; ++i) {
+        BOOST_REQUIRE_MESSAGE(engine.Timeout(error), "view " << engine.View() << ": " << error);
+    }
+    BOOST_CHECK_EQUAL(engine.View(), VIEWS);
+    BOOST_CHECK(!engine.Halted());
+    // Retry rebroadcasts retained records only, not every abandoned view.
+    output.clear();
+    BOOST_REQUIRE(engine.Retry(error));
+    for (const auto& message : output) BOOST_CHECK(message.view + 8 >= VIEWS);
+}
+
+BOOST_AUTO_TEST_CASE(views_past_the_old_limit_survive_restart)
+{
+    const AgreementFixture f;
+    const fs::path path{m_args.GetDataDirBase() / "agreement-views-restart"};
+    std::vector<AgreementMessage> output;
+    bool available{true}; std::string error;
+    {
+        node::FlowMeshAgreement engine{DBParams{.path = path, .cache_bytes = 1 << 20}, f.Callbacks(1, output, available)};
+        BOOST_REQUIRE(engine.Open(f.context, f.seats, Filled(77), true, error));
+        BOOST_REQUIRE(engine.SubmitCandidate(f.a, error));
+        for (uint32_t i{0}; i < 300; ++i) BOOST_REQUIRE_MESSAGE(engine.Timeout(error), error);
+        BOOST_CHECK_EQUAL(engine.View(), 300U);
+    }
+    node::FlowMeshAgreement restarted{DBParams{.path = path, .cache_bytes = 1 << 20}, f.Callbacks(1, output, available)};
+    BOOST_REQUIRE_MESSAGE(restarted.Open(f.context, f.seats, Filled(77), false, error), error);
+    BOOST_CHECK_EQUAL(restarted.View(), 300U);
+    BOOST_REQUIRE_MESSAGE(restarted.Timeout(error), error);
+    BOOST_CHECK_EQUAL(restarted.View(), 301U);
+    BOOST_CHECK(!restarted.Halted());
+}
+
+BOOST_AUTO_TEST_CASE(network_decides_after_a_total_outage_of_hundreds_of_views)
+{
+    const AgreementFixture f;
+    Network network{f};
+    std::string error;
+    for (const auto& node : network.nodes) BOOST_REQUIRE(node->SubmitCandidate(f.a, error));
+    // Nothing is delivered during the outage; every replica keeps timing out.
+    for (uint32_t i{0}; i < 300; ++i) {
+        for (const auto& node : network.nodes) BOOST_REQUIRE_MESSAGE(node->Timeout(error), error);
+    }
+    for (size_t i{0}; i < network.nodes.size(); ++i) network.delivered[i] = network.outputs[i].size();
+    // The network heals: one more view change, now delivered, completes.
+    for (const auto& node : network.nodes) BOOST_REQUIRE_MESSAGE(node->Timeout(error), error);
+    network.Drain();
+    for (const auto& node : network.nodes) {
+        BOOST_REQUIRE(node->DecidedCandidate());
+        BOOST_CHECK(*node->DecidedCandidate() == f.hash_a);
+        BOOST_CHECK_EQUAL(node->View(), 301U);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(hidden_prepared_certificate_is_still_reported_after_pruned_views)
+{
+    const AgreementFixture f;
+    const fs::path path{m_args.GetDataDirBase() / "agreement-hidden-prepare-pruned"};
+    std::vector<AgreementMessage> output;
+    bool available{true}; std::string error;
+    {
+        node::FlowMeshAgreement engine{DBParams{.path = path, .cache_bytes = 1 << 20}, f.Callbacks(1, output, available)};
+        BOOST_REQUIRE(engine.Open(f.context, f.seats, Filled(77), true, error));
+        BOOST_REQUIRE(engine.Receive(f.Proposal(f.a), error));
+        // Only this replica learns A's view-zero prepared quorum.
+        BOOST_REQUIRE(engine.Receive(f.Vote(AgreementStage::COMMIT, 0, f.hash_a, 0, f.Prepared(f.hash_a)), error));
+        BOOST_REQUIRE(std::any_of(output.begin(), output.end(),
+            [](const auto& message) { return message.stage == AgreementStage::COMMIT && message.view == 0; }));
+        for (uint32_t i{0}; i < 300; ++i) BOOST_REQUIRE_MESSAGE(engine.Timeout(error), error);
+    }
+    output.clear();
+    // Restart validation still sees the local COMMIT and its preparation.
+    node::FlowMeshAgreement restarted{DBParams{.path = path, .cache_bytes = 1 << 20}, f.Callbacks(1, output, available)};
+    BOOST_REQUIRE_MESSAGE(restarted.Open(f.context, f.seats, Filled(77), false, error), error);
+    BOOST_REQUIRE_MESSAGE(restarted.Timeout(error), error);
+    const auto report{std::find_if(output.begin(), output.end(), [](const auto& message) {
+        return message.stage == AgreementStage::VIEW_CHANGE && message.view == 301;
+    })};
+    BOOST_REQUIRE(report != output.end());
+    // The view-zero proof is never concealed, however many views were pruned.
+    BOOST_REQUIRE(report->prepared);
+    BOOST_CHECK_EQUAL(report->prepared->view, 0U);
+    BOOST_CHECK(report->prepared->candidate == f.hash_a);
+    // The authenticated A proposal remains available to serve that candidate.
+    BOOST_CHECK(restarted.CandidateBytes(f.hash_a));
+}
+
+BOOST_AUTO_TEST_CASE(view_reports_are_admitted_only_within_a_bounded_window_ahead)
+{
+    const AgreementFixture f;
+    std::vector<AgreementMessage> output;
+    bool available{true}; std::string error;
+    node::FlowMeshAgreement engine{DBParams{.path = fs::PathFromString("agreement-view-window"),
+        .cache_bytes = 1 << 20, .memory_only = true}, f.Callbacks(1, output, available)};
+    BOOST_REQUIRE(engine.Open(f.context, f.seats, Filled(77), true, error));
+    for (uint32_t i{0}; i < 200; ++i) BOOST_REQUIRE_MESSAGE(engine.Timeout(error), error);
+    // Reports for a view far past the old fixed limit, but near this replica.
+    BOOST_REQUIRE_MESSAGE(engine.Receive(f.Report(0, 300), error), error);
+    // A report too far ahead is refused for now, not a reason to halt.
+    BOOST_CHECK(!engine.Receive(f.Report(0, 200 + 129), error));
+    BOOST_CHECK(!engine.Halted());
+    // f+1 = 3 distinct reports for one bounded higher view move the replica.
+    BOOST_REQUIRE_MESSAGE(engine.Receive(f.Report(2, 300), error), error);
+    BOOST_REQUIRE_MESSAGE(engine.Receive(f.Report(3, 300), error), error);
+    BOOST_CHECK_EQUAL(engine.View(), 300U);
+    BOOST_CHECK(!engine.Halted());
+}
+
 BOOST_AUTO_TEST_SUITE_END()
