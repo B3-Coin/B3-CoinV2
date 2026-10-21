@@ -1436,8 +1436,10 @@ async fn passphrase_request(
     let id = nonce.iter().map(|b| format!("{b:02x}")).collect();
     *core.passphrase.lock().unwrap() = Some(passphrase::Request { id, kind, wallet });
     let (title, height) = match kind {
-        passphrase::Kind::Encrypt => ("Encrypt wallet – B3 Hive", 520.0),
-        passphrase::Kind::Change => ("Change passphrase – B3 Hive", 520.0),
+        // Tall enough for the warning, the strength guide, both fields and
+        // the acknowledgement without scrolling; the window can be resized.
+        passphrase::Kind::Encrypt => ("Encrypt wallet – B3 Hive", 680.0),
+        passphrase::Kind::Change => ("Change passphrase – B3 Hive", 600.0),
         passphrase::Kind::Stake => ("Start staking – B3 Hive", 380.0),
     };
     WebviewWindowBuilder::new(&app, PASSPHRASE, WebviewUrl::App("passphrase.html".into()))
