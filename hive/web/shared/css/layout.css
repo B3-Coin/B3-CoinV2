@@ -151,6 +151,8 @@
   border-bottom: 1px solid var(--border);
 }
 .page-head .page-title { font-size: var(--text-xl); }
+/* The skip link's target: it takes focus, but is not a control to outline. */
+.page-head .page-title:focus { outline: none; box-shadow: none; }
 .page-head .page-sub { color: var(--text-muted); margin-top: 2px; }
 .page-head .page-actions { display: flex; align-items: center; gap: var(--space-2); flex: none; }
 
