@@ -918,10 +918,8 @@ pub fn coin_list(client: &Client, wallet: &str) -> Result<CoinList, RpcError> {
 pub fn coins(client: &Client, wallet: &str) -> Result<Vec<Coin>, RpcError> {
     let unspent = client.call_wallet(wallet, "listunspent", json!([0]))?;
     let mut coins = parse_coins(&unspent)?;
-    coins.sort_by(|a, b| {
-        let key = |c: &Coin| c.amount.parse::<f64>().unwrap_or(0.0);
-        key(b).total_cmp(&key(a))
-    });
+    // Exact base units, so coins a float cannot tell apart keep their order.
+    coins.sort_by_key(|c| std::cmp::Reverse(base_units(&c.amount).unwrap_or(0)));
     Ok(coins)
 }
 
