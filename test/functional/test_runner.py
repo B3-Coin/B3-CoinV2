@@ -90,6 +90,8 @@ EXTENDED_SCRIPTS = [
     'feature_pruning.py',
     'feature_dbcrash.py',
     'feature_index_prune.py',
+    # Real-P2P four-validator workload; observed latencies, no timing threshold.
+    'feature_flowmesh_speed.py',
     # Regtest bridge harness (local anvil + forge --offline); skips without foundry.
     'feature_b3_bridge_rt0_toolchain.py',
     # RT2 and RT3a also skip without the B3_BRIDGE_TOOLS executables.
@@ -129,6 +131,7 @@ BASE_SCRIPTS = [
     # Scripts that are run by default.
     # Longest test should go first, to favor running tests in parallel
     # vv Tests less than 5m vv
+    'feature_flowmesh_reverse_client.py',
     'feature_fee_estimation.py',
     'feature_taproot.py',
     'feature_block.py',
@@ -153,6 +156,7 @@ BASE_SCRIPTS = [
     'feature_flowmesh_independent.py',
     'feature_flowmesh_remote_client.py',
     'feature_flowmesh_client_join.py',
+    'feature_flowmesh_client_poll.py',
     'mempool_updatefromblock.py',
     'mempool_persist.py',
     # vv Tests less than 60s vv
@@ -194,6 +198,10 @@ BASE_SCRIPTS = [
     'wallet_listtransactions.py',
     'wallet_miniscript.py',
     # vv Tests less than 30s vv
+    'wallet_readonly_reconcile.py',
+    'feature_flowmesh_offline_unit_tests.py',
+    # Default-build negative control; fails if BUILD_FLOWMESH_P2FV_REGTEST_GATE=ON.
+    'feature_flowmesh_p2fv_build_gate.py',
     'p2p_invalid_messages.py',
     'rpc_createmultisig.py',
     'p2p_timeouts.py --v1transport',
@@ -458,6 +466,25 @@ NON_SCRIPTS = [
     "feature_flowmesh_client_watch.py",
     "feature_flowmesh_market_views.py",
     "feature_flowmesh_observed_time.py",
+    # Opt-in performance, fault, crash and delivery campaigns; run directly.
+    "feature_flowmesh_client_crash.py",
+    "feature_flowmesh_delivery_review.py",
+    "feature_flowmesh_performance.py",
+    "feature_flowmesh_performance_faults.py",
+    "feature_flowmesh_persistent_trades.py",
+    # Needs BUILD_FLOWMESH_P2FV_REGTEST_GATE=ON; deliberately outside the runner.
+    "feature_flowmesh_p2fv_bootstrap.py",
+    # Report analyzers used by the campaigns above, not tests.
+    "flowmesh_performance_analyze.py",
+    "flowmesh_performance_worker_analyze.py",
+    "flowmesh_public_consistency_analyze.py",
+    # Offline unittest modules, run by feature_flowmesh_offline_unit_tests.py.
+    "flowmesh_performance_fault_metrics_test.py",
+    "flowmesh_performance_metrics_test.py",
+    "flowmesh_performance_worker_analyze_test.py",
+    "flowmesh_public_consistency_analyze_test.py",
+    "flowmesh_public_trace_test.py",
+    "flowmesh_relay_read_failure_test.py",
 ]
 
 def main():

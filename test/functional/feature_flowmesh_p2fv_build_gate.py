@@ -39,7 +39,10 @@ class FlowMeshP2fvBuildGateTest(BitcoinTestFramework):
         if self.result["child_exit_code"] != 0:
             self.result["complete"] = False
             code = 1
-        Path(self.options.tmpdir, "p2fv-build-gate.json").write_text(json.dumps(self.result, indent=2) + "\n")
+        # The report is retained only with --nocleanup; on success the
+        # framework has already removed tmpdir.
+        if Path(self.options.tmpdir).is_dir():
+            Path(self.options.tmpdir, "p2fv-build-gate.json").write_text(json.dumps(self.result, indent=2) + "\n")
         return code
 
 
