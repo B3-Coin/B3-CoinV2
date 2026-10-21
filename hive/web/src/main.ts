@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { amountNode, amountUnits, el, formatAmount, icon, initTheme, setMasked, shorten, sumAmounts, toggleTheme, type Theme } from "../shared/ui";
+import { amountNode, amountText, amountUnits, el, formatAmount, icon, initTheme, setMasked, shorten, sumAmounts, toggleTheme, type Theme } from "../shared/ui";
 import { startTrade, stopTrade, tradeMaskChanged, tradeWalletChanged, tradeDecided, type TradeResult } from "./trade";
 import { pickAddress, sortOwn } from "./picker";
 import { single } from "./single";
@@ -1269,7 +1269,7 @@ function activityRow(e: ActivityEntry): HTMLElement {
   if (e.fee) {
     const fee = document.createElement("span");
     fee.className = "t-sm muted";
-    fee.textContent = `Fee ${formatAmount(e.fee.replace(/^-/, ""))}`;
+    fee.append("Fee ", amountText(e.fee.replace(/^-/, "")));
     trail.append(fee);
   }
 
@@ -1544,7 +1544,7 @@ async function showTransaction(txid: string): Promise<void> {
     if (d.block_height !== null) rows.push(detailRow("Block", count(d.block_height)));
     // The node leaves maturing coins out of the net amount; the lines show them.
     if (!d.generated) rows.push(detailRow("Net amount", amountNode(d.amount)));
-    if (d.fee) rows.push(detailRow("Fee", formatAmount(d.fee.replace(/^-/, ""))));
+    if (d.fee) rows.push(detailRow("Fee", amountText(d.fee.replace(/^-/, ""))));
     for (const line of d.lines) {
       const kind = CATEGORY[line.category]?.text ?? line.category;
       const who = line.label ? `${line.label} (${line.address})` : line.address || "—";

@@ -81,6 +81,23 @@ export function formatAmount(value: string, minDecimals = 2): string {
   return `${p.neg ? "−" : ""}${groupInt(p.int)}${frac ? "." + groupFrac(frac) : ""} B3`;
 }
 
+/** formatAmount as plain text that screen readers get without the digit
+ *  grouping, which they would read as separate numbers. */
+export function amountText(value: string, minDecimals = 2): HTMLSpanElement {
+  const span = document.createElement("span");
+  const shown = document.createElement("span");
+  shown.textContent = formatAmount(value, minDecimals);
+  span.append(shown);
+  if (!masked) {
+    shown.setAttribute("aria-hidden", "true");
+    const spoken = document.createElement("span");
+    spoken.className = "sr-only";
+    spoken.textContent = shown.textContent.replaceAll(GROUP, "").replace("−", "-");
+    span.append(spoken);
+  }
+  return span;
+}
+
 /** The amount treatment from b3_docker: whole part bold, fraction smaller
  *  and muted, then the unit. `extra` adds a size class such as amt-hero. */
 export function amountNode(value: string, extra = "", minDecimals = 2): HTMLSpanElement {
@@ -109,6 +126,10 @@ export function amountNode(value: string, extra = "", minDecimals = 2): HTMLSpan
   const frac = trimFrac(p.frac, minDecimals);
   if (frac) add("amt-frac", "." + groupFrac(frac));
   add("amt-unit", "B3");
+  // Screen readers get the number without the visual digit grouping, which
+  // they would read as separate numbers.
+  for (const part of span.children) part.setAttribute("aria-hidden", "true");
+  add("sr-only", `${p.neg ? "-" : ""}${p.int}${frac ? "." + frac : ""} B3`);
   return span;
 }
 
