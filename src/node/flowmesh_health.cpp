@@ -55,6 +55,7 @@ const char* FlowMeshGateReasonName(const FlowMeshGateReason reason)
     case FlowMeshGateReason::MARKET_REFRESH_FAILED: return "market_refresh_failed";
     case FlowMeshGateReason::CHECKPOINT_RECONCILIATION_FAILED: return "checkpoint_reconciliation_failed";
     case FlowMeshGateReason::TIP_CHANGED: return "tip_changed";
+    case FlowMeshGateReason::RECONCILIATION_EXCEPTION: return "reconciliation_exception";
     }
     return "unknown";
 }
@@ -277,6 +278,20 @@ FlowMeshMarketReadiness EvaluateFlowMeshMarketReadiness(
         if (market->lag.proven_since && now - *market->lag.proven_since >= policy.lag_grace) {
             Add(out.not_ready, FlowMeshNotReady::CATCHING_UP);
         }
+        // Certification stalled: includable work and no head advance for the
+        // grace, measured from the later of the two so a market that keeps
+        // certifying behind a backlog never qualifies. Only when nothing else
+        // explains it: a service problem, a halt, a pause, a pending handoff
+        // or proven lag each already has its own reason.
+        // The normal per-block reconciliation pause is not a pause here either,
+        // or a real stall would flicker ready at every block.
+        const bool paused{market->paused && market->pause_reason != B3_RECONCILIATION_PAUSE};
+        if (market->eligible_work_since && service_not_ready.empty() && market->installed &&
+            !market->halted && !paused && !market->pending_handoff && !market->lag.proven_since) {
+            auto since{*market->eligible_work_since};
+            if (market->head_advanced_at) since = std::max(since, *market->head_advanced_at);
+            if (now - since >= policy.stall_grace) Add(out.not_ready, FlowMeshNotReady::STALLED_WITH_PENDING_WORK);
+        }
     }
     out.ready = out.not_ready.empty();
     const auto has = [&](const FlowMeshNotReady reason) { return Contains(out.not_ready, reason); };
@@ -415,6 +430,7 @@ UniValue FlowMeshServiceHealthJson(const FlowMeshServiceHealth& health, const bo
     policy.pushKV("lag_grace_ms", static_cast<int64_t>(p.lag_grace.count()));
     policy.pushKV("worker_stall_ms", static_cast<int64_t>(p.worker_stall.count()));
     policy.pushKV("no_peers_grace_ms", static_cast<int64_t>(p.no_peers_grace.count()));
+    policy.pushKV("stall_grace_ms", static_cast<int64_t>(p.stall_grace.count()));
     policy.pushKV("live_window_ms", static_cast<int64_t>(p.live_window.count()));
     out.pushKV("policy", std::move(policy));
 
@@ -437,6 +453,7 @@ UniValue FlowMeshServiceHealthJson(const FlowMeshServiceHealth& health, const bo
             item.pushKV("next_microblock_sequence", market->next_sequence);
             item.pushKV("last_microblock_hash", market->last_hash.GetHex());
             if (market->head_advanced_at) item.pushKV("head_age_ms", ElapsedMs(*market->head_advanced_at, now));
+            if (market->eligible_work_since) item.pushKV("work_waiting_ms", ElapsedMs(*market->eligible_work_since, now));
             if (market->local_observed_at) item.pushKV("head_local_observed_unix", *market->local_observed_at);
             UniValue catchup{UniValue::VOBJ};
             catchup.pushKV("behind", market->lag.behind_since.has_value());

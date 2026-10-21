@@ -1077,6 +1077,70 @@ BOOST_AUTO_TEST_CASE(pending_checkpoint_status_is_retained_per_marker_and_never_
     BOOST_CHECK_EQUAL(counts().pending_checkpoint_scans, appended.pending_checkpoint_scans + 1);
 }
 
+BOOST_AUTO_TEST_CASE(failed_reconciliation_retries_without_waiting_for_a_new_tip)
+{
+    const auto genesis{Genesis()};
+    Retain(genesis);
+    std::string error;
+    node::FlowMeshService service{*m_node.chainman, ServicePath()};
+    BOOST_REQUIRE_MESSAGE(service.Start(*m_node.peerman, error), error);
+    BOOST_REQUIRE_MESSAGE(service.ArmSeatKeys(secrets, error), error);
+    BOOST_REQUIRE(WaitUntil([&] { return !service.Health().gate.closed; }));
+
+    // A tip callback whose block is no longer the active tip fails
+    // reconciliation (the markets refresh at the real tip). The gate must not
+    // stay shut until B3 happens to produce another block, which on mainnet
+    // is a minute or more: the service retries against the current tip.
+    const CBlockIndex* stale{WITH_LOCK(::cs_main, return m_node.chainman->ActiveChain().Tip()->pprev)};
+    BOOST_REQUIRE(stale);
+    auto& signals{*m_node.validation_signals};
+    signals.RegisterValidationInterface(&service);
+    signals.UpdatedBlockTip(stale, nullptr, /*fInitialDownload=*/false);
+    signals.SyncWithValidationInterfaceQueue();
+    BOOST_CHECK(service.Health().gate.closed);
+    BOOST_CHECK(service.Health().gate.reason == node::FlowMeshGateReason::TIP_CHANGED);
+    BOOST_CHECK(WaitUntil([&] { return !service.Health().gate.closed; }));
+    signals.UnregisterValidationInterface(&service);
+    signals.SyncWithValidationInterfaceQueue();
+    service.Stop();
+}
+
+BOOST_AUTO_TEST_CASE(reconciliation_exception_keeps_gate_closed_and_retries)
+{
+    const auto genesis{Genesis()};
+    Retain(genesis);
+    std::string error;
+    node::FlowMeshService service{*m_node.chainman, ServicePath()};
+    BOOST_REQUIRE_MESSAGE(service.Start(*m_node.peerman, error), error);
+    BOOST_REQUIRE_MESSAGE(service.ArmSeatKeys(secrets, error), error);
+    BOOST_REQUIRE(WaitUntil([&] { return !service.Health().gate.closed; }));
+
+    // An exception escaping reconciliation would terminate the node: on the
+    // validation-interface thread for a tip callback, on the ticker thread
+    // for a retry. Both must fail closed instead: the gate stays shut and the
+    // ticker retries. Here the callback throws, then the first retry.
+    service.ThrowOnReconciliationsForTest(2);
+    const CBlockIndex* tip{WITH_LOCK(::cs_main, return m_node.chainman->ActiveChain().Tip())};
+    auto& signals{*m_node.validation_signals};
+    signals.RegisterValidationInterface(&service);
+    signals.UpdatedBlockTip(tip, nullptr, /*fInitialDownload=*/false);
+    signals.SyncWithValidationInterfaceQueue();
+    const auto health{service.Health()};
+    BOOST_CHECK(health.gate.closed);
+    BOOST_CHECK(health.gate.reason == node::FlowMeshGateReason::RECONCILIATION_EXCEPTION);
+    BOOST_CHECK_EQUAL(node::FlowMeshServiceHealthJson(health, /*operator_detail=*/false)["service"]["chain_gate_reason"].get_str(),
+                      "reconciliation_exception");
+    // Retries back off (2s, then 4s), so allow longer than WaitUntil does.
+    const auto deadline{std::chrono::steady_clock::now() + std::chrono::seconds{15}};
+    while (service.Health().gate.closed && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds{10});
+    }
+    BOOST_CHECK(!service.Health().gate.closed);
+    signals.UnregisterValidationInterface(&service);
+    signals.SyncWithValidationInterfaceQueue();
+    service.Stop();
+}
+
 BOOST_AUTO_TEST_CASE(health_reports_an_installed_market_head_and_pause_reason)
 {
     const auto genesis{Genesis()};

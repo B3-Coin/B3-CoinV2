@@ -481,7 +481,7 @@ static RPCResult HealthResult()
         {Type::OBJ, "service", "", {
             {Type::STR, "state", "running, stopped or dormant (the A2/A3 schedule is incomplete)"},
             {Type::STR, "chain_gate", /*optional=*/true, "B3 reconciliation gate while running: open or closed"},
-            {Type::STR, "chain_gate_reason", /*optional=*/true, "open, starting, initial_block_download, below_activation, reconciling, idle_wait_timeout, store_reconciliation_failed, market_refresh_failed, checkpoint_reconciliation_failed or tip_changed"},
+            {Type::STR, "chain_gate_reason", /*optional=*/true, "open, starting, initial_block_download, below_activation, reconciling, idle_wait_timeout, store_reconciliation_failed, market_refresh_failed, checkpoint_reconciliation_failed, tip_changed or reconciliation_exception"},
             {Type::NUM, "chain_gate_closed_ms", /*optional=*/true, "Local milliseconds the gate has been continuously closed"},
             {Type::NUM, "worker_observation_age_ms", /*optional=*/true, "Local milliseconds since the runtime worker last published an observation; grows while the worker is stalled"},
             {Type::NUM, "flowmesh_peers", /*optional=*/true, "Connected FlowMesh peers (operator detail)"},
@@ -492,13 +492,14 @@ static RPCResult HealthResult()
             {Type::NUM, "lag_grace_ms", "Catch-up duration before catching_up"},
             {Type::NUM, "worker_stall_ms", "Observation age before worker_stalled"},
             {Type::NUM, "no_peers_grace_ms", "Time without FlowMesh peers before no_flowmesh_peers"},
+            {Type::NUM, "stall_grace_ms", "Time with includable signed work and no head advance before stalled_with_pending_work"},
             {Type::NUM, "live_window_ms", "Label only: a head applied within this window is live, otherwise idle"},
         }},
         {Type::ARR, "markets", "At most 256 markets, in market id order", {
             {Type::OBJ, "", "", {
                 {Type::STR_HEX, "market_id", "Market identity"},
                 {Type::BOOL, "ready", "No not-ready code for this market"},
-                {Type::ARR, "not_ready", "Service codes plus market_not_installed, market_halted or catching_up (stalled_with_pending_work is reserved)", {codes}},
+                {Type::ARR, "not_ready", "Service codes plus market_not_installed, market_halted, catching_up or stalled_with_pending_work", {codes}},
                 {Type::STR, "state", "One label: stopped, not_installed, halted, inactive, reconciling, worker_stalled, isolated, insufficient_seats, handoff_pending, paused, stalled, catching_up, live or idle"},
                 {Type::STR, "halt", /*optional=*/true, "Runtime halt code, or none"},
                 {Type::BOOL, "paused", /*optional=*/true, "Runtime pause"},
@@ -511,6 +512,7 @@ static RPCResult HealthResult()
                 {Type::NUM, "next_microblock_sequence", /*optional=*/true, "Next sequence this node will apply"},
                 {Type::STR_HEX, "last_microblock_hash", /*optional=*/true, "Hash of this node's certified head, or zero"},
                 {Type::NUM, "head_age_ms", /*optional=*/true, "Local milliseconds since this process applied its head; idle markets age legitimately"},
+                {Type::NUM, "work_waiting_ms", /*optional=*/true, "Local milliseconds this pool has continuously held an includable signed action; absent when it holds none"},
                 {Type::NUM, "head_local_observed_unix", /*optional=*/true, "Local wall-clock seconds when this node applied its head; an observation, not certified time"},
                 {Type::OBJ, "catchup", /*optional=*/true, "Catch-up observation", {
                     {Type::BOOL, "behind", "Proven or speculative lag"},

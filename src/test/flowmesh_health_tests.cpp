@@ -391,6 +391,54 @@ BOOST_AUTO_TEST_CASE(market_readiness_is_market_scoped_and_labels_one_state)
     BOOST_CHECK_EQUAL(evaluate({FlowMeshNotReady::NO_FLOWMESH_PEERS}, &market, T0).state, "isolated");
 }
 
+BOOST_AUTO_TEST_CASE(market_with_includable_work_and_no_head_advance_reports_a_stall)
+{
+    node::FlowMeshHealthPolicy policy;
+    using Names_t = std::vector<std::string>;
+    const auto evaluate = [&](const std::vector<FlowMeshNotReady>& service,
+                              const node::FlowMeshMarketHealthObservation& market, Clock::time_point now) {
+        return node::EvaluateFlowMeshMarketReadiness(service, &market, now, policy);
+    };
+    const auto grace{policy.stall_grace};
+    auto market{Market(1)};
+    market.head_advanced_at = T0;
+    market.eligible_work_since = T0;
+    BOOST_CHECK(evaluate({}, market, T0 + grace - 1ms).ready);
+    auto readiness{evaluate({}, market, T0 + grace)};
+    BOOST_CHECK(Names(readiness.not_ready) == Names_t{"stalled_with_pending_work"});
+    BOOST_CHECK_EQUAL(readiness.state, "stalled");
+
+    // A market that keeps certifying behind a standing backlog is not stalled:
+    // the wait counts from the later of the work and the last head advance.
+    market.head_advanced_at = T0 + grace;
+    BOOST_CHECK(evaluate({}, market, T0 + grace + 1s).ready);
+    market.head_advanced_at = T0;
+    // No includable work: an idle head ages legitimately.
+    market.eligible_work_since.reset();
+    BOOST_CHECK(evaluate({}, market, T0 + 1h).ready);
+    market.eligible_work_since = T0;
+
+    // Every other explanation keeps its own reason, not a stall.
+    auto paused{market};
+    paused.paused = true;
+    paused.pause_reason = "handoff_checkpoints_pending";
+    BOOST_CHECK(evaluate({}, paused, T0 + 1h).ready);
+    // The normal per-block pause does not hide a real stall.
+    paused.pause_reason = "b3_reconciliation_pending";
+    BOOST_CHECK(Names(evaluate({}, paused, T0 + 1h).not_ready) == Names_t{"stalled_with_pending_work"});
+    auto handoff{market};
+    handoff.pending_handoff = true;
+    BOOST_CHECK(evaluate({}, handoff, T0 + 1h).ready);
+    auto behind{market};
+    behind.lag.behind_since = behind.lag.proven_since = T0 + 1h - 1s;
+    BOOST_CHECK(evaluate({}, behind, T0 + 1h).ready);
+    auto halted{market};
+    halted.halted = true;
+    BOOST_CHECK(Names(evaluate({}, halted, T0 + 1h).not_ready) == Names_t{"market_halted"});
+    BOOST_CHECK(Names(evaluate({FlowMeshNotReady::NO_FLOWMESH_PEERS}, market, T0 + 1h).not_ready) ==
+                Names_t{"no_flowmesh_peers"});
+}
+
 BOOST_AUTO_TEST_CASE(service_health_rows_union_filter_and_bound)
 {
     auto snapshot{Snapshot()};
@@ -469,7 +517,7 @@ BOOST_AUTO_TEST_CASE(health_json_is_versioned_omits_absent_values_and_operator_t
     BOOST_CHECK_EQUAL(service["chain_gate_closed_ms"].getInt<int64_t>(), 1500);
     BOOST_CHECK_EQUAL(service["worker_observation_age_ms"].getInt<int64_t>(), 120);
     BOOST_CHECK(Keys(json["policy"]) == (std::set<std::string>{"reconcile_grace_ms", "lag_grace_ms", "worker_stall_ms",
-                                                               "no_peers_grace_ms", "live_window_ms"}));
+                                                               "no_peers_grace_ms", "stall_grace_ms", "live_window_ms"}));
     const auto& markets{json["markets"].getValues()};
     BOOST_REQUIRE_EQUAL(markets.size(), 3U);
     const std::set<std::string> row_keys{"market_id", "ready", "not_ready", "state", "halt", "paused", "pause_reason",

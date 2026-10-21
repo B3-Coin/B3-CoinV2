@@ -408,6 +408,9 @@ struct FlowMeshRuntime::Market {
     // this process last applied a head, and verified catch-up lag.
     std::string pause_reason;
     std::optional<flowmesh::WireClock::time_point> head_advanced_at;
+    //! Since when the pool has held an includable signed action (sampled
+    //! when health is published).
+    std::optional<flowmesh::WireClock::time_point> eligible_work_since;
     FlowMeshLagTracker lag;
     std::optional<flowmesh::AnchorRef> previous_anchor;
     std::map<std::pair<int32_t, uint256>, uint64_t> committed_anchors;
@@ -1919,6 +1922,7 @@ const char* FlowMeshRuntimeHaltName(const FlowMeshRuntimeHalt halt)
     case FlowMeshRuntimeHalt::CERTIFICATE_CONFLICT:
         return "certificate-conflict";
     case FlowMeshRuntimeHalt::ANCHOR_INVALIDATED: return "anchor-invalidated";
+    case FlowMeshRuntimeHalt::INTERNAL_ERROR: return "internal-error";
     }
     return "unknown";
 }
@@ -4653,12 +4657,14 @@ void FlowMeshRuntime::WorkerLoop()
             } else if (!m_catchup_commands.empty()) {
                 catchup = m_catchup_commands.front();
                 m_catchup_commands.pop_front();
-            } else if (m_tick_pending) {
+            } else if (FlowMeshWorkerRunsTickFirst(m_tick_pending, !m_queue.Empty(), m_messages_since_tick)) {
                 tick = true;
                 tick_requested_us = m_tick_requested_us;
                 m_tick_pending = false;
+                m_messages_since_tick = 0;
             } else {
                 message = m_queue.Pop();
+                if (message) ++m_messages_since_tick;
             }
             dequeued_us = TraceNow(*m_config.clock);
             if (trace.enabled) {
@@ -4675,18 +4681,54 @@ void FlowMeshRuntime::WorkerLoop()
 
         if (message) trace.Wire(message->message, message->peer);
         if (trace.enabled) trace.processing_started_us = TraceNow(*m_config.clock);
-        if (delivery) ProcessDeliveryEvent(*delivery);
+        // An exception escaping this thread would terminate the node. Contain
+        // it here and fail the affected market closed instead. A delivery
+        // completion, peer removal or tick is not tied to one market.
+        if (delivery) {
+            try {
+                ProcessDeliveryEvent(*delivery);
+            } catch (const std::exception& e) {
+                ContainWorkerException(std::nullopt, e.what());
+            } catch (...) {
+                ContainWorkerException(std::nullopt, "unknown exception");
+            }
+        }
         if (trace.enabled) trace.work_started_us = TraceNow(*m_config.clock);
-        if (removed) {
-            RemovePeerOnWorker(*removed);
+        std::optional<flowmesh::MarketId> work_market;
+        if (message) {
+            work_market = message->message.header.market_id;
         } else if (add_market) {
-            ProcessAddMarketCommand(std::move(*add_market));
+            work_market = add_market->market.market_id;
         } else if (catchup) {
-            ProcessCatchupCommand(*catchup);
-        } else if (tick) {
-            ProcessTick(tick_requested_us, dequeued_us);
-        } else if (message) {
-            ProcessMessage(*message, dequeued_us);
+            work_market = catchup->market_id;
+        }
+        // ProcessAddMarketCommand takes the command by value; keep the
+        // completion so a failure still answers the waiting AddMarket caller.
+        const auto add_completion{add_market ? add_market->completion : nullptr};
+        const auto contain{[&](const std::string& what) {
+            ContainWorkerException(work_market, what);
+            if (add_completion) {
+                try {
+                    add_completion->set_value({false, "FlowMesh market setup failed: " + what});
+                } catch (const std::future_error&) { /* Already answered. */ }
+            }
+        }};
+        try {
+            if (removed) {
+                RemovePeerOnWorker(*removed);
+            } else if (add_market) {
+                ProcessAddMarketCommand(std::move(*add_market));
+            } else if (catchup) {
+                ProcessCatchupCommand(*catchup);
+            } else if (tick) {
+                ProcessTick(tick_requested_us, dequeued_us);
+            } else if (message) {
+                ProcessMessage(*message, dequeued_us);
+            }
+        } catch (const std::exception& e) {
+            contain(e.what());
+        } catch (...) {
+            contain("unknown exception");
         }
 
         {
@@ -4708,6 +4750,54 @@ void FlowMeshRuntime::WorkerLoop()
             }
         }
     }
+}
+
+void FlowMeshRuntime::ContainWorkerException(
+    const std::optional<flowmesh::MarketId>& market_id, const std::string& what)
+{
+    // The handler's own locks were released while unwinding. Its market may
+    // hold a partial in-memory update, so it halts for good (fails closed):
+    // it neither signs nor applies anything more until the node restarts.
+    const std::string error{"FlowMesh worker exception: " + what};
+    try {
+        std::lock_guard<std::mutex> lock{m_market_mutex};
+        const auto it{market_id ? m_markets.find(*market_id) : m_markets.end()};
+        if (it != m_markets.end()) {
+            LogError("FlowMesh market %s halted after a worker exception: %s\n",
+                     it->first.ToString(), what);
+            HaltMarket(*it->second, FlowMeshRuntimeHalt::INTERNAL_ERROR, error);
+        } else if (!market_id) {
+            LogError("FlowMesh halted every market after a worker exception: %s\n", what);
+            for (auto& [id, market] : m_markets) {
+                HaltMarket(*market, FlowMeshRuntimeHalt::INTERNAL_ERROR, error);
+            }
+        } else {
+            // The market was never installed, so there is no state to halt.
+            LogError("FlowMesh work for an unknown market failed: %s\n", what);
+        }
+        size_t connected_peers{0};
+        std::optional<flowmesh::WireClock::time_point> no_peers_since;
+        {
+            std::lock_guard<std::mutex> queue_lock{m_queue_mutex};
+            connected_peers = m_connected_peers.size();
+            no_peers_since = m_no_peers_since;
+        }
+        PublishHealth(m_config.clock->Now(), connected_peers, no_peers_since, /*force=*/true);
+    } catch (...) {
+        // Containment must not throw out of the worker either. Without a
+        // usable market view, stopping the whole service is the only safe end.
+        LogError("FlowMesh worker could not contain an exception (%s); stopping FlowMesh\n", what);
+        {
+            std::lock_guard<std::mutex> lock{m_queue_mutex};
+            m_stopping = true;
+            m_work_cv.notify_all();
+            m_idle_cv.notify_all();
+        }
+        m_client_waits_closed = true;
+        m_client_events.WakeWaiters();
+        return;
+    }
+    WakeClientWaiters();
 }
 
 void FlowMeshRuntime::ProcessAddMarketCommand(AddMarketCommand command)
@@ -5224,6 +5314,12 @@ void FlowMeshRuntime::PublishHealth(const flowmesh::WireClock::time_point now, c
         row.error = market.error.substr(0, 1024);
         if (market.proposal_wait_sequence == market.next_sequence) row.proposal_wait_reason = market.proposal_wait_reason;
         row.head_advanced_at = market.head_advanced_at;
+        if (market.ready && market.pool.HasEligibleSignedAction(market.state)) {
+            if (!market.eligible_work_since) market.eligible_work_since = now;
+        } else {
+            market.eligible_work_since.reset();
+        }
+        row.eligible_work_since = market.eligible_work_since;
         row.local_observed_at = market.local_observed_at;
         row.lag = market.lag.Summary();
         row.seat_evidence_recorded = market.seat_evidence_recorded;

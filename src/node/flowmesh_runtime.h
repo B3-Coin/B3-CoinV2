@@ -161,6 +161,9 @@ enum class FlowMeshRuntimeHalt : uint8_t {
     SIGNING_CONFLICT,
     CERTIFICATE_CONFLICT,
     ANCHOR_INVALIDATED,
+    /** An unexpected exception escaped a worker handler. The market's
+     * in-memory state may be partially updated, so it stops for good. */
+    INTERNAL_ERROR,
 };
 
 enum class FlowMeshRuntimeMarketReadiness : uint8_t {
@@ -340,6 +343,20 @@ struct FlowMeshRuntimeMarketStatus {
     uint256 current_seat_set_hash;
     std::optional<flowmesh::AnchorRef> current_seat_anchor;
 };
+
+//! Queued wire messages the worker may take ahead of a pending tick.
+inline constexpr size_t FLOWMESH_MESSAGES_PER_TICK{8};
+
+/** Local scheduling only: whether the worker runs a pending tick before the
+ * next queued message. Every admitted action on an agreement market requests
+ * a tick, so preferring ticks outright ran one full maintenance pass over all
+ * markets per message during a burst. A tick now waits behind at most
+ * FLOWMESH_MESSAGES_PER_TICK messages, and runs at once when none are queued. */
+inline bool FlowMeshWorkerRunsTickFirst(const bool tick_pending, const bool messages_queued,
+                                        const size_t messages_since_tick)
+{
+    return tick_pending && (!messages_queued || messages_since_tick >= FLOWMESH_MESSAGES_PER_TICK);
+}
 
 /** Local scheduling only: a fully applied page could fit any further entry,
  * so a greedy honest sender would have included it. This is not a tip proof. */
@@ -729,6 +746,10 @@ private:
                           std::deque<flowmesh::ClientEvent>* startup_events = nullptr)
         EXCLUSIVE_LOCKS_REQUIRED(!m_read_mutex);
     void WorkerLoop() EXCLUSIVE_LOCKS_REQUIRED(!m_read_mutex, !m_health_mutex);
+    //! Halt the market a failed work item belonged to, or every market when
+    //! the item was not market-scoped. Never lets the exception leave the worker.
+    void ContainWorkerException(const std::optional<flowmesh::MarketId>& market_id,
+                                const std::string& what);
     //! EnqueueWireMessage, with the frame marked counted (QueuedWireMessage).
     flowmesh::QueueResult Enqueue(flowmesh::WirePeerId peer, flowmesh::WireMessage message, bool counted,
                                  uint64_t local_retention_id = 0);
@@ -899,6 +920,8 @@ private:
     std::deque<FlowMeshDeliveryEvent> m_delivery_events;
     std::atomic<uint64_t> m_delivery_event_overflows{0};
     bool m_tick_pending{false};
+    //! Wire messages taken since the last tick (FlowMeshWorkerRunsTickFirst).
+    size_t m_messages_since_tick{0};
     //! Observation of the first coalesced tick request; never a timer input.
     uint64_t m_tick_requested_us{0};
     bool m_discovery_refresh{false};

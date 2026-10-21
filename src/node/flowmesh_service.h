@@ -286,6 +286,9 @@ public:
     FlowMeshServiceMemoCounts MemoCountsForTest() const;
     //! For tests: the display-only observed-time store.
     FlowMeshObservedTimeStore& ObservedTimeStoreForTest() const;
+    //! For tests: the next `count` chain reconciliations throw part way
+    //! through, after the gate has closed.
+    void ThrowOnReconciliationsForTest(unsigned count);
     bool ArmSeatKeys(std::vector<bls::SecretKey> keys, std::string& error,
                      const std::optional<uint256>& expected_fingerprint = std::nullopt,
                      FlowMeshSeatKeyStatus* result = nullptr);

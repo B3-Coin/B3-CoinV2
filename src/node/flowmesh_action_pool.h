@@ -257,6 +257,26 @@ public:
         return out;
     }
 
+    //! Health probe: whether some signed action is the next sequence of its
+    //! account, so Select would include it now. Deposits are left out on
+    //! purpose: one can legitimately wait for its B3 anchor depth, and a
+    //! deposit-only wait must not read as a stall. Bounded by the pool.
+    bool HasEligibleSignedAction(const flowmesh::FlowMeshState& state) const
+    {
+        // As Select: stale entries below the next sequence may still be pooled.
+        const flowmesh::AccountId* signer_before{nullptr};
+        uint64_t expected{0};
+        for (const auto& [key, id] : m_signed) {
+            const auto& [signer, sequence]{key};
+            if (signer_before == nullptr || *signer_before != signer) {
+                signer_before = &key.first;
+                expected = state.NextSequence(signer);
+            }
+            if (sequence == expected) return true;
+        }
+        return false;
+    }
+
     // Admit an obligation only for an incoming exact authenticated duplicate.
     // Action::Id deliberately excludes credentials, so compare full bytes.
     bool QueueDuplicateForward(const flowmesh::Action& action,
