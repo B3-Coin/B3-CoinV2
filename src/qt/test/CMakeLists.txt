@@ -228,6 +228,19 @@ if(ENABLE_WALLET)
   set_tests_properties(test_b3_themerendering-qt PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=minimal")
 endif()
 
+# Every bitcoinqt user links its moc code, which references BitcoinApplication
+# in qt/bitcoin.cpp and through it interfaces::MakeGuiInit.
+foreach(target IN ITEMS
+    test_b3_splash-qt test_b3_sendcoinsentry-qt test_b3_flowmeshtrading-qt
+    test_b3_flowmeshtradingpanel-qt test_b3_flowmeshworkspace-qt
+    test_b3_flowmeshperf-qt test_b3_flowmeshop-qt test_b3_assettransfer-qt
+    test_b3_flowmeshpanel-qt test_b3_stakecoincontrol-qt
+    test_b3_stakingunlock-qt test_b3_uipreview-qt test_b3_themerendering-qt)
+  if(TARGET ${target})
+    target_sources(${target} PRIVATE ../../init/bitcoin-qt.cpp)
+  endif()
+endforeach()
+
 add_test(NAME test_bitcoin-qt
   COMMAND test_bitcoin-qt
 )

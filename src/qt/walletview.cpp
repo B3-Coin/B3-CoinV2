@@ -244,7 +244,7 @@ void WalletView::encryptWallet()
 {
     auto dlg = new AskPassphraseDialog(AskPassphraseDialog::Encrypt, this);
     dlg->setModel(walletModel);
-    connect(dlg, &QDialog::finished, this, &WalletView::encryptionStatusChanged);
+    connect(dlg, &QDialog::finished, walletModel, &WalletModel::updateStatus);
     GUIUtil::ShowModalDialogAsynchronously(dlg);
 }
 
@@ -284,7 +284,9 @@ void WalletView::unlockWallet()
         // A modal dialog must be synchronous here as expected
         // in the WalletModel::requestUnlock() function.
         dlg.exec();
-        Q_EMIT encryptionStatusChanged();
+        // Refresh through the model, never around it: a status the model has
+        // not recorded makes it miss the change when the wallet locks again.
+        walletModel->updateStatus();
     }
 }
 
@@ -292,7 +294,7 @@ void WalletView::lockWallet()
 {
     if (walletModel->getEncryptionStatus() == WalletModel::Unlocked &&
         walletModel->setWalletLocked(true)) {
-        Q_EMIT encryptionStatusChanged();
+        walletModel->updateStatus();
     }
 }
 
@@ -304,7 +306,7 @@ void WalletView::unlockWalletForStaking()
         // requestUnlock(StakingOnly) owns the mandatory relock when its scope
         // ends. Never expose this prompt as a standalone permanent unlock.
         dlg.exec();
-        Q_EMIT encryptionStatusChanged();
+        walletModel->updateStatus();
     }
 }
 

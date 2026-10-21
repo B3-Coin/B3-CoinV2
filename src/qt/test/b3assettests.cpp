@@ -538,11 +538,8 @@ void B3AssetTests::nativeOnlySourceEnablesOnlySupportedActions()
     QVERIFY(mesh_note);
     QVERIFY(mesh_note->isVisibleTo(&page));
     QCOMPARE(mesh_note->textFormat(), Qt::PlainText);
-    QVERIFY(mesh_note->text().contains(QStringLiteral("pending successful market, deposit and withdrawal testing")));
-    QVERIFY(mesh_note->text().contains(QStringLiteral("Activation height alone does not make a market ready")));
-    QVERIFY(mesh_note->text().contains(QStringLiteral("keyless vault")));
-    QVERIFY(mesh_note->text().contains(QStringLiteral("Trading remains disabled")));
-    QVERIFY(!mesh_note->text().contains(QStringLiteral("Use the console")));
+    // No wallet is attached, so the FlowMesh actions name what is missing.
+    QCOMPARE(mesh_note->text(), QStringLiteral("Select a spending wallet to open FlowMesh actions."));
     QCOMPARE(deposit->toolTip(), mesh_note->text());
     QCOMPARE(withdraw->accessibleDescription(), mesh_note->text());
 

@@ -861,6 +861,60 @@ private Q_SLOTS:
         QCOMPARE(start_stop->text(), action);
     }
 
+    void topbarPadlockFollowsStakingRelock()
+    {
+        // The real topbar padlock, wallet view and staking-only prompt with an
+        // in-memory wallet; never open a disk wallet or start staking.
+        QSettings{}.setValue("fHiveUpdateAutoCheck", false);
+        const std::unique_ptr<const NetworkStyle> network_style{
+            NetworkStyle::instantiate(ChainType::REGTEST)};
+        QVERIFY(network_style != nullptr);
+        BitcoinGUI window{*m_node, m_style.get(), network_style.get()};
+        auto* frame = window.findChild<WalletFrame*>();
+        auto* padlock = window.findChild<QLabel*>(QStringLiteral("B3WalletSecurity"));
+        QVERIFY(frame && padlock);
+        frame->setClientModel(m_client.get());
+        auto controller = std::make_unique<WalletController>(*m_client, m_style.get(), nullptr);
+        window.setWalletController(controller.get(), false);
+
+        const auto wallet = MakeWallet(true, "padlock");
+        WalletModel* model = controller->getOrCreateWallet(
+            interfaces::MakeWallet(*m_loader->context(), wallet));
+        QVERIFY(model->setWalletEncrypted(Passphrase()));
+        QCoreApplication::processEvents();
+        QCOMPARE(model->getEncryptionStatus(), WalletModel::Locked);
+        QCOMPARE(padlock->accessibleName(), QStringLiteral("Wallet locked"));
+
+        // Answer the wallet view's own staking-only prompt.
+        bool answered{false};
+        QTimer::singleShot(0, [&answered] {
+            auto* dialog = qobject_cast<AskPassphraseDialog*>(QApplication::activeModalWidget());
+            QVERIFY(dialog != nullptr);
+            auto* passphrase = dialog->findChild<QLineEdit*>(QStringLiteral("passEdit1"));
+            QVERIFY(passphrase != nullptr);
+            passphrase->setText(QString::fromUtf8(TEST_PASSPHRASE));
+            dialog->accept();
+            answered = true;
+        });
+        {
+            // As when staking starts: the context relocks the wallet before
+            // the event loop delivers the wallet's queued status changes.
+            auto unlock = model->requestUnlock(WalletModel::UnlockPurpose::StakingOnly);
+            QVERIFY(answered);
+            QVERIFY(unlock.isValid());
+            QCOMPARE(model->getEncryptionStatus(), WalletModel::Unlocked);
+        }
+        QCOMPARE(model->getEncryptionStatus(), WalletModel::Locked);
+        QCoreApplication::processEvents();
+        // Previously the padlock stayed open: the view showed the unlock it
+        // saw after the prompt, but the model never saw a status change.
+        QCOMPARE(padlock->accessibleName(), QStringLiteral("Wallet locked"));
+
+        window.removeAllWallets();
+        QCoreApplication::processEvents();
+        controller.reset();
+    }
+
     void cleanupTestCase()
     {
         m_model.reset();
