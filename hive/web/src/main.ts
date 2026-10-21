@@ -2315,6 +2315,8 @@ const PHASE_TEXT: Record<string, string> = {
   legacy: "Legacy era: stakes open after the B3 transition",
   corridor: "Transition corridor: staking begins after it",
   modern_pos: "Modern proof of stake",
+  // A test network without B3's history and staking schedule.
+  modern: "Test network: no B3 staking schedule",
 };
 
 type StakeStep = { title: string; detail: string; state: "done" | "active" | "pending" };
