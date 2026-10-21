@@ -585,14 +585,27 @@ struct BridgeTxAuthorization {
  * by the submitter: nothing to sponsor) or to a managed-V1 or
  * decentralized-V1 withdrawal, which keep plain SIGHASH_ALL.
  */
-bool BridgeV2SponsoredSighashAllowed(const BridgeWithdrawalV2Request& withdrawal,
-                                     const Consensus::Params& params,
-                                     int height);
+//! Inline so the standalone wallet tool, which does not link the node
+//! library, can use it through wallet RPC.
+inline bool BridgeV2SponsoredSighashAllowed(const BridgeWithdrawalV2Request& withdrawal,
+                                            const Consensus::Params& params,
+                                            const int height)
+{
+    return !withdrawal.sweep && params.BridgeV2SponsoredSighashActive(height);
+}
 //! The same for a transaction's whole bridge result: true only for a
 //! bridge V2 leaf with no mint and no managed or V1 withdrawal beside it.
-bool BridgeV2SponsoredSighashAllowed(const BridgeTxAuthorization& authorization,
-                                     const Consensus::Params& params,
-                                     int height);
+inline bool BridgeV2SponsoredSighashAllowed(const BridgeTxAuthorization& authorization,
+                                            const Consensus::Params& params,
+                                            const int height)
+{
+    if (!authorization.withdrawal_v2 || authorization.mint ||
+        authorization.withdrawal || authorization.decentralized_withdrawal) {
+        return false;
+    }
+    return BridgeV2SponsoredSighashAllowed(*authorization.withdrawal_v2,
+                                           params, height);
+}
 
 /** Exact before/after accounting for one configured asset epoch. */
 struct BridgeEpochMintChange {
