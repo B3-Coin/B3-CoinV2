@@ -8,6 +8,7 @@
 
 #include <arith_uint256.h>
 #include <chain.h>
+#include <common/system.h>
 #include <consensus/block_codec.h>
 #include <consensus/boundary.h>
 #include <consensus/era.h>
@@ -50,6 +51,8 @@
 #include <util/translation.h>
 #include <validation.h>
 
+#include <algorithm>
+#include <bit>
 #include <cerrno>
 #include <compare>
 #include <cstddef>
@@ -61,7 +64,21 @@
 #include <span>
 #include <stdexcept>
 #include <system_error>
+#include <thread>
 #include <unordered_map>
+#include <vector>
+
+#ifdef WIN32
+#include <windows.h>
+#else
+#include <pthread.h>
+#include <sched.h>
+#include <sys/resource.h>
+#ifdef __linux__
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
+#endif
 
 namespace kernel {
 static constexpr uint8_t DB_BLOCK_FILES{'f'};
@@ -77,6 +94,40 @@ static constexpr uint8_t DB_FN_POD_ISSUED_TOTAL{'N'};
 // BlockTreeDB::DB_TXINDEX{'t'}
 
 namespace {
+
+//! Drop the calling thread to the lowest normal scheduling priority, so the
+//! startup hashing workers only get CPU time interactive programs leave idle.
+void LowerStartupWorkerPriority()
+{
+#if defined(WIN32)
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
+#elif defined(__APPLE__)
+    pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
+#elif defined(__linux__)
+    // Linux applies nice values per thread.
+    setpriority(PRIO_PROCESS, static_cast<id_t>(syscall(SYS_gettid)), 19);
+#endif
+}
+
+//! Number of CPUs this process may run on. GetNumCores() reports every CPU
+//! in the machine, even when the process is restricted to fewer of them
+//! (CPU affinity, some VMs and containers); one hashing thread per reported
+//! core would then crowd onto the allowed ones.
+int AvailableCores()
+{
+#if defined(WIN32)
+    DWORD_PTR process_mask{0};
+    DWORD_PTR system_mask{0};
+    if (GetProcessAffinityMask(GetCurrentProcess(), &process_mask, &system_mask) && process_mask != 0) {
+        return std::popcount(static_cast<uint64_t>(process_mask));
+    }
+#elif defined(__linux__)
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    if (sched_getaffinity(0, sizeof(set), &set) == 0) return CPU_COUNT(&set);
+#endif
+    return GetNumCores();
+}
 
 struct FnPodIssuedTotalKey {
     uint32_t height{0};
@@ -171,47 +222,92 @@ bool BlockTreeDB::ReadFlag(const std::string& name, bool& fValue)
     return true;
 }
 
-bool BlockTreeDB::LoadBlockIndexGuts(const Consensus::Params& consensusParams, std::function<CBlockIndex*(const uint256&)> insertBlockIndex, const util::SignalInterrupt& interrupt)
+bool BlockTreeDB::LoadBlockIndexGuts(const Consensus::Params& consensusParams, std::function<CBlockIndex*(const uint256&)> insertBlockIndex, const util::SignalInterrupt& interrupt, const std::function<void(int)>& progress)
 {
     AssertLockHeld(::cs_main);
     std::unique_ptr<CDBIterator> pcursor(NewIterator());
     pcursor->Seek(std::make_pair(DB_BLOCK_INDEX, uint256()));
 
-    // Load m_block_index
+    // Load m_block_index. A legacy B3 identity is the scrypt hash of the stored
+    // header (~0.2 ms each, ~810k legacy headers on mainnet), which made this
+    // loop the bulk of startup on one core. Every record is still hashed from
+    // its stored header exactly as before; only the hashing of each batch is
+    // spread over worker threads. Records are inserted in the same order, on
+    // this thread, under cs_main.
+    //
+    // Starting the wallet must never make the machine unresponsive: the
+    // workers leave one core untouched and run at the lowest normal priority,
+    // so they only use CPU time other programs leave idle. A single-core (or
+    // unknown, reported as 0) machine still gets one worker.
+    constexpr size_t BATCH_SIZE{16384};
+    const size_t workers{static_cast<size_t>(std::clamp(AvailableCores() - 1, 1, 16))};
+    std::vector<CDiskBlockIndex> batch;
+    std::vector<uint256> hashes;
+    batch.reserve(BATCH_SIZE);
+    // Records are keyed by block hash, which is uniformly distributed, and
+    // iterated in key byte order, so the first two bytes of the last key read
+    // tell how much of the index is loaded without counting it first.
+    uint256 last_key;
+    int reported{-1};
+    const auto report{[&](const int percent) {
+        if (!progress || percent == reported) return;
+        reported = percent;
+        progress(percent);
+    }};
+    const auto insert_batch{[&] {
+        hashes.assign(batch.size(), uint256{});
+        const size_t threads{std::min(workers, (batch.size() + 255) / 256)};
+        const auto hash_range{[&](const size_t first) {
+            LowerStartupWorkerPriority();
+            for (size_t i{first}; i < batch.size(); i += threads) {
+                hashes[i] = batch[i].ConstructBlockHash(consensusParams);
+            }
+        }};
+        std::vector<std::thread> pool;
+        for (size_t t{0}; t < threads; ++t) pool.emplace_back(hash_range, t);
+        for (std::thread& thread : pool) thread.join();
+        for (size_t i{0}; i < batch.size(); ++i) {
+            const CDiskBlockIndex& diskindex{batch[i]};
+            // Construct block index object
+            CBlockIndex* pindexNew = insertBlockIndex(hashes[i]);
+            pindexNew->pprev          = insertBlockIndex(diskindex.hashPrev);
+            pindexNew->nHeight        = diskindex.nHeight;
+            pindexNew->nFile          = diskindex.nFile;
+            pindexNew->nDataPos       = diskindex.nDataPos;
+            pindexNew->nUndoPos       = diskindex.nUndoPos;
+            pindexNew->nVersion       = diskindex.nVersion;
+            pindexNew->hashMerkleRoot = diskindex.hashMerkleRoot;
+            pindexNew->nTime          = diskindex.nTime;
+            pindexNew->nBits          = diskindex.nBits;
+            pindexNew->nNonce         = diskindex.nNonce;
+            pindexNew->m_legacy_proof_of_stake = diskindex.m_legacy_proof_of_stake;
+            pindexNew->m_legacy_stake_modifier_generated = diskindex.m_legacy_stake_modifier_generated;
+            pindexNew->m_legacy_stake_modifier = diskindex.m_legacy_stake_modifier;
+            pindexNew->m_legacy_hash_proof = diskindex.m_legacy_hash_proof;
+            pindexNew->m_legacy_money_supply = diskindex.m_legacy_money_supply;
+            pindexNew->m_legacy_fn_integrated = diskindex.m_legacy_fn_integrated;
+            // The cached modern-PoS eligibility digest is the NEXT
+            // height's seed: without it a restarted node can neither
+            // produce nor connect further modern blocks ("modern-PoS
+            // seed for the parent is unavailable"). It is persisted by
+            // CDiskBlockIndex and must be restored here (found by the
+            // multi-node finality soak's restart scenario).
+            pindexNew->m_modern_pos_digest = diskindex.m_modern_pos_digest;
+            pindexNew->nStatus        = diskindex.nStatus;
+            pindexNew->nTx            = diskindex.nTx;
+        }
+        batch.clear();
+        report(static_cast<int>(((last_key.data()[0] << 8) | last_key.data()[1]) * 100 / 65536));
+    }};
     while (pcursor->Valid()) {
         if (interrupt) return false;
         std::pair<uint8_t, uint256> key;
         if (pcursor->GetKey(key) && key.first == DB_BLOCK_INDEX) {
             CDiskBlockIndex diskindex;
             if (pcursor->GetValue(diskindex)) {
-                // Construct block index object
-                CBlockIndex* pindexNew = insertBlockIndex(diskindex.ConstructBlockHash(consensusParams));
-                pindexNew->pprev          = insertBlockIndex(diskindex.hashPrev);
-                pindexNew->nHeight        = diskindex.nHeight;
-                pindexNew->nFile          = diskindex.nFile;
-                pindexNew->nDataPos       = diskindex.nDataPos;
-                pindexNew->nUndoPos       = diskindex.nUndoPos;
-                pindexNew->nVersion       = diskindex.nVersion;
-                pindexNew->hashMerkleRoot = diskindex.hashMerkleRoot;
-                pindexNew->nTime          = diskindex.nTime;
-                pindexNew->nBits          = diskindex.nBits;
-                pindexNew->nNonce         = diskindex.nNonce;
-                pindexNew->m_legacy_proof_of_stake = diskindex.m_legacy_proof_of_stake;
-                pindexNew->m_legacy_stake_modifier_generated = diskindex.m_legacy_stake_modifier_generated;
-                pindexNew->m_legacy_stake_modifier = diskindex.m_legacy_stake_modifier;
-                pindexNew->m_legacy_hash_proof = diskindex.m_legacy_hash_proof;
-                pindexNew->m_legacy_money_supply = diskindex.m_legacy_money_supply;
-                pindexNew->m_legacy_fn_integrated = diskindex.m_legacy_fn_integrated;
-                // The cached modern-PoS eligibility digest is the NEXT
-                // height's seed: without it a restarted node can neither
-                // produce nor connect further modern blocks ("modern-PoS
-                // seed for the parent is unavailable"). It is persisted by
-                // CDiskBlockIndex and must be restored here (found by the
-                // multi-node finality soak's restart scenario).
-                pindexNew->m_modern_pos_digest = diskindex.m_modern_pos_digest;
-                pindexNew->nStatus        = diskindex.nStatus;
-                pindexNew->nTx            = diskindex.nTx;
-
+                last_key = key.second;
+                batch.push_back(std::move(diskindex));
+                if (batch.size() == BATCH_SIZE) insert_batch();
                 pcursor->Next();
             } else {
                 LogError("%s: failed to read value\n", __func__);
@@ -221,6 +317,8 @@ bool BlockTreeDB::LoadBlockIndexGuts(const Consensus::Params& consensusParams, s
             break;
         }
     }
+    insert_batch();
+    report(100);
 
     // Load the optional FN issuance sidecars only after every regular block
     // index entry has been materialized. Calling insertBlockIndex now therefore
@@ -705,7 +803,8 @@ bool BlockManager::LoadBlockIndex(const std::optional<uint256>& snapshot_blockha
     }
 
     if (!m_block_tree_db->LoadBlockIndexGuts(
-            GetConsensus(), [this](const uint256& hash) EXCLUSIVE_LOCKS_REQUIRED(cs_main) { return this->InsertBlockIndex(hash); }, m_interrupt)) {
+            GetConsensus(), [this](const uint256& hash) EXCLUSIVE_LOCKS_REQUIRED(cs_main) { return this->InsertBlockIndex(hash); }, m_interrupt,
+            [this](int percent) { m_opts.notifications.progress(_("Loading block index…"), percent, /*resume_possible=*/false); })) {
         return false;
     }
 

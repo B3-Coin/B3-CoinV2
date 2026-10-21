@@ -1741,6 +1741,12 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
      */
     if (args.GetBoolArg("-server", false)) {
         uiInterface.InitMessage_connect(SetRPCWarmupStatus);
+        // Long startup steps (loading the block index, verifying blocks,
+        // wallet rescans) report progress, which the GUI splash screen shows;
+        // put it in the warmup status too, so RPC clients can show it.
+        uiInterface.ShowProgress_connect([](const std::string& title, int progress, bool) {
+            SetRPCWarmupStatus(progress >= 0 && progress < 100 ? strprintf("%s %d%%", title, progress) : title);
+        });
         if (!AppInitServers(node))
             return InitError(_("Unable to start HTTP server. See debug log for details."));
     }

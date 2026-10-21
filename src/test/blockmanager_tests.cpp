@@ -24,6 +24,7 @@
 #include <test/util/logging.h>
 #include <test/util/setup_common.h>
 
+#include <algorithm>
 #include <deque>
 #include <vector>
 
@@ -36,6 +37,69 @@ using node::MAX_BLOCKFILE_SIZE;
 
 // use BasicTestingSetup here for the data directory configuration, setup, and cleanup
 BOOST_FIXTURE_TEST_SUITE(blockmanager_tests, BasicTestingSetup)
+
+BOOST_AUTO_TEST_CASE(block_index_load_hashes_every_record_across_batches)
+{
+    // More records than one loading batch, all legacy-codec headers, so each
+    // identity is the scrypt hash the loader computes on its worker threads.
+    const auto main_params{CreateChainParams(*m_node.args, ChainType::MAIN)};
+    const Consensus::Params& consensus{main_params->GetConsensus()};
+    BOOST_REQUIRE(consensus.legacy_b3coin);
+    constexpr int RECORDS{20'000};
+    std::vector<uint256> keys(RECORDS);
+    std::vector<CBlockIndex> stored(RECORDS);
+    std::vector<const CBlockIndex*> to_write;
+    FastRandomContext rng{uint256{42}};
+    for (int i{0}; i < RECORDS; ++i) {
+        // The loader keys entries by the hash it recomputes; the stored key
+        // only orders the iteration, so a random one keeps the setup cheap.
+        keys[i] = rng.rand256();
+        CBlockIndex& index{stored[i]};
+        index.phashBlock = &keys[i];
+        index.nHeight = i;
+        index.nVersion = 4;
+        index.hashMerkleRoot = rng.rand256();
+        index.nTime = 1'500'000'000 + i;
+        index.nBits = 0x1e0fffff;
+        index.nNonce = static_cast<uint32_t>(i);
+        BOOST_REQUIRE(!Consensus::HasB3BlockCodecV2(index.nVersion));
+        to_write.push_back(&index);
+    }
+    BlockTreeDB db{DBParams{.path = "", .cache_bytes = 8 << 20, .memory_only = true}};
+    db.WriteBatchSync({}, /*nLastFile=*/0, to_write);
+
+    node::BlockMap loaded;
+    const auto insert{[&](const uint256& hash) -> CBlockIndex* {
+        if (hash.IsNull()) return nullptr;
+        const auto [it, inserted]{loaded.try_emplace(hash)};
+        if (inserted) it->second.phashBlock = &it->first;
+        return &it->second;
+    }};
+    std::vector<int> progress;
+    BOOST_REQUIRE(WITH_LOCK(cs_main, return db.LoadBlockIndexGuts(consensus, insert, m_interrupt, [&](int percent) { progress.push_back(percent); })));
+
+    // Progress is reported after each batch, from the hash-ordered keys, and
+    // ends at 100: the first of the two batches holds 16384 of 20000 records.
+    BOOST_REQUIRE(progress.size() >= 2 && progress.size() <= 3);
+    BOOST_CHECK(std::is_sorted(progress.begin(), progress.end()));
+    BOOST_CHECK(progress.front() >= 78 && progress.front() <= 86);
+    BOOST_CHECK_EQUAL(progress.back(), 100);
+
+    // Each record arrives exactly once with its fields; a sample is checked
+    // against an independent scrypt of the stored header.
+    BOOST_REQUIRE_EQUAL(loaded.size(), size_t{RECORDS});
+    std::vector<bool> seen(RECORDS, false);
+    for (const auto& [hash, index] : loaded) {
+        BOOST_REQUIRE(index.nHeight >= 0 && index.nHeight < RECORDS);
+        BOOST_REQUIRE(!seen[index.nHeight]);
+        seen[index.nHeight] = true;
+        const CBlockIndex& expected{stored[index.nHeight]};
+        BOOST_CHECK_EQUAL(index.nNonce, expected.nNonce);
+        BOOST_CHECK_EQUAL(index.nTime, expected.nTime);
+        BOOST_CHECK(index.hashMerkleRoot == expected.hashMerkleRoot);
+        if (index.nHeight % 97 == 0) BOOST_CHECK(hash == expected.GetBlockHeader().GetLegacyB3Hash());
+    }
+}
 
 BOOST_AUTO_TEST_CASE(fn_pod_issued_total_sidecar_roundtrip)
 {
