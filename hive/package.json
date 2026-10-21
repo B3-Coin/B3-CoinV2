@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
+    "test": "node --experimental-strip-types --test web/test/*.test.ts",
     "tauri": "tauri",
     "package": "tauri build --config src-tauri/tauri.bundle.json"
   },
