@@ -3,6 +3,7 @@ import { listen } from "@tauri-apps/api/event";
 import { amountNode, amountUnits, el, formatAmount, icon, initTheme, setMasked, shorten, sumAmounts, toggleTheme, type Theme } from "../shared/ui";
 import { startTrade, stopTrade, tradeMaskChanged, tradeWalletChanged, tradeDecided, type TradeResult } from "./trade";
 import { pickAddress, sortOwn } from "./picker";
+import { single } from "./single";
 
 // Mirrors NodeStatus in src-tauri/src/node.rs (serde tag "phase").
 type NodeStatus =
@@ -419,9 +420,42 @@ function renderStaking(s: Staking | null, error: string | null): void {
   );
 }
 
+// The wallet card's last good read, so a failed one can say how old it is.
+let walletReadAt: number | null = null;
+let walletReads = 0;
+
+/** A failed read leaves the last balance up, marked with its age, never
+ *  passed off as current. */
+function walletStale(error: string | null): void {
+  el("wallet").classList.toggle("is-stale", error !== null);
+  const note = el("wallet-stale");
+  note.hidden = error === null;
+  if (error === null) return;
+  note.textContent =
+    walletReadAt === null
+      ? "This wallet could not be read. Trying again…"
+      : `Not updated since ${readTime(walletReadAt)}: the wallet could not be read. Trying again…`;
+  note.title = error;
+}
+
+/** Another wallet is in use: nothing of the previous one stays up. */
+function clearWalletCard(): void {
+  walletReads++;
+  walletReadAt = null;
+  el("wallet-name").textContent = "Loading…";
+  el("spendable").replaceChildren(amountNode("—", "amt-hero"));
+  el("pending-chip").hidden = el("immature-chip").hidden = true;
+  el("staking-lines").replaceChildren();
+  walletStale(null);
+}
+
 async function refreshWallet(): Promise<void> {
+  const mine = ++walletReads;
   try {
     const w = await invoke<WalletOverview | null>("wallet_overview");
+    if (mine !== walletReads) return;
+    walletReadAt = Date.now();
+    walletStale(null);
     el("no-wallet").hidden = w !== null;
     el("wallet").hidden = w === null;
     el("era-card").hidden = el("staking-card").hidden = w === null;
@@ -440,7 +474,9 @@ async function refreshWallet(): Promise<void> {
     renderStaking(w.staking, w.staking_error);
     el("fund").hidden = !w.can_fund;
   } catch (e) {
-    showBanner("danger", "The wallet could not be read", String(e));
+    if (mine !== walletReads) return;
+    if (el("wallet").hidden && el("no-wallet").hidden) el("wallet").hidden = false;
+    walletStale(String(e));
   }
 }
 
@@ -658,11 +694,13 @@ function renderOwnList(): void {
   );
 }
 
-const refreshReceiving = single(async () => {
+const refreshReceiving = single(async (current) => {
   try {
     const list = await invoke<Receiving[]>("receive_addresses");
+    if (!current()) return;
     ownAddresses = sortOwn(list);
   } catch (e) {
+    if (!current()) return;
     receiveResult(String(e));
     return;
   }
@@ -938,9 +976,20 @@ async function manageWallet(action: WalletAction): Promise<void> {
       create: "Created",
     }[action.action];
     walletsResult("success", `${done} ${walletName(action.action === "create" ? (v.current ?? action.name) : action.name)}.`);
-    // Every page shows the wallet in use.
+    // Every page shows the wallet in use, and nothing of the previous one.
+    clearWalletCard();
+    el("recent-list").replaceChildren();
+    el("activity-list").replaceChildren();
+    el("activity-count").textContent = "";
+    activityResult("danger", "");
+    shownCoins = [];
+    chosenCoins.clear();
+    if (el<HTMLInputElement>("send-cc").checked) renderCoins();
+    contacts = [];
     void refreshWallet();
     void refreshRecent();
+    void refreshBook();
+    void refreshCoins();
     tradeWalletChanged();
     // Another wallet has other addresses.
     receiveShown = null;
@@ -1117,17 +1166,9 @@ function ago(unix: number): string {
 }
 
 /** Runs `refresh` unless the previous run is still going. */
-function single(refresh: () => Promise<void>): () => Promise<void> {
-  let running = false;
-  return async () => {
-    if (running) return;
-    running = true;
-    try {
-      await refresh();
-    } finally {
-      running = false;
-    }
-  };
+/** The time of day a read was made, for "not updated since" notes. */
+function readTime(at: number): string {
+  return new Date(at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
 }
 
 // ---- dashboard -------------------------------------------------------------
@@ -1274,13 +1315,19 @@ type TxDetails = {
 const ACTIVITY_STEP = 100;
 let activityShown = ACTIVITY_STEP;
 
-const refreshRecent = single(async () => {
+const refreshRecent = single(async (current) => {
   try {
     const lines = await invoke<ActivityEntry[]>("wallet_activity", { count: 5 });
+    if (!current()) return;
     el("recent").hidden = false;
     el("recent-list").replaceChildren(...activityList(lines));
   } catch {
-    el("recent").hidden = true;
+    if (!current()) return;
+    // Never an empty list that reads as "no transactions".
+    el("recent").hidden = false;
+    el("recent-list").replaceChildren(
+      emptyState("Not available", "Recent activity could not be read. It is read again with the next block.", "activity"),
+    );
   }
 });
 
@@ -1339,9 +1386,10 @@ function historyFilter(): HistoryFilter {
   };
 }
 
-const refreshActivity = single(async () => {
+const refreshActivity = single(async (current) => {
   try {
     const page = await invoke<HistoryPage>("wallet_history", { filter: historyFilter(), count: activityShown });
+    if (!current()) return;
     activityResult("danger", "");
     el("activity-list").replaceChildren(
       ...(page.entries.length
@@ -1357,7 +1405,8 @@ const refreshActivity = single(async () => {
         : `${count(page.matching)} of ${plural(page.total, "line")}`
       : "";
   } catch (e) {
-    activityResult("danger", `The wallet's transactions could not be read: ${String(e)}`);
+    if (!current()) return;
+    activityResult("danger", `The wallet's transactions could not be read, so the list may be out of date: ${String(e)}`);
   }
 });
 
@@ -2316,6 +2365,7 @@ function renderStake(s: StakeStatus): void {
   );
   const releasable = s.stakes.filter((k) => k.status !== "UNCONFIRMED");
   el("stk-release-all-row").hidden = releasable.length < 2;
+  el<HTMLButtonElement>("stk-release-all").disabled = false;
   el("stk-release-all").textContent = `Release all ${releasable.length}`;
 
   el("stk-min").textContent = s.min_stake
@@ -2354,6 +2404,9 @@ let stakeGeneration = 0;
 function clearStake(): void {
   stakeGeneration++;
   stakeStatus = null;
+  stakeReadAt = null;
+  el("view-stake").classList.remove("is-stale");
+  el("stk-stale").hidden = true;
   for (const id of ["stk-start", "stk-stop"]) {
     const b = el<HTMLButtonElement>(id);
     b.hidden = true;
@@ -2372,6 +2425,22 @@ function clearStake(): void {
 
 let stakeRefreshAgain = false;
 let stakeRefreshing = false;
+let stakeReadAt: number | null = null;
+
+/** A failed read keeps the last one up, marked with its age, and turns its
+ *  controls off: they act on what the page last saw. The next good read
+ *  turns them on again. */
+function stakeStale(error: string): void {
+  const note = el("stk-stale");
+  note.hidden = false;
+  note.textContent =
+    stakeReadAt === null
+      ? "Staking could not be read. Trying again…"
+      : `Not updated since ${readTime(stakeReadAt)}: staking could not be read. Its controls are off until it is. Trying again…`;
+  note.title = error;
+  el("view-stake").classList.add("is-stale");
+  for (const b of el("view-stake").querySelectorAll<HTMLButtonElement>("button")) b.disabled = true;
+}
 async function refreshStake(): Promise<void> {
   // A request that arrives while one is in flight (for example right after a
   // wallet switch) runs again afterwards instead of being dropped.
@@ -2388,7 +2457,7 @@ async function refreshStake(): Promise<void> {
       try {
         status = await invoke<StakeStatus>("stake_status");
       } catch (e) {
-        if (generation === stakeGeneration && current === "stake") stakeResult("danger", String(e));
+        if (generation === stakeGeneration) stakeStale(String(e));
         continue;
       }
       if (generation !== stakeGeneration) {
@@ -2396,6 +2465,9 @@ async function refreshStake(): Promise<void> {
         continue;
       }
       stakeStatus = status;
+      stakeReadAt = Date.now();
+      el("view-stake").classList.remove("is-stale");
+      el("stk-stale").hidden = true;
       renderStake(status);
     } while (stakeRefreshAgain);
   } finally {
@@ -2510,11 +2582,13 @@ function editContact(c: Contact): void {
   el<HTMLInputElement>("book-label").focus();
 }
 
-const refreshBook = single(async () => {
+const refreshBook = single(async (fresh) => {
   try {
-    contacts = await invoke<Contact[]>("book_list");
+    const list = await invoke<Contact[]>("book_list");
+    if (!fresh()) return;
+    contacts = list;
   } catch (e) {
-    if (current === "book") bookResult("danger", String(e));
+    if (fresh() && current === "book") bookResult("danger", String(e));
     return;
   }
   el("book-options").replaceChildren(
@@ -2858,14 +2932,15 @@ function renderCoins(): void {
   showCoinSum();
 }
 
-const refreshCoins = single(async () => {
+const refreshCoins = single(async (current) => {
   if (!el<HTMLInputElement>("send-cc").checked) return;
   try {
     const list = await invoke<CoinList>("send_coins");
+    if (!current()) return;
     shownCoins = list.coins;
     inputBudget = list.input_budget;
   } catch (e) {
-    sendResult("danger", String(e));
+    if (current()) sendResult("danger", String(e));
     return;
   }
   const present = new Set(shownCoins.map(outpoint));

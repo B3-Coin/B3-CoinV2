@@ -340,3 +340,12 @@
 .pick-list { max-height: min(56vh, 520px); overflow-y: auto; margin: 0 calc(-1 * var(--space-4)); border-top: 1px solid var(--border); }
 .pick-row { width: 100%; text-align: left; }
 .send-add { justify-self: start; }
+
+/* A read that failed: the last values stay, dimmed, beside a note that
+   says how old they are. */
+#wallet.is-stale #spendable,
+#wallet.is-stale .hero-chips { opacity: 0.55; }
+.hero-stale { margin: 0; }
+#view-stake.is-stale #stk-rows,
+#view-stake.is-stale #stk-list,
+#view-stake.is-stale #stk-totals { opacity: 0.55; }
