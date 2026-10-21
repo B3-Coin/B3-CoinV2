@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { amountNode, amountText, amountUnits, bannerTone, count, el, formatAmount, icon, initTheme, isMasked, measure, setMasked, shorten, sumAmounts, toggleTheme, type Theme } from "../shared/ui";
-import { startTrade, stopTrade, tradeMaskChanged, tradeWalletChanged, tradeDecided, type TradeResult } from "./trade";
+import { startTrade, stopTrade, tradeMaskChanged, tradeWalletChanged, tradeDecided, type TradeOutcome } from "./trade";
 import { pickAddress, sortOwn } from "./picker";
 import { single } from "./single";
 import { tabKeys, trapDialog } from "./a11y";
@@ -124,8 +124,9 @@ type DraftResult =
   | { outcome: "signed"; id: string; psbt: string; complete: boolean }
   | { outcome: "rejected"; id: string }
   | { outcome: "failed"; id: string; error: string }
-  // A FlowMesh order or cancellation; the Trade page handles its own.
-  | { outcome: "traded"; id: string };
+  // FlowMesh orders, cancellations, deposits and payouts; the Trade page
+  // handles its own.
+  | TradeOutcome;
 
 function showThemeIcon(theme: Theme): void {
   // The button shows, and is named by, the theme it switches to.
@@ -3419,7 +3420,7 @@ await listen<PassResult>("passphrase-result", (event) => {
 
 await listen<DraftResult>("draft-result", (event) => {
   const r = event.payload;
-  if (tradeDecided(r as TradeResult)) return;
+  if (tradeDecided(r)) return;
   if (psbtDrafts.has(r.id)) {
     psbtDrafts.delete(r.id);
     void psbtDecided(r);

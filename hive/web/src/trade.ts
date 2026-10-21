@@ -127,13 +127,17 @@ type Payout = { effect_id: string; asset: "b3" | "token"; amount: string; sequen
 type Checkpoint = { checkpoint_id: string; sequence: number; waiting: number };
 /** A deposit counts once it is this deep (flowmesh::DEPOSIT_CONFIRMATIONS). */
 const DEPOSIT_CONFIRMATIONS = 31;
-export type TradeResult =
+/** The core's DraftResult variants only trading drafts produce. */
+export type TradeOutcome =
   | { outcome: "traded"; id: string; receipt: Receipt }
   | { outcome: "deposited"; id: string; deposit: { txid: string; vout: number; fee: string } }
-  | { outcome: "published"; id: string; payout: { txid: string; fee: string } }
+  | { outcome: "published"; id: string; payout: { txid: string; fee: string } };
+/** Every decision reaches tradeDecided first; it takes only its own. */
+export type TradeResult =
+  | TradeOutcome
   | { outcome: "rejected"; id: string }
   | { outcome: "failed"; id: string; error: string }
-  | { outcome: string; id: string };
+  | { outcome: "sent" | "signed"; id: string };
 type MarketView = {
   market_id: string;
   base_asset_id: string;
@@ -1534,8 +1538,11 @@ async function admit(d: Deposit, button: HTMLButtonElement): Promise<void> {
   if (!marketId) return;
   button.disabled = true;
   const key = `${d.txid}:${d.vout}`;
+  // As the other reads: a reply for a market no longer shown is dropped.
+  const mine = generation;
   try {
     const r = await invoke<Receipt>("trade_admit", { marketId, txid: d.txid, vout: d.vout });
+    if (mine !== generation) return;
     if (r.state === "rejected") {
       showFundResult("danger", `Admission refused${r.reason ? `: ${r.reason}` : ""}.`);
     } else {
@@ -1548,6 +1555,7 @@ async function admit(d: Deposit, button: HTMLButtonElement): Promise<void> {
       );
     }
   } catch (e) {
+    if (mine !== generation) return;
     showFundResult("danger", String(e));
   }
   void loadRequests();
