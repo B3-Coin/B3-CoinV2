@@ -38,6 +38,7 @@
   background: var(--bg-surface);
   border-top: 1px solid var(--border);
 }
+.console-prompt { color: var(--accent); font-family: var(--font-mono); user-select: none; }
 #prompt .console-prompt { font-size: var(--text-md); }
 
 /* Opens upwards: the prompt sits at the bottom of the window. */

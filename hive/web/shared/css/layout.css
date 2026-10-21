@@ -5,7 +5,8 @@
      >=1280px  full rail (248px) with group labels
      1024px    compact rail (216px)
      640px     icon-only rail (64px), labels become tooltips
-     <640px    top appbar + bottom tab bar (thumb zone)
+     <640px    not used: the window is at least 700px wide (the phone
+               app bar and tab bar were removed)
    Plus an explicit short-viewport pass for MOBILE LANDSCAPE, which is where
    most wallet UIs fall apart (keyboard eats the viewport, dialog buttons go
    off-screen). */
@@ -94,8 +95,7 @@
 }
 
 /* Icon rail centres its icons. At 64px wide the footer controls cannot sit
-   side by side — they overflowed into the content area — so stack them and
-   drop the mode pill's label. */
+   side by side — they overflowed into the content area — so stack them. */
 @media (min-width: 640px) and (max-width: 1023.98px) {
   .nav-item { justify-content: center; padding: 0; }
   .nav-item[aria-current="page"]::before { left: 0; }
@@ -103,12 +103,7 @@
 
   .rail-foot { padding: var(--space-1-5); }
   .rail-foot .rail-foot-row { flex-direction: column; align-items: stretch; }
-  .rail-foot .mode-pill { justify-content: center; padding: 0; }
-  .rail-foot .mode-pill .pill-text { display: none; }
 }
-
-/* The label is only meaningful once the rail is wide enough to show it. */
-.mode-pill .pill-text { display: inline; }
 
 /* --- Expanded rail ------------------------------------------------------- */
 
@@ -142,27 +137,6 @@
 @media (min-width: 1280px) {
   .app { grid-template-columns: var(--rail-w) 1fr; }
 }
-
-/* ============================================================ App bar ==== */
-/* Mobile: the only chrome at the top. Desktop: replaced by .page-head. */
-
-.appbar {
-  position: sticky; top: 0; z-index: var(--z-50);
-  display: flex; align-items: center; gap: var(--space-2);
-  min-height: var(--appbar-h);
-  padding: var(--space-2) var(--space-3);
-  padding-top: max(var(--space-2), env(safe-area-inset-top, 0px));
-  background: var(--bg-surface);
-  border-bottom: 1px solid var(--border);
-}
-.appbar .appbar-title {
-  flex: 1; min-width: 0;
-  font-size: var(--text-md); font-weight: 650;
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-}
-.appbar .btn-icon { width: 40px; min-height: 40px; }
-
-@media (min-width: 640px) { .appbar { display: none; } }
 
 /* ============================================================ Page head == */
 
@@ -224,39 +198,6 @@
 .stack-4  { display: flex; flex-direction: column; gap: var(--space-4); }
 @media (min-width: 640px) { .stack { gap: var(--space-4); } }
 
-/* ============================================================ Tab bar ==== */
-
-.tabbar {
-  position: fixed; bottom: 0; left: 0; right: 0;
-  z-index: var(--z-100);
-  display: flex;
-  background: var(--bg-surface);
-  border-top: 1px solid var(--border);
-  padding-bottom: var(--safe-bottom);
-}
-.tabbar-item {
-  flex: 1;
-  display: flex; flex-direction: column; align-items: center;
-  justify-content: center; gap: 3px;
-  min-height: var(--tabbar-h);
-  padding: var(--space-1) 2px;
-  color: var(--text-muted);
-  font-size: 10.5px; font-weight: 600; letter-spacing: 0.01em;
-  transition: color var(--duration-fast);
-}
-.tabbar-item .i { width: 22px; height: 22px; }
-.tabbar-item[aria-current="page"] { color: var(--accent-text); }
-.tabbar-item .tabbar-label { line-height: 1; }
-.tabbar-item .nav-count {
-  position: absolute; translate: 14px -10px;
-  min-width: 16px; height: 16px; padding: 0 4px;
-  display: grid; place-items: center; border-radius: var(--radius-pill);
-  background: var(--danger); color: var(--danger-on);
-  font-size: 10px; font-weight: 700;
-}
-
-@media (min-width: 640px) { .tabbar { display: none; } }
-
 /* ============================================================ Grids ====== */
 
 .grid { display: grid; gap: var(--space-3); grid-template-columns: minmax(0, 1fr); }
@@ -304,35 +245,12 @@
 .wallet-chip[data-state="locked"]   { background: var(--warning-bg); border-color: var(--warning-border); color: var(--warning); }
 .wallet-chip[data-state="no-node"]  { background: var(--danger-bg);  border-color: var(--danger-border); color: var(--danger); }
 
-/* ======================================================= Mode pill ======= */
-
-.mode-pill {
-  display: inline-flex; align-items: center; gap: var(--space-1-5);
-  min-height: var(--min-target-sm); padding: 0 var(--space-3);
-  border: 1px solid var(--border-strong); border-radius: var(--radius-pill);
-  background: var(--bg-surface); color: var(--text-muted);
-  font-size: var(--text-xs); font-weight: 650;
-  text-transform: uppercase; letter-spacing: var(--tracking-label);
-}
-.mode-pill:hover { color: var(--text); border-color: var(--text-muted); }
-[data-mode="advanced"] .mode-pill {
-  background: var(--accent-bg); color: var(--accent-text); border-color: var(--accent-border);
-}
-
-/* ======================================================= Mode gating ===== */
-
-.adv-only { display: none; }
-[data-mode="advanced"] .adv-only { display: revert; }
-[data-mode="advanced"] .simple-only { display: none; }
-
 /* ======================================================= Setup lock ====== */
-/* First run: the wizard is the ONLY thing rendered. No rail, no tab bar,
-   no appbar — so there is nothing to click away to and no dashboard flash. */
+/* First run: the wizard is the ONLY thing rendered. No rail and no page
+   head, so there is nothing to click away to and no dashboard flash. */
 
 .app[data-setup="active"] { grid-template-columns: 1fr; }
 .app[data-setup="active"] .rail,
-.app[data-setup="active"] .tabbar,
-.app[data-setup="active"] .appbar,
 .app[data-setup="active"] .page-head { display: none !important; }
 .app[data-setup="active"] .view { padding-bottom: var(--space-6); }
 
@@ -340,14 +258,6 @@
 /* Short viewports: reclaim vertical space aggressively. */
 
 @media (max-height: 480px) {
-  .tabbar { --tabbar-h: 44px; }
-  .tabbar-item { min-height: 44px; gap: 0; }
-  .tabbar-item .tabbar-label { display: none; }   /* icons only */
-  .tabbar-item .i { width: 20px; height: 20px; }
-
-  .appbar { min-height: 44px; padding-block: var(--space-1); }
-  .appbar .btn-icon { width: 36px; min-height: 36px; }
-
   .view { padding-block: var(--space-3); }
 
   /* Balance hero goes horizontal so hero + next-step both stay above the fold. */
@@ -363,11 +273,7 @@
   .modal-foot { padding: var(--space-2) var(--space-3); }
   .sheet .modal { max-height: 96dvh; }
 
-  .palette-backdrop { padding-top: var(--space-3); }
-  .palette { max-height: calc(100dvh - var(--space-6)); }
-
   .empty { padding-block: var(--space-4); }
-  .flow-q { font-size: var(--text-lg); }
 }
 
 /* Two-up cards on a landscape phone: the width is there, the height is not. */

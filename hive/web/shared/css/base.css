@@ -21,9 +21,6 @@ body {
   text-rendering: optimizeLegibility;
 }
 
-/* Alpine: hide un-initialised templates so nothing flashes unstyled. */
-[x-cloak] { display: none !important; }
-
 img, svg { display: block; max-width: 100%; }
 svg { fill: none; flex: none; }
 
