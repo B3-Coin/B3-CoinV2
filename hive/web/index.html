@@ -742,6 +742,24 @@
                         <div class="details" id="tr-deposit-rows"></div>
                         <p class="t-xs muted">A deposit counts once it has 31 confirmations and the market admits it. If admission is slow, ask again for the same deposit; do not deposit again.</p>
                       </div>
+                      <div class="stack" id="tr-payouts" hidden>
+                        <h3 class="t-sm">Withdrawal payouts</h3>
+                        <div class="details" id="tr-payout-rows"></div>
+                        <form class="stack" id="tr-payout-ask" hidden>
+                          <label for="tr-payout-to">Address you withdrew to</label>
+                          <div class="pick-field">
+                            <input class="input input-mono" id="tr-payout-to" autocomplete="off" spellcheck="false" required />
+                            <button class="btn btn-secondary" type="button" id="tr-payout-pick" aria-label="Choose an address" title="Choose an address">
+                              <svg class="i-sm" aria-hidden="true"><use href="/icons.svg#i-book" /></svg>
+                            </button>
+                          </div>
+                          <div class="row gap-2">
+                            <button class="btn btn-primary btn-sm" type="submit">Review payout</button>
+                            <button class="btn btn-ghost btn-sm" type="button" id="tr-payout-cancel">Cancel</button>
+                          </div>
+                        </form>
+                        <p class="t-xs muted">A certified withdrawal is paid once its payout transaction is published, which is possible after the market's checkpoint for it confirms on the B3 chain. Anyone may publish a checkpoint; if none comes, publish it here. Only the address the withdrawal names can be paid, so publish your own payout. This wallet pays each network fee.</p>
+                      </div>
                     </div>
                   </div>
                 </section>

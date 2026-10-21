@@ -9,7 +9,7 @@
 // this page never signs.
 import { invoke } from "@tauri-apps/api/core";
 
-import { amountNode, el, isMasked, shorten } from "../shared/ui";
+import { el, isMasked, shorten } from "../shared/ui";
 import { pickAddress } from "./picker";
 import {
   B3_DECIMALS,
@@ -86,7 +86,7 @@ type Trade = {
   own_sold: string | null;
   observed_ms: number | null;
 };
-type Outcome = { status: string | null; text: string; fill_quantity: string | null; fill_price: string | null };
+type Outcome = { status: string | null; text: string; code: string; fill_quantity: string | null; fill_price: string | null };
 type Receipt = { action_id: string; accepted: boolean; state: string; stage: string; reason: string; outcome: Outcome };
 type TradeRequest = {
   action_id: string;
@@ -118,11 +118,19 @@ type Deposit = {
   amount: string | null;
   vault_id: string | null;
 };
+/** Mirrors flowmesh::Payout: a certified withdrawal whose payout waits to
+ *  be published. destination is null when Hive cannot tell which address
+ *  it pays. */
+type Payout = { effect_id: string; asset: "b3" | "token"; amount: string; sequence: number; destination: string | null };
+/** Mirrors flowmesh::Checkpoint: the next certified entry waiting for its
+ *  checkpoint on the B3 chain, while a withdrawal of this wallet's waits. */
+type Checkpoint = { checkpoint_id: string; sequence: number; waiting: number };
 /** A deposit counts once it is this deep (flowmesh::DEPOSIT_CONFIRMATIONS). */
 const DEPOSIT_CONFIRMATIONS = 31;
 export type TradeResult =
   | { outcome: "traded"; id: string; receipt: Receipt }
   | { outcome: "deposited"; id: string; deposit: { txid: string; vout: number; fee: string } }
+  | { outcome: "published"; id: string; payout: { txid: string; fee: string } }
   | { outcome: "rejected"; id: string }
   | { outcome: "failed"; id: string; error: string }
   | { outcome: string; id: string };
@@ -195,7 +203,10 @@ let chartView: "price" | "depth" = "price";
 /** Which sides of the book are listed. */
 let bookShow: "both" | "bids" | "asks" = "both";
 /** Drafts this page opened, until the approval window decides them. */
-const drafts = new Map<string, { what: "order" | "cancel" | "deposit" | "withdraw"; epoch: number }>();
+const drafts = new Map<
+  string,
+  { what: "order" | "cancel" | "deposit" | "withdraw" | "payout" | "checkpoint"; epoch: number; effect?: string; checkpoint?: string }
+>();
 /** Bumped when the wallet or market changes. A draft or read that belongs to
  *  an older epoch must not touch the view that replaced it. */
 let epoch = 0;
@@ -213,6 +224,16 @@ let requestsRead = 0;
 let requestsLoadingEpoch: number | null = null;
 /** The last deposit read failed with this message. */
 let depositsError: string | null = null;
+let payouts: Payout[] = [];
+let payoutsError: string | null = null;
+/** Payouts published from this page: effect id to transaction id. They stay
+ *  listed until the transaction confirms. */
+const published = new Map<string, string>();
+/** The payout whose address is being asked for. */
+let askingPayout: Payout | null = null;
+let checkpoint: Checkpoint | null = null;
+/** A checkpoint published from this page, until another is pending. */
+let publishedCheckpoint: { id: string; txid: string } | null = null;
 
 function blank(): Market {
   return {
@@ -274,6 +295,12 @@ export function tradeWalletChanged(): void {
   deposits = [];
   depositsRead = 0;
   depositsError = null;
+  payouts = [];
+  payoutsError = null;
+  published.clear();
+  askingPayout = null;
+  checkpoint = null;
+  publishedCheckpoint = null;
   admitted.clear();
   clearForm();
   clearFunding();
@@ -314,6 +341,12 @@ function selectMarket(id: string): void {
   deposits = [];
   depositsRead = 0;
   depositsError = null;
+  payouts = [];
+  payoutsError = null;
+  published.clear();
+  askingPayout = null;
+  checkpoint = null;
+  publishedCheckpoint = null;
   admitted.clear();
   renderDeposits();
   clearForm();
@@ -1248,7 +1281,7 @@ export function tradeDecided(r: TradeResult): boolean {
     }
     return true;
   }
-  const result = what === "deposit" || what === "withdraw" ? showFundResult : showResult;
+  const result = what === "deposit" || what === "withdraw" || what === "payout" || what === "checkpoint" ? showFundResult : showResult;
   if (r.outcome === "traded" && "receipt" in r) {
     const [kind, text] = what === "withdraw" ? withdrawText(r.receipt) : receiptText(r.receipt, what === "cancel" ? "cancel" : "order");
     result(kind, text);
@@ -1259,6 +1292,21 @@ export function tradeDecided(r: TradeResult): boolean {
       `Deposit broadcast (network fee ${r.deposit.fee} B3). It counts after ${DEPOSIT_CONFIRMATIONS} confirmations and admission; it is listed under Your deposits.`,
     );
     clearFunding();
+    void loadDeposits();
+  } else if (r.outcome === "published" && "payout" in r && what === "checkpoint") {
+    if (draft.checkpoint) publishedCheckpoint = { id: draft.checkpoint, txid: r.payout.txid };
+    result(
+      "success",
+      `Checkpoint broadcast (network fee ${r.payout.fee} B3). Once it confirms, the next checkpoint or your payout can be published here.`,
+    );
+    void loadDeposits();
+  } else if (r.outcome === "published" && "payout" in r) {
+    if (draft.effect) published.set(draft.effect, r.payout.txid);
+    askingPayout = null;
+    result(
+      "success",
+      `Payout broadcast (network fee ${r.payout.fee} B3). It is paid once the transaction confirms on the B3 chain; it leaves the list then.`,
+    );
     void loadDeposits();
   } else if (r.outcome === "rejected") {
     result("warning", "Rejected. Nothing was signed.");
@@ -1279,6 +1327,18 @@ function fillText(o: Outcome): string {
   return `Filled ${formatQuantity(q, u.decimals)} ${tokenWord()}${at}.`;
 }
 
+/** Why the market refused a certified request. The node's text for a state
+ *  refusal is the same for every kind; its cause depends on the kind, as in
+ *  the node's RejectedByStateText. No trailing full stop. */
+function refusal(o: Outcome, kind: string): string {
+  if (o.code === "REJECTED_BY_STATE") {
+    if (kind === "withdraw") return "not enough free balance, or the market's vault cannot pay that much yet. Nothing left your balance";
+    if (kind === "cancel") return "there was nothing to cancel on that side";
+    if (kind === "order") return "the funds could not be reserved or the prices were not valid. Nothing is held for it";
+  }
+  return (o.text || "the market state refused it").replace(/\.+$/, "");
+}
+
 function receiptText(r: Receipt, what: "order" | "cancel"): [string, string] {
   if (r.state === "rejected") return ["danger", `Refused${r.reason ? `: ${r.reason}` : ""}. Nothing is pending.`];
   if (r.state === "unknown") {
@@ -1286,8 +1346,8 @@ function receiptText(r: Receipt, what: "order" | "cancel"): [string, string] {
   }
   if (r.state === "certified_inclusion") {
     const o = r.outcome;
-    if (o.status === "rejected") return ["danger", `Certified but not applied: ${o.text || "the market state refused it"}.`];
-    if (o.status === "not_executed") return ["warning", `Certified but not executed: ${o.text || "another action used its sequence"}.`];
+    if (o.status === "rejected") return ["danger", `Refused: ${refusal(o, what)}.`];
+    if (o.status === "not_executed") return ["warning", `Certified but not executed: ${(o.text || "another action used its sequence").replace(/\.+$/, "")}.`];
     if (what === "cancel") return ["success", "Cancellation certified. What the order held is back in your trading balance."];
     return ["success", `Certified. ${fillText(o)}`.trim()];
   }
@@ -1346,7 +1406,7 @@ function renderFunding(): void {
   el("tr-fund-to-field").hidden = !out;
   el("tr-fund-review").textContent = out ? "Review withdrawal" : "Review deposit";
   el("tr-fund-help").textContent = out
-    ? "A withdrawal is a request: once certified it leaves your trading balance, and the B3 chain pays it out after a checkpoint. What open orders hold cannot be withdrawn."
+    ? "A withdrawal is a request: once certified it leaves your trading balance. After a checkpoint you publish its payout here, for a small network fee. What open orders hold cannot be withdrawn."
     : `A deposit is a B3 transaction into the market's vault. It counts after ${DEPOSIT_CONFIRMATIONS} confirmations, once the market admits it.` +
       (market.accountKnown && !market.account ? " The first one creates this wallet's trading account key: back up the wallet afterwards." : "");
   const amount = fundAmount();
@@ -1410,9 +1470,9 @@ function withdrawText(r: Receipt): [string, string] {
   }
   if (r.state === "certified_inclusion") {
     const o = r.outcome;
-    if (o.status === "rejected") return ["danger", `Certified but not applied: ${o.text || "the market state refused it"}.`];
-    if (o.status === "not_executed") return ["warning", `Certified but not executed: ${o.text || "another action used its sequence"}.`];
-    return ["success", "Withdrawal certified: it has left your trading balance. The payout follows on the B3 chain after a checkpoint; it is not paid yet."];
+    if (o.status === "rejected") return ["danger", `Withdrawal refused: ${refusal(o, "withdraw")}.`];
+    if (o.status === "not_executed") return ["warning", `Certified but not executed: ${(o.text || "another action used its sequence").replace(/\.+$/, "")}.`];
+    return ["success", "Withdrawal certified: it has left your trading balance. It is not paid yet: once a checkpoint confirms it on the B3 chain, publish its payout under Withdrawal payouts below."];
   }
   return ["info", "Accepted: queued, not yet certified. Nothing has left your trading balance yet; see Requests."];
 }
@@ -1422,15 +1482,27 @@ async function loadDeposits(): Promise<void> {
   const id = marketId;
   if (!id) return;
   depositsRead = Date.now();
-  try {
-    const list = await invoke<Deposit[]>("trade_deposits", { marketId: id });
-    if (mine !== generation) return;
-    deposits = list;
+  const [dep, pay] = await Promise.allSettled([
+    invoke<Deposit[]>("trade_deposits", { marketId: id }),
+    invoke<{ payouts: Payout[]; checkpoint: Checkpoint | null }>("trade_payouts", { marketId: id }),
+  ]);
+  if (mine !== generation) return;
+  // An empty list must not be mistaken for "none".
+  if (dep.status === "fulfilled") {
+    deposits = dep.value;
     depositsError = null;
-  } catch (e) {
-    if (mine !== generation) return;
-    // An empty list must not be mistaken for "no deposits".
-    depositsError = String(e);
+  } else {
+    depositsError = String(dep.reason);
+  }
+  if (pay.status === "fulfilled") {
+    payouts = pay.value.payouts;
+    checkpoint = pay.value.checkpoint;
+    payoutsError = null;
+    if (publishedCheckpoint && checkpoint?.checkpoint_id !== publishedCheckpoint.id) publishedCheckpoint = null;
+    for (const effect of [...published.keys()]) if (!payouts.some((p) => p.effect_id === effect)) published.delete(effect);
+    if (askingPayout && !payouts.some((p) => p.effect_id === askingPayout?.effect_id)) askingPayout = null;
+  } else {
+    payoutsError = String(pay.reason);
   }
   renderDeposits();
 }
@@ -1459,31 +1531,152 @@ async function admit(d: Deposit, button: HTMLButtonElement): Promise<void> {
   void loadDeposits();
 }
 
-/** A deposit's amount as the page shows amounts: B3, or the token in its
- *  verified decimals (base units when they are not verified). */
-function depositAmount(d: Deposit): Node {
+/** A deposit's or payout's amount, from B3 atoms or token base units: the
+ *  token in its verified decimals, or base units when they are not. */
+function depositAmount(d: { asset: "b3" | "token" | null; amount: string | null }): Node {
   if (d.amount === null) {
     const unknown = document.createElement("span");
     unknown.className = "muted";
     unknown.textContent = "Amount unknown";
     return unknown;
   }
-  if (d.asset === "b3") return amountNode(d.amount);
   const span = document.createElement("span");
-  const label = tokenLabel(market.metadata, markets.find((m) => m.market_id === marketId)?.base_asset_id);
-  const decimals = market.metadata?.decimals;
+  const label = d.asset === "b3" ? "B3" : tokenLabel(market.metadata, markets.find((m) => m.market_id === marketId)?.base_asset_id);
+  const decimals = d.asset === "b3" ? B3_DECIMALS : market.metadata?.decimals;
   if (isMasked()) {
     span.textContent = `•••• ${label}`;
     span.setAttribute("aria-label", "Amount hidden");
   } else if (decimals === null || decimals === undefined) {
     span.textContent = `${d.amount} base units of ${label}`;
   } else {
-    span.textContent = `${formatQuantity(BigInt(d.amount), decimals, quantityPlaces([BigInt(d.amount)], decimals))} ${label}`;
+    const q = BigInt(d.amount);
+    span.textContent = `${d.asset === "b3" ? formatB3(q) : formatQuantity(q, decimals, quantityPlaces([q], decimals))} ${label}`;
   }
   return span;
 }
 
+async function reviewPayout(p: Payout, destination: string): Promise<void> {
+  if (!marketId || preparing) return;
+  preparing = true;
+  showFundResult("", "");
+  const at = epoch;
+  try {
+    const draft = await invoke<string>("trade_payout_draft", { marketId, effectId: p.effect_id, destination });
+    drafts.set(draft, { what: "payout", epoch: at, effect: p.effect_id });
+    showFundResult("info", "Review the payout in the approval window. Nothing is signed until you approve it there.");
+  } catch (e) {
+    showFundResult("danger", String(e));
+  } finally {
+    preparing = false;
+  }
+  render();
+}
+
+async function reviewCheckpoint(c: Checkpoint): Promise<void> {
+  if (!marketId || preparing) return;
+  preparing = true;
+  showFundResult("", "");
+  const at = epoch;
+  try {
+    const draft = await invoke<string>("trade_checkpoint_draft", { marketId });
+    drafts.set(draft, { what: "checkpoint", epoch: at, checkpoint: c.checkpoint_id });
+    showFundResult("info", "Review the checkpoint in the approval window. Nothing is signed until you approve it there.");
+  } catch (e) {
+    showFundResult("danger", String(e));
+  } finally {
+    preparing = false;
+  }
+  render();
+}
+
+function checkpointRow(c: Checkpoint): HTMLElement {
+  const drow = document.createElement("div");
+  drow.className = "drow";
+  const k = document.createElement("span");
+  k.className = "dkey";
+  k.textContent = c.waiting === 1 ? "1 withdrawal waits for a checkpoint" : `${c.waiting} withdrawals wait for a checkpoint`;
+  const sub = document.createElement("span");
+  sub.className = "muted";
+  sub.textContent = ` · entry ${c.sequence}`;
+  sub.title = `Checkpoint ${c.checkpoint_id}`;
+  k.append(sub);
+  const v = document.createElement("span");
+  v.className = "dval";
+  if (publishedCheckpoint?.id === c.checkpoint_id) {
+    v.textContent = "Published, confirming";
+    v.title = `Transaction ${publishedCheckpoint.txid}`;
+  } else {
+    const go = document.createElement("button");
+    go.type = "button";
+    go.className = "btn btn-secondary btn-sm";
+    go.textContent = "Publish checkpoint";
+    go.title = "Anyone may publish it. Opens the approval window; this wallet pays the network fee.";
+    go.disabled = preparing;
+    go.addEventListener("click", () => void reviewCheckpoint(c));
+    v.append(go);
+  }
+  drow.append(k, v);
+  return drow;
+}
+
+function renderPayouts(): void {
+  el("tr-payouts").hidden = payouts.length === 0 && checkpoint === null && payoutsError === null;
+  const rows: HTMLElement[] = [];
+  if (checkpoint) rows.push(checkpointRow(checkpoint));
+  if (payoutsError !== null) {
+    const drow = document.createElement("div");
+    drow.className = "drow";
+    const k = document.createElement("span");
+    k.className = "dkey";
+    k.textContent = "Could not read your payouts.";
+    k.title = payoutsError;
+    drow.append(k);
+    rows.push(drow);
+  }
+  for (const p of payouts) {
+    const drow = document.createElement("div");
+    drow.className = "drow";
+    const k = document.createElement("span");
+    k.className = "dkey";
+    k.append(depositAmount(p));
+    const to = document.createElement("span");
+    to.className = "muted";
+    to.textContent = p.destination ? ` · to ${shorten(p.destination, 8, 6)}` : " · to the address you withdrew to";
+    if (p.destination) to.title = p.destination;
+    k.append(to);
+    const v = document.createElement("span");
+    v.className = "dval";
+    const txid = published.get(p.effect_id);
+    if (txid) {
+      v.textContent = "Published, confirming";
+      v.title = `Transaction ${txid}`;
+    } else {
+      const go = document.createElement("button");
+      go.type = "button";
+      go.className = "btn btn-primary btn-sm";
+      go.textContent = p.destination ? "Publish payout" : "Publish payout…";
+      go.title = "Opens the approval window. This wallet pays the network fee.";
+      go.disabled = preparing;
+      go.addEventListener("click", () => {
+        if (p.destination) {
+          void reviewPayout(p, p.destination);
+        } else {
+          askingPayout = p;
+          renderPayouts();
+          el<HTMLInputElement>("tr-payout-to").focus();
+        }
+      });
+      v.append(go);
+    }
+    drow.append(k, v);
+    rows.push(drow);
+  }
+  el("tr-payout-rows").replaceChildren(...rows);
+  el("tr-payout-ask").hidden = askingPayout === null;
+}
+
 function renderDeposits(): void {
+  renderPayouts();
   el("tr-deposits").hidden = deposits.length === 0 && depositsError === null;
   const failed: HTMLElement[] = [];
   if (depositsError !== null) {
@@ -1613,7 +1806,7 @@ function outcomeText(r: TradeRequest): string {
     case "applied":
       return r.kind === "cancel" ? "Cancelled" : shortFill(o) || "Applied";
     case "rejected":
-      return `Rejected: ${o.text}`;
+      return `Refused: ${refusal(o, r.kind)}`;
     case "included_not_executed":
       return "Included, not executed yet";
     case "not_executed":
@@ -1789,6 +1982,20 @@ for (const [id, way] of [
   });
 }
 el("tr-fund-form").addEventListener("input", renderFunding);
+el("tr-payout-ask").addEventListener("submit", (e) => {
+  e.preventDefault();
+  const p = askingPayout;
+  if (p) void reviewPayout(p, el<HTMLInputElement>("tr-payout-to").value.trim());
+});
+el("tr-payout-cancel").addEventListener("click", () => {
+  askingPayout = null;
+  el<HTMLInputElement>("tr-payout-to").value = "";
+  renderPayouts();
+});
+el("tr-payout-pick").addEventListener("click", async () => {
+  const picked = await pickAddress("Address you withdrew to", "The payout can only go to the exact address the withdrawal named.", "mine");
+  if (picked) el<HTMLInputElement>("tr-payout-to").value = picked.address;
+});
 el("tr-fund-pick").addEventListener("click", async () => {
   const picked = await pickAddress("Withdraw to", "One of your own addresses, or a saved contact.", "mine");
   if (!picked) return;

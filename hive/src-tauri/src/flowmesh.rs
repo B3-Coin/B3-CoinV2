@@ -523,6 +523,8 @@ pub struct Outcome {
     /// no outcome is verified.
     pub status: Option<String>,
     pub text: String,
+    /// The node's reason code, such as REJECTED_BY_STATE.
+    pub code: String,
     /// Base units filled in the including entry. None when it is not an
     /// order or nothing is verified: never a guessed zero.
     pub fill_quantity: Option<String>,
@@ -559,6 +561,8 @@ pub struct Request {
     pub stage: String,
     pub reason: String,
     pub certified: bool,
+    /// The certified entry (microblock sequence) that included it.
+    pub microblock: Option<u64>,
     pub outcome: Outcome,
     /// Below the certified account's next sequence: the market has taken it
     /// in, or another action used its sequence.
@@ -960,6 +964,7 @@ fn outcome(r: &Value) -> Outcome {
     Outcome {
         status: Some(text(&o["status"])),
         text: text(&o["reason_text"]),
+        code: text(&o["reason_code"]),
         fill_quantity: fill.map(|f| int(&f["quantity"])),
         fill_price: fill
             .filter(|f| f["cleared"].as_bool() == Some(true))
@@ -1018,6 +1023,9 @@ fn request(a: &Value) -> Request {
         reason: text(&r["reason"]),
         certified: a["previously_certified"].as_bool().unwrap_or(false)
             || r["receipt_state"] == "certified_inclusion",
+        microblock: r["microblock_sequence"]
+            .as_u64()
+            .or_else(|| r["outcome"]["microblock_sequence"].as_u64()),
         outcome: outcome(r),
         settled: false,
         pending: false,
@@ -1130,7 +1138,7 @@ pub struct Deposit {
     /// What the vault output carries, read from its script; None when the
     /// output cannot be read as a vault deposit.
     pub asset: Option<Asset>,
-    /// B3 as exact decimal text, or the token in base units.
+    /// B3 atoms or token base units.
     pub amount: Option<String>,
     /// The vault it pays, as the node prints vault ids.
     pub vault_id: Option<String>,
@@ -1247,7 +1255,7 @@ pub fn deposit(client: &Client, draft: &DepositDraft) -> Result<Deposited, Strin
             "flowmeshdeposit",
             json!([draft.base_asset_id, asset, amount]),
         )
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| unfunded(e, "the deposit and its network fee"))?;
     if r["broadcast"].as_bool() != Some(true) {
         return Err("The node did not broadcast the deposit.".into());
     }
@@ -1293,11 +1301,7 @@ pub fn deposits(client: &Client, wallet: &str, vault_id: &str) -> Result<Vec<Dep
         let script = &tx["decoded"]["vout"][d.vout as usize]["scriptPubKey"]["hex"];
         if let Some(v) = script.as_str().and_then(vault_output) {
             d.asset = Some(if v.native { Asset::B3 } else { Asset::Token });
-            d.amount = Some(if v.native {
-                b3_decimal(v.amount)
-            } else {
-                v.amount.to_string()
-            });
+            d.amount = Some(v.amount.to_string());
             d.vault_id = Some(v.vault_id);
         }
     }
@@ -1445,9 +1449,501 @@ fn int(v: &Value) -> String {
     }
 }
 
+// ---- payouts -------------------------------------------------------------------
+
+/// The label Hive gives the new address a withdrawal pays when none is typed.
+const WITHDRAWAL_LABEL: &str = "FlowMesh withdrawal";
+/// Addresses checked against a payout's destination, at most.
+const PAYOUT_CANDIDATES: usize = 200;
+
+/// A certified withdrawal of this wallet's whose payout can be published now
+/// (listflowmeshvaultoperations). Nothing pays it until someone publishes
+/// it, and only with the exact address the withdrawal named, so in practice
+/// the withdrawer does.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Payout {
+    pub effect_id: String,
+    pub asset: Asset,
+    /// B3 atoms or token base units.
+    pub amount: String,
+    /// The certified entry (microblock sequence) of its withdrawal.
+    pub sequence: u64,
+    /// The address it pays, when it is one of this wallet's withdrawal
+    /// addresses or a contact; otherwise the page asks for it.
+    pub destination: Option<String>,
+    /// SHA-256 of the destination's script, as the node prints it.
+    #[serde(skip)]
+    commitment: String,
+}
+
+/// The next certified entry waiting for its checkpoint on the B3 chain,
+/// when a withdrawal of this wallet's waits for it. Checkpoints land one
+/// entry at a time and in order, and a payout can be published only once
+/// the checkpoint of the entry that certified its withdrawal confirms.
+/// Anyone may publish one; nothing in Hive does so on its own.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Checkpoint {
+    pub checkpoint_id: String,
+    /// The entry it checkpoints.
+    pub sequence: u64,
+    /// This wallet's certified withdrawals at or after that entry.
+    pub waiting: u64,
+}
+
+/// A market's payouts to publish and the checkpoint they may wait for.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Payouts {
+    pub payouts: Vec<Payout>,
+    pub checkpoint: Option<Checkpoint>,
+}
+
+/// Publishing an approved checkpoint.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct CheckpointDraft {
+    pub chain: String,
+    pub wallet: String,
+    pub market_id: String,
+    pub checkpoint_id: String,
+    pub sequence: u64,
+    pub waiting: u64,
+}
+
+/// Publishing an approved payout: the vault transaction that pays a
+/// certified withdrawal out.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PayoutDraft {
+    pub chain: String,
+    pub wallet: String,
+    pub market_id: String,
+    pub base_asset_id: String,
+    pub metadata: Metadata,
+    pub effect_id: String,
+    pub asset: Asset,
+    /// B3 atoms or token base units.
+    pub amount: String,
+    pub sequence: u64,
+    pub destination: String,
+    /// The destination is this wallet's own address.
+    pub mine: bool,
+}
+
+/// What an approved payout did on the B3 chain.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Published {
+    pub txid: String,
+    /// B3 network fee, decimal.
+    pub fee: String,
+}
+
+/// The node's owner commitment for a script (modern::AssetOwnerCommitment):
+/// its SHA-256, printed with the bytes reversed as uint256::GetHex does.
+pub(crate) fn owner_commitment(script_hex: &str) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    if script_hex.len() % 2 != 0 {
+        return None;
+    }
+    let script = (0..script_hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(script_hex.get(i..i + 2)?, 16).ok())
+        .collect::<Option<Vec<u8>>>()?;
+    Some(
+        Sha256::digest(&script)
+            .iter()
+            .rev()
+            .map(|b| format!("{b:02x}"))
+            .collect(),
+    )
+}
+
+/// The withdrawals in a listflowmeshvaultoperations reply that pay
+/// `account_id` this market's B3 or token.
+fn parse_payouts(list: &Value, account_id: &str, base_asset_id: &str) -> Vec<Payout> {
+    let same = |a: &Value, b: &str| a.as_str().is_some_and(|a| a.eq_ignore_ascii_case(b));
+    list.as_array()
+        .into_iter()
+        .flatten()
+        .filter(|o| o["kind"] == "withdrawal" && same(&o["account_id"], account_id))
+        .filter_map(|o| {
+            let (asset, amount) = if o["asset"] == "B3" {
+                let text = crate::wallet::decimal(&o["amount"]).ok()?;
+                (Asset::B3, decimal_atoms(&text)?)
+            } else if same(&o["asset"], base_asset_id) {
+                (Asset::Token, o["amount"].as_u64()?)
+            } else {
+                return None;
+            };
+            Some(Payout {
+                effect_id: text(&o["effect_id"]),
+                asset,
+                amount: amount.to_string(),
+                sequence: o["sequence"].as_u64()?,
+                destination: None,
+                commitment: text(&o["destination_owner_commitment"]).to_lowercase(),
+            })
+        })
+        .collect()
+}
+
+/// An address's script commitment and whether it is this wallet's, or None
+/// when the node does not take it as an address.
+fn address_commitment(client: &Client, wallet: &str, address: &str) -> Option<(String, bool)> {
+    let info = client
+        .call_wallet(wallet, "getaddressinfo", json!([address]))
+        .ok()?;
+    let commitment = owner_commitment(info["scriptPubKey"].as_str()?)?;
+    Some((commitment, info["ismine"].as_bool().unwrap_or(false)))
+}
+
+/// Plain words for a wallet that could not fund `what` (RPC_WALLET_INSUFFICIENT_FUNDS).
+/// These transactions spend confirmed coins only.
+fn unfunded(e: RpcError, what: &str) -> String {
+    match e {
+        RpcError::Rpc { code: -6, .. } => format!(
+            "This wallet does not have enough confirmed B3 for {what}. Coins from a transaction that has not confirmed yet cannot pay it; try again after the next block."
+        ),
+        e => e.to_string(),
+    }
+}
+
+/// The pending checkpoint in a getflowmeshbalance reply.
+fn pending_checkpoint(balance: &Value) -> Option<(String, u64)> {
+    if balance["checkpoint_pending"].as_bool() != Some(true) {
+        return None;
+    }
+    let id = text(&balance["pending_checkpoint_id"]).to_lowercase();
+    valid_id(&id).then_some(())?;
+    Some((id, balance["pending_checkpoint_sequence"].as_u64()?))
+}
+
+/// This wallet's withdrawals certified in entry `sequence` or later that
+/// were not refused. An unproved outcome counts: it may have applied.
+fn waiting_withdrawals(list: &[Request], sequence: u64) -> u64 {
+    list.iter()
+        .filter(|r| r.kind == "withdraw" && r.certified)
+        .filter(|r| {
+            !matches!(
+                r.outcome.status.as_deref(),
+                Some("rejected" | "not_executed")
+            )
+        })
+        .filter(|r| r.microblock.is_some_and(|m| m >= sequence))
+        .count() as u64
+}
+
+/// The pending checkpoint, when a withdrawal of this wallet's waits for it.
+pub fn checkpoint(
+    client: &Client,
+    wallet: &str,
+    market_id: &str,
+) -> Result<Option<Checkpoint>, String> {
+    if !valid_id(market_id) {
+        return Err("That is not a market id.".into());
+    }
+    let balance = client
+        .call_wallet(wallet, "getflowmeshbalance", json!([market_id]))
+        .map_err(|e| e.to_string())?;
+    let Some((checkpoint_id, sequence)) = pending_checkpoint(&balance) else {
+        return Ok(None);
+    };
+    let list = requests(client, wallet, market_id).map_err(|e| e.to_string())?;
+    let waiting = waiting_withdrawals(&list, sequence);
+    Ok((waiting > 0).then_some(Checkpoint {
+        checkpoint_id,
+        sequence,
+        waiting,
+    }))
+}
+
+/// Drafts publishing the pending checkpoint a withdrawal waits for.
+pub fn prepare_checkpoint(
+    client: &Client,
+    chain: &str,
+    wallet: &str,
+    market_id: &str,
+) -> Result<CheckpointDraft, String> {
+    let c = checkpoint(client, wallet, market_id)?
+        .ok_or("None of your withdrawals waits for a checkpoint now.")?;
+    Ok(CheckpointDraft {
+        chain: chain.to_owned(),
+        wallet: wallet.to_owned(),
+        market_id: market_id.to_owned(),
+        checkpoint_id: c.checkpoint_id,
+        sequence: c.sequence,
+        waiting: c.waiting,
+    })
+}
+
+/// Signs the approved checkpoint and broadcasts it only when it is still
+/// the one approved. This wallet pays its network fee.
+pub fn publish_checkpoint(client: &Client, draft: &CheckpointDraft) -> Result<Published, String> {
+    let r = client
+        .call_wallet(
+            &draft.wallet,
+            "createflowmeshcheckpoint",
+            json!([draft.market_id, {"broadcast": false}]),
+        )
+        .map_err(|e| unfunded(e, "the network fee"))?;
+    if !text(&r["checkpoint_id"]).eq_ignore_ascii_case(&draft.checkpoint_id)
+        || !text(&r["market_id"]).eq_ignore_ascii_case(&draft.market_id)
+        || r["sequence"].as_u64() != Some(draft.sequence)
+    {
+        return Err(
+            "Someone published that checkpoint meanwhile. Nothing was sent; check again.".into(),
+        );
+    }
+    let hex = r["hex"]
+        .as_str()
+        .ok_or("The node returned no transaction.")?;
+    let txid = client
+        .call("sendrawtransaction", json!([hex]))
+        .map_err(|e| e.to_string())?;
+    Ok(Published {
+        txid: txid.as_str().unwrap_or_default().to_owned(),
+        fee: crate::wallet::decimal(&r["network_fee"]).unwrap_or_default(),
+    })
+}
+
+/// This wallet's payouts waiting to be published in a market, oldest
+/// first, with the address each pays when Hive can find it, and the
+/// checkpoint its other withdrawals wait for.
+pub fn payouts(client: &Client, wallet: &str, market_id: &str) -> Result<Payouts, String> {
+    let view = fresh(client, wallet, market_id)?;
+    let Some(account) = view.account else {
+        return Ok(Payouts {
+            payouts: Vec::new(),
+            checkpoint: None,
+        });
+    };
+    let checkpoint = checkpoint(client, wallet, market_id)?;
+    let payouts = withdrawal_payouts(client, wallet, market_id, &account, &view.base_asset_id)?;
+    Ok(Payouts {
+        payouts,
+        checkpoint,
+    })
+}
+
+fn withdrawal_payouts(
+    client: &Client,
+    wallet: &str,
+    market_id: &str,
+    account: &Account,
+    base_asset_id: &str,
+) -> Result<Vec<Payout>, String> {
+    let list = client
+        .call_wallet(wallet, "listflowmeshvaultoperations", json!([market_id]))
+        .map_err(|e| e.to_string())?;
+    let mut out = parse_payouts(&list, &account.account_id, base_asset_id);
+    out.sort_by_key(|p| p.sequence);
+    if out.is_empty() {
+        return Ok(out);
+    }
+    // The addresses Hive made for withdrawals, then the address book.
+    let mut candidates: Vec<String> = client
+        .call_wallet(wallet, "getaddressesbylabel", json!([WITHDRAWAL_LABEL]))
+        .ok()
+        .and_then(|v| v.as_object().map(|m| m.keys().cloned().collect()))
+        .unwrap_or_default();
+    candidates.extend(
+        crate::book::contacts(client, wallet)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|c| c.address),
+    );
+    for address in candidates.into_iter().take(PAYOUT_CANDIDATES) {
+        if out.iter().all(|p| p.destination.is_some()) {
+            break;
+        }
+        let Some((commitment, _)) = address_commitment(client, wallet, &address) else {
+            continue;
+        };
+        for p in out.iter_mut().filter(|p| p.commitment == commitment) {
+            p.destination = Some(address.clone());
+        }
+    }
+    Ok(out)
+}
+
+/// Checks that `effect_id` is still waiting and pays exactly `destination`.
+pub fn prepare_payout(
+    client: &Client,
+    chain: &str,
+    wallet: &str,
+    market_id: &str,
+    effect_id: &str,
+    destination: &str,
+) -> Result<PayoutDraft, String> {
+    if !valid_id(effect_id) {
+        return Err("That is not a payout id.".into());
+    }
+    let view = fresh(client, wallet, market_id)?;
+    let account = view
+        .account
+        .as_ref()
+        .ok_or("This wallet has no trading account in this market.")?;
+    let list = client
+        .call_wallet(wallet, "listflowmeshvaultoperations", json!([market_id]))
+        .map_err(|e| e.to_string())?;
+    let payout = parse_payouts(&list, &account.account_id, &view.base_asset_id)
+        .into_iter()
+        .find(|p| p.effect_id.eq_ignore_ascii_case(effect_id))
+        .ok_or(
+            "This payout is no longer waiting: it may have been published already. Check Activity.",
+        )?;
+    let metadata = view
+        .metadata
+        .clone()
+        .filter(|m| payout.asset == Asset::B3 || m.decimals.is_some())
+        .ok_or("The token's decimals are not verified, so the amount cannot be shown.")?;
+    let destination = destination.trim();
+    let (commitment, mine) =
+        address_commitment(client, wallet, destination).ok_or("That is not a valid B3 address.")?;
+    if commitment != payout.commitment {
+        return Err(
+            "This withdrawal does not pay that address. Give the exact address you withdrew to."
+                .into(),
+        );
+    }
+    Ok(PayoutDraft {
+        chain: chain.to_owned(),
+        wallet: wallet.to_owned(),
+        market_id: market_id.to_owned(),
+        base_asset_id: view.base_asset_id,
+        metadata,
+        effect_id: payout.effect_id,
+        asset: payout.asset,
+        amount: payout.amount,
+        sequence: payout.sequence,
+        destination: destination.to_owned(),
+        mine,
+    })
+}
+
+/// Signs and broadcasts the approved payout, after checking it is still
+/// waiting and unchanged. This wallet pays its network fee.
+pub fn publish_payout(client: &Client, draft: &PayoutDraft) -> Result<Published, String> {
+    let now = prepare_payout(
+        client,
+        &draft.chain,
+        &draft.wallet,
+        &draft.market_id,
+        &draft.effect_id,
+        &draft.destination,
+    )?;
+    if now.asset != draft.asset || now.amount != draft.amount {
+        return Err("The payout changed since it was drafted. Nothing was sent.".into());
+    }
+    let r = client
+        .call_wallet(
+            &draft.wallet,
+            "createflowmeshvaulttx",
+            json!([draft.effect_id, draft.destination, {"broadcast": true}]),
+        )
+        .map_err(|e| unfunded(e, "the network fee"))?;
+    if r["broadcast"].as_bool() != Some(true) || r["operation"] != "withdrawal" {
+        return Err("The node did not broadcast the payout.".into());
+    }
+    Ok(Published {
+        txid: text(&r["txid"]),
+        fee: crate::wallet::decimal(&r["network_fee"]).unwrap_or_default(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn payouts_are_this_accounts_withdrawals_in_this_market() {
+        let me = "aa".repeat(32);
+        let token = "e3".repeat(32);
+        let op = |kind: &str, account: &str, asset: &str, amount: Value, seq: u64| {
+            json!({
+                "effect_id": format!("{seq:064x}"), "kind": kind, "account_id": account,
+                "asset": asset, "amount": amount, "sequence": seq,
+                "destination_owner_commitment": "AB".repeat(32),
+            })
+        };
+        let list = json!([
+            op("withdrawal", &me, "B3", json!(1.5), 3),
+            op("withdrawal", &me, &token, json!(42), 4),
+            op("withdrawal", &"bb".repeat(32), "B3", json!(1), 5),
+            op("deposit-sweep", &me, "B3", json!(1), 6),
+            op("withdrawal", &me, &"cc".repeat(32), json!(7), 7),
+        ]);
+        let got = parse_payouts(&list, &me.to_uppercase(), &token);
+        assert_eq!(got.len(), 2);
+        assert_eq!(
+            (got[0].asset, got[0].amount.as_str(), got[0].sequence),
+            (Asset::B3, "1500000000", 3)
+        );
+        assert_eq!((got[1].asset, got[1].amount.as_str()), (Asset::Token, "42"));
+        assert_eq!(got[0].commitment, "ab".repeat(32));
+    }
+
+    #[test]
+    fn withdrawals_wait_for_the_checkpoint_of_their_entry() {
+        let balance = json!({"checkpoint_pending": true, "pending_checkpoint_id": "AB".repeat(32),
+                             "pending_checkpoint_sequence": 19});
+        assert_eq!(pending_checkpoint(&balance), Some(("ab".repeat(32), 19)));
+        assert_eq!(
+            pending_checkpoint(&json!({"checkpoint_pending": false})),
+            None
+        );
+        assert_eq!(
+            pending_checkpoint(
+                &json!({"checkpoint_pending": true, "pending_checkpoint_id": "x",
+                                       "pending_checkpoint_sequence": 19})
+            ),
+            None
+        );
+        let action = |kind: u64, entry: u64, outcome: Value| {
+            request(
+                &json!({"action_type": kind, "sequence": 1, "previously_certified": true,
+                            "receipt": {"receipt_state": "certified_inclusion",
+                                        "microblock_sequence": entry, "outcome": outcome}}),
+            )
+        };
+        let rejected = json!({"status": "rejected", "microblock_sequence": 20});
+        let list = [
+            action(4, 19, Value::Null), // unproved: may have applied
+            action(4, 20, json!({"status": "applied"})),
+            action(4, 18, json!({"status": "applied"})), // its checkpoint landed
+            action(4, 20, rejected),
+            action(0, 20, json!({"status": "applied"})), // an order
+        ];
+        assert_eq!(list[0].microblock, Some(19));
+        assert_eq!(waiting_withdrawals(&list, 19), 2);
+        assert_eq!(waiting_withdrawals(&list, 21), 0);
+    }
+
+    #[test]
+    fn an_unfunded_wallet_is_told_in_plain_words() {
+        let short = RpcError::Rpc {
+            code: -6,
+            message: "Insufficient funds".into(),
+        };
+        assert!(unfunded(short, "the network fee")
+            .starts_with("This wallet does not have enough confirmed B3 for the network fee."));
+        let other = RpcError::Rpc {
+            code: -4,
+            message: "x".into(),
+        };
+        assert_eq!(
+            unfunded(other.clone(), "the network fee"),
+            other.to_string()
+        );
+    }
+
+    #[test]
+    fn owner_commitments_match_the_node() {
+        // SHA-256 of a P2PKH script, bytes reversed as the node prints it.
+        assert_eq!(
+            owner_commitment("76a91417abed3f7128812a48e780f56ec65a4d40c68ca488ac").as_deref(),
+            Some("7e6c67d53fa912560acfdec469143cb6e16c05cd199ff8c13451ab2b56dfc313")
+        );
+        assert_eq!(owner_commitment("abc"), None);
+        assert_eq!(owner_commitment("zz"), None);
+    }
 
     /// A USER_DEPOSIT output script as modern::DexVaultPayload writes it.
     fn vault_script(asset: [u8; 32], amount: u64, vault: [u8; 32]) -> String {

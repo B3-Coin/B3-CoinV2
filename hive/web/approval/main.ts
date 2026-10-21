@@ -75,6 +75,29 @@ type WithdrawDraft = {
   sequence: number;
   remote: boolean;
 };
+// Mirrors flowmesh::PayoutDraft.
+type PayoutDraft = {
+  chain: string;
+  wallet: string;
+  market_id: string;
+  base_asset_id: string;
+  metadata: Metadata;
+  effect_id: string;
+  asset: "b3" | "token";
+  amount: string;
+  sequence: number;
+  destination: string;
+  mine: boolean;
+};
+// Mirrors flowmesh::CheckpointDraft.
+type CheckpointDraft = {
+  chain: string;
+  wallet: string;
+  market_id: string;
+  checkpoint_id: string;
+  sequence: number;
+  waiting: number;
+};
 // Mirrors drafts::Request in src-tauri/src/drafts.rs.
 type Request =
   | { kind: "pay"; summary: Summary }
@@ -86,7 +109,9 @@ type Request =
   | { kind: "trade_order"; order: OrderDraft }
   | { kind: "trade_cancel"; cancel: CancelDraft }
   | { kind: "trade_deposit"; deposit: DepositDraft }
-  | { kind: "trade_withdraw"; withdraw: WithdrawDraft };
+  | { kind: "trade_withdraw"; withdraw: WithdrawDraft }
+  | { kind: "trade_payout"; payout: PayoutDraft }
+  | { kind: "trade_checkpoint"; checkpoint: CheckpointDraft };
 type DraftView = {
   id: string;
   request: Request;
@@ -311,8 +336,8 @@ function showTrade(r: Extract<Request, { kind: "trade_order" | "trade_cancel" }>
 }
 
 // A deposit into a market's vault, or a request to pay trading balance out.
-function showFunding(r: Extract<Request, { kind: "trade_deposit" | "trade_withdraw" }>): void {
-  const d = r.kind === "trade_deposit" ? r.deposit : r.withdraw;
+function showFunding(r: Extract<Request, { kind: "trade_deposit" | "trade_withdraw" | "trade_payout" }>): void {
+  const d = r.kind === "trade_deposit" ? r.deposit : r.kind === "trade_withdraw" ? r.withdraw : r.payout;
   const token = tokenName(d.metadata, d.base_asset_id);
   const value = (atoms: string): string | null =>
     d.asset === "b3" ? B3(atoms) : d.metadata.decimals === null ? null : `${formatQuantity(BigInt(atoms), d.metadata.decimals)} ${token}`;
@@ -341,12 +366,12 @@ function showFunding(r: Extract<Request, { kind: "trade_deposit" | "trade_withdr
       (dep.has_account ? "" : " This also creates the wallet's trading account key. Back up the wallet afterwards.");
     el("action-rows").replaceChildren(row("Deposit", amount), asset, ...market);
     el("approve").textContent = "Deposit";
-  } else {
+  } else if (r.kind === "trade_withdraw") {
     const w = r.withdraw;
     el("title").textContent = `Request a withdrawal of ${amount}?`;
     el("action-text").textContent =
-      "This signs a withdrawal request and sends it to the market. It is a request, not a payout: once certified, the amount leaves your trading balance, " +
-      "and a later vault transaction on the B3 chain pays it to the address after a checkpoint. That can take a while. It has no network fee of its own." +
+      "This signs a withdrawal request and sends it to the market. It is a request, not a payout: once certified, the amount leaves your trading balance. " +
+      "After a checkpoint confirms it on the B3 chain, you publish the payout from the Trade page's Funds tab, which costs a small network fee. That can take a while. The request itself has no network fee." +
       (w.mine ? "" : " The address is not one of this wallet's; check it carefully, a payout cannot be taken back.");
     el("action-rows").replaceChildren(
       row("Withdraw", amount),
@@ -358,7 +383,43 @@ function showFunding(r: Extract<Request, { kind: "trade_deposit" | "trade_withdr
       row("Verified by", w.remote ? "Trading endpoint" : "This node's engine", undefined, false),
     );
     el("approve").textContent = "Request withdrawal";
+  } else {
+    const p = r.payout;
+    el("title").textContent = `Publish the payout of ${amount}?`;
+    el("action-text").textContent =
+      "This signs and broadcasts the B3 transaction that pays your certified withdrawal out of the market's vault to the address below. " +
+      "The amount and the address were fixed when the withdrawal was certified; this transaction cannot change them. " +
+      "This wallet pays its network fee, which the node picks when it builds the transaction (at most 0.1 B3); it is shown afterwards.";
+    el("action-rows").replaceChildren(
+      row("Payout", amount),
+      row("Pay to", p.mine ? "This wallet" : "Another wallet", p.destination, false),
+      asset,
+      ...market,
+      row("Certified in entry", String(p.sequence), undefined, false),
+      row("Payout id", shorten(p.effect_id, 10, 6), p.effect_id, false),
+    );
+    el("approve").textContent = "Publish payout";
   }
+  el("pass-help").textContent =
+    "The wallet is locked. It unlocks only to sign this request and locks again straight after.";
+}
+
+function showCheckpoint(c: CheckpointDraft): void {
+  el("from").textContent = `From ${walletName(c.wallet)} on ${c.chain}`;
+  el("title").textContent = "Publish the market's next checkpoint?";
+  el("action-text").textContent =
+    "This signs and broadcasts a B3 transaction that records the market's next certified entry on the B3 chain. " +
+    `${c.waiting === 1 ? "A withdrawal of yours waits" : `${c.waiting} withdrawals of yours wait`} for checkpoints; ` +
+    "once the one for its entry confirms, its payout can be published. Checkpoints land one entry at a time, so a later entry may need more than one. " +
+    "Anyone may publish a checkpoint, and it moves no funds of the market. This wallet pays its network fee, which the node picks when it builds the transaction (at most 0.1 B3); it is shown afterwards. " +
+    "If someone else publishes this checkpoint first, nothing is sent.";
+  el("action-rows").replaceChildren(
+    row("Entry", String(c.sequence), undefined, false),
+    row("Market", shorten(c.market_id, 10, 6), undefined, false),
+    row("Network", c.chain, undefined, false),
+    row("Checkpoint id", shorten(c.checkpoint_id, 10, 6), c.checkpoint_id, false),
+  );
+  el("approve").textContent = "Publish checkpoint";
   el("pass-help").textContent =
     "The wallet is locked. It unlocks only to sign this request and locks again straight after.";
 }
@@ -377,7 +438,8 @@ function show(draft: DraftView | null): void {
   else if (r.kind === "release") showRelease(r.summary);
   else if (r.kind === "sign_psbt" || r.kind === "send_psbt") showPsbt(r.kind, r.summary);
   else if (r.kind === "trade_order" || r.kind === "trade_cancel") showTrade(r);
-  else if (r.kind === "trade_deposit" || r.kind === "trade_withdraw") showFunding(r);
+  else if (r.kind === "trade_deposit" || r.kind === "trade_withdraw" || r.kind === "trade_payout") showFunding(r);
+  else if (r.kind === "trade_checkpoint") showCheckpoint(r.checkpoint);
   else showAction(r);
   el("pass-field").hidden = !draft.locked;
   el<HTMLInputElement>("pass").value = "";

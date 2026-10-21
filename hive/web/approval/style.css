@@ -7,6 +7,8 @@
 .approval .modal-body { overflow-y: auto; }
 .approval .empty { margin-block: auto; }
 
-/* Output lines: the amount on the right, the address under its label. */
-.approval .drow .dkey { flex: none; }
+/* Output lines: the amount on the right, the address under its label. A
+   long address or id wraps under its label; the value keeps its width. */
+.approval .drow .dkey { flex: 1 1 auto; min-width: 0; }
+.approval .drow .dval { flex: 0 0 auto; max-width: 65%; }
 .approval .addr-line { display: block; margin-top: 2px; font-family: var(--font-mono); font-size: var(--text-xs); word-break: break-all; color: var(--text); }

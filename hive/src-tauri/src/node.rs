@@ -85,6 +85,10 @@ const PAGE_METHODS: &[&str] = &[
     "gettxout",
     "submitflowmeshdeposit",
     "requestflowmeshwithdrawal",
+    "listflowmeshvaultoperations",
+    "createflowmeshvaulttx",
+    "createflowmeshcheckpoint",
+    "getflowmeshbalance",
 ];
 
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -570,6 +574,56 @@ mod tests {
             assert!(
                 !whitelist.contains(never),
                 "{never} must not be whitelisted"
+            );
+        }
+    }
+
+    /// The RPC methods the page modules name where they call the node.
+    fn called_methods(source: &str) -> Vec<String> {
+        let literal_at = |rest: &str| -> Option<String> {
+            let rest = rest.trim_start().strip_prefix('"')?;
+            Some(rest[..rest.find('"')?].to_owned())
+        };
+        let mut out = Vec::new();
+        for (at, _) in source.match_indices(".call(") {
+            out.extend(literal_at(&source[at + ".call(".len()..]));
+        }
+        for (at, _) in source.match_indices("call_wallet(") {
+            // The method follows the wallet argument.
+            let rest = &source[at + "call_wallet(".len()..];
+            if let Some(comma) = rest.find(',') {
+                out.extend(literal_at(&rest[comma + 1..]));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn every_method_the_pages_call_is_whitelisted() {
+        let sources = [
+            include_str!("book.rs"),
+            include_str!("chain.rs"),
+            include_str!("flowmesh.rs"),
+            include_str!("history.rs"),
+            include_str!("lib.rs"),
+            include_str!("passphrase.rs"),
+            include_str!("psbt.rs"),
+            include_str!("receive.rs"),
+            include_str!("settings.rs"),
+            include_str!("stake.rs"),
+            include_str!("wallet.rs"),
+        ];
+        let called: Vec<String> = sources.iter().flat_map(|s| called_methods(s)).collect();
+        assert!(called.len() > 40, "the scan found only {called:?}");
+        // The console window reads the command list with its own login.
+        let console_only = ["help"];
+        for method in called
+            .iter()
+            .filter(|m| !console_only.contains(&m.as_str()))
+        {
+            assert!(
+                PAGE_METHODS.contains(&method.as_str()),
+                "{method} is called by a page but the node would refuse it"
             );
         }
     }

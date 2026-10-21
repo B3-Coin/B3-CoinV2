@@ -163,6 +163,11 @@ pub enum DraftResult {
         id: String,
         deposit: flowmesh::Deposited,
     },
+    /// A withdrawal's payout, or the checkpoint it waits for, was broadcast.
+    Published {
+        id: String,
+        payout: flowmesh::Published,
+    },
     Rejected {
         id: String,
     },
@@ -584,6 +589,74 @@ async fn trade_withdraw_draft(
             .lock()
             .unwrap()
             .insert(Request::TradeWithdraw { withdraw })
+            .map_err(|e| e.to_string())
+    })
+    .await?;
+    open_approval(&app).map_err(|e| e.to_string())?;
+    Ok(id)
+}
+
+/// The page wallet's certified withdrawals in a market whose payouts wait
+/// to be published, and the checkpoint the others wait for.
+#[tauri::command]
+async fn trade_payouts(
+    core: State<'_, Arc<Core>>,
+    market_id: String,
+) -> Result<flowmesh::Payouts, String> {
+    let core = Arc::clone(&core);
+    blocking(move || {
+        let node = core.node();
+        let (client, name) = page_wallet(&core, &node)?;
+        flowmesh::payouts(client, &name, &market_id)
+    })
+    .await
+}
+
+/// Drafts publishing a certified withdrawal's payout to `destination`,
+/// which must be the exact address the withdrawal named.
+#[tauri::command]
+async fn trade_payout_draft(
+    app: AppHandle,
+    core: State<'_, Arc<Core>>,
+    market_id: String,
+    effect_id: String,
+    destination: String,
+) -> Result<String, String> {
+    let core = Arc::clone(&core);
+    let id = blocking(move || {
+        let node = core.node();
+        let (client, name) = page_wallet(&core, &node)?;
+        let chain = node.chain().unwrap_or_default();
+        let payout =
+            flowmesh::prepare_payout(client, &chain, &name, &market_id, &effect_id, &destination)?;
+        core.drafts
+            .lock()
+            .unwrap()
+            .insert(Request::TradePayout { payout })
+            .map_err(|e| e.to_string())
+    })
+    .await?;
+    open_approval(&app).map_err(|e| e.to_string())?;
+    Ok(id)
+}
+
+/// Drafts publishing the checkpoint the page wallet's withdrawals wait for.
+#[tauri::command]
+async fn trade_checkpoint_draft(
+    app: AppHandle,
+    core: State<'_, Arc<Core>>,
+    market_id: String,
+) -> Result<String, String> {
+    let core = Arc::clone(&core);
+    let id = blocking(move || {
+        let node = core.node();
+        let (client, name) = page_wallet(&core, &node)?;
+        let chain = node.chain().unwrap_or_default();
+        let checkpoint = flowmesh::prepare_checkpoint(client, &chain, &name, &market_id)?;
+        core.drafts
+            .lock()
+            .unwrap()
+            .insert(Request::TradeCheckpoint { checkpoint })
             .map_err(|e| e.to_string())
     })
     .await?;
@@ -1709,6 +1782,7 @@ enum Done {
     Signed { psbt: String, complete: bool },
     Traded(flowmesh::Receipt),
     Deposited(flowmesh::Deposited),
+    Published(flowmesh::Published),
 }
 
 /// Carries out an approved request.
@@ -1740,6 +1814,12 @@ fn execute(client: &rpc::Client, request: Request) -> Result<Done, String> {
         Request::TradeDeposit { deposit } => {
             flowmesh::deposit(client, &deposit).map(Done::Deposited)
         }
+        Request::TradePayout { payout } => {
+            flowmesh::publish_payout(client, &payout).map(Done::Published)
+        }
+        Request::TradeCheckpoint { checkpoint } => {
+            flowmesh::publish_checkpoint(client, &checkpoint).map(Done::Published)
+        }
         Request::TradeCancel { cancel } => {
             flowmesh::recheck(client, &cancel.wallet, &cancel.market_id, cancel.sequence)?;
             flowmesh::submit(client, &cancel.wallet, flowmesh::cancel_call(&cancel))
@@ -1768,7 +1848,9 @@ fn execute_sent(client: &rpc::Client, request: Request) -> Result<String, String
         | Request::TradeOrder { .. }
         | Request::TradeCancel { .. }
         | Request::TradeDeposit { .. }
-        | Request::TradeWithdraw { .. } => unreachable!("handled by execute"),
+        | Request::TradeWithdraw { .. }
+        | Request::TradePayout { .. }
+        | Request::TradeCheckpoint { .. } => unreachable!("handled by execute"),
     }
 }
 
@@ -1870,6 +1952,10 @@ async fn approval_decide(
             Ok(Done::Deposited(deposit)) => DraftResult::Deposited {
                 id: id.clone(),
                 deposit,
+            },
+            Ok(Done::Published(payout)) => DraftResult::Published {
+                id: id.clone(),
+                payout,
             },
             Err(error) => DraftResult::Failed {
                 id: id.clone(),
@@ -2272,6 +2358,9 @@ pub fn run() {
             trade_acknowledge,
             trade_deposit_draft,
             trade_withdraw_draft,
+            trade_payouts,
+            trade_payout_draft,
+            trade_checkpoint_draft,
             trade_deposits,
             trade_admit,
             stake_draft,

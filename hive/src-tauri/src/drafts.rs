@@ -93,6 +93,14 @@ pub enum Request {
     TradeWithdraw {
         withdraw: crate::flowmesh::WithdrawDraft,
     },
+    /// Publish the vault transaction that pays a certified withdrawal out.
+    TradePayout {
+        payout: crate::flowmesh::PayoutDraft,
+    },
+    /// Publish the checkpoint a certified withdrawal waits for.
+    TradeCheckpoint {
+        checkpoint: crate::flowmesh::CheckpointDraft,
+    },
 }
 
 impl Request {
@@ -107,6 +115,8 @@ impl Request {
             Request::TradeCancel { cancel } => &cancel.wallet,
             Request::TradeDeposit { deposit } => &deposit.wallet,
             Request::TradeWithdraw { withdraw } => &withdraw.wallet,
+            Request::TradePayout { payout } => &payout.wallet,
+            Request::TradeCheckpoint { checkpoint } => &checkpoint.wallet,
         }
     }
 
