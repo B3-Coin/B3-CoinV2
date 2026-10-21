@@ -69,6 +69,7 @@ add_library(bitcoinkernel
   ../uint256.cpp
   ../util/chaintype.cpp
   ../util/check.cpp
+  ../util/crash_report.cpp
   ../util/expected.cpp
   ../util/feefrac.cpp
   ../util/fs.cpp
@@ -111,6 +112,7 @@ target_link_libraries(bitcoinkernel
     kernel_warn_interface
     secp256k1_objs
     $<$<PLATFORM_ID:Windows>:bcrypt>
+    ${CMAKE_DL_LIBS}
     $<TARGET_NAME_IF_EXISTS:USDT::headers>
     Boost::headers
 )
