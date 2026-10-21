@@ -2,7 +2,7 @@
 //! would after downloading it. Runs only when given one:
 //!   B3_HIVE_BOOTSTRAP_ARCHIVE=/path/bootstrap-860000.tar.zst \
 //!   B3_HIVE_BOOTSTRAP_SHA256=<manifest sha256> \
-//!   B3_HIVE_BOOTSTRAP_TARGET=/empty/folder cargo test --release --test bootstrap_archive
+//!   B3_HIVE_BOOTSTRAP_TARGET=/empty/folder cargo test --release --test bootstrap_archive -- --ignored
 //! The target keeps the installed chain, so b3coind can be pointed at it
 //! (offline: -connect=0 -listen=0 -dnsseed=0).
 
@@ -13,14 +13,14 @@ use std::sync::atomic::AtomicBool;
 use b3_hive::bootstrap;
 
 #[test]
+#[ignore = "needs a bootstrap archive: set B3_HIVE_BOOTSTRAP_* and pass --ignored"]
 fn installs_a_real_bootstrap() {
     let (Some(archive), Ok(sha256), Some(target)) = (
         std::env::var_os("B3_HIVE_BOOTSTRAP_ARCHIVE").map(PathBuf::from),
         std::env::var("B3_HIVE_BOOTSTRAP_SHA256"),
         std::env::var_os("B3_HIVE_BOOTSTRAP_TARGET").map(PathBuf::from),
     ) else {
-        eprintln!("skipped: B3_HIVE_BOOTSTRAP_ARCHIVE, _SHA256 and _TARGET are not all set");
-        return;
+        panic!("B3_HIVE_BOOTSTRAP_ARCHIVE, _SHA256 and _TARGET must all be set");
     };
     let size = std::fs::metadata(&archive).unwrap().len();
     let name = archive.file_name().unwrap().to_str().unwrap().to_owned();

@@ -1,6 +1,7 @@
-//! Starts a real b3coind on regtest with no peers. Runs only when
-//! B3_HIVE_B3COIND names the binary:
-//!   B3_HIVE_B3COIND=/path/to/b3coind cargo test --test node_regtest -- --test-threads=1
+//! Starts a real b3coind on regtest with no peers. The tests are ignored
+//! unless asked for, so a plain cargo test reports them as not run; asked
+//! for, they fail when B3_HIVE_B3COIND does not name the binary:
+//!   B3_HIVE_B3COIND=/path/to/b3coind cargo test --test node_regtest -- --ignored --test-threads=1
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
@@ -41,8 +42,7 @@ impl TestNode {
     /// Like start, after `prepare` has filled the empty datadir.
     fn start_prepared(name: &str, prepare: impl FnOnce(&Path)) -> Option<(Self, NodeStatus)> {
         let Some(b3coind) = std::env::var_os("B3_HIVE_B3COIND") else {
-            eprintln!("skipped: B3_HIVE_B3COIND is not set");
-            return None;
+            panic!("B3_HIVE_B3COIND is not set: it must name the b3coind to test with");
         };
         let datadir = std::env::temp_dir().join(format!("hive-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&datadir);
@@ -83,6 +83,7 @@ impl Drop for TestNode {
 }
 
 #[test]
+#[ignore = "starts b3coind: set B3_HIVE_B3COIND and pass --ignored"]
 fn starts_reports_ready_and_stops() {
     let Some((test, status)) = TestNode::start("start") else {
         return;
@@ -104,6 +105,7 @@ fn starts_reports_ready_and_stops() {
 }
 
 #[test]
+#[ignore = "starts b3coind: set B3_HIVE_B3COIND and pass --ignored"]
 fn the_page_login_reads_the_dashboard_network_and_activity() {
     let Some((test, status)) = TestNode::start("pages") else {
         return;
@@ -219,6 +221,7 @@ fn the_page_login_reads_the_dashboard_network_and_activity() {
 /// A bootstrap made from one node's chain folders starts another node at
 /// the same tip.
 #[test]
+#[ignore = "starts b3coind: set B3_HIVE_B3COIND and pass --ignored"]
 fn a_bootstrap_installs_a_working_chain() {
     let Some((source, status)) = TestNode::start("boot-src") else {
         return;
@@ -315,6 +318,7 @@ fn proxy_of(client: &Client, network: &str) -> String {
 
 /// b3coind reads the settings B3 Hive writes, and a restart picks up a change.
 #[test]
+#[ignore = "starts b3coind: set B3_HIVE_B3COIND and pass --ignored"]
 fn node_settings_take_effect_after_a_restart() {
     let first = NodeSettings {
         proxy: Some("127.0.0.1:9050".into()),
@@ -369,6 +373,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 #[test]
+#[ignore = "starts b3coind: set B3_HIVE_B3COIND and pass --ignored"]
 fn follow_reports_new_blocks_and_an_exit() {
     let Some((test, status)) = TestNode::start("follow") else {
         return;
@@ -419,6 +424,7 @@ fn reserved(client: &Client) -> Vec<serde_json::Value> {
 }
 
 #[test]
+#[ignore = "starts b3coind: set B3_HIVE_B3COIND and pass --ignored"]
 fn a_drafted_send_is_submitted_exactly_once() {
     let Some((test, status)) = TestNode::start("send") else {
         return;
@@ -479,6 +485,7 @@ fn a_drafted_send_is_submitted_exactly_once() {
 }
 
 #[test]
+#[ignore = "starts b3coind: set B3_HIVE_B3COIND and pass --ignored"]
 fn the_page_login_cannot_export_keys() {
     let Some((test, status)) = TestNode::start("whitelist") else {
         return;
@@ -504,6 +511,7 @@ fn the_page_login_cannot_export_keys() {
 }
 
 #[test]
+#[ignore = "starts b3coind: set B3_HIVE_B3COIND and pass --ignored"]
 fn the_console_runs_typed_commands_with_full_access() {
     let Some((test, status)) = TestNode::start("console") else {
         return;
@@ -550,6 +558,7 @@ fn the_console_runs_typed_commands_with_full_access() {
 }
 
 #[test]
+#[ignore = "starts b3coind: set B3_HIVE_B3COIND and pass --ignored"]
 fn wallets_open_close_create_and_back_up() {
     let Some((test, status)) = TestNode::start("wallets") else {
         return;
@@ -611,6 +620,7 @@ fn wallets_open_close_create_and_back_up() {
 }
 
 #[test]
+#[ignore = "starts b3coind: set B3_HIVE_B3COIND and pass --ignored"]
 fn receive_makes_labelled_addresses_and_links() {
     let Some((test, status)) = TestNode::start("receive") else {
         return;
@@ -674,6 +684,7 @@ fn entry(old: &str, new: &str) -> Entry {
 }
 
 #[test]
+#[ignore = "starts b3coind: set B3_HIVE_B3COIND and pass --ignored"]
 fn passphrases_encrypt_change_and_lock() {
     let Some((test, status)) = TestNode::start("passphrase") else {
         return;
@@ -730,6 +741,7 @@ fn passphrases_encrypt_change_and_lock() {
 }
 
 #[test]
+#[ignore = "starts b3coind: set B3_HIVE_B3COIND and pass --ignored"]
 fn a_locked_wallet_signs_only_with_its_passphrase() {
     let Some((test, status)) = TestNode::start("locked-send") else {
         return;
@@ -766,6 +778,7 @@ fn a_locked_wallet_signs_only_with_its_passphrase() {
 }
 
 #[test]
+#[ignore = "starts b3coind: set B3_HIVE_B3COIND and pass --ignored"]
 fn payments_split_fees_choose_coins_and_save_labels() {
     let Some((test, status)) = TestNode::start("payment") else {
         return;
@@ -851,6 +864,7 @@ fn payments_split_fees_choose_coins_and_save_labels() {
 }
 
 #[test]
+#[ignore = "starts b3coind: set B3_HIVE_B3COIND and pass --ignored"]
 fn a_psbt_is_read_signed_and_broadcast() {
     let Some((test, status)) = TestNode::start("psbt") else {
         return;
@@ -903,6 +917,7 @@ fn a_psbt_is_read_signed_and_broadcast() {
 }
 
 #[test]
+#[ignore = "starts b3coind: set B3_HIVE_B3COIND and pass --ignored"]
 fn wallets_are_restored_and_legacy_dumps_imported() {
     let Some((test, status)) = TestNode::start("restore") else {
         return;
@@ -996,6 +1011,7 @@ fn wallets_are_restored_and_legacy_dumps_imported() {
 }
 
 #[test]
+#[ignore = "starts b3coind: set B3_HIVE_B3COIND and pass --ignored"]
 fn the_address_book_adds_and_renames_sending_addresses() {
     let Some((test, status)) = TestNode::start("book") else {
         return;
@@ -1060,6 +1076,7 @@ changetype=legacy
 ";
 
 #[test]
+#[ignore = "starts b3coind: set B3_HIVE_B3COIND and pass --ignored"]
 fn staking_unlocks_only_to_create_and_start() {
     let Some((test, status)) = TestNode::start_prepared("stake", |dir| {
         std::fs::write(dir.join("b3coin.conf"), MODERN_REGTEST).unwrap();

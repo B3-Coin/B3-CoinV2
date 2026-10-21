@@ -1,7 +1,8 @@
 //! Drives the real b3-hive-update helper with a scripted network: no
-//! sockets, real signatures. Runs only when both tools are named:
+//! sockets, real signatures. Ignored unless asked for; asked for, it fails
+//! when the tools are not both named:
 //!   B3_HIVE_UPDATE=/path/to/b3-hive-update B3_HIVE_SIGN=/path/to/b3hive-sign \
-//!     cargo test --test update_helper
+//!     cargo test --test update_helper -- --ignored
 //! The helper must be a developer build (no pinned channel), which takes
 //! the channel on its command line.
 
@@ -62,8 +63,7 @@ impl Tools {
             std::env::var_os("B3_HIVE_UPDATE"),
             std::env::var_os("B3_HIVE_SIGN"),
         ) else {
-            eprintln!("skipped: B3_HIVE_UPDATE and B3_HIVE_SIGN are not both set");
-            return None;
+            panic!("B3_HIVE_UPDATE and B3_HIVE_SIGN must both be set");
         };
         let dir = std::env::temp_dir().join(format!("hive-update-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -167,6 +167,7 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 #[test]
+#[ignore = "runs b3-hive-update: set B3_HIVE_UPDATE and B3_HIVE_SIGN and pass --ignored"]
 fn checks_and_downloads_a_signed_release() {
     let Some(tools) = Tools::get("flow") else {
         return;
@@ -203,6 +204,7 @@ fn checks_and_downloads_a_signed_release() {
 }
 
 #[test]
+#[ignore = "runs b3-hive-update: set B3_HIVE_UPDATE and B3_HIVE_SIGN and pass --ignored"]
 fn refuses_what_the_policy_does_not_allow() {
     let Some(tools) = Tools::get("refuse") else {
         return;
