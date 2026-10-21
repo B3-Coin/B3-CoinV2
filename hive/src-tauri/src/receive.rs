@@ -192,9 +192,18 @@ pub struct Receiving {
     /// them separately, without their address.
     pub balance: String,
     pub coins: usize,
-    /// A change address: the wallet made it for itself, not to hand out.
+    /// The wallet made it for itself, not to hand out: change, or an address
+    /// the node keeps for staking or FlowMesh (NODE_LABELS).
     pub change: bool,
 }
+
+/// Labels the node gives addresses it makes for its own use: a stake's
+/// owner, staking rewards, a FlowMesh checkpoint's output.
+const NODE_LABELS: [&str; 3] = [
+    "b3-stake-owner",
+    "b3-staking-rewards",
+    "b3-flowmesh-checkpoint",
+];
 
 pub fn addresses(client: &Client, wallet: &str) -> Result<Vec<Receiving>, RpcError> {
     // minconf 0, include addresses that never received anything.
@@ -209,14 +218,15 @@ pub(crate) fn parse_addresses(
 ) -> Result<Vec<Receiving>, RpcError> {
     let mut out = Vec::new();
     for item in received.as_array().into_iter().flatten() {
+        let label = item["label"].as_str().unwrap_or_default();
         out.push(Receiving {
             address: item["address"].as_str().unwrap_or_default().to_owned(),
-            label: item["label"].as_str().unwrap_or_default().to_owned(),
+            label: label.to_owned(),
             received: decimal(&item["amount"])?,
             transactions: item["txids"].as_array().map_or(0, Vec::len),
             balance: units_amount(0),
             coins: 0,
-            change: false,
+            change: NODE_LABELS.contains(&label),
         });
     }
     // Sums per address in base units, so the balance is exact. Addresses
@@ -343,6 +353,20 @@ mod tests {
         assert_eq!(r[0].transactions, 2);
         assert_eq!(r[1].label, "");
         assert_eq!(r[1].balance, "0.000000000");
+        assert!(!r[0].change && !r[1].change);
+    }
+
+    #[test]
+    fn addresses_the_node_keeps_for_itself_are_not_handed_out() {
+        let list = json!([
+            {"address": "a", "amount": 0, "label": "b3-flowmesh-checkpoint", "txids": ["t"]},
+            {"address": "b", "amount": 0, "label": "b3-stake-owner", "txids": []},
+            {"address": "c", "amount": 0, "label": "b3-staking-rewards", "txids": []},
+            {"address": "d", "amount": 0, "label": "b3-savings", "txids": []},
+        ]);
+        let r = parse_addresses(&list, &json!([])).unwrap();
+        let change: Vec<bool> = r.iter().map(|a| a.change).collect();
+        assert_eq!(change, [true, true, true, false]);
     }
 
     #[test]

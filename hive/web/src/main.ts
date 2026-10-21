@@ -565,10 +565,15 @@ const isUnused = (a: Receiving) => !a.change && a.transactions === 0 && a.coins 
 // What Receive shows first: an unused address without a label, since a
 // labelled one was likely made for someone; else any unused one; else the
 // first receiving address.
+/** Labels Hive gives addresses it makes for one purpose (flowmesh.rs
+ *  WITHDRAWAL_LABEL): fine to receive on, but not offered by default. */
+const PURPOSE_LABELS = new Set(["FlowMesh withdrawal"]);
+
 function defaultReceiving(): Receiving | null {
   const receiving = ownAddresses.filter((a) => !a.change);
+  const offered = receiving.filter((a) => !PURPOSE_LABELS.has(a.label));
   return (
-    receiving.find((a) => isUnused(a) && !a.label) ?? receiving.find(isUnused) ?? receiving[0] ?? null
+    offered.find((a) => isUnused(a) && !a.label) ?? offered.find(isUnused) ?? offered[0] ?? receiving[0] ?? null
   );
 }
 
@@ -654,8 +659,12 @@ function renderOwnList(): void {
       if (a.change) {
         const badge = document.createElement("span");
         badge.className = "badge badge-neutral";
-        badge.textContent = "Change";
-        badge.title = "The wallet made this address for change from your own payments.";
+        // Change has no label; the node labels the addresses it keeps for
+        // staking or FlowMesh.
+        badge.textContent = a.label ? "Wallet's own" : "Change";
+        badge.title = a.label
+          ? "The node made this address for its own use (staking or FlowMesh). Give out a receiving address instead."
+          : "The wallet made this address for change from your own payments.";
         title.append(badge);
       } else if (isUnused(a)) {
         const badge = document.createElement("span");

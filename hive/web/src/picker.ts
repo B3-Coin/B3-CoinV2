@@ -105,7 +105,7 @@ function render(): void {
         row(
           a.label,
           a.address,
-          a.change ? "Change" : a.transactions === 0 && a.coins === 0 ? "Unused" : null,
+          a.change ? (a.label ? "Wallet's own" : "Change") : a.transactions === 0 && a.coins === 0 ? "Unused" : null,
           a.coins ? amountNode(a.balance) : null,
           { address: a.address, label: a.label, mine: true },
         ),
