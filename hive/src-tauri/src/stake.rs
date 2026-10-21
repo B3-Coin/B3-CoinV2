@@ -214,8 +214,12 @@ fn start_unlocked(client: &Client, wallet: &str) -> Result<(), String> {
         .call_wallet(wallet, "startstaking", json!([]))
         .map_err(|e| e.to_string())?;
     if r["finality_signing"].as_bool() != Some(true) {
-        let _ = stop_loop(client, wallet);
-        return Err("Staking was stopped because the finality signer was not armed.".into());
+        return Err(match stop_loop(client, wallet) {
+            Ok(()) => "Staking was stopped because the finality signer was not armed.".to_owned(),
+            Err(e) => format!(
+                "The finality signer was not armed, and staking could not be confirmed stopped ({e}). Stop staking before trying again."
+            ),
+        });
     }
     Ok(())
 }
@@ -266,8 +270,12 @@ pub fn start(client: &Client, wallet: &str, passphrase: Option<&str>) -> Result<
     match (started, locked) {
         (Ok(()), true) => Ok(()),
         (Ok(()), false) => {
-            let _ = stop_loop(client, wallet);
-            Err("The wallet could not be locked after starting staking, so staking was stopped. Lock the wallet and try again.".into())
+            Err(match stop_loop(client, wallet) {
+                Ok(()) => "The wallet could not be locked after starting staking, so staking was stopped. Lock the wallet and try again.".to_owned(),
+                Err(e) => format!(
+                    "The wallet could not be locked after starting staking, and staking could not be confirmed stopped ({e}). Lock the wallet and stop staking now."
+                ),
+            })
         }
         (Err(e), true) => Err(e),
         (Err(e), false) => Err(format!(
@@ -285,8 +293,16 @@ fn stop_loop(client: &Client, wallet: &str) -> Result<(), String> {
 
 /// Stops the node's staking loop, if it stakes with this wallet's validator.
 pub fn stop(client: &Client, wallet: &str) -> Result<(), String> {
-    let info = status(client, wallet).map_err(|e| e.to_string())?;
-    if info.staking.running && !info.staking.ours {
+    // Ownership is known from the staking info alone; finality details are
+    // not needed, so a failing finality read cannot block a stop.
+    let info = client
+        .call_wallet(wallet, "getstakinginfo", json!([]))
+        .map_err(|e| e.to_string())?;
+    let validator_key = info["validator_key"].as_str();
+    let running = info["staking"]["running"].as_bool() == Some(true);
+    let ours =
+        validator_key.is_some() && info["staking"]["validator_key"].as_str() == validator_key;
+    if running && !ours {
         return Err(
             "Another wallet's validator is staking; switch to that wallet to stop it.".into(),
         );

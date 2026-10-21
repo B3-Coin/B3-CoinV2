@@ -949,6 +949,9 @@ async function manageWallet(action: WalletAction): Promise<void> {
     renderRequest();
     renderOwnList();
     if (current === "receive") void refreshReceiving();
+    // The previous wallet's stakes and controls must not linger.
+    clearStake();
+    void refreshStake();
   } catch (e) {
     walletsResult("danger", String(e));
     void refreshWallets();
@@ -2266,6 +2269,8 @@ function renderStake(s: StakeStatus): void {
   el("stk-rows").replaceChildren(...rows);
   el<HTMLButtonElement>("stk-start").hidden = l.running;
   el<HTMLButtonElement>("stk-stop").hidden = !l.running || !l.ours;
+  el<HTMLButtonElement>("stk-start").disabled = false;
+  el<HTMLButtonElement>("stk-stop").disabled = false;
 
   el("stk-count").textContent = s.stakes.length ? plural(s.stakes.length, "stake") : "";
   el("stk-totals").replaceChildren(
@@ -2330,7 +2335,9 @@ function renderStake(s: StakeStatus): void {
     el("fin-text").textContent =
       f.key_is_ours === false
         ? "The bound key is not this wallet's. Rotate it to bind this wallet's key."
-        : "Staking can sign finality with this key. Rotating replaces it at the next epoch boundary.";
+        : f.key_is_ours === true
+          ? "This wallet holds the bound key. Rotating replaces it at the next epoch boundary."
+          : "Ownership of the bound key could not be checked, for example while the wallet is locked. Starting staking checks it.";
     bind.disabled = false;
     bind.textContent = "Rotate finality key";
   } else {
@@ -2341,15 +2348,60 @@ function renderStake(s: StakeStatus): void {
   }
 }
 
-const refreshStake = single(async () => {
-  try {
-    stakeStatus = await invoke<StakeStatus>("stake_status");
-  } catch (e) {
-    if (current === "stake") stakeResult("danger", String(e));
+// Bumped whenever the wallet changes, so a slow reply for the old wallet is dropped.
+let stakeGeneration = 0;
+
+function clearStake(): void {
+  stakeGeneration++;
+  stakeStatus = null;
+  for (const id of ["stk-start", "stk-stop"]) {
+    const b = el<HTMLButtonElement>(id);
+    b.hidden = true;
+    b.disabled = true;
+  }
+  el<HTMLButtonElement>("fin-bind").disabled = true;
+  el("stk-rows").replaceChildren();
+  el("stk-list").replaceChildren();
+  el("stk-totals").replaceChildren();
+  el("stk-count").textContent = "";
+  el("stk-state").textContent = "Loading this wallet's staking…";
+  setBadge("fin-badge", "Loading", "neutral");
+  el("fin-text").textContent = "";
+  el("stk-result").hidden = true;
+}
+
+let stakeRefreshAgain = false;
+let stakeRefreshing = false;
+async function refreshStake(): Promise<void> {
+  // A request that arrives while one is in flight (for example right after a
+  // wallet switch) runs again afterwards instead of being dropped.
+  if (stakeRefreshing) {
+    stakeRefreshAgain = true;
     return;
   }
-  renderStake(stakeStatus);
-});
+  stakeRefreshing = true;
+  try {
+    do {
+      stakeRefreshAgain = false;
+      const generation = stakeGeneration;
+      let status: StakeStatus;
+      try {
+        status = await invoke<StakeStatus>("stake_status");
+      } catch (e) {
+        if (generation === stakeGeneration && current === "stake") stakeResult("danger", String(e));
+        continue;
+      }
+      if (generation !== stakeGeneration) {
+        stakeRefreshAgain = true;
+        continue;
+      }
+      stakeStatus = status;
+      renderStake(status);
+    } while (stakeRefreshAgain);
+  } finally {
+    stakeRefreshing = false;
+  }
+}
 
 // Releasing (unstaking) goes through the approval window, like a payment.
 async function releaseStakes(outpoints: { txid: string; vout: number }[]): Promise<void> {
