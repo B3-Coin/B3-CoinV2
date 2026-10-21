@@ -938,8 +938,8 @@ function renderWalletSecurity(v: WalletsView): void {
   el("wl-backup-plain").hidden = s !== "unencrypted";
 }
 
-async function askPassphrase(kind: "encrypt" | "change"): Promise<void> {
-  walletsResult("", "");
+async function askPassphrase(kind: "encrypt" | "change", keepResult = false): Promise<void> {
+  if (!keepResult) walletsResult("", "");
   try {
     // The outcome arrives as a passphrase-result event.
     await invoke("passphrase_request", { kind });
@@ -986,8 +986,9 @@ const refreshWallets = single(async () => {
 
 let walletBusy = false;
 
-async function manageWallet(action: WalletAction): Promise<void> {
-  if (walletBusy) return;
+/** True when the action went through. */
+async function manageWallet(action: WalletAction): Promise<boolean> {
+  if (walletBusy) return false;
   walletBusy = true;
   walletsResult("", "");
   try {
@@ -1025,9 +1026,11 @@ async function manageWallet(action: WalletAction): Promise<void> {
     // The previous wallet's stakes and controls must not linger.
     clearStake();
     void refreshStake();
+    return true;
   } catch (e) {
     walletsResult("danger", String(e));
     void refreshWallets();
+    return false;
   } finally {
     walletBusy = false;
   }
@@ -1044,9 +1047,12 @@ el("wl-create").addEventListener("submit", async (e) => {
   const input = el<HTMLInputElement>("wl-name");
   const button = el<HTMLButtonElement>("wl-create-submit");
   button.disabled = true;
-  await manageWallet({ action: "create", name: input.value });
-  if (el("wl-result").classList.contains("banner-success")) input.value = "";
+  const created = await manageWallet({ action: "create", name: input.value });
   button.disabled = false;
+  if (!created) return;
+  input.value = "";
+  // The new wallet is the one in use, so the request is for it.
+  if (el<HTMLInputElement>("wl-create-encrypt").checked) await askPassphrase("encrypt", true);
 });
 
 // Restore and legacy recovery: the core opens the file picker and returns

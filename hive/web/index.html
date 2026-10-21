@@ -976,13 +976,16 @@
                     the node starts until you close it.
                   </span>
                 </div>
-                <div class="callout callout-warning">
-                  <div class="callout-title">
-                    <svg class="i-sm" aria-hidden="true"><use href="/icons.svg#i-alert" /></svg>New wallets are not encrypted
-                  </div>
-                  Anyone who can read the wallet file can spend from it. Back it up after creating it,
-                  and keep the backup somewhere safe.
-                </div>
+                <label class="check">
+                  <input type="checkbox" id="wl-create-encrypt" checked />
+                  <span class="check-body">
+                    <span>Encrypt it with a passphrase straight away</span>
+                    <span class="help">
+                      Recommended. Without a passphrase, anyone who can read the wallet file can spend
+                      from it. Back the wallet up afterwards, and keep the backup somewhere safe.
+                    </span>
+                  </span>
+                </label>
               </div>
               <div class="card-foot">
                 <button class="btn btn-primary" type="submit" id="wl-create-submit">Create wallet</button>
