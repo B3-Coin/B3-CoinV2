@@ -30,16 +30,51 @@ pub struct Request {
     pub wallet: String,
 }
 
+/// A typed passphrase. Its bytes are overwritten when it is dropped, so the
+/// copies the core holds do not linger in freed memory. Copies made on the
+/// way to the node (the JSON request and its body) are not reached.
+#[derive(Deserialize, Default)]
+#[serde(transparent)]
+pub struct Secret(String);
+
+impl std::ops::Deref for Secret {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<&str> for Secret {
+    fn from(text: &str) -> Self {
+        Secret(text.to_owned())
+    }
+}
+
+impl Drop for Secret {
+    fn drop(&mut self) {
+        let mut bytes = std::mem::take(&mut self.0).into_bytes();
+        bytes.fill(0);
+        // Keeps the writes from being optimised away as dead.
+        std::hint::black_box(&bytes);
+    }
+}
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Secret(..)")
+    }
+}
+
 /// What the passphrase window sends back. Fields a kind does not use are
 /// ignored.
 #[derive(Deserialize)]
 pub struct Entry {
     #[serde(default)]
-    pub old: String,
+    pub old: Secret,
     #[serde(default)]
-    pub new: String,
+    pub new: Secret,
     #[serde(default)]
-    pub repeat: String,
+    pub repeat: Secret,
 }
 
 // Entries never reach a log through Debug.
@@ -83,14 +118,14 @@ pub fn check_entry(kind: Kind, entry: &Entry) -> Result<(), String> {
     if entry.new.is_empty() {
         return Err("Enter a new passphrase.".into());
     }
-    if entry.new != entry.repeat {
+    if *entry.new != *entry.repeat {
         return Err("The new passphrases do not match.".into());
     }
     // The node would cut a passphrase at a zero byte (Bitcoin Core #27067).
     if entry.new.contains('\0') || entry.old.contains('\0') {
         return Err("A passphrase cannot contain a zero byte.".into());
     }
-    if kind == Kind::Change && entry.old == entry.new {
+    if kind == Kind::Change && *entry.old == *entry.new {
         return Err("The new passphrase is the same as the current one.".into());
     }
     Ok(())
@@ -104,11 +139,11 @@ pub fn apply(client: &Client, request: &Request, entry: &Entry) -> Result<(), St
     check_kind(request.kind, security)?;
     let result = match request.kind {
         Kind::Stake => return crate::stake::start(client, &request.wallet, Some(&entry.old)),
-        Kind::Encrypt => client.call_wallet(&request.wallet, "encryptwallet", json!([entry.new])),
+        Kind::Encrypt => client.call_wallet(&request.wallet, "encryptwallet", json!([&*entry.new])),
         Kind::Change => client.call_wallet(
             &request.wallet,
             "walletpassphrasechange",
-            json!([entry.old, entry.new]),
+            json!([&*entry.old, &*entry.new]),
         ),
     };
     result.map(|_| ()).map_err(|e| match e {
@@ -155,9 +190,13 @@ mod tests {
         assert!(check_entry(Kind::Encrypt, &entry("", "", "")).is_err());
         assert!(check_entry(Kind::Encrypt, &entry("", "a", "b")).is_err());
         assert!(check_entry(Kind::Encrypt, &entry("", "a\0b", "a\0b")).is_err());
-        assert!(check_entry(Kind::Change, &entry("", "n", "n")).is_err());
-        assert!(check_entry(Kind::Change, &entry("o", "o", "o")).is_err());
-        assert!(check_entry(Kind::Change, &entry("o", "n", "n")).is_ok());
+        assert!(check_entry(Kind::Change, &entry("", "new secret", "new secret")).is_err());
+        assert!(check_entry(
+            Kind::Change,
+            &entry("old secret", "old secret", "old secret")
+        )
+        .is_err());
+        assert!(check_entry(Kind::Change, &entry("o", "new secret", "new secret")).is_ok());
         assert!(check_entry(Kind::Stake, &entry("pw", "", "")).is_ok());
         assert!(check_entry(Kind::Stake, &entry("", "", "")).is_err());
     }
@@ -166,5 +205,6 @@ mod tests {
     fn entries_do_not_print() {
         let e = entry("old secret", "new secret", "new secret");
         assert_eq!(format!("{e:?}"), "Entry { .. }");
+        assert_eq!(format!("{:?}", e.old), "Secret(..)");
     }
 }

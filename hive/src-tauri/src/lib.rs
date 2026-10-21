@@ -1939,7 +1939,7 @@ async fn approval_decide(
     core: State<'_, Arc<Core>>,
     id: String,
     approve: bool,
-    passphrase: Option<String>,
+    passphrase: Option<passphrase::Secret>,
 ) -> Result<Option<DraftView>, String> {
     require_window(&window, APPROVAL)?;
     let core = Arc::clone(&core);
