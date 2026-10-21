@@ -1,0 +1,73 @@
+{
+  "format": "b3-owned-nitro-producer-provenance/1",
+  "mainnet_enabled": false,
+  "scope": "owned-standalone-Nitro-development-execution-and-untrusted-raw-witness-availability",
+  "nitro": {
+    "version": "v3.12.1",
+    "source_commit": "70fa99a6e711f09eedd96a907290c3df0f3bcf7d",
+    "image_tag_discovery_only": "offchainlabs/nitro-node:v3.12.1-70fa99a",
+    "image_manifest_list": "sha256:62fc024836967fd3a0fe59c346f2d8706cdf5200cbea1e16bfdf07996d3b45fd",
+    "linux_amd64_image": "offchainlabs/nitro-node@sha256:948cf8c42a6ed85bc055f13866fb9a029c8234dc16c12d7ffa4ed669270aaea8",
+    "compressed_layer_bytes": 1421009134,
+    "executable_sha256": "a2d6988c0ef2706ec85b8eb0e8ed9fc50f9eef1ac866f6d8667e2a1436e0115a",
+    "observed_client_version": "nitro/v3.12.1+70fa99a-20260929T140226Z/linux-amd64/go1.25.12",
+    "geth_submodule": "5eee8f546e7602b7deeef7909f291bbebc77e233",
+    "testnode_submodule": "d46fe1bfe6dd0dbc2e27dcc6d0dc559a248433f5",
+    "contracts_submodule": "4341b132cfbdcc980ead03765ca5224ff6cb5d97"
+  },
+  "owned_dev_source": {
+    "chain_id": 412346,
+    "genesis_hash": "0x91d25fc61240927ab960347f3ede23305bcea43d9123601d6d0534df47170daa",
+    "mode": "--dev",
+    "external_provider_required": false,
+    "availability_interface": "owned-loopback-local-fullnode-JSON-RPC",
+    "raw_bytes_are_authority": false,
+    "l1_settlement_verified": false,
+    "arbitrum_one_history_qualified": false
+  },
+  "runtime_limits": {
+    "cpus": 4,
+    "memory_including_swap_bytes": 8589934592,
+    "pids": 512,
+    "docker_log_bytes_each": 10485760,
+    "docker_log_files": 2,
+    "read_only_container_root": true,
+    "all_capabilities_dropped": true,
+    "no_new_privileges": true,
+    "host_bind_address": "127.0.0.1",
+    "docker_executable": "/usr/bin/docker",
+    "docker_control_socket": "unix:///var/run/docker.sock",
+    "docker_child_environment": ["PATH", "HOME", "LANG", "LC_ALL", "TZ"],
+    "default_host_port": 18547,
+    "bridge_ip_masquerading": false,
+    "runtime_data_monitored_limit_bytes": 8589934592,
+    "runtime_data_check_seconds": 2,
+    "runtime_data_limit_is_filesystem_quota": false,
+    "maximum_keepalive_seconds": 43200,
+    "fresh_runtime_required": true,
+    "retained_data_automatically_deleted": false
+  },
+  "read_only_availability_apis": [
+    "debug_getRawHeader",
+    "debug_getRawBlock",
+    "debug_getRawReceipts",
+    "eth_getRawTransactionByBlockHashAndIndex",
+    "eth_getProof"
+  ],
+  "primary_references": [
+    "https://github.com/OffchainLabs/nitro/releases/tag/v3.12.1",
+    "https://docs.arbitrum.io/run-a-node/run-nitro-dev-node",
+    "https://docs.arbitrum.io/run-a-node/run-local-full-chain-simulation",
+    "https://github.com/OffchainLabs/nitro-devnode/blob/main/run-dev-node.sh",
+    "https://github.com/OffchainLabs/go-ethereum/blob/5eee8f546e7602b7deeef7909f291bbebc77e233/internal/ethapi/api.go",
+    "https://github.com/OffchainLabs/nitro-testnode/blob/d46fe1bfe6dd0dbc2e27dcc6d0dc559a248433f5/scripts/config.ts"
+  ],
+  "qualification_limits": [
+    "An owned fullnode API is still an API; external-provider independence is not a claim that no local RPC was used.",
+    "Standalone --dev does not produce or prove L1 rollup assertions or Ethereum consensus finality.",
+    "The raw exporter cannot create a native source capability or authorize ledger facts.",
+    "The generic history checker requires an independently authenticated checkpoint for any future source-authority use.",
+    "The genuine static Deposit/Withdrawn fixture is an event emitter, not ERC20 custody.",
+    "The upstream testnode simple mode bypasses the block validator and must not be reported as validated settlement."
+  ]
+}
