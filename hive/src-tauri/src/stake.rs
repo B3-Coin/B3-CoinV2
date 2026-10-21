@@ -71,6 +71,9 @@ pub struct Status {
     pub staking: Loop,
     /// Absent until the wallet has a validator key.
     pub finality: Option<Finality>,
+    /// The txid of this wallet's finality key binding while it waits to
+    /// confirm: the node shows it as unbound until then.
+    pub bind_pending: Option<String>,
 }
 
 pub fn status(client: &Client, wallet: &str) -> Result<Status, RpcError> {
@@ -80,7 +83,33 @@ pub fn status(client: &Client, wallet: &str) -> Result<Status, RpcError> {
     } else {
         None
     };
-    parse_status(&info, finality.as_ref())
+    let mut status = parse_status(&info, finality.as_ref())?;
+    if status.finality.is_some() {
+        status.bind_pending = waiting_bind(client, wallet)?;
+    }
+    Ok(status)
+}
+
+/// The node tags the transactions bindfinalitykey sends with this.
+const BIND_TAG: &str = "finality-key-bind";
+
+fn waiting_bind(client: &Client, wallet: &str) -> Result<Option<String>, RpcError> {
+    let list = client.call_wallet(wallet, "listtransactions", json!(["*", 100]))?;
+    Ok(pending_bind(&list))
+}
+
+/// An unconfirmed, unabandoned binding among `listtransactions` entries.
+/// A conflicted one has negative confirmations and never confirms.
+pub(crate) fn pending_bind(list: &Value) -> Option<String> {
+    list.as_array()?
+        .iter()
+        .find(|t| {
+            t["b3"] == BIND_TAG
+                && t["confirmations"].as_i64() == Some(0)
+                && t["abandoned"].as_bool() != Some(true)
+        })
+        .and_then(|t| t["txid"].as_str())
+        .map(str::to_owned)
 }
 
 pub(crate) fn parse_status(info: &Value, finality: Option<&Value>) -> Result<Status, RpcError> {
@@ -130,6 +159,7 @@ pub(crate) fn parse_status(info: &Value, finality: Option<&Value>) -> Result<Sta
         unconfirmed: decimal(&info["unconfirmed"])?,
         staking,
         finality,
+        bind_pending: None,
     })
 }
 
@@ -158,7 +188,15 @@ pub fn create(client: &Client, wallet: &str, amount: &str) -> Result<String, Str
 }
 
 /// Binds (or rotates) this wallet's BLS finality key. Returns its txid.
+/// The node takes a second binding for the same key sequence into its
+/// memory pool, but no block can hold both, so one would never confirm:
+/// a binding waiting to confirm is refused here.
 pub fn bind(client: &Client, wallet: &str) -> Result<String, String> {
+    if let Some(txid) = waiting_bind(client, wallet).map_err(|e| e.to_string())? {
+        return Err(format!(
+            "A finality key binding is already waiting to confirm (transaction {txid}). Bind again only after it confirms."
+        ));
+    }
     let r = client
         .call_wallet(wallet, "bindfinalitykey", json!([]))
         .map_err(|e| e.to_string())?;
@@ -377,6 +415,23 @@ pub fn prepare_release(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_binding_waiting_to_confirm_is_found() {
+        let tx = |txid: &str, tag: &str, confirmations: i64, abandoned: bool| json!({"txid": txid, "b3": tag, "confirmations": confirmations, "abandoned": abandoned, "category": "send"});
+        assert_eq!(
+            pending_bind(&json!([
+                tx("a", BIND_TAG, 3, false),
+                tx("b", "flowmesh-deposit", 0, false),
+                tx("c", BIND_TAG, -2, false),
+                tx("d", BIND_TAG, 0, true),
+                tx("e", BIND_TAG, 0, false),
+            ])),
+            Some("e".into())
+        );
+        assert_eq!(pending_bind(&json!([tx("a", BIND_TAG, 1, false)])), None);
+        assert_eq!(pending_bind(&json!(null)), None);
+    }
 
     #[test]
     fn only_confirmed_stakes_of_this_wallet_are_released() {
