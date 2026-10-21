@@ -172,7 +172,7 @@ fn the_page_login_reads_the_dashboard_network_and_activity() {
         kind: Kind::Mined,
         ..Default::default()
     };
-    let page = history::filter(all.clone(), &mined, 10).unwrap();
+    let page = history::filter(&all, &mined, 10).unwrap();
     assert_eq!(
         (page.entries.len(), page.matching, page.total),
         (10, 130, 130)
@@ -181,7 +181,16 @@ fn the_page_login_reads_the_dashboard_network_and_activity() {
         kind: Kind::Sent,
         ..Default::default()
     };
-    assert_eq!(history::filter(all.clone(), &sent, 10).unwrap().matching, 0);
+    assert_eq!(history::filter(&all, &sent, 10).unwrap().matching, 0);
+    // The cache gives the same history, and the same read while nothing
+    // changed; a new block makes it read again.
+    let cache = history::Cache::default();
+    let first = cache.all(client, W).unwrap();
+    assert_eq!(*first, all);
+    assert!(std::sync::Arc::ptr_eq(
+        &first,
+        &cache.all(client, W).unwrap()
+    ));
     let d = history::details(client, W, &all[0].txid).unwrap();
     assert_eq!(d.txid, all[0].txid);
     assert!(d.generated, "{d:?}");
@@ -196,6 +205,15 @@ fn the_page_login_reads_the_dashboard_network_and_activity() {
         .windows(2)
         .all(|w| w[0].confirmations <= w[1].confirmations));
     assert_eq!(chain::overview(client).unwrap().blocks, wallet::FUND_BLOCKS);
+
+    // A new block makes the cache read the history again.
+    let to = client.call_wallet(W, "getnewaddress", json!([])).unwrap();
+    test.admin()
+        .call("generatetoaddress", json!([1, to]))
+        .unwrap();
+    let after = cache.all(client, W).unwrap();
+    assert!(!std::sync::Arc::ptr_eq(&first, &after));
+    assert_eq!(after.len(), all.len() + 1);
 }
 
 /// A bootstrap made from one node's chain folders starts another node at

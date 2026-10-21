@@ -64,6 +64,8 @@ pub struct Core {
     passphrase: Mutex<Option<passphrase::Request>>,
     /// The theme picked in the main window, so the other windows open in it.
     theme: Mutex<Option<Theme>>,
+    /// The Activity page's last full history read.
+    history: history::Cache,
     updates: Updates,
     setup: Setup,
 }
@@ -323,8 +325,8 @@ async fn wallet_history(
     blocking(move || {
         let node = core.node();
         let (client, name) = page_wallet(&core, &node)?;
-        let lines = history::all(client, &name).map_err(|e| e.to_string())?;
-        history::filter(lines, &filter, count)
+        let lines = core.history.all(client, &name).map_err(|e| e.to_string())?;
+        history::filter(&lines, &filter, count)
     })
     .await
 }
@@ -366,8 +368,8 @@ async fn wallet_export_csv(
         };
         let node = core.node();
         let (client, name) = page_wallet(&core, &node)?;
-        let lines = history::all(client, &name).map_err(|e| e.to_string())?;
-        let page = history::filter(lines, &filter, usize::MAX)?;
+        let lines = core.history.all(client, &name).map_err(|e| e.to_string())?;
+        let page = history::filter(&lines, &filter, usize::MAX)?;
         // The save dialog already asked before replacing a file.
         std::fs::write(&path, history::csv(&page.entries).as_bytes())
             .map_err(|e| format!("Cannot write {}: {e}", path.display()))?;
@@ -421,6 +423,8 @@ async fn book_save(
     blocking(move || {
         let node = core.node();
         let (client, name) = page_wallet(&core, &node)?;
+        // Activity shows labels.
+        core.history.clear();
         book::save(client, &name, &address, &label)
     })
     .await
@@ -1016,6 +1020,7 @@ async fn receive_rename(
     blocking(move || {
         let node = core.node();
         let (client, name) = page_wallet(&core, &node)?;
+        core.history.clear();
         receive::rename(client, &name, &address, &label)
     })
     .await
@@ -2343,6 +2348,7 @@ pub fn run() {
                 wallet: Mutex::new(None),
                 passphrase: Mutex::new(None),
                 theme: Mutex::new(None),
+                history: history::Cache::default(),
                 updates,
                 setup: Setup::default(),
             }));

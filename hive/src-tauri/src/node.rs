@@ -29,6 +29,7 @@ const CONSOLE_USER: &str = "hive-console";
 /// generatetoaddress only serves the regtest funding button.
 const PAGE_METHODS: &[&str] = &[
     "getblockchaininfo",
+    "getbestblockhash",
     "getnetworkinfo",
     "getmempoolinfo",
     "getpeerinfo",

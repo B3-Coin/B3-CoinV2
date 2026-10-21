@@ -3,6 +3,8 @@
 //! transaction's details, and Qt's CSV export.
 
 use std::fmt::Write as _;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -113,6 +115,55 @@ pub fn all(client: &Client, wallet: &str) -> Result<Vec<ActivityEntry>, RpcError
         .map(wallet::settle_flowmesh)
 }
 
+/// What a cached history depends on: a new block changes every line's
+/// confirmations, a new wallet transaction adds lines.
+#[derive(Debug, Clone, PartialEq)]
+struct Key {
+    wallet: String,
+    tip: String,
+    txcount: u64,
+}
+
+/// Longest a cached history is reused even when its key still matches, for
+/// what the key cannot see (an abandoned transaction, a changed label).
+const CACHE_TTL: Duration = Duration::from_secs(15);
+
+/// The last full history read. The Activity page asks again on every
+/// filter change and keystroke; reading the whole history each time is
+/// slow on a large wallet and holds the wallet meanwhile.
+#[derive(Default)]
+pub struct Cache(Mutex<Option<Cached>>);
+
+type Cached = (Key, Instant, Arc<Vec<ActivityEntry>>);
+
+impl Cache {
+    /// Forgets the cached history, after something it holds changed, such
+    /// as an address label.
+    pub fn clear(&self) {
+        self.0.lock().unwrap().take();
+    }
+
+    /// The wallet's whole history, newest first: the cached one when the
+    /// tip and the wallet's transaction count are unchanged, else read anew.
+    pub fn all(&self, client: &Client, wallet: &str) -> Result<Arc<Vec<ActivityEntry>>, RpcError> {
+        let tip = client.call("getbestblockhash", json!([]))?;
+        let info = client.call_wallet(wallet, "getwalletinfo", json!([]))?;
+        let key = Key {
+            wallet: wallet.to_owned(),
+            tip: tip.as_str().unwrap_or_default().to_owned(),
+            txcount: info["txcount"].as_u64().unwrap_or(u64::MAX),
+        };
+        if let Some((cached, at, lines)) = &*self.0.lock().unwrap() {
+            if *cached == key && at.elapsed() < CACHE_TTL {
+                return Ok(Arc::clone(lines));
+            }
+        }
+        let lines = Arc::new(all(client, wallet)?);
+        *self.0.lock().unwrap() = Some((key, Instant::now(), Arc::clone(&lines)));
+        Ok(lines)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Page {
     /// The newest `count` matching lines.
@@ -123,17 +174,20 @@ pub struct Page {
     pub total: usize,
 }
 
-pub fn filter(lines: Vec<ActivityEntry>, filter: &Filter, count: usize) -> Result<Page, String> {
+pub fn filter(lines: &[ActivityEntry], filter: &Filter, count: usize) -> Result<Page, String> {
     let minimum = filter.minimum()?;
-    let total = lines.len();
-    let kept: Vec<_> = lines
-        .into_iter()
-        .filter(|e| filter.keeps(e, minimum))
-        .collect();
+    let mut matching = 0;
+    let mut entries = Vec::new();
+    for line in lines.iter().filter(|e| filter.keeps(e, minimum)) {
+        matching += 1;
+        if entries.len() < count {
+            entries.push(line.clone());
+        }
+    }
     Ok(Page {
-        matching: kept.len(),
-        entries: kept.into_iter().take(count).collect(),
-        total,
+        entries,
+        matching,
+        total: lines.len(),
     })
 }
 
@@ -342,7 +396,7 @@ mod tests {
     }
 
     fn times(f: &Filter, count: usize) -> (Vec<i64>, usize) {
-        let page = filter(sample(), f, count).unwrap();
+        let page = filter(&sample(), f, count).unwrap();
         assert_eq!(page.total, 4);
         (page.entries.iter().map(|e| e.time).collect(), page.matching)
     }
@@ -392,7 +446,7 @@ mod tests {
             min_amount: Some("lots".into()),
             ..Default::default()
         };
-        assert!(filter(sample(), &bad, 10).is_err());
+        assert!(filter(&sample(), &bad, 10).is_err());
     }
 
     #[test]
