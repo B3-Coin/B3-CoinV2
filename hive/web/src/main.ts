@@ -935,6 +935,7 @@ function renderWalletSecurity(v: WalletsView): void {
   el("wl-encrypt").hidden = s !== "unencrypted";
   el("wl-change").hidden = s !== "locked" && s !== "unlocked";
   el("wl-lock").hidden = s !== "unlocked";
+  el("wl-backup-plain").hidden = s !== "unencrypted";
 }
 
 async function askPassphrase(kind: "encrypt" | "change"): Promise<void> {
@@ -1145,8 +1146,8 @@ el("wl-backup").addEventListener("click", async () => {
   const button = el<HTMLButtonElement>("wl-backup");
   button.disabled = true;
   try {
-    const path = await invoke<string>("wallet_backup");
-    walletsResult("success", `Saved the backup to ${path}`);
+    const path = await invoke<string | null>("wallet_backup");
+    if (path !== null) walletsResult("success", `Saved the backup to ${path}`);
   } catch (e) {
     walletsResult("danger", String(e));
   } finally {
@@ -1462,8 +1463,8 @@ el("activity-export").addEventListener("click", async () => {
   const button = el<HTMLButtonElement>("activity-export");
   button.disabled = true;
   try {
-    const path = await invoke<string>("wallet_export_csv", { filter: historyFilter() });
-    activityResult("success", `Saved the transactions shown by these filters to ${path}`);
+    const path = await invoke<string | null>("wallet_export_csv", { filter: historyFilter() });
+    if (path !== null) activityResult("success", `Saved the transactions shown by these filters to ${path}`);
   } catch (e) {
     activityResult("danger", `The transactions were not exported: ${String(e)}`);
   } finally {
@@ -2260,8 +2261,8 @@ el("psbt-copy").addEventListener("click", () => {
 el("psbt-save").addEventListener("click", async () => {
   if (!psbtShown) return;
   try {
-    const path = await invoke<string>("psbt_save", { psbt: psbtShown.psbt });
-    psbtResult("success", `Saved to ${path}`);
+    const path = await invoke<string | null>("psbt_save", { psbt: psbtShown.psbt });
+    if (path !== null) psbtResult("success", `Saved to ${path}`);
   } catch (e) {
     psbtResult("danger", String(e));
   }

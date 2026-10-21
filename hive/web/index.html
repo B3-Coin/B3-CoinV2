@@ -995,10 +995,17 @@
               </div>
               <div class="card-pad">
                 <p class="t-sm muted">
-                  Saves a copy of <strong id="wl-backup-name">the wallet in use</strong> to your Downloads
-                  folder under a new name. The copy holds the wallet's keys: anyone who has it can spend
-                  the wallet's coins.
+                  Saves a copy of <strong id="wl-backup-name">the wallet in use</strong> to a new file you
+                  choose. The copy holds the wallet's keys: keep it away from cloud-synced and shared
+                  folders.
                 </p>
+                <div class="callout callout-warning mt-2" id="wl-backup-plain" hidden>
+                  <div class="callout-title">
+                    <svg class="i-sm" aria-hidden="true"><use href="/icons.svg#i-alert" /></svg>This backup is not encrypted
+                  </div>
+                  The wallet has no passphrase, so anyone who can read the backup can spend its coins.
+                  Encrypt the wallet first, or keep the file on encrypted storage.
+                </div>
                 <button class="btn btn-secondary mt-2" type="button" id="wl-backup">Back up wallet</button>
               </div>
             </div>

@@ -343,38 +343,35 @@ async fn wallet_transaction(
     .await
 }
 
-/// Writes the lines that pass the filter as Qt's CSV into the Downloads
-/// folder, under a new name, and returns where.
+/// Writes the lines that pass the filter as Qt's CSV to a file chosen in
+/// the save dialog, and returns where; None when the dialog is cancelled.
 #[tauri::command]
 async fn wallet_export_csv(
     app: AppHandle,
     window: Window,
     core: State<'_, Arc<Core>>,
     filter: history::Filter,
-) -> Result<String, String> {
+) -> Result<Option<String>, String> {
     require_window(&window, MAIN)?;
-    let folder = app
-        .path()
-        .download_dir()
-        .map_err(|e| format!("The Downloads folder was not found: {e}"))?;
     let core = Arc::clone(&core);
     blocking(move || {
+        let suggested = format!("b3-hive-transactions-{}.csv", file_time());
+        let Some(path) = save_file(
+            &app,
+            "Export transactions",
+            &suggested,
+            ("CSV files", &["csv"]),
+        ) else {
+            return Ok(None);
+        };
         let node = core.node();
         let (client, name) = page_wallet(&core, &node)?;
         let lines = history::all(client, &name).map_err(|e| e.to_string())?;
         let page = history::filter(lines, &filter, usize::MAX)?;
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs() as i64);
-        let path = folder.join(format!(
-            "b3-hive-transactions-{}.csv",
-            history::utc(now).replace(':', "")
-        ));
-        let mut file = std::fs::File::create_new(&path)
-            .map_err(|e| format!("Cannot create {}: {e}", path.display()))?;
-        std::io::Write::write_all(&mut file, history::csv(&page.entries).as_bytes())
+        // The save dialog already asked before replacing a file.
+        std::fs::write(&path, history::csv(&page.entries).as_bytes())
             .map_err(|e| format!("Cannot write {}: {e}", path.display()))?;
-        Ok(path.display().to_string())
+        Ok(Some(path.display().to_string()))
     })
     .await
 }
@@ -854,29 +851,26 @@ async fn psbt_draft(
     Ok(id)
 }
 
-/// Saves a PSBT as a binary .psbt file, as Qt does, into the Downloads
-/// folder under a new name, and returns where.
+/// Saves a PSBT as a binary .psbt file, as Qt does, to a file chosen in the
+/// save dialog, and returns where; None when the dialog is cancelled.
 #[tauri::command]
-async fn psbt_save(app: AppHandle, window: Window, psbt: String) -> Result<String, String> {
+async fn psbt_save(app: AppHandle, window: Window, psbt: String) -> Result<Option<String>, String> {
     require_window(&window, MAIN)?;
-    let folder = app
-        .path()
-        .download_dir()
-        .map_err(|e| format!("The Downloads folder was not found: {e}"))?;
     blocking(move || {
         let bytes = psbt::file_bytes(&psbt)?;
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs() as i64);
-        let path = folder.join(format!(
-            "b3-hive-transaction-{}.psbt",
-            history::utc(now).replace(':', "")
-        ));
-        let mut file = std::fs::File::create_new(&path)
-            .map_err(|e| format!("Cannot create {}: {e}", path.display()))?;
-        std::io::Write::write_all(&mut file, &bytes)
+        let suggested = format!("b3-hive-transaction-{}.psbt", file_time());
+        let Some(path) = save_file(
+            &app,
+            "Save the PSBT",
+            &suggested,
+            ("Partially signed transactions", &["psbt"]),
+        ) else {
+            return Ok(None);
+        };
+        // The save dialog already asked before replacing a file.
+        std::fs::write(&path, &bytes)
             .map_err(|e| format!("Cannot write {}: {e}", path.display()))?;
-        Ok(path.display().to_string())
+        Ok(Some(path.display().to_string()))
     })
     .await
 }
@@ -1118,6 +1112,38 @@ async fn wallet_manage(
 
 /// Asks for a file with the native picker, over the main window. None when
 /// it is cancelled.
+/// The native save dialog over the main window, opening in the Downloads
+/// folder with `name` suggested. None when it is cancelled.
+fn save_file(
+    app: &AppHandle,
+    title: &str,
+    name: &str,
+    filter: (&str, &[&str]),
+) -> Option<std::path::PathBuf> {
+    use tauri_plugin_dialog::DialogExt;
+    let mut dialog = app
+        .dialog()
+        .file()
+        .set_title(title)
+        .set_file_name(name)
+        .add_filter(filter.0, filter.1);
+    if let Ok(downloads) = app.path().download_dir() {
+        dialog = dialog.set_directory(downloads);
+    }
+    if let Some(main) = app.get_webview_window(MAIN) {
+        dialog = dialog.set_parent(&main);
+    }
+    dialog.blocking_save_file()?.into_path().ok()
+}
+
+/// The current UTC time for a suggested file name, without colons.
+fn file_time() -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64);
+    history::utc(now).replace(':', "")
+}
+
 fn pick_file(app: &AppHandle, title: &str, filter: (&str, &[&str])) -> Option<std::path::PathBuf> {
     use tauri_plugin_dialog::DialogExt;
     let mut dialog = app
@@ -1347,37 +1373,50 @@ async fn wallet_lock(
     .await
 }
 
-/// Qt's Backup wallet, into the Downloads folder under a new name.
+/// Qt's Backup wallet, to a new file chosen in the save dialog; None when
+/// the dialog is cancelled.
 #[tauri::command]
 async fn wallet_backup(
     app: AppHandle,
     window: Window,
     core: State<'_, Arc<Core>>,
-) -> Result<String, String> {
+) -> Result<Option<String>, String> {
     require_window(&window, MAIN)?;
-    let folder = app
-        .path()
-        .download_dir()
-        .map_err(|e| format!("The Downloads folder was not found: {e}"))?;
     let core = Arc::clone(&core);
     blocking(move || {
-        let node = core.node();
-        let (client, name) = page_wallet(&core, &node)?;
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs() as i64);
+        // The node is not held while the dialog is open.
+        let name = {
+            let node = core.node();
+            page_wallet(&core, &node)?.1
+        };
         let label = if name.is_empty() {
             "default"
         } else {
             name.as_str()
         };
-        let path = folder.join(format!(
+        let suggested = format!(
             "b3-hive-wallet-{}-{}.dat",
             label.replace(' ', "_"),
-            history::utc(now).replace(':', "")
-        ));
+            file_time()
+        );
+        let Some(path) = save_file(
+            &app,
+            "Back up the wallet",
+            &suggested,
+            ("Wallet backups", &["dat"]),
+        ) else {
+            return Ok(None);
+        };
+        if path.exists() {
+            return Err(format!(
+                "{} already exists. A backup is never written over another file: choose a new name.",
+                path.display()
+            ));
+        }
+        let node = core.node();
+        let client = node.client().ok_or("The node is not ready yet.")?;
         wallet::backup(client, &name, &path)?;
-        Ok(path.display().to_string())
+        Ok(Some(path.display().to_string()))
     })
     .await
 }
