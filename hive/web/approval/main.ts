@@ -243,8 +243,8 @@ function stepRows(side: "bid" | "ask", points: Point[], u: Units, token: string)
 
 function marketRows(d: { chain: string; market_id: string; base_asset_id: string; sequence: number; remote: boolean }): HTMLElement[] {
   return [
-    row("Market", shorten(d.market_id, 10, 6), undefined, false),
-    row("Token", shorten(d.base_asset_id, 10, 6), undefined, false),
+    row("Market", shorten(d.market_id, 10, 6), d.market_id, false),
+    row("Token", shorten(d.base_asset_id, 10, 6), d.base_asset_id, false),
     row("Account sequence", String(d.sequence), undefined, false),
     row("Verified by", d.remote ? "Trading endpoint" : "This node's engine", undefined, false),
     row("Network", d.chain, undefined, false),

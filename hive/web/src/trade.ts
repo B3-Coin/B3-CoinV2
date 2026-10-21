@@ -183,7 +183,12 @@ let chartView: "price" | "depth" = "price";
 /** Which sides of the book are listed. */
 let bookShow: "both" | "bids" | "asks" = "both";
 /** Drafts this page opened, until the approval window decides them. */
-const drafts = new Map<string, "order" | "cancel" | "deposit" | "withdraw">();
+const drafts = new Map<string, { what: "order" | "cancel" | "deposit" | "withdraw"; epoch: number }>();
+/** Bumped when the wallet or market changes. A draft or read that belongs to
+ *  an older epoch must not touch the view that replaced it. */
+let epoch = 0;
+/** A draft is being prepared: a second click or Enter must not make another. */
+let preparing = false;
 /** The funding form moves funds in (deposit) or out (withdraw). */
 let funding: "in" | "out" = "in";
 let deposits: Deposit[] = [];
@@ -192,7 +197,10 @@ let depositsRead = 0;
 const admitted = new Set<string>();
 let requests: TradeRequest[] = [];
 let requestsRead = 0;
-let requestsLoading = false;
+/** The epoch whose request read is in flight, if any. */
+let requestsLoadingEpoch: number | null = null;
+/** The last deposit read failed with this message. */
+let depositsError: string | null = null;
 
 function blank(): Market {
   return {
@@ -247,11 +255,19 @@ export function stopTrade(): void {
 export function tradeWalletChanged(): void {
   if (!active) return;
   generation++;
+  epoch++;
   market = blank();
   requests = [];
+  requestsRead = 0;
   deposits = [];
   depositsRead = 0;
+  depositsError = null;
   admitted.clear();
+  clearForm();
+  clearFunding();
+  showResult("", "");
+  showFundResult("", "");
+  renderDeposits();
   void loadMarkets();
 }
 
@@ -279,10 +295,15 @@ async function loadMarkets(): Promise<void> {
 function selectMarket(id: string): void {
   if (id === marketId) return;
   marketId = id;
+  epoch++;
   market = blank();
   requests = [];
   requestsRead = 0;
+  deposits = [];
   depositsRead = 0;
+  depositsError = null;
+  admitted.clear();
+  renderDeposits();
   clearForm();
   clearFunding();
   showResult("", "");
@@ -1084,7 +1105,7 @@ function renderForm(): void {
     total.textContent = "—";
     el("tr-replaces-row").hidden = true;
   } else {
-    total.textContent = `${formatB3(steps.reduce((sum, s) => sum + notional(s.quantity, s.price), 0n))} B3`;
+    total.textContent = isMasked() ? "•••• B3" : `${formatB3(steps.reduce((sum, s) => sum + notional(s.quantity, s.price), 0n))} B3`;
     el("tr-replaces-row").hidden = !replaced;
     if (replaced) {
       el("tr-replaces").textContent = isMasked() ? "••••" : `open ${buy ? "buy" : "sell"}, ${formatQuantity(BigInt(replaced.remaining), u.decimals)} ${token} left`;
@@ -1160,30 +1181,40 @@ async function reviewOrder(): Promise<void> {
   }
   // The form already says what is wrong; the core would refuse it too.
   if (typeof steps === "string" || reservation(steps).reserve > reservation(steps).available) return renderForm();
+  if (preparing) return;
+  preparing = true;
   showResult("", "");
   const id = marketId;
+  const at = epoch;
   try {
     const draft = await invoke<string>("trade_order_draft", {
       marketId: id,
       side,
       steps: steps.map((s) => ({ price: s.price.toString(), quantity: s.quantity.toString() })),
     });
-    drafts.set(draft, "order");
+    drafts.set(draft, { what: "order", epoch: at });
     showResult("info", "Review the order in the approval window. Nothing is signed until you approve it there.");
   } catch (e) {
     showResult("danger", String(e));
+  } finally {
+    preparing = false;
   }
   renderForm();
 }
 
 async function cancelOrder(s: "bid" | "ask"): Promise<void> {
   if (gate() !== null || !marketId) return renderGate();
+  if (preparing) return;
+  preparing = true;
+  const at = epoch;
   try {
     const draft = await invoke<string>("trade_cancel_draft", { marketId, side: s });
-    drafts.set(draft, "cancel");
+    drafts.set(draft, { what: "cancel", epoch: at });
     showResult("info", "Review the cancellation in the approval window.");
   } catch (e) {
     showResult("danger", String(e));
+  } finally {
+    preparing = false;
   }
   render();
 }
@@ -1191,9 +1222,20 @@ async function cancelOrder(s: "bid" | "ask"): Promise<void> {
 /** Handles the approval window's decision on a draft this page opened;
  *  false when the draft is not this page's. */
 export function tradeDecided(r: TradeResult): boolean {
-  const what = drafts.get(r.id);
-  if (!what) return false;
+  const draft = drafts.get(r.id);
+  if (!draft) return false;
+  const { what } = draft;
   drafts.delete(r.id);
+  if (draft.epoch !== epoch) {
+    // Decided after the wallet or market changed: say so, but leave the form
+    // and results of the current view alone.
+    if (active) {
+      const done = r.outcome === "rejected" ? "was rejected" : r.outcome === "failed" ? "failed" : "was submitted";
+      showResult("info", `A request made for another wallet or market ${done}. Check Requests there.`);
+      render();
+    }
+    return true;
+  }
   const result = what === "deposit" || what === "withdraw" ? showFundResult : showResult;
   if (r.outcome === "traded" && "receipt" in r) {
     const [kind, text] = what === "withdraw" ? withdrawText(r.receipt) : receiptText(r.receipt, what === "cancel" ? "cancel" : "order");
@@ -1325,8 +1367,11 @@ function clearFunding(): void {
 async function reviewFunding(): Promise<void> {
   const amount = fundAmount();
   if (fundGate() !== null || !marketId || typeof amount !== "bigint") return renderFunding();
+  if (preparing) return;
+  preparing = true;
   showFundResult("", "");
   const out = funding === "out";
+  const at = epoch;
   try {
     const draft = out
       ? await invoke<string>("trade_withdraw_draft", {
@@ -1336,10 +1381,12 @@ async function reviewFunding(): Promise<void> {
           destination: el<HTMLInputElement>("tr-fund-to").value.trim(),
         })
       : await invoke<string>("trade_deposit_draft", { marketId, asset: fundAsset(), amount: amount.toString() });
-    drafts.set(draft, out ? "withdraw" : "deposit");
+    drafts.set(draft, { what: out ? "withdraw" : "deposit", epoch: at });
     showFundResult("info", `Review the ${out ? "withdrawal" : "deposit"} in the approval window. Nothing is signed until you approve it there.`);
   } catch (e) {
     showFundResult("danger", String(e));
+  } finally {
+    preparing = false;
   }
   render();
 }
@@ -1365,9 +1412,11 @@ async function loadDeposits(): Promise<void> {
     const list = await invoke<Deposit[]>("trade_deposits");
     if (mine !== generation) return;
     deposits = list;
-  } catch {
-    // Deposits are a convenience; the balance above is what counts.
-    return;
+    depositsError = null;
+  } catch (e) {
+    if (mine !== generation) return;
+    // An empty list must not be mistaken for "no deposits".
+    depositsError = String(e);
   }
   renderDeposits();
 }
@@ -1397,8 +1446,28 @@ async function admit(d: Deposit, button: HTMLButtonElement): Promise<void> {
 }
 
 function renderDeposits(): void {
-  el("tr-deposits").hidden = deposits.length === 0;
+  el("tr-deposits").hidden = deposits.length === 0 && depositsError === null;
+  const failed: HTMLElement[] = [];
+  if (depositsError !== null) {
+    const drow = document.createElement("div");
+    drow.className = "drow";
+    const k = document.createElement("span");
+    k.className = "dkey";
+    k.textContent = "Could not read your deposits. Do not deposit again until you have checked.";
+    k.title = depositsError;
+    const v = document.createElement("span");
+    v.className = "dval";
+    const retry = document.createElement("button");
+    retry.type = "button";
+    retry.className = "btn btn-secondary btn-sm";
+    retry.textContent = "Retry";
+    retry.addEventListener("click", () => void loadDeposits());
+    v.append(retry);
+    drow.append(k, v);
+    failed.push(drow);
+  }
   el("tr-deposit-rows").replaceChildren(
+    ...failed,
     ...deposits.map((d) => {
       const drow = document.createElement("div");
       drow.className = "drow";
@@ -1435,19 +1504,20 @@ const REQUESTS_NOTE = el("tr-requests-note").textContent ?? "";
 
 async function loadRequests(): Promise<void> {
   const id = marketId;
-  if (!active || !id || requestsLoading) return;
-  requestsLoading = true;
+  const at = epoch;
+  if (!active || !id || requestsLoadingEpoch === at) return;
+  requestsLoadingEpoch = at;
   try {
     const list = await invoke<TradeRequest[]>("trade_requests", { marketId: id });
-    if (id !== marketId) return;
+    if (at !== epoch) return;
     requests = list;
     el("tr-requests-note").textContent = REQUESTS_NOTE;
   } catch (e) {
-    if (id !== marketId) return;
+    if (at !== epoch) return;
     el("tr-requests-note").textContent = `Could not read your requests: ${e}`;
   } finally {
-    requestsLoading = false;
-    requestsRead = Date.now();
+    if (requestsLoadingEpoch === at) requestsLoadingEpoch = null;
+    if (at === epoch) requestsRead = Date.now();
   }
   renderRequests();
   renderGate();
