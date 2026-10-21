@@ -3155,27 +3155,27 @@ BOOST_AUTO_TEST_CASE(fresh_key_erasure_policy_truth_table)
                             const int tip, const std::optional<int> horizon = std::nullopt) {
         return node::FreshKeyErasable(s, Pk(sk), target, tip, horizon.value_or(H));
     }};
-    constexpr int FAR{1'000'000};
+    constexpr int FAR_TIP{1'000'000};
 
     // Unbootstrapped: keep everything.
-    BOOST_CHECK(!erasable(node::FreshLineageState{}, g_a, 0, FAR));
+    BOOST_CHECK(!erasable(node::FreshLineageState{}, g_a, 0, FAR_TIP));
     {
         node::FreshLineageState unboot{e2};
         unboot.bootstrapped = false;
-        BOOST_CHECK(!erasable(unboot, g_a, 0, FAR));
+        BOOST_CHECK(!erasable(unboot, g_a, 0, FAR_TIP));
     }
 
     // Epoch 1: the genesis keys are the current committee's; the epoch-2
     // keys are the next committee's. Keep.
-    BOOST_CHECK(!erasable(e1, g_a, 0, FAR));
-    BOOST_CHECK(!erasable(e1, g_d, 0, FAR));
-    BOOST_CHECK(!erasable(e1, k2_a, 2, FAR));
+    BOOST_CHECK(!erasable(e1, g_a, 0, FAR_TIP));
+    BOOST_CHECK(!erasable(e1, g_d, 0, FAR_TIP));
+    BOOST_CHECK(!erasable(e1, k2_a, 2, FAR_TIP));
     // D's voided epoch-2 key (target e+1, not seated): its committee is
     // fixed, so it goes at start_1 + H.
     BOOST_CHECK(!erasable(e1, k2_d, 2, S1 + H - 1));
     BOOST_CHECK(erasable(e1, k2_d, 2, S1 + H));
     // A key for a later epoch (target e+2) is kept: its committee is open.
-    BOOST_CHECK(!erasable(e1, k3_a, 3, FAR));
+    BOOST_CHECK(!erasable(e1, k3_a, 3, FAR_TIP));
 
     // Epoch 2: the genesis keys (last seated in epoch 1) go once the
     // handover into epoch 2 is H deep: at start_2 + H, not one block earlier.
@@ -3183,11 +3183,11 @@ BOOST_AUTO_TEST_CASE(fresh_key_erasure_policy_truth_table)
         BOOST_CHECK(!erasable(e2, *g, 0, S2));
         BOOST_CHECK(!erasable(e2, *g, 0, S2 + H - 1));
         BOOST_CHECK(erasable(e2, *g, 0, S2 + H));
-        BOOST_CHECK(erasable(e2, *g, 0, FAR));
+        BOOST_CHECK(erasable(e2, *g, 0, FAR_TIP));
     }
     // Current (Set'_2) and next (Set'_3) keys stay.
-    for (const auto* k : {&k2_a, &k2_b, &k2_c}) BOOST_CHECK(!erasable(e2, *k, 2, FAR));
-    for (const auto* k : {&k3_a, &k3_b, &k3_c}) BOOST_CHECK(!erasable(e2, *k, 3, FAR));
+    for (const auto* k : {&k2_a, &k2_b, &k2_c}) BOOST_CHECK(!erasable(e2, *k, 2, FAR_TIP));
+    for (const auto* k : {&k3_a, &k3_b, &k3_c}) BOOST_CHECK(!erasable(e2, *k, 3, FAR_TIP));
     // Never seated, target e (void): Set'_2 was fixed at start_1, so the key
     // stays erasable from start_1 + H as it was in epoch 1 (not only from
     // start_2 + H). Target e+1 (void): Set'_3 was fixed at start_2, so from
@@ -3202,8 +3202,8 @@ BOOST_AUTO_TEST_CASE(fresh_key_erasure_policy_truth_table)
         BOOST_CHECK(erasable(e2, *k, 3, S2 + H));
     }
     // Future target (e+2) keep, however deep.
-    BOOST_CHECK(!erasable(e2, k4_a, 4, FAR));
-    BOOST_CHECK(!erasable(e2, k4_a, std::numeric_limits<uint64_t>::max(), FAR));
+    BOOST_CHECK(!erasable(e2, k4_a, 4, FAR_TIP));
+    BOOST_CHECK(!erasable(e2, k4_a, std::numeric_limits<uint64_t>::max(), FAR_TIP));
 
     // Carry-over: Set'_2 below the floor carried Set'_1 (the genesis keys)
     // into epoch 2, and Set'_3 carries them again. They stay seated, so they
@@ -3212,29 +3212,29 @@ BOOST_AUTO_TEST_CASE(fresh_key_erasure_policy_truth_table)
         node::FreshLineageState carried{e2};
         carried.current = node::MakeFreshLineageSet(set1->members, 2);
         carried.next = node::MakeFreshLineageSet(set1->members, 3);
-        for (const auto* g : {&g_a, &g_b, &g_c, &g_d}) BOOST_CHECK(!erasable(carried, *g, 0, FAR));
+        for (const auto* g : {&g_a, &g_b, &g_c, &g_d}) BOOST_CHECK(!erasable(carried, *g, 0, FAR_TIP));
         // The carry-over that skipped them was decided at start_1.
         BOOST_CHECK(erasable(carried, k2_a, 2, S1 + H));
         BOOST_CHECK(!erasable(carried, k2_a, 2, S1 + H - 1));
         // Only the next committee still carries them: still kept.
         carried.current = set2;
-        for (const auto* g : {&g_a, &g_b, &g_c, &g_d}) BOOST_CHECK(!erasable(carried, *g, 0, FAR));
+        for (const auto* g : {&g_a, &g_b, &g_c, &g_d}) BOOST_CHECK(!erasable(carried, *g, 0, FAR_TIP));
     }
 
     // Degenerate inputs keep: no horizon, a malformed state, a tip below
     // the epoch start.
-    BOOST_CHECK(!erasable(e2, g_a, 0, FAR, 0));
-    BOOST_CHECK(!erasable(e2, g_a, 0, FAR, -1));
+    BOOST_CHECK(!erasable(e2, g_a, 0, FAR_TIP, 0));
+    BOOST_CHECK(!erasable(e2, g_a, 0, FAR_TIP, -1));
     BOOST_CHECK(!erasable(e2, g_a, 0, std::numeric_limits<int>::max(), std::numeric_limits<int>::max()));
     BOOST_CHECK(erasable(e2, g_a, 0, std::numeric_limits<int>::max(), std::numeric_limits<int>::max() - S2));
     BOOST_CHECK(!erasable(e2, g_a, 0, S2 - 1, 1));
     {
         node::FreshLineageState short_starts{e2};
         short_starts.epoch_starts.pop_back();
-        BOOST_CHECK(!erasable(short_starts, g_a, 0, FAR));
+        BOOST_CHECK(!erasable(short_starts, g_a, 0, FAR_TIP));
         node::FreshLineageState no_next{e2};
         no_next.next.reset();
-        BOOST_CHECK(!erasable(no_next, g_a, 0, FAR));
+        BOOST_CHECK(!erasable(no_next, g_a, 0, FAR_TIP));
         // Without a readable Set'_{e-1} the depth counts from start_e (later).
         node::FreshLineageState no_previous{e2};
         no_previous.previous.reset();
@@ -3283,7 +3283,7 @@ BOOST_AUTO_TEST_CASE(fresh_key_erasure_policy_truth_table)
             BOOST_CHECK(erasable(e4, *k, 3, S4 + E, E));
         }
         // The carried-over Set'_4 keys stay.
-        for (const auto* k : {&k4_a, &k4_b, &k4_c}) BOOST_CHECK(!erasable(e4, *k, 4, FAR, E));
+        for (const auto* k : {&k4_a, &k4_b, &k4_c}) BOOST_CHECK(!erasable(e4, *k, 4, FAR_TIP, E));
     }
 
     // The horizon: the modern reorg horizon, else E; never without modern PoS.

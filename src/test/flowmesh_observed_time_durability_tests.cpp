@@ -23,6 +23,12 @@
 #include <utility>
 #include <vector>
 
+// <windows.h>, reached through a later include, maps DeleteFile to
+// DeleteFileA. leveldb::Env declares the unmapped name; match it.
+#if defined(_WIN32) && defined(DeleteFile)
+#undef DeleteFile
+#endif
+
 namespace {
 
 using flowmesh::CandleInterval;

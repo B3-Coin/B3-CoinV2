@@ -21,7 +21,7 @@ QString Who(const QString& source, bool remote)
 }
 QString Utc(int64_t ms)
 {
-    return QDateTime::fromMSecsSinceEpoch(ms, QTimeZone::UTC).toString(QStringLiteral("yyyy-MM-dd HH:mm:ss.zzz")) + QStringLiteral(" UTC");
+    return QDateTime::fromMSecsSinceEpoch(ms, QTimeZone::utc()).toString(QStringLiteral("yyyy-MM-dd HH:mm:ss.zzz")) + QStringLiteral(" UTC");
 }
 } // namespace
 

@@ -93,12 +93,12 @@ BOOST_AUTO_TEST_CASE(local_window_admits_next_plus_64_refuses_65)
         BOOST_CHECK(decision.kind == Kind::ENQUEUE);
         BOOST_CHECK_EQUAL(decision.next_account_sequence, 10U);
     }
-    const auto far{f.Decide(f.Signed(75))};
-    BOOST_CHECK(far.kind == Kind::REFUSE);
-    BOOST_CHECK(far.code == Code::FAR_FUTURE_SEQUENCE);
-    BOOST_CHECK(!far.consumer);
+    const auto far_seq{f.Decide(f.Signed(75))};
+    BOOST_CHECK(far_seq.kind == Kind::REFUSE);
+    BOOST_CHECK(far_seq.code == Code::FAR_FUTURE_SEQUENCE);
+    BOOST_CHECK(!far_seq.consumer);
     BOOST_CHECK(f.Decide(f.Signed(std::numeric_limits<uint64_t>::max())).kind == Kind::REFUSE);
-    BOOST_CHECK_EQUAL(node::FlowMeshLocalAdmissionText(far),
+    BOOST_CHECK_EQUAL(node::FlowMeshLocalAdmissionText(far_seq),
                       "FlowMesh action account sequence is more than 64 ahead of the certified next sequence; not queued");
 }
 
