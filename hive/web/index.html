@@ -139,6 +139,15 @@
           </div>
         </div>
 
+        <div class="banner banner-danger" id="lock-warning" role="alert" hidden>
+          <svg class="i" aria-hidden="true"><use href="/icons.svg#i-alert" /></svg>
+          <div class="banner-body">
+            <strong>The wallet could not be locked</strong>
+            <div class="t-sm" id="lock-warning-text">Your last action went through, but the wallet may still be unlocked for a short while.</div>
+            <button class="btn btn-secondary btn-sm mt-2" id="lock-warning-lock" type="button">Lock the wallet</button>
+          </div>
+        </div>
+
         <main class="view view--flow" id="view-setup" hidden>
           <div class="stack">
             <p class="flow-sub">

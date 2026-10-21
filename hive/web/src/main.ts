@@ -3180,5 +3180,26 @@ await listen<DraftResult>("draft-result", (event) => {
   // A sent payment may have saved new labels.
   void refreshBook();
 });
+// The wallet an approval could not lock again; the Lock button locks that
+// one, even if the page has switched to another wallet since.
+let relockWallet: string | null = null;
+await listen<string>("relock-failed", (event) => {
+  relockWallet = event.payload;
+  el("lock-warning-text").textContent = `Your last action went through, but ${
+    relockWallet === "" ? "the default wallet" : `wallet ${relockWallet}`
+  } may still be unlocked for a short while. Lock it now.`;
+  el("lock-warning").hidden = false;
+});
+el("lock-warning-lock").addEventListener("click", async () => {
+  try {
+    await invoke("wallet_lock", { wallet: relockWallet });
+    el("lock-warning").hidden = true;
+    relockWallet = null;
+  } catch (e) {
+    el("lock-warning-text").textContent = `Still could not lock the wallet: ${String(e)}`;
+  }
+  void refreshWallets();
+  void refreshWallet();
+});
 await listen<NodeStatus>("node-status", (event) => render(event.payload));
 render(await invoke<NodeStatus>("node_status"));

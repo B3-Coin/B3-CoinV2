@@ -1230,15 +1230,31 @@ async fn passphrase_request(
         })
 }
 
-/// Qt's Lock wallet, for an encrypted wallet that is unlocked.
+/// Qt's Lock wallet, for an encrypted wallet that is unlocked: the page's
+/// wallet, or a named loaded one, such as a wallet an approval could not
+/// lock again after the page switched away from it.
 #[tauri::command]
-async fn wallet_lock(window: Window, core: State<'_, Arc<Core>>) -> Result<(), String> {
+async fn wallet_lock(
+    window: Window,
+    core: State<'_, Arc<Core>>,
+    wallet: Option<String>,
+) -> Result<(), String> {
     require_window(&window, MAIN)?;
     let core = Arc::clone(&core);
     blocking(move || {
         let node = core.node();
-        let (client, name) = page_wallet(&core, &node)?;
-        passphrase::lock(client, &name)
+        let name = match wallet {
+            Some(name) => name,
+            None => page_wallet(&core, &node)?.1,
+        };
+        let client = node.client().ok_or("The node is not ready yet.")?;
+        passphrase::lock(client, &name)?;
+        match wallet::security(client, &name) {
+            Ok(wallet::Security::Unlocked) => {
+                Err("The node still reports the wallet as unlocked.".into())
+            }
+            _ => Ok(()),
+        }
     })
     .await
 }
@@ -1787,6 +1803,7 @@ async fn approval_decide(
     let result = if approve {
         let core2 = Arc::clone(&core);
         let id2 = id.clone();
+        let app2 = app.clone();
         let outcome: Outcome = blocking(move || {
             let node = core2.node();
             let client = node.client().ok_or("The node is not ready.")?;
@@ -1814,8 +1831,15 @@ async fn approval_decide(
                 Some(draft) => execute(client, draft.request),
             };
             if locked {
-                // Only a lock this approval opened is closed again.
-                let _ = passphrase::lock(client, &wallet_name);
+                // Only a lock this approval opened is closed again. The
+                // transaction outcome stands either way; a failed relock is
+                // reported on its own so a sent payment is never resent.
+                let relocked = passphrase::lock(client, &wallet_name).is_ok()
+                    && wallet::security(client, &wallet_name).ok()
+                        == Some(wallet::Security::Locked);
+                if !relocked {
+                    let _ = app2.emit_to(MAIN, "relock-failed", wallet_name.clone());
+                }
             }
             Ok(outcome)
         })
