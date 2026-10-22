@@ -304,6 +304,8 @@ BOOST_AUTO_TEST_CASE(load_external_block_file_uses_legacy_codec)
             GetSerializeSize(legacy::TX_LEGACY(block)))};
         file << chainman.GetParams().MessageStart() << size
              << legacy::TX_LEGACY(block);
+        // A written AutoFile must be closed explicitly (its destructor asserts).
+        BOOST_REQUIRE_EQUAL(file.fclose(), 0);
     }
     {
         AutoFile file{fsbridge::fopen(bootstrap, "rb")};
