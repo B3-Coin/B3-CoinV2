@@ -474,6 +474,12 @@ NON_SCRIPTS = [
     "feature_flowmesh_persistent_trades.py",
     # Needs BUILD_FLOWMESH_P2FV_REGTEST_GATE=ON; deliberately outside the runner.
     "feature_flowmesh_p2fv_bootstrap.py",
+    # Opt-in durability and diagnostic phases that need a separately compiled
+    # crash-hook daemon or an approved experiment; run directly.
+    "feature_flowmesh_client_durability.py",
+    "feature_flowmesh_outcome_slice.py",
+    "feature_flowmesh_snapshot_atomic.py",
+    "feature_flowmesh_snapshot_atomic_faults.py",
     # Report analyzers used by the campaigns above, not tests.
     "flowmesh_performance_analyze.py",
     "flowmesh_performance_worker_analyze.py",
