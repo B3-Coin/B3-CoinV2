@@ -128,8 +128,8 @@ static const CAmount DEFAULT_CONSOLIDATE_FEERATE{10000}; // 10 sat/vbyte
  * A value > 0 means to do partial spend avoidance if the fee difference against a regular coin selection instance is in the range [0..value].
  */
 static const CAmount DEFAULT_MAX_AVOIDPARTIALSPEND_FEE = 0;
-//! discourage APS fee higher than this amount
-constexpr CAmount HIGH_APS_FEE{COIN / 10000};
+//! discourage APS fee higher than this amount (0.0001 B3 in the MODERN display unit)
+constexpr CAmount HIGH_APS_FEE{KILO_COIN / 10000};
 //! minimum recommended increment for replacement txs
 static const CAmount WALLET_INCREMENTAL_RELAY_FEE = 5000;
 //! Default for -spendzeroconfchange
@@ -148,9 +148,12 @@ static const bool DEFAULT_WALLETCROSSCHAIN = false;
 //! AT the legacy network's relay floor, so every acceptable legacy-era fee
 //! was refused as "too high" (live-QA finding 2026-08-27).
 constexpr CAmount DEFAULT_TRANSACTION_MAXFEE{KILO_COIN / 10};
-//! Discourage users to set fees higher than this amount (in satoshis) per kB
-constexpr CAmount HIGH_TX_FEE_PER_KB{COIN / 100};
-//! -maxtxfee will warn if called with a higher fee than this amount (in satoshis)
+//! Discourage users to set fees higher than this amount per kB: 0.01 B3 in
+//! the MODERN display unit, as -maxtxfee above. The stock COIN/100 is
+//! 0.00001 B3, so the test framework's fallbackfee=0.0002 and any ordinary
+//! -mintxfee/-discardfee setting warned "set very high" at every start.
+constexpr CAmount HIGH_TX_FEE_PER_KB{KILO_COIN / 100};
+//! -maxtxfee will warn if called with a higher fee than this amount (1 B3)
 constexpr CAmount HIGH_MAX_TX_FEE{100 * HIGH_TX_FEE_PER_KB};
 //! Pre-calculated constants for input size estimation in *virtual size*
 static constexpr size_t DUMMY_NESTED_P2WPKH_INPUT_SIZE = 91;
