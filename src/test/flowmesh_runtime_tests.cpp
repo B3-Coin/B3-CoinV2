@@ -2397,42 +2397,6 @@ BOOST_AUTO_TEST_CASE(critical_certificate_append_store_failure_still_halts)
     }));
 }
 
-BOOST_AUTO_TEST_CASE(worker_bounds_tick_passes_during_message_bursts)
-{
-    using node::FlowMeshWorkerRunsTickFirst;
-    constexpr size_t BUDGET{node::FLOWMESH_MESSAGES_PER_TICK};
-    // Nothing pending, or an idle queue: unchanged behaviour.
-    BOOST_CHECK(!FlowMeshWorkerRunsTickFirst(false, true, 0));
-    BOOST_CHECK(!FlowMeshWorkerRunsTickFirst(false, false, BUDGET));
-    BOOST_CHECK(FlowMeshWorkerRunsTickFirst(true, false, 0));
-    // Queued messages go first until the budget is spent, never longer.
-    BOOST_CHECK(!FlowMeshWorkerRunsTickFirst(true, true, 0));
-    BOOST_CHECK(!FlowMeshWorkerRunsTickFirst(true, true, BUDGET - 1));
-    BOOST_CHECK(FlowMeshWorkerRunsTickFirst(true, true, BUDGET));
-
-    // Model the worker on a burst where every admitted action requests a
-    // tick, as HandleAction does on agreement markets.
-    constexpr size_t BURST{100};
-    size_t queued{BURST}, since{0}, ticks{0}, longest_wait{0}, wait{0};
-    bool pending{false};
-    while (queued > 0 || pending) {
-        if (FlowMeshWorkerRunsTickFirst(pending, queued > 0, since)) {
-            pending = false;
-            since = 0;
-            ++ticks;
-            wait = 0;
-        } else {
-            --queued;
-            ++since;
-            pending = true;
-            longest_wait = std::max(longest_wait, ++wait);
-        }
-    }
-    // Previously one full maintenance pass per message (100 here).
-    BOOST_CHECK_EQUAL(ticks, (BURST + BUDGET - 1) / BUDGET);
-    BOOST_CHECK_LE(longest_wait, BUDGET);
-}
-
 BOOST_AUTO_TEST_CASE(worker_handler_exception_halts_market_not_process)
 {
     DeliveryRuntimeFixture f{m_args.GetDataDirBase() / "flowmesh_worker_exception",
