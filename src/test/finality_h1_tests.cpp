@@ -892,7 +892,8 @@ BOOST_FIXTURE_TEST_CASE(broken_lineage_frozen_then_rotates, H1ChainFixture)
         BOOST_CHECK(tracker.ProducerScheduleAvailable(next, consensus));
         BOOST_CHECK(!tracker.ProducerScheduleAvailable(next + 1, consensus));
         BOOST_CHECK(!tracker.SetInForceAt(next + 1, consensus));
-        BOOST_CHECK(!tracker.Projected(next + 1, consensus).producers);
+        // Projected() itself requires the synced tip + 1 (its V1 projection
+        // Assumes it, which aborts a Debug build), so it is not probed here.
         BOOST_CHECK(tracker.ProducerScheduleAvailable(R_h - 1, consensus)); // below R_h: V1, always available
     }
 }
