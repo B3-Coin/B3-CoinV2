@@ -4096,8 +4096,11 @@ size_t FlowMeshRuntime::RetryLocalActionAdmissions(const bool open, const size_t
         } else if (source.admitted && open && (reopened || now >= source.next_queue_attempt)) {
             // A queue copy may have been evicted by higher-priority recovery.
             // Its source survives, and every new copy carries the same token.
+            // One queued copy is enough: a second would only hold action-pool
+            // capacity until the worker pops and drops it as a duplicate.
             source.next_queue_attempt = now + DEFERRED_RETRY_INTERVAL;
-            (void)EnqueueReservedLocalActionLocked(id);
+            const bool queued{[&] { std::lock_guard<std::mutex> queue_lock{m_queue_mutex}; return m_queue.RetainedCopies(id) > 0; }()};
+            if (!queued) (void)EnqueueReservedLocalActionLocked(id);
         }
     }
     return maximum;

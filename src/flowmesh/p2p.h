@@ -255,6 +255,8 @@ public:
     size_t PeerBytes(WirePeerId peer) const;
     size_t PeerCount(WirePeerId peer) const;
     size_t MarketActionCount(const MarketId& market) const;
+    //! Queued copies carrying this nonzero local retention token.
+    size_t RetainedCopies(uint64_t local_retention_id) const;
     bool Empty() const { return m_size == 0; }
 
 private:
@@ -297,6 +299,8 @@ private:
     std::map<WirePeerId, size_t> m_peer_count;
     std::map<MarketId, Usage> m_market_actions;
     std::map<PeerMarket, Usage> m_peer_market_actions;
+    //! Queued copies per nonzero local retention token.
+    std::map<uint64_t, size_t> m_retained_copies;
     std::map<PeerMarket, TokenBucket> m_tokens;
     std::map<WirePeerId, ControlTokenBucket> m_control_tokens;
     //! Only peers that reached ConsumeSettled; RemovePeer erases the entry.

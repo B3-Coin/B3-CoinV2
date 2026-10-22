@@ -428,6 +428,7 @@ void BoundedWireQueue::AccountAdd(const QueuedWireMessage& item)
     m_bytes += bytes;
     m_peer_bytes[item.peer] += bytes;
     ++m_peer_count[item.peer];
+    if (item.local_retention_id) ++m_retained_copies[item.local_retention_id];
     if (item.message.kind == WireMessageKind::ACTION) {
         Usage& market{m_market_actions[item.message.header.market_id]};
         ++market.count;
@@ -444,6 +445,10 @@ void BoundedWireQueue::AccountRemove(const QueuedWireMessage& item)
     const size_t bytes{item.message.MemoryUsage()};
     --m_size;
     m_bytes -= bytes;
+    if (item.local_retention_id) {
+        const auto retained_it{m_retained_copies.find(item.local_retention_id)};
+        if (retained_it != m_retained_copies.end() && --retained_it->second == 0) m_retained_copies.erase(retained_it);
+    }
     auto peer_it{m_peer_bytes.find(item.peer)};
     if (peer_it != m_peer_bytes.end()) {
         peer_it->second -= bytes;
@@ -639,6 +644,12 @@ size_t BoundedWireQueue::MarketActionCount(const MarketId& market) const
 {
     const auto it{m_market_actions.find(market)};
     return it == m_market_actions.end() ? 0 : it->second.count;
+}
+
+size_t BoundedWireQueue::RetainedCopies(const uint64_t local_retention_id) const
+{
+    const auto it{m_retained_copies.find(local_retention_id)};
+    return it == m_retained_copies.end() ? 0 : it->second;
 }
 
 bool CatchupRequestTracker::Begin(const WirePeerId peer, const MarketId& market,

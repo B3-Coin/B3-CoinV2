@@ -559,4 +559,24 @@ BOOST_AUTO_TEST_CASE(market_hello_revision_and_targeted_catchup_expiry)
     BOOST_CHECK(tracker.Begin(8, uint256::ONE, 0, 64, 4096));
 }
 
+// A local retention token counts its queued copies through push, pop and
+// removal, so the runtime can tell an evicted copy from one still waiting.
+BOOST_AUTO_TEST_CASE(retained_copies_follow_push_pop_and_removal)
+{
+    using namespace flowmesh;
+    const auto now{WireClock::time_point{std::chrono::seconds{100}}};
+    BoundedWireQueue queue;
+    BOOST_CHECK_EQUAL(queue.RetainedCopies(7), 0U);
+    BOOST_REQUIRE(queue.Push(1, Message(WireMessageKind::ACTION), now, false, 7) == QueueResult::ACCEPTED);
+    BOOST_REQUIRE(queue.Push(1, Message(WireMessageKind::ACTION), now, true, 7) == QueueResult::ACCEPTED);
+    BOOST_REQUIRE(queue.Push(1, Message(WireMessageKind::ACTION), now) == QueueResult::ACCEPTED);
+    BOOST_CHECK_EQUAL(queue.RetainedCopies(7), 2U);
+    BOOST_CHECK_EQUAL(queue.RetainedCopies(0), 0U);
+    BOOST_REQUIRE(queue.Pop()); // FIFO within the lane: the first retained copy.
+    BOOST_CHECK_EQUAL(queue.RetainedCopies(7), 1U);
+    queue.RemovePeer(1);
+    BOOST_CHECK_EQUAL(queue.RetainedCopies(7), 0U);
+    BOOST_CHECK(queue.Empty());
+}
+
 BOOST_AUTO_TEST_SUITE_END()

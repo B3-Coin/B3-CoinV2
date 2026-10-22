@@ -135,6 +135,23 @@ public:
             runtime.m_config.clock->Now(), source.queued.counted, id) == flowmesh::QueueResult::ACCEPTED);
         runtime.m_queue.RemovePeer(FLOWMESH_LOCAL_ACTION_PEER); // priority/drop semantics: source survives
     }
+    //! Queue the accepted original without waking the worker, run one reopen
+    //! retry pass over it, and return how many copies the queue then holds.
+    static size_t RetryWithQueuedCopy(FlowMeshRuntime& runtime, uint64_t id)
+    {
+        std::lock_guard market{runtime.m_market_mutex};
+        auto& source{runtime.m_local_action_sources.at(id)};
+        {
+            std::lock_guard queue{runtime.m_queue_mutex};
+            source.admitted = true;
+            BOOST_REQUIRE(runtime.m_queue.Push(FLOWMESH_LOCAL_ACTION_PEER, source.queued.message,
+                runtime.m_config.clock->Now(), source.queued.counted, id) == flowmesh::QueueResult::ACCEPTED);
+        }
+        runtime.RetryLocalActionAdmissions(/*open=*/true, /*budget=*/8, /*reopened=*/true);
+        const size_t copies{[&] { std::lock_guard queue{runtime.m_queue_mutex}; return runtime.m_queue.RetainedCopies(id); }()};
+        runtime.NotifyTick(); // Wake the worker for the copy pushed above.
+        return copies;
+    }
     static void ExhaustTokens(FlowMeshRuntime& runtime)
     {
         std::lock_guard lock{runtime.m_market_mutex};
@@ -12101,6 +12118,29 @@ BOOST_AUTO_TEST_CASE(local_source_survives_queue_drop_and_cannot_be_claimed_by_r
     BOOST_CHECK_EQUAL(runtime.MarketStatus(f.market)->pending_actions, 0U);
     node::FlowMeshRuntimeTestAccess::ExhaustTokens(runtime);
     BOOST_CHECK_EQUAL(node::FlowMeshRuntimeTestAccess::Reserve(runtime, wire, f.domain, f.initial.ConfigId()), 0U);
+}
+
+BOOST_AUTO_TEST_CASE(local_source_retry_keeps_a_single_queue_copy)
+{
+    PreagreementRuntimeHarness f{m_args.GetDataDirBase() / "local_source_single_copy"};
+    f.block_commits = false; f.Reach(1); f.Drain();
+    auto& runtime{*f.runtimes[0]};
+    CKey key; key.MakeNewKey(true);
+    const auto action{SignedAction(key, f.domain, f.initial.ConfigId(), 0, flowmesh::ActionType::CANCEL_ASK)};
+    const flowmesh::WireMessage wire{flowmesh::WireMessageKind::ACTION,
+        {flowmesh::FLOWMESH_WIRE_VERSION_V1, f.market, f.seats.seats.epoch, 1}, *flowmesh::EncodeProductionActionPayload(action)};
+    const auto id{node::FlowMeshRuntimeTestAccess::Reserve(runtime, wire, f.domain, f.initial.ConfigId())};
+    BOOST_REQUIRE(id);
+    // A reopen pass that finds the accepted original still queued must not
+    // add a second copy: it would only hold action-pool capacity until the
+    // worker popped and dropped it as a duplicate of the settled token.
+    BOOST_CHECK_EQUAL(node::FlowMeshRuntimeTestAccess::RetryWithQueuedCopy(runtime, id), 1U);
+    f.Tick(std::chrono::milliseconds{250});
+    BOOST_REQUIRE(WaitUntil([&] { return f.AllAt(2); }));
+    f.Drain();
+    BOOST_CHECK_EQUAL(runtime.StateSnapshot(f.market)->NextSequence(action.signer), 1U);
+    BOOST_CHECK_EQUAL(node::FlowMeshRuntimeTestAccess::Sources(runtime).first, 0U);
+    BOOST_CHECK_EQUAL(runtime.PublicSubmittersForTest(f.market), 0U);
 }
 
 BOOST_AUTO_TEST_CASE(local_source_open_chain_seat_pause_preserves_retry_pacing_and_expiry)
