@@ -4993,7 +4993,13 @@ BOOST_AUTO_TEST_CASE(api_reserved_and_ordinary_health_share_exactly_once_existin
     UniValue refused;
     BOOST_REQUIRE(refused.read(fifth.body));
     BOOST_CHECK_EQUAL(refused["error"].get_str(), node::FLOWMESH_API_HEALTH_BUDGET_ERROR);
+    const auto before_close{node::FlowMeshHttpsTestAccess::AdmissionCounts(*api)[0]};
     first.NotifyClose(); second.NotifyClose();
+    // Each shutdown is noticed on the idle socket, queued and closed under
+    // an ordinary permit. While both permits do that, the reserve takes any
+    // other queued request and answers it busy, so wait until the server has
+    // dropped both owners before the ordinary requests below.
+    BOOST_REQUIRE(AwaitAdmissionForTest(*api, [&](const auto& counts) { return counts[0] + 2 <= before_close && counts[2] == 0; }));
     // All five health requests charged ONE ordinary read token each, even
     // the health-budget refusal. Exactly 23 more reach the peer-read cap28.
     const std::string markets{R"({"method":"markets","params":{}})"};
