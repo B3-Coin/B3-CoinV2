@@ -360,7 +360,8 @@ BOOST_FIXTURE_TEST_CASE(updatecoins_simulation_test, UpdateTest)
             tx.vout.resize(1);
             tx.vout[0].nValue = i; //Keep txs unique unless intended to duplicate
             tx.vout[0].scriptPubKey.assign(m_rng.rand32() & 0x3F, 0); // Random sizes so we can test memory usage accounting
-            const int height{int(m_rng.rand32() >> 1)};
+            // Any non-negative height that fits Coin::nHeight (Coin::MAX_HEIGHT).
+            const int height{int(m_rng.rand32() >> 2)};
             Coin old_coin;
 
             // 2/20 times create a new coinbase
