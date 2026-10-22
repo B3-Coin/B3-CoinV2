@@ -41,6 +41,7 @@
 #include <script/script.h>
 #include <script/solver.h>
 #include <streams.h>
+#include <test/util/legacy_pow.h>
 #include <test/util/setup_common.h>
 #include <undo.h>
 #include <uint256.h>
@@ -206,9 +207,7 @@ BOOST_AUTO_TEST_CASE(full_evolution_scenario)
             block.vtx.push_back(MakeTransactionRef(std::move(mtx)));
         }
         block.hashMerkleRoot = BlockMerkleRoot(block);
-        const arith_uint256 target{arith_uint256().SetCompact(block.nBits)};
-        block.nNonce = 0;
-        while (UintToArith256(block.GetLegacyB3Hash()) > target) ++block.nNonce;
+        block.nNonce = b3test::MineLegacyProofOfWork(block);
         return block;
     }};
 

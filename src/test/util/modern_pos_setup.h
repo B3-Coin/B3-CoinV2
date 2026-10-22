@@ -39,6 +39,7 @@
 #include <util/time.h>
 #include <validation.h>
 
+#include <test/util/legacy_pow.h>
 #include <test/util/setup_common.h>
 
 #include <boost/test/unit_test.hpp>
@@ -163,9 +164,7 @@ struct ModernPosSetup : public ChainTestingSetup {
             block.vtx.push_back(MakeTransactionRef(std::move(mtx)));
         }
         block.hashMerkleRoot = BlockMerkleRoot(block);
-        const arith_uint256 target{arith_uint256().SetCompact(block.nBits)};
-        block.nNonce = 0;
-        while (UintToArith256(block.GetLegacyB3Hash()) > target) ++block.nNonce;
+        block.nNonce = MineLegacyProofOfWork(block);
         return block;
     }
 

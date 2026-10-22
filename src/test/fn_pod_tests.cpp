@@ -28,6 +28,7 @@
 #include <script/script.h>
 #include <streams.h>
 #include <txdb.h>
+#include <test/util/legacy_pow.h>
 #include <test/util/setup_common.h>
 #include <undo.h>
 #include <uint256.h>
@@ -349,9 +350,7 @@ BOOST_FIXTURE_TEST_CASE(chain_derivation_and_determinism, PodTestSetup)
             block.vtx.push_back(MakeTransactionRef(std::move(mtx)));
         }
         block.hashMerkleRoot = BlockMerkleRoot(block);
-        const arith_uint256 target{arith_uint256().SetCompact(block.nBits)};
-        block.nNonce = 0;
-        while (UintToArith256(block.GetLegacyB3Hash()) > target) ++block.nNonce;
+        block.nNonce = b3test::MineLegacyProofOfWork(block);
         return block;
     }};
 
@@ -620,9 +619,7 @@ BOOST_FIXTURE_TEST_CASE(rollback_recovery, PodTestSetup)
         block.nBits = legacy::GetNextTargetRequired(prev, false, consensus);
         block.vtx.push_back(MakeTransactionRef(std::move(coinbase)));
         block.hashMerkleRoot = BlockMerkleRoot(block);
-        const arith_uint256 target{arith_uint256().SetCompact(block.nBits)};
-        block.nNonce = 0;
-        while (UintToArith256(block.GetLegacyB3Hash()) > target) ++block.nNonce;
+        block.nNonce = b3test::MineLegacyProofOfWork(block);
         SetMockTime(static_cast<int64_t>(block.nTime) + 600);
         DataStream bytes;
         bytes << legacy::TX_LEGACY(block);
@@ -695,9 +692,7 @@ BOOST_FIXTURE_TEST_CASE(pinned_h_rewind_and_fail_closed_sync, PodTestSetup)
             block.vtx.push_back(MakeTransactionRef(std::move(mtx)));
         }
         block.hashMerkleRoot = BlockMerkleRoot(block);
-        const arith_uint256 target{arith_uint256().SetCompact(block.nBits)};
-        block.nNonce = 0;
-        while (UintToArith256(block.GetLegacyB3Hash()) > target) ++block.nNonce;
+        block.nNonce = b3test::MineLegacyProofOfWork(block);
         SetMockTime(static_cast<int64_t>(block.nTime) + 600);
         DataStream bytes;
         bytes << legacy::TX_LEGACY(block);

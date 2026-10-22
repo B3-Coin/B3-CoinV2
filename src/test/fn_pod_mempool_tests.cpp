@@ -28,6 +28,7 @@
 #include <primitives/transaction.h>
 #include <script/script.h>
 #include <streams.h>
+#include <test/util/legacy_pow.h>
 #include <test/util/setup_common.h>
 #include <txmempool.h>
 #include <uint256.h>
@@ -152,8 +153,7 @@ BOOST_AUTO_TEST_CASE(slot_competitors_and_descendants_follow_confirmed_branch)
         block.nBits = legacy::GetNextTargetRequired(prev, false, consensus);
         block.vtx.push_back(MakeTransactionRef(std::move(coinbase)));
         block.hashMerkleRoot = BlockMerkleRoot(block);
-        const arith_uint256 target{arith_uint256().SetCompact(block.nBits)};
-        while (UintToArith256(block.GetLegacyB3Hash()) > target) ++block.nNonce;
+        block.nNonce = b3test::MineLegacyProofOfWork(block);
         return block;
     }};
 
