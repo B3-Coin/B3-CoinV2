@@ -916,9 +916,18 @@ void StakingLoop::ThreadLoop()
         const WaitResult waited{wait_until_or_tip_change(send_time_ms)};
         if (waited == WaitResult::STOPPED) return;
         if (waited == WaitResult::TIP_CHANGED) continue;
+        // A round skipped here leaves no state change behind: the next pass
+        // reranks. Log the stage so a slow assembler or a clock jump is
+        // visible rather than a silent string of "waiting" states.
+        const auto missed_window = [&](const char* stage) {
+            LogDebug(BCLog::VALIDATION,
+                     "staking: recovery round %d at height %d: tip changed or send window closed during %s; reranking\n",
+                     round, next_height, stage);
+        };
         if (!candidate_is_current() ||
             TicksSinceEpoch<std::chrono::milliseconds>(NodeClock::now()) >=
                 send_deadline_ms) {
+            missed_window("the wait for the send time");
             continue;
         }
 
@@ -940,6 +949,7 @@ void StakingLoop::ThreadLoop()
             if (block.hashPrevBlock != tip_hash || !candidate_is_current() ||
                 TicksSinceEpoch<std::chrono::milliseconds>(NodeClock::now()) >=
                     send_deadline_ms) {
+                missed_window("block assembly");
                 continue;
             }
             block.hashMerkleRoot = BlockMerkleRoot(block);
@@ -952,6 +962,7 @@ void StakingLoop::ThreadLoop()
             if (!candidate_is_current() ||
                 TicksSinceEpoch<std::chrono::milliseconds>(NodeClock::now()) >=
                     send_deadline_ms) {
+                missed_window("block signing");
                 continue;
             }
             bool new_block{false};
