@@ -411,9 +411,14 @@ BOOST_FIXTURE_TEST_CASE(regtest_staking_preserves_last_handover_carrier, Finalit
             Finality(), chainstate.m_chain, m_node.chainman->GetConsensus(),
             chainstate.FinalitySignatures()).empty());
     }
+    // The proposer's send window is five mock seconds after its round starts
+    // and the staking loop polls every 250 ms of real time. Advance the mock
+    // clock at ten times real time: a poll then covers 2.5 mock seconds, so
+    // the loop cannot wake past every window, and a Debug block assembly has
+    // half a real second inside one. 1200 steps = 1200 mock seconds = 40 rounds.
     for (int i{0}; i < 1200 && Tip()->nHeight < last_carrier + 1; ++i) {
-        UninterruptibleSleep(std::chrono::milliseconds{10});
-        SetMockTime(GetTime() + 30);
+        UninterruptibleSleep(std::chrono::milliseconds{100});
+        SetMockTime(GetTime() + 1);
     }
     const auto resumed{loop.Status(std::nullopt)};
     loop.Stop();
