@@ -222,7 +222,9 @@ BOOST_AUTO_TEST_CASE(commitment_recomputation_matches_executor_randomized)
     for (size_t i{0}; i < accounts.size(); ++i) accounts[i] = Account(static_cast<unsigned char>(0x60 + i));
     size_t cleared{0}, zero_price{0}, fees{0}, equivocations{0}, bad_sequences{0}, withdrawals{0}, deposits{0},
         state_rejections{0}, cancels{0};
-    for (size_t round{0}; round < 520; ++round) {
+    // 640 rounds: with seed 7, 520 rounds clear exactly 20 entries and the
+    // coverage checks below need strictly more.
+    for (size_t round{0}; round < 640; ++round) {
         auto state{f.State()};
         std::map<flowmesh::AccountId, uint64_t> next;
         for (const auto& account : accounts) {
