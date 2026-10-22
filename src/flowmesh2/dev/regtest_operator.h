@@ -34,6 +34,7 @@ UniValue RegtestNetworkKeyInfo(const UniValue& request);
 UniValue RegtestEvmSign(const UniValue& request);
 UniValue RegtestEvmKeygen();
 UniValue RegtestEvmKeyInfo(const UniValue& request);
+UniValue RegtestNitroLabProfile(const UniValue& request);
 
 /** One real static-roster regtest operator. Explicit modes exercise direct
  * quorum commit, fixed-view PREPARE/COMMIT, or durable view change under its

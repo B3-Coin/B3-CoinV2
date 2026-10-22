@@ -1,0 +1,25 @@
+{
+  "actual_erc20_custody": false,
+  "availability_transport": "owned-loopback-nitro-rpc",
+  "blocks": [
+    7,
+    6
+  ],
+  "exporter_is_untrusted": true,
+  "format": "b3-owned-nitro-range-export/1",
+  "image": "offchainlabs/nitro-node@sha256:948cf8c42a6ed85bc055f13866fb9a029c8234dc16c12d7ffa4ed669270aaea8",
+  "l1_settlement_verified": false,
+  "live_arbitrum_authority": false,
+  "mainnet_enabled": false,
+  "proof_bytes": 6557,
+  "proof_sha256": "e9b52f71484ab6959bbe133719f397916325ce76599e2f25b4b387b3216e4c56",
+  "receipts_per_block": [
+    2,
+    2
+  ],
+  "source": {
+    "chain_id": 412346,
+    "genesis_hash": "0x91d25fc61240927ab960347f3ede23305bcea43d9123601d6d0534df47170daa",
+    "kind": "owned-regtest"
+  }
+}

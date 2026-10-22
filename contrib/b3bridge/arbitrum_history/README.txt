@@ -150,3 +150,68 @@ Component qualification is separate from live acquisition, real-token fork
 testing and mainnet readiness. All activation flags remain false.
 
 Primary sources and exact upstream pins are in provenance.json.
+
+
+Native offline history verification (encoding B3ARPR01)
+----------------------------------------------------
+
+proof_bundle.py assembles a bounded native proof from exact hash-addressed
+raw objects. It can read this module's HistoryStore or a separately labelled
+owned-regtest object directory. Context is explicit: chain412346 development
+exports cannot be relabelled as Arbitrum One. The binary contains only
+untrusted witness bytes, never a verified flag or an authority capability.
+
+  python3 -B proof_bundle.py export-native-proof \
+    --manifest /absolute/proof-manifest.json \
+    --objects-dir /absolute/objects --output /absolute/fresh-proof.bin
+
+The native b3-bridge-arbitrumcheck tool reads the binary on standard input.
+Its expected range endpoints must be supplied separately. Hash/address
+arguments are lowercase 0x-prefixed raw bytes; heights are strict decimals.
+
+  /absolute/build/bin/b3-bridge-arbitrumcheck \
+    --previous-height <height> --previous-hash <0x32bytes> \
+    --to-height <height> --to-hash <0x32bytes> \
+    --vault <0x20bytes> < /absolute/fresh-proof.bin
+
+It reconstructs BOTH complete ordered receipt and transaction tries for every
+header, checks exact parent ancestry/range endpoints, and verifies requested
+account/storage witnesses at distinct newest/oldest state roots. Exact vault
+Deposit/Withdrawn ABI records become candidate events; their indices include
+unrelated/system/token logs. Amounts retain all 256 bits. Malformed frames,
+over-budget inputs, incomplete ranges and changed proofs refuse.
+
+This tool authenticates neither endpoint. Commitments can match a fabricated
+chain when the supplied checkpoint is fabricated. Its successful reply is
+candidate data only, not ConfirmedRange or an operator Apply/ACK capability.
+It always reports arbitrum_authority=false, execution_verified=false,
+rollup_settlement_verified=false and mainnet_enabled=false. Production
+Verifier::VerifyConfirmedRange still refuses UNREVIEWED_DEPLOYMENT. An owned
+maintained Nitro node is the explicit local trust root in the separate lab.
+
+Build with the existing bridge tools/test build options, then qualify the
+actual executable against the retained genuine Nitro two-block fixture:
+
+  python3 -B contrib/b3bridge/arbitrum_history/test_native_proof_cli.py \
+    --native /absolute/build/bin/b3-bridge-arbitrumcheck \
+    --fixture /absolute/source/src/test/data/nitro_history_v1 \
+    --evidence-dir /absolute/fresh-evidence-outside-source
+
+The Linux process qualification creates a distinct disconnected network
+namespace and requires IPv4/IPv6 TCP/UDP denial before and after execution.
+It verifies exact deposit/payout records, both historical storage values,
+absence and deterministic replay; re-encoded header/transaction/receipt
+changes, event omission and state-proof swaps must fail. Fixture and tool
+hashes are bound before/after. It has no live-provider fallback or skip mode.
+
+Additional Python codec/object-boundary tests:
+  python3 -B -m unittest -v test_proof_bundle
+Native suites in test_bitcoin:
+  bridge_arbitrum_source_tests, bridge_arbitrum_proof_codec_tests,
+  bridge_arbitrum_history_tests
+
+The fixture's Solidity emitter deliberately has no ERC20 custody. Actual
+USDT0-bytecode custody/trading is a separate owned-Nitro lab under
+contrib/flowmesh2/nitro_regtest/ with its own encoding5 profile. Neither local
+test enables Arbitrum One, authenticates a live L1 assertion, proves current
+data availability, or qualifies permissionless exits.

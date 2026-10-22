@@ -55,6 +55,17 @@ void CheckCode(const Result<void>& result, ErrorCode expected, std::string_view 
 
 //! One mutation per ProfileParams field. field_count_matches_struct below
 //! fails to compile if a field is added without a mutation here.
+NitroLabBinding LabBinding()
+{
+    NitroLabBinding binding;
+    binding.source_genesis_hash.data()[0] = 0x11;
+    binding.quote_token.fill(0x22);
+    binding.quote_token_code_hash.data()[0] = 0x33;
+    binding.quote_implementation.fill(0x44);
+    binding.quote_implementation_code_hash.data()[0] = 0x55;
+    return binding;
+}
+
 std::vector<std::pair<std::string, std::function<void(ProfileParams&)>>> FieldMutations()
 {
     return {
@@ -86,11 +97,12 @@ std::vector<std::pair<std::string, std::function<void(ProfileParams&)>>> FieldMu
         {"source_range_commitment", [](ProfileParams& p) { p.source_range_commitment = true; }},
         {"source_chain_id", [](ProfileParams& p) { p.source_chain_id = 31337; }},
         {"source_confirmations", [](ProfileParams& p) { p.source_confirmations = 2; }},
+        {"nitro_lab", [](ProfileParams& p) { p.nitro_lab = LabBinding(); }},
     };
 }
 
 constexpr size_t LEGACY_PROFILE_FIELDS{21};
-constexpr size_t PROFILE_FIELDS{28};
+constexpr size_t PROFILE_FIELDS{29};
 
 std::string ReadFile(const std::filesystem::path& path)
 {
@@ -109,9 +121,9 @@ BOOST_AUTO_TEST_CASE(field_count_matches_struct)
     // removing a ProfileParams field breaks this line until FieldMutations,
     // EncodeProfile, the JSON file and PROFILE_FIELDS are updated with it.
     const ProfileParams p{Dev()};
-    const auto& [f1, f2, f3, f4, f5, f6, f7, f8, f9, f10, f11, f12, f13, f14, f15, f16, f17, f18, f19, f20, f21, f22, f23, f24, f25, f26, f27, f28] = p;
+    const auto& [f1, f2, f3, f4, f5, f6, f7, f8, f9, f10, f11, f12, f13, f14, f15, f16, f17, f18, f19, f20, f21, f22, f23, f24, f25, f26, f27, f28, f29] = p;
     (void)f1, (void)f2, (void)f3, (void)f4, (void)f5, (void)f6, (void)f7, (void)f8, (void)f9, (void)f10, (void)f11;
-    (void)f12, (void)f13, (void)f14, (void)f15, (void)f16, (void)f17, (void)f18, (void)f19, (void)f20, (void)f21, (void)f22, (void)f23, (void)f24, (void)f25, (void)f26, (void)f27, (void)f28;
+    (void)f12, (void)f13, (void)f14, (void)f15, (void)f16, (void)f17, (void)f18, (void)f19, (void)f20, (void)f21, (void)f22, (void)f23, (void)f24, (void)f25, (void)f26, (void)f27, (void)f28, (void)f29;
     BOOST_CHECK_EQUAL(FieldMutations().size(), PROFILE_FIELDS);
 }
 
@@ -523,6 +535,89 @@ BOOST_AUTO_TEST_CASE(stable_q_network_profile_json_matches_code)
     BOOST_CHECK_EQUAL(json["source_chain_id"].getInt<uint64_t>(), profile.source_chain_id);
     BOOST_CHECK_EQUAL(json["source_confirmations"].getInt<uint32_t>(), profile.source_confirmations);
     BOOST_CHECK(!json["mainnet_valid"].get_bool());
+}
+
+BOOST_AUTO_TEST_CASE(nitro_lab_profile_binds_local_usdt0_and_preserves_archives)
+{
+    const auto binding{LabBinding()};
+    const auto profile{NitroLabRegtestProfile(ChainType::REGTEST, binding)};
+    BOOST_REQUIRE(profile.has_value());
+    BOOST_CHECK_EQUAL(profile->profile_id, NITRO_LAB_PROFILE_ID);
+    BOOST_CHECK_EQUAL(EncodeProfile(*profile).front(), 5U);
+    BOOST_CHECK(profile->stable_fee_asset == NitroLabQuoteAsset(binding));
+    BOOST_CHECK(profile->stable_fee_asset != RegtestQuoteAsset());
+    BOOST_CHECK(profile->nitro_lab == binding);
+    BOOST_CHECK(profile->withdrawals_enabled && profile->source_range_commitment && !profile->view_bound_commits);
+    BOOST_CHECK_EQUAL(profile->source_chain_id, 412346U);
+    BOOST_CHECK_EQUAL(profile->source_confirmations, 1U);
+    BOOST_CHECK(Validate(*profile).has_value());
+    // These fixed old hashes/JSON vectors retain their original encodings.
+    BOOST_CHECK_EQUAL(Hex(ProfileHash(StableQRegtestProfile(ChainType::REGTEST).value())), "5cc396e7254c54c792e2dfa33666268fb6cd9f73b41e6bdca648f054f3ae94ad");
+    BOOST_CHECK_EQUAL(Hex(ProfileHash(StableQViewRegtestProfile(ChainType::REGTEST).value())), "c1e76cd5d1d4b8e1a2c510ea964c9d2ff73a954370d6cb0c0985b1357cd930fc");
+    for (const auto& [factory, file] : std::vector<std::pair<ProfileParams, std::string>>{
+             {Dev(), "PROFILE_DEX1_REGTEST.json"},
+             {StableQRegtestProfile(ChainType::REGTEST).value(), "PROFILE_STABLE_Q_REGTEST.json"},
+             {StableQViewRegtestProfile(ChainType::REGTEST).value(), "PROFILE_STABLE_Q_VIEW_REGTEST.json"},
+             {StableQNetworkRegtestProfile(ChainType::REGTEST).value(), "PROFILE_STABLE_Q_NETWORK_REGTEST.json"}}) {
+        UniValue json;
+        BOOST_REQUIRE(json.read(ReadFile(std::filesystem::path{FM2_SOURCE_ROOT} / "src" / "flowmesh2" / file)));
+        BOOST_CHECK_EQUAL(Hex(ProfileHash(factory)), json["profile_hash"].get_str());
+        if (json.exists("encoded_profile")) BOOST_CHECK_EQUAL(HexStr(EncodeProfile(factory)), json["encoded_profile"].get_str());
+        BOOST_CHECK(!factory.nitro_lab);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(nitro_lab_profile_refuses_live_networks_and_invalid_pins)
+{
+    for (const auto chain : {ChainType::MAIN, ChainType::TESTNET, ChainType::TESTNET4, ChainType::SIGNET}) {
+        const auto rejected{NitroLabRegtestProfile(chain, LabBinding())};
+        BOOST_REQUIRE(!rejected.has_value()); BOOST_CHECK(rejected.error().code == ErrorCode::UNSUPPORTED_NETWORK);
+    }
+    for (const auto& mutate : std::vector<std::function<void(NitroLabBinding&)>>{
+             [](auto& b) { b.source_genesis_hash.SetNull(); }, [](auto& b) { b.quote_token.fill(0); },
+             [](auto& b) { b.quote_token_code_hash.SetNull(); }, [](auto& b) { b.quote_implementation.fill(0); },
+             [](auto& b) { b.quote_implementation_code_hash.SetNull(); }, [](auto& b) { b.quote_implementation = b.quote_token; }}) {
+        auto binding{LabBinding()}; mutate(binding);
+        BOOST_CHECK(!NitroLabRegtestProfile(ChainType::REGTEST, binding).has_value());
+    }
+    const auto profile{NitroLabRegtestProfile(ChainType::REGTEST, LabBinding()).value()};
+    for (const auto& mutate : std::vector<std::function<void(ProfileParams&)>>{
+             [](auto& p) { p.source_chain_id = 42161; }, [](auto& p) { p.source_chain_id = 31337; },
+             [](auto& p) { p.source_confirmations = 0; }, [](auto& p) { p.source_confirmations = 2; },
+             [](auto& p) { p.source_range_commitment = false; }, [](auto& p) { p.withdrawals_enabled = false; },
+             [](auto& p) { p.view_bound_commits = true; }, [](auto& p) { p.nitro_lab.reset(); },
+             [](auto& p) { p.stable_fee_asset = RegtestQuoteAsset(); }}) {
+        auto wrong{profile}; mutate(wrong); CheckCode(Validate(wrong), ErrorCode::INVALID_INPUT);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(nitro_lab_quote_and_profile_commit_every_identity_pin)
+{
+    const auto original{NitroLabRegtestProfile(ChainType::REGTEST, LabBinding()).value()};
+    for (const auto& mutate : std::vector<std::function<void(NitroLabBinding&)>>{
+             [](auto& b) { b.source_genesis_hash.data()[0] ^= 1; }, [](auto& b) { b.quote_token[0] ^= 1; },
+             [](auto& b) { b.quote_token_code_hash.data()[0] ^= 1; }, [](auto& b) { b.quote_implementation[0] ^= 1; },
+             [](auto& b) { b.quote_implementation_code_hash.data()[0] ^= 1; }}) {
+        auto binding{LabBinding()}; mutate(binding);
+        auto stale{original}; stale.nitro_lab = binding;
+        CheckCode(Validate(stale), ErrorCode::INVALID_INPUT);
+        const auto changed{NitroLabRegtestProfile(ChainType::REGTEST, binding)};
+        BOOST_REQUIRE(changed.has_value());
+        BOOST_CHECK(changed->stable_fee_asset != original.stable_fee_asset);
+        BOOST_CHECK(ProfileHash(*changed) != ProfileHash(original));
+    }
+}
+
+BOOST_AUTO_TEST_CASE(nitro_lab_bindings_cannot_reinterpret_any_old_profile)
+{
+    for (auto profile : {Dev(), StableQRegtestProfile(ChainType::REGTEST).value(),
+                         StableQViewRegtestProfile(ChainType::REGTEST).value(), StableQNetworkRegtestProfile(ChainType::REGTEST).value()}) {
+        const auto original{EncodeProfile(profile)};
+        profile.nitro_lab = LabBinding();
+        CheckCode(Validate(profile), ErrorCode::INVALID_INPUT);
+        BOOST_CHECK_EQUAL(EncodeProfile(profile).front(), 5U);
+        BOOST_CHECK(EncodeProfile(profile) != original);
+    }
 }
 
 BOOST_AUTO_TEST_SUITE_END()

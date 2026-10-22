@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Qualify offline proof components; never activate an Arbitrum source.
 
-The native suite uses synthetic adversarial confirmed-proof fixtures inside a
-fresh, disconnected Linux network namespace. Raw history transport tests have
-their own scope. Neither result makes an RPC-seeded token fork RPC-independent.
+All three native proof/codec/history suites run inside a fresh disconnected
+Linux network namespace. Raw history transport/codec tests have their own
+scope. The genuine dev-chain CLI process checker is a separate acceptance
+command. None grants an Arbitrum One source authority or live activation.
 """
 import argparse
 import errno
@@ -22,10 +23,14 @@ import xml.etree.ElementTree as ET
 
 FORMAT = 'b3-arbitrum-history-component-qualification/1'
 NATIVE_SUITE = 'bridge_arbitrum_source_tests'
+NATIVE_COUNTS = {'bridge_arbitrum_source_tests': 18,
+                 'bridge_arbitrum_proof_codec_tests': 20,
+                 'bridge_arbitrum_history_tests': 13}
+NATIVE_SOURCES = {name: 'src/test/' + name + '.cpp' for name in NATIVE_COUNTS}
 PYTHON_MODULES = ('test_history_store', 'test_history_transport', 'test_feed_history', 'test_node_preflight',
-                  'test_qualification')
+                  'test_qualification', 'test_proof_bundle')
 PYTHON_COUNTS = {'test_history_store': 18, 'test_history_transport': 19, 'test_feed_history': 9,
-                 'test_node_preflight': 10, 'test_qualification': 13}
+                 'test_node_preflight': 10, 'test_qualification': 13, 'test_proof_bundle': 27}
 MAX_REPORT_BYTES = 8 * 1024 * 1024
 MAX_LOG_BYTES = 32 * 1024 * 1024
 MAX_EMPTY_ROUTE_BYTES = 1024
@@ -100,17 +105,22 @@ def source_inventory(root):
     return {'files': entries, 'sha256': hashlib.sha256(canonical(entries).encode()).hexdigest()}
 
 
-def native_inventory(source):
+def native_inventory(source, selected_suite=NATIVE_SUITE):
     text = read_bounded(source).decode('utf-8')
     suites = re.findall(r'BOOST_(?:AUTO|FIXTURE)_TEST_SUITE\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)', text)
     cases = re.findall(r'BOOST_(?:AUTO|FIXTURE)_TEST_CASE\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)', text)
-    if suites != [NATIVE_SUITE] or not cases or len(set(cases)) != len(cases):
+    if (selected_suite not in NATIVE_COUNTS or suites != [selected_suite]
+            or not cases or len(set(cases)) != len(cases)):
         raise QualificationError('native source has an empty/ambiguous suite inventory')
     return frozenset(cases)
 
 
 def validate_native_xml(raw, expected):
-    if not expected or len(raw) > MAX_REPORT_BYTES or b'<!DOCTYPE' in raw or b'<!ENTITY' in raw:
+    if (not isinstance(expected, dict) or set(expected) != set(NATIVE_COUNTS)
+            or any(not isinstance(cases, (set, frozenset)) or len(cases) != NATIVE_COUNTS[name]
+                   or any(not isinstance(case, str) or not re.fullmatch('[A-Za-z_][A-Za-z0-9_]*', case)
+                          for case in cases) for name, cases in expected.items())
+            or len(raw) > MAX_REPORT_BYTES or b'<!DOCTYPE' in raw or b'<!ENTITY' in raw):
         raise QualificationError('native report is empty, unbounded or has external declarations')
     try:
         document = ET.fromstring(raw)
@@ -119,29 +129,38 @@ def validate_native_xml(raw, expected):
     masters = document.findall('TestSuite')
     if document.tag != 'TestResult' or len(masters) != 1 or masters[0].get('result') != 'passed':
         raise QualificationError('native master result is absent or failed')
-    selected = [item for item in document.iter('TestSuite') if item.get('name') == NATIVE_SUITE]
-    if len(selected) != 1:
-        raise QualificationError('native selected suite is absent or duplicated')
-    suite = selected[0]
-    cases = list(suite.iter('TestCase'))
-    names = [item.get('name') for item in cases]
-    if not names or len(set(names)) != len(names) or set(names) != set(expected):
-        raise QualificationError('native executed inventory differs from pinned source')
-    if suite.get('test_cases_passed') != str(len(expected)):
-        raise QualificationError('native successful case count differs from inventory')
-    for key in ('test_cases_passed_with_warnings', 'test_cases_failed', 'test_cases_skipped',
-                'test_cases_aborted', 'test_cases_timed_out', 'test_suites_timed_out'):
-        if suite.get(key) != '0':
-            raise QualificationError('native suite has skipped, failed or ambiguous counters')
-    for row in [masters[0], *suite.iter()]:
+    selected, summaries, all_cases, qualified_names = [], {}, [], []
+    for name in NATIVE_COUNTS:
+        suites = [item for item in document.iter('TestSuite') if item.get('name') == name]
+        if len(suites) != 1:
+            raise QualificationError('native selected suite is absent or duplicated')
+        suite = suites[0]
+        cases = list(suite.iter('TestCase'))
+        names = [item.get('name') for item in cases]
+        if (not names or len(set(names)) != len(names) or set(names) != expected[name]
+                or list(suite) != cases):
+            raise QualificationError('native executed inventory differs from pinned source')
+        if suite.get('test_cases_passed') != str(len(expected[name])):
+            raise QualificationError('native successful case count differs from inventory')
+        for key in ('test_cases_passed_with_warnings', 'test_cases_failed', 'test_cases_skipped',
+                    'test_cases_aborted', 'test_cases_timed_out', 'test_suites_timed_out'):
+            if suite.get(key) != '0':
+                raise QualificationError('native suite has skipped, failed or ambiguous counters')
+        summaries[name] = {'suite': name, 'tests_passed': len(cases), 'tests_skipped': 0,
+                           'cases': sorted(names)}
+        selected.extend([suite, *cases])
+        all_cases.extend(cases)
+        qualified_names.extend(name + '.' + case for case in sorted(names))
+    for row in [masters[0], *selected]:
         if row.tag not in ('TestSuite', 'TestCase') or row.get('result') != 'passed':
             raise QualificationError('native selected case/suite did not pass')
         if any(row.get(key) != '0' for key in ('assertions_failed', 'warnings_failed', 'expected_failures')):
             raise QualificationError('native report contains failed or ambiguous assertions')
-    if any(row.get('result') != 'skipped' for row in document.iter('TestCase') if row not in cases):
+    if any(row.get('result') != 'skipped' for row in document.iter('TestCase') if row not in all_cases):
         raise QualificationError('native unselected tests executed outside exact filter')
-    return {'suite': NATIVE_SUITE, 'tests_passed': len(cases), 'tests_skipped': 0,
-            'cases': sorted(names), 'xml_sha256': hashlib.sha256(raw).hexdigest()}
+    return {'suite_names': list(NATIVE_COUNTS), 'suites': summaries,
+            'tests_passed': len(all_cases), 'tests_skipped': 0,
+            'cases': qualified_names, 'xml_sha256': hashlib.sha256(raw).hexdigest()}
 
 
 def validate_python_receipt(value):
@@ -293,7 +312,7 @@ def qualify(args):
              'unshare': Path(args.unshare).resolve(strict=True)}
     before_tools = {key: file_hash(value) for key, value in tools.items()}
     before_source = source_inventory(source)
-    expected = native_inventory(source / 'src/test/bridge_arbitrum_source_tests.cpp')
+    expected = {name: native_inventory(source / path, name) for name, path in NATIVE_SOURCES.items()}
     home = evidence / 'home'
     home.mkdir(mode=0o700)
     environment = clean_environment(home)
@@ -322,15 +341,19 @@ def qualify(args):
         'live_history_acquisition_qualified': False, 'production_activation': False,
         'source_sha256': before_source['sha256'], 'source_files': before_source['files'], 'tool_sha256': before_tools,
         'source_scope': ['src/', 'contrib/b3bridge/arbitrum_history/'],
-        'python_history_tests': python_result, 'native_confirmed_proof_tests': native_result,
+        'python_history_tests': python_result,
+        'native_confirmed_proof_tests': {**native_result['suites'][NATIVE_SUITE],
+                                       'xml_sha256': native_result['xml_sha256']},
+        'native_component_tests': native_result, 'native_tests_by_suite': NATIVE_COUNTS,
         'python_tests_by_module': PYTHON_COUNTS,
         'native_network_namespace': namespace_result,
-        'scope': 'Synthetic adversarial native confirmed-proof fixtures without network access; raw-object history transport tests separately scoped',
+        'scope': 'All native confirmed-proof, binary-codec and offline-history suites without network access; raw-object history transport/codec tests separately scoped',
         'rpc_seeded_usdt0_fork_is_rpc_free': False,
         'limitations': ['Compiled deployment registry and operator source activation remain separately gated',
             'CAS hashes and peer provenance do not establish chain authority',
             'No maintained Nitro replay, complete live Arbitrum history availability or fast sequencer finality is qualified',
             'Synthetic fixtures bind complete transaction bodies and receipt indices to their roots; live authenticated transaction identity and native operator fact handoff remain unqualified',
+            'Offline history commitments require a separately authenticated L2 checkpoint and cannot grant source authority; the genuine local Nitro CLI process suite is a separate command',
             'The independent real-token fork uses RPC-derived state and retains its separate provider finality policy'],
         'artifact_sha256': {name: file_hash(evidence / name) for name in
             ('python-results.json', 'python-tests-private.log', 'native-results.xml',
@@ -346,7 +369,7 @@ def main(argv=None):
         return 0
     if argv[:1] == ['--child-native'] and len(argv) == 5:
         namespace = disconnected_namespace(argv[1])
-        command = [argv[3], '--run_test=' + NATIVE_SUITE, '--report_format=XML', '--report_level=detailed',
+        command = [argv[3], '--run_test=' + ','.join(NATIVE_COUNTS), '--report_format=XML', '--report_level=detailed',
                    '--report_sink=' + argv[4], '--log_level=test_suite']
         result = subprocess.run(command, stdin=subprocess.DEVNULL, close_fds=True)
         if result.returncode != 0:

@@ -53,6 +53,7 @@ int main(int argc, char**)
             else if (cmd == "evm_sign") result = RegtestEvmSign(request);
             else if (cmd == "evm_keygen") result = RegtestEvmKeygen();
             else if (cmd == "evm_key_info") result = RegtestEvmKeyInfo(request);
+            else if (cmd == "nitro_lab_profile") result = RegtestNitroLabProfile(request);
             else if (cmd == "open") {
                 if (worker) throw OperatorFailure{ErrorCode::ORDER_VIOLATION, "operator already opened"};
                 worker = RegtestOperator::Open(request["config"]);

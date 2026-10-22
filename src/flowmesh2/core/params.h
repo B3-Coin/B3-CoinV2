@@ -50,6 +50,10 @@ inline constexpr std::string_view STABLE_Q_VIEW_PROFILE_ID{"fm2-regtest-stable-q
 //! Encoding 4 commits every observed source range, including empty event batches.
 inline constexpr uint8_t STABLE_Q_NETWORK_PROFILE_ENCODING_VERSION{4};
 inline constexpr std::string_view STABLE_Q_NETWORK_PROFILE_ID{"fm2-regtest-stable-q/3"};
+//! Owned Nitro development deployment; never an Arbitrum One asset/profile.
+inline constexpr uint8_t NITRO_LAB_PROFILE_ENCODING_VERSION{5};
+inline constexpr std::string_view NITRO_LAB_PROFILE_ID{"fm2-owned-nitro-usdt0-lab/1"};
+inline constexpr uint64_t NITRO_LAB_CHAIN_ID{412346};
 //! Longest accepted profile_id, in bytes.
 inline constexpr size_t MAX_PROFILE_ID_BYTES{64};
 
@@ -83,6 +87,17 @@ enum class FeeIncidence : uint8_t {
 enum class SignerMode : uint8_t {
     STRICT_SIGNING = 1, //!< intent barrier, sign, signed-vote barrier, send (DUR-1)
     FOLDED_SIGNING = 2, //!< sign, then one barrier; Validate refuses it (M4-STO-05, D15)
+};
+
+/** Exact locally deployed USDT0 identity. These are committed lab pins, not
+ * verified Arbitrum One governance or a native source-proof capability. */
+struct NitroLabBinding {
+    uint256 source_genesis_hash;
+    std::array<unsigned char, 20> quote_token{};
+    uint256 quote_token_code_hash;
+    std::array<unsigned char, 20> quote_implementation{};
+    uint256 quote_implementation_code_hash;
+    friend bool operator==(const NitroLabBinding&, const NitroLabBinding&) = default;
 };
 
 /** The engine profile: every rule parameter of FlowMesh V2 that is not part of
@@ -132,6 +147,7 @@ struct ProfileParams {
     bool source_range_commitment{false}; //!< encoding 4: exactly one terminal SourceRangeFact per slot
     uint64_t source_chain_id{0};           //!< /3 pins isolated EVM31337; legacy profiles require zero
     uint32_t source_confirmations{0};      //!< /3 pins two regtest confirmations; no production finality claim
+    std::optional<NitroLabBinding> nitro_lab; //!< encoding 5 only; isolated chain412346 quote/deployment pins
 
     friend bool operator==(const ProfileParams&, const ProfileParams&) = default;
 };
@@ -159,6 +175,12 @@ Result<ProfileParams> StableQViewRegtestProfile(ChainType chain);
 //! Authenticated-network prerelease profile: /2 rules plus a committed exact source range.
 //! Every earlier profile/signature/journal keeps its original encoding and rules.
 Result<ProfileParams> StableQNetworkRegtestProfile(ChainType chain);
+
+//! Distinct quote ID derived from every exact owned-Nitro binding field.
+AssetId NitroLabQuoteAsset(const NitroLabBinding& binding);
+//! B3 REGTEST, direct certificate v2, source412346 and one local L2 successor.
+//! No Ethereum finality, rollup settlement or live-asset activation is implied.
+Result<ProfileParams> NitroLabRegtestProfile(ChainType chain, const NitroLabBinding& binding);
 
 /** Checks a profile, in this order:
  * 1. chain is not REGTEST: UNSUPPORTED_NETWORK;

@@ -105,6 +105,32 @@ uint256 JsonHash(const UniValue& object, const std::string& key)
     std::copy(bytes.begin(), bytes.end(), value.begin());
     return value;
 }
+NitroLabBinding ReadNitroLab(const UniValue& value)
+{
+    const std::set<std::string> expected{"source_chain_id", "source_genesis_hash", "quote_token", "quote_token_code_hash",
+                                         "quote_implementation", "quote_implementation_code_hash"};
+    Need(value.isObject() && value.size() == expected.size(), "exact owned Nitro lab binding required");
+    const auto& keys{value.getKeys()};
+    Need(std::set<std::string>{keys.begin(), keys.end()} == expected, "unknown/duplicate owned Nitro lab binding field");
+    Need(Number<uint64_t>(value, "source_chain_id") == NITRO_LAB_CHAIN_ID, "owned Nitro lab source must be chain412346");
+    NitroLabBinding out;
+    out.source_genesis_hash = JsonHash(value, "source_genesis_hash");
+    const auto token{Hex(value, "quote_token", 20, 20)}, implementation{Hex(value, "quote_implementation", 20, 20)};
+    std::copy(token.begin(), token.end(), out.quote_token.begin());
+    std::copy(implementation.begin(), implementation.end(), out.quote_implementation.begin());
+    out.quote_token_code_hash = JsonHash(value, "quote_token_code_hash");
+    out.quote_implementation_code_hash = JsonHash(value, "quote_implementation_code_hash");
+    return out;
+}
+UniValue NitroLabJson(const NitroLabBinding& value)
+{
+    UniValue out{UniValue::VOBJ};
+    out.pushKV("source_chain_id", NITRO_LAB_CHAIN_ID); out.pushKV("source_genesis_hash", HexStr(value.source_genesis_hash));
+    out.pushKV("quote_token", HexStr(value.quote_token)); out.pushKV("quote_token_code_hash", HexStr(value.quote_token_code_hash));
+    out.pushKV("quote_implementation", HexStr(value.quote_implementation));
+    out.pushKV("quote_implementation_code_hash", HexStr(value.quote_implementation_code_hash));
+    return out;
+}
 FactCursor Cursor(const UniValue& value)
 {
     return FactCursor{Number<uint32_t>(value, "height"), Number<uint32_t>(value, "index")};
@@ -189,6 +215,17 @@ std::vector<Bytes> Frames(const UniValue& array, size_t count_cap, size_t byte_c
 }
 } // namespace
 
+UniValue RegtestNitroLabProfile(const UniValue& request)
+{
+    const auto profile{Must(NitroLabRegtestProfile(ChainType::REGTEST, ReadNitroLab(request["nitro_lab"])))};
+    UniValue out{UniValue::VOBJ};
+    out.pushKV("profile_name", profile.profile_id); out.pushKV("profile_hash", HexStr(ProfileHash(profile)));
+    out.pushKV("encoding", NITRO_LAB_PROFILE_ENCODING_VERSION); out.pushKV("quote_asset", HexStr(profile.stable_fee_asset->id));
+    out.pushKV("encoded_profile", HexStr(EncodeProfile(profile))); out.pushKV("nitro_lab", NitroLabJson(*profile.nitro_lab));
+    out.pushKV("lab_only", true); out.pushKV("mainnet_enabled", false); out.pushKV("rollup_settlement_verified", false);
+    return out;
+}
+
 UniValue RegtestKeyInfo(const UniValue& request)
 {
     const auto key{bls::SecretKey::FromIKM(Hex(request, "ikm", 64, 32))};
@@ -206,8 +243,11 @@ UniValue RegtestClientAction(const UniValue& request)
     action.nonce = Number<uint64_t>(request, "nonce"); action.ref_slot = Number<uint64_t>(request, "ref_slot");
     action.max_delay = request.exists("max_delay") ? Number<uint16_t>(request, "max_delay") : 32;
     const auto profile_name{request.exists("profile_name") ? Text(request, "profile_name") : std::string{STABLE_Q_PROFILE_ID}};
-    Need(profile_name == STABLE_Q_PROFILE_ID || profile_name == STABLE_Q_VIEW_PROFILE_ID || profile_name == STABLE_Q_NETWORK_PROFILE_ID, "unknown client helper profile");
-    const auto profile{Must(profile_name == STABLE_Q_NETWORK_PROFILE_ID ? StableQNetworkRegtestProfile(ChainType::REGTEST) :
+    Need(profile_name == STABLE_Q_PROFILE_ID || profile_name == STABLE_Q_VIEW_PROFILE_ID || profile_name == STABLE_Q_NETWORK_PROFILE_ID ||
+         profile_name == NITRO_LAB_PROFILE_ID, "unknown client helper profile");
+    Need(profile_name == NITRO_LAB_PROFILE_ID || !request.exists("nitro_lab"), "lab binding cannot reinterpret an old client profile");
+    const auto profile{Must(profile_name == NITRO_LAB_PROFILE_ID ? NitroLabRegtestProfile(ChainType::REGTEST, ReadNitroLab(request["nitro_lab"])) :
+        profile_name == STABLE_Q_NETWORK_PROFILE_ID ? StableQNetworkRegtestProfile(ChainType::REGTEST) :
         profile_name == STABLE_Q_VIEW_PROFILE_ID ? StableQViewRegtestProfile(ChainType::REGTEST) : StableQRegtestProfile(ChainType::REGTEST))};
     Need(!action.domain.IsNull() && action.MaxDelayValid(profile), "invalid action domain/window");
     const UniValue& p{request["payload"]};
@@ -300,6 +340,7 @@ struct RegtestOperator::Impl {
     std::optional<SlotHeaderV2> pbft_header;
     std::map<storage::ProposalKey, uint256> accepted_headers;
     bool network_mode{false};
+    bool nitro_lab_mode{false};
     std::optional<CKey> network_key;
     UniValue network_manifest;
     std::unique_ptr<net::SeatMesh> mesh;
@@ -404,7 +445,16 @@ struct RegtestOperator::Impl {
         UniValue deployment_json;
         Need(deployment_json.read(std::string{deployment.begin(), deployment.end()}) && deployment_json.isObject(), "deployment identity must encode an exact JSON object");
         network_mode = deployment_json.exists("transport");
-        if (pbft_view_change) profile = Must(network_mode ? StableQNetworkRegtestProfile(ChainType::REGTEST) : StableQViewRegtestProfile(ChainType::REGTEST));
+        nitro_lab_mode = config.exists("nitro_lab");
+        Need(nitro_lab_mode == deployment_json.exists("nitro_lab"), "lab config and deployment binding must both be explicit");
+        if (nitro_lab_mode) {
+            Need(!network_mode && !pbft_mode, "owned Nitro lab uses its explicit direct four-worker fixture mode");
+            const auto binding{ReadNitroLab(config["nitro_lab"])};
+            Need(binding == ReadNitroLab(deployment_json["nitro_lab"]), "configured and deployed Nitro lab identity differ");
+            profile = Must(NitroLabRegtestProfile(ChainType::REGTEST, binding));
+            q = *profile.stable_fee_asset;
+            markets = {{a, q, 1'000'000, 10'000}, {b, q, 1'000'000, 10'000}};
+        } else if (pbft_view_change) profile = Must(network_mode ? StableQNetworkRegtestProfile(ChainType::REGTEST) : StableQViewRegtestProfile(ChainType::REGTEST));
         seat = Number<uint32_t>(config, "seat"); Need(seat < 4, "seat outside static four-seat roster");
         signer_instance = Number<uint64_t>(config, "signer_instance"); commit_instance = Number<uint64_t>(config, "commit_instance");
         Need(signer_instance != 0 && commit_instance != 0, "journal instances must be explicit and nonzero");
@@ -425,9 +475,11 @@ struct RegtestOperator::Impl {
         }
         seats = Must(SeatSet::FromPoP(registrations));
         Need(seats->Size() == 4 && seats->Quorum() == 3 && own_key->GetPublicKey() == seats->Keys()[seat].Key(), "local key does not match fixed quorum roster");
-        Need(Text(deployment_json, "format") == "fm2-regtest-deployment/1" &&
-             Number<uint64_t>(deployment_json, "chain_id") == 31337 &&
+        Need(Text(deployment_json, "format") == (nitro_lab_mode ? "fm2-owned-nitro-lab-deployment/1" : "fm2-regtest-deployment/1") &&
+             Number<uint64_t>(deployment_json, "chain_id") == (nitro_lab_mode ? NITRO_LAB_CHAIN_ID : uint64_t{31337}) &&
              Text(deployment_json, "profile_name") == profile.profile_id, "deployment must be the exact local regtest profile/chain");
+        if (nitro_lab_mode) Need(deployment_json["mainnet_enabled"].isBool() && !deployment_json["mainnet_enabled"].get_bool(),
+                                 "owned Nitro lab deployment must explicitly keep mainnet disabled");
         if (pbft_view_change) Need(Text(deployment_json, "agreement") == mode, "deployment does not opt into view-change mode");
         if (network_mode) {
             Need(pbft_view_change && Text(deployment_json["transport"], "format") == "fm2-seat-tcp/1",
@@ -442,7 +494,7 @@ struct RegtestOperator::Impl {
                  "private transport key differs from the pinned seat identity");
         } else Need(!config.exists("network_identity"), "legacy deployment cannot use a transport key");
         const UniValue& routes{deployment_json["routes"]};
-        Need(routes.isObject() && routes.size() == 3, "deployment needs exactly Q/TOKENA/TOKENB synthetic custody routes");
+        Need(routes.isObject() && routes.size() == 3, "deployment needs exactly Q/TOKENA/TOKENB custody routes");
         for (const auto& [name, asset] : std::vector<std::pair<std::string, AssetId>>{{"Q", q}, {"TOKENA", a}, {"TOKENB", b}}) {
             Need(AssetId{JsonHash(routes[name], "custody_asset")} == asset, "deployment custody asset differs from fixed market registry");
         }
@@ -458,7 +510,8 @@ struct RegtestOperator::Impl {
         const FactCursor start{Cursor(config["facts_start"])};
         Need(start.height >= anchor.height && uint64_t{start.height} <= uint64_t{anchor.height} + 1, "genesis fact cursor outside anchor boundary");
         Bytes domain_bytes;
-        VectorWriter{domain_bytes, 0, std::string{"fm2-regtest/operator/v1"}, deployment, ProfileHash(profile), seats->Root(), markets, anchor, start};
+        VectorWriter{domain_bytes, 0, std::string{nitro_lab_mode ? "fm2-owned-nitro-lab/operator/v1" : "fm2-regtest/operator/v1"},
+                     deployment, ProfileHash(profile), seats->Root(), markets, anchor, start};
         domain = Tagged(HashTag::NET_DOMAIN, domain_bytes);
         authority = AuthorityVersion{0, seats->Root(), ProfileHash(profile)};
         genesis = Must(state::GenesisHead(profile, markets, domain, authority, anchor, start));
@@ -1087,6 +1140,10 @@ struct RegtestOperator::Impl {
         out.pushKV("signer_seq", signer_journal->DurableSeq()); out.pushKV("commit_seq", commit_journal->DurableSeq());
         if (pbft_view_change) out.pushKV("control_seq", control_journal->DurableSeq());
         out.pushKV("profile_name", profile.profile_id);
+        if (nitro_lab_mode) {
+            out.pushKV("nitro_lab", NitroLabJson(*profile.nitro_lab)); out.pushKV("lab_only", true);
+            out.pushKV("mainnet_enabled", false); out.pushKV("rollup_settlement_verified", false);
+        }
         out.pushKV("pending_actions", pool->Size()); return out;
     }
 
@@ -1151,7 +1208,7 @@ struct RegtestOperator::Impl {
             const Fact fact{Must(DecodeFact(bytes))};
             if (const auto* deposit{std::get_if<DepositFact>(&fact)}) Need(deposit->asset == a || deposit->asset == b || deposit->asset == q, "deposit route is not in deployment asset registry");
             else if (const auto* payout{std::get_if<PayoutConfirmedFact>(&fact)}) Need(payout->asset == q && payout->domain == domain, "payout differs from deployment Q/domain");
-            else if (const auto* range{std::get_if<SourceRangeFact>(&fact)}) Need(network_mode && profile.source_range_commitment && range->domain == domain &&
+            else if (const auto* range{std::get_if<SourceRangeFact>(&fact)}) Need((network_mode || nitro_lab_mode) && profile.source_range_commitment && range->domain == domain &&
                 range->chain_id == profile.source_chain_id && range->confirmations == profile.source_confirmations,
                 "source-range marker differs from the authenticated network profile");
             else Fail(ErrorCode::UNSUPPORTED, "observer supplied an unsupported fact kind");
