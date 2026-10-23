@@ -36,7 +36,9 @@
 #include <sys/stat.h>
 #include <sys/utsname.h>
 #include <unistd.h>
-#if defined(__linux__) || defined(__APPLE__)
+// backtrace() is a glibc and macOS extension; musl (the static release
+// builds) has no <execinfo.h>, and the report then carries no frames.
+#if (defined(__linux__) || defined(__APPLE__)) && __has_include(<execinfo.h>)
 #include <dlfcn.h>
 #include <execinfo.h>
 #define B3_CRASH_BACKTRACE 1
