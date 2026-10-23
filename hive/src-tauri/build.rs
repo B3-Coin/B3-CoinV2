@@ -3,6 +3,12 @@ use std::path::PathBuf;
 fn main() {
     generate_convert_params();
 
+    // tauri-build embeds the window and taskbar icon from icons/icon.ico but
+    // does not watch the file, so a new icon kept the old one until a clean
+    // build.
+    println!("cargo:rerun-if-changed=icons/icon.ico");
+    println!("cargo:rerun-if-changed=icons/icon.png");
+
     // Listing the app's commands makes each one a permission that a window's
     // capability must grant explicitly (capabilities/*.json).
     tauri_build::try_build(tauri_build::Attributes::new().app_manifest(

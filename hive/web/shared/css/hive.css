@@ -366,3 +366,6 @@ button.tr-book-row { width: 100%; text-align: left; }
 #view-stake.is-stale #stk-rows,
 #view-stake.is-stale #stk-list,
 #view-stake.is-stale #stk-totals { opacity: 0.55; }
+#chain.is-stale .details,
+#chain.is-stale #sync-badge { opacity: 0.55; }
+.card-stale { margin: 0; padding: var(--space-2) var(--space-4) 0; }

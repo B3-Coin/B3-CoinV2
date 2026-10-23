@@ -1193,14 +1193,35 @@ function readTime(at: number): string {
 
 // ---- dashboard -------------------------------------------------------------
 
+// The node card's last good read, so a failed one can say how old it is.
+let chainReadAt: number | null = null;
+
+/** A failed read leaves the last figures up, marked with their age, never
+ *  passed off as current: a node busy connecting blocks can refuse the
+ *  page for a while, and a stale "no peers" would look like a fact. */
+function chainStale(error: string | null): void {
+  el("chain").classList.toggle("is-stale", error !== null);
+  const note = el("chain-stale");
+  note.hidden = error === null;
+  if (error === null) return;
+  note.textContent =
+    chainReadAt === null
+      ? "The node could not be read. Trying again…"
+      : `Not updated since ${readTime(chainReadAt)}: the node could not be read. Trying again…`;
+  note.title = error;
+}
+
 const refreshOverview = single(async () => {
   let o: ChainOverview;
   try {
     o = await invoke<ChainOverview>("chain_overview");
-  } catch {
-    // The node stopped or is busy; its status banner says which.
+  } catch (error) {
+    // The node stopped or is busy; the status banner says if it stopped.
+    chainStale(String(error));
     return;
   }
+  chainReadAt = Date.now();
+  chainStale(null);
   // The node counts itself behind until its tip is recent. Without peers
   // nothing is downloading, so say that rather than "Syncing".
   const peers = o.connections_in + o.connections_out;
