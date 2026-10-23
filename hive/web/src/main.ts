@@ -2696,12 +2696,12 @@ function renderStakeOutlook(): void {
   const help = el("stk-outlook");
   const s = stakeStatus;
   const amount = el<HTMLInputElement>("stk-amount").value;
-  const o = s && amount.trim() ? stakeOutlook(amount, s.active_weight, s.total_active_weight) : null;
+  // Below the network's minimum (333 B3 on mainnet) the node refuses the
+  // stake, and the line above already says so.
+  const enough = s?.min_stake ? Number(amount) >= Number(s.min_stake) : true;
+  const o = s && enough && amount.trim() ? stakeOutlook(amount, s.active_weight, s.total_active_weight) : null;
   if (!o) {
-    help.textContent =
-      s && amount.trim() && Math.floor(Number(amount)) === 0 && Number(amount) > 0
-        ? "Weight counts in whole B3: a stake under 1 B3 adds no weight, so it makes no blocks."
-        : "";
+    help.textContent = "";
     return;
   }
   const wait = waitText(o.secondsBetween);
