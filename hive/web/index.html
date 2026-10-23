@@ -1271,6 +1271,14 @@
                     <span class="help">Other B3 nodes may connect to yours.</span>
                   </span>
                 </label>
+                <div class="field">
+                  <label for="set-port">Listening port</label>
+                  <input class="input" id="set-port" inputmode="numeric" autocomplete="off" placeholder="5647" />
+                  <span class="help">
+                    Empty uses 5647, the B3 default. Another B3 node on this computer needs a port of its
+                    own.
+                  </span>
+                </div>
                 <label class="check">
                   <input type="checkbox" id="set-natpmp" />
                   <span class="check-body">
@@ -1307,6 +1315,27 @@
                 <svg class="i-sm" aria-hidden="true"><use href="/icons.svg#i-info" /></svg>Saving restarts the node
               </div>
               <span id="settings-note"></span>
+            </div>
+
+            <div class="card">
+              <div class="card-head">
+                <h2 class="row"><svg class="i" aria-hidden="true"><use href="/icons.svg#i-folder" /></svg>Data folder</h2>
+              </div>
+              <div class="card-pad details">
+                <div class="drow"><span class="dkey">In use</span><span class="dval is-mono" id="set-datadir"></span></div>
+                <div class="drow"><span class="dkey">Next start</span><span class="dval" id="set-datadir-next"></span></div>
+              </div>
+              <div class="card-pad">
+                <span class="help" id="set-datadir-help">
+                  The chain and the wallets live here. A different folder takes effect when B3 Hive is
+                  started again, not now: a running node cannot move. A folder without a chain starts
+                  with the setup wizard.
+                </span>
+                <div class="row mt-2">
+                  <button class="btn btn-secondary" type="button" id="set-datadir-choose">Choose a folder…</button>
+                  <button class="btn btn-secondary" type="button" id="set-datadir-reset">Use the default folder</button>
+                </div>
+              </div>
             </div>
             <div class="row">
               <button class="btn btn-primary" type="submit" id="settings-save">Save and restart</button>

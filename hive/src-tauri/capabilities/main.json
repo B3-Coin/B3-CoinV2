@@ -65,6 +65,8 @@
     "allow-wallet-export-csv",
     "allow-node-settings",
     "allow-node-settings-apply",
+    "allow-datadir-choose",
+    "allow-datadir-reset",
     "allow-setup-info",
     "allow-setup-bootstrap",
     "allow-setup-cancel",

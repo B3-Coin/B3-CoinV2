@@ -1978,8 +1978,16 @@ type NodeSettings = {
   natpmp: boolean | null;
   proxy: string | null;
   onion: string | null;
+  port: number | null;
 };
-type SettingsView = { settings: NodeSettings; file: string; network: "main" | "regtest" };
+type SettingsView = {
+  settings: NodeSettings;
+  file: string;
+  network: "main" | "regtest";
+  datadir: string;
+  datadir_source: "argument" | "environment" | "preference" | "default";
+  datadir_saved: string | null;
+};
 
 // b3coind's defaults for the two flags.
 const DEFAULT_LISTEN = true;
@@ -2008,8 +2016,25 @@ function fillSettings(s: NodeSettings): void {
   el<HTMLInputElement>("set-proxy").value = s.proxy ?? "";
   el<HTMLInputElement>("set-onion-use").checked = s.onion !== null;
   el<HTMLInputElement>("set-onion").value = s.onion ?? "";
-  for (const id of ["set-dbcache", "set-par", "set-proxy", "set-onion"]) valid(el<HTMLInputElement>(id));
+  el<HTMLInputElement>("set-port").value = s.port === null ? "" : String(s.port);
+  for (const id of ["set-dbcache", "set-par", "set-proxy", "set-onion", "set-port"]) valid(el<HTMLInputElement>(id));
   syncProxyRows();
+}
+
+/** The Data folder card: the folder in use, and what the next start uses. */
+function fillDatadir(view: Pick<SettingsView, "datadir" | "datadir_source" | "datadir_saved">): void {
+  el("set-datadir").textContent = view.datadir;
+  el("set-datadir").title = view.datadir;
+  const fixed = view.datadir_source === "argument" || view.datadir_source === "environment";
+  const next = view.datadir_saved === null ? "The default folder" : view.datadir_saved;
+  el("set-datadir-next").textContent = fixed
+    ? `${next} (this start was given its folder ${view.datadir_source === "argument" ? "on the command line" : "by B3_HIVE_DATADIR"}, which wins)`
+    : view.datadir_saved === null && view.datadir_source === "default"
+      ? "The same folder (the default)"
+      : view.datadir_saved === view.datadir
+        ? "The same folder"
+        : next;
+  el<HTMLButtonElement>("set-datadir-reset").disabled = view.datadir_saved === null;
 }
 
 async function loadSettings(): Promise<void> {
@@ -2018,6 +2043,7 @@ async function loadSettings(): Promise<void> {
     const view = await invoke<SettingsView>("node_settings");
     loadedSettings = view.settings;
     fillSettings(view.settings);
+    fillDatadir(view);
     el("settings-note").textContent =
       `The node stops and starts again with the new settings. They are kept in ${view.file}, ` +
       "which B3-Qt uses too, and take the place of the same options in b3coin.conf." +
@@ -2080,7 +2106,17 @@ function readSettingsForm(): NodeSettings {
     natpmp: flagField("set-natpmp", loadedSettings?.natpmp ?? null, DEFAULT_NATPMP),
     proxy: proxyField("set-proxy-use", "set-proxy", "proxy address"),
     onion: proxyField("set-onion-use", "set-onion", "Tor proxy address"),
+    port: portField(),
   };
+}
+
+function portField(): number | null {
+  const port = wholeNumber("set-port", "The listening port");
+  if (port !== null && (port < 1 || port > 65535)) {
+    invalid(el<HTMLInputElement>("set-port"));
+    throw new Error("The listening port must be between 1 and 65535.");
+  }
+  return port;
 }
 
 async function applySettings(settings: NodeSettings): Promise<void> {
@@ -2134,11 +2170,37 @@ el("settings-defaults").addEventListener("click", () => {
     natpmp: null,
     proxy: null,
     onion: null,
+    port: null,
   });
   // Flags left at their defaults are then saved as unset, as in a file
   // without them.
   if (loadedSettings) loadedSettings = { ...loadedSettings, listen: null, natpmp: null };
   settingsResult("success", "The form now shows the defaults. Save and restart to use them.");
+});
+
+// The data folder is chosen for the next start, outside the form: nothing
+// restarts, and the choice is saved as soon as it is made.
+el("set-datadir-choose").addEventListener("click", async () => {
+  settingsResult("success", "");
+  try {
+    const picked = await invoke<string | null>("datadir_choose");
+    if (picked === null) return;
+    await loadSettings();
+    settingsResult("success", `Saved. B3 Hive uses ${picked} the next time it is started.`);
+  } catch (e) {
+    settingsResult("danger", String(e));
+  }
+});
+
+el("set-datadir-reset").addEventListener("click", async () => {
+  settingsResult("success", "");
+  try {
+    await invoke("datadir_reset");
+    await loadSettings();
+    settingsResult("success", "Saved. B3 Hive uses the default folder the next time it is started.");
+  } catch (e) {
+    settingsResult("danger", String(e));
+  }
 });
 
 // ---- send ------------------------------------------------------------------

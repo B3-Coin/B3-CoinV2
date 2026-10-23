@@ -35,9 +35,11 @@ pub struct NodeSettings {
     pub proxy: Option<String>,
     /// -onion, a separate SOCKS5 proxy for Tor onion services, as ip:port.
     pub onion: Option<String>,
+    /// -port: the P2P listening port, for a second B3 node on one computer.
+    pub port: Option<u16>,
 }
 
-const KEYS: [&str; 6] = ["dbcache", "par", "listen", "natpmp", "proxy", "onion"];
+const KEYS: [&str; 7] = ["dbcache", "par", "listen", "natpmp", "proxy", "onion", "port"];
 
 pub fn path(chain_dir: &Path) -> PathBuf {
     chain_dir.join(FILE)
@@ -117,6 +119,14 @@ pub fn read(chain_dir: &Path) -> Result<NodeSettings, String> {
         natpmp: flag("natpmp", get("natpmp"))?,
         proxy: text("proxy", get("proxy"))?,
         onion: text("onion", get("onion"))?,
+        port: integer("port", get("port"))?
+            .map(|n| {
+                u16::try_from(n)
+                    .ok()
+                    .filter(|p| *p != 0)
+                    .ok_or_else(|| unreadable("port", get("port")))
+            })
+            .transpose()?,
     })
 }
 
@@ -146,6 +156,9 @@ impl NodeSettings {
                     "Script verification threads must be between {MIN_SCRIPT_THREADS} and {MAX_SCRIPT_THREADS}."
                 ));
             }
+        }
+        if self.port == Some(0) {
+            return Err("The listening port must be between 1 and 65535.".into());
         }
         Ok(NodeSettings {
             proxy: self
@@ -199,6 +212,7 @@ pub fn write(chain_dir: &Path, settings: &NodeSettings) -> Result<(), String> {
     put("natpmp", settings.natpmp.map(Value::Bool));
     put("proxy", settings.proxy.map(Value::String));
     put("onion", settings.onion.map(Value::String));
+    put("port", settings.port.map(|n| Value::String(n.to_string())));
 
     fs::create_dir_all(chain_dir)
         .map_err(|e| format!("Cannot create {}: {e}", chain_dir.display()))?;
@@ -236,7 +250,7 @@ mod tests {
         fs::write(
             path(&dir),
             r#"{"_warning_": "generated", "dbcache": "600", "par": "-2", "listen": false,
-                "natpmp": "1", "proxy": "127.0.0.1:9050", "onion": "", "wallet": ["main"]}"#,
+                "natpmp": "1", "proxy": "127.0.0.1:9050", "onion": "", "port": "5649", "wallet": ["main"]}"#,
         )
         .unwrap();
         assert_eq!(
@@ -248,6 +262,7 @@ mod tests {
                 natpmp: Some(true),
                 proxy: Some("127.0.0.1:9050".into()),
                 onion: None,
+                port: Some(5649),
             }
         );
         let _ = fs::remove_dir_all(dir);
@@ -268,6 +283,7 @@ mod tests {
             natpmp: Some(false),
             proxy: None,
             onion: Some(" [::1]:9050 ".into()),
+            port: Some(5649),
         };
         write(&dir, &wanted).unwrap();
         let map = read_object(&dir).unwrap();
@@ -277,6 +293,7 @@ mod tests {
         assert_eq!(map["dbcache"], "1024");
         assert!(!map.contains_key("proxy"));
         assert_eq!(map["onion"], "[::1]:9050");
+        assert_eq!(map["port"], "5649");
         assert_eq!(
             read(&dir).unwrap(),
             NodeSettings {
@@ -326,6 +343,10 @@ mod tests {
             },
             NodeSettings {
                 proxy: Some("localhost:9050".into()),
+                ..Default::default()
+            },
+            NodeSettings {
+                port: Some(0),
                 ..Default::default()
             },
             NodeSettings {

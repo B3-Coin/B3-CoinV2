@@ -9,6 +9,7 @@ pub mod chain;
 pub mod console;
 pub mod drafts;
 pub mod flowmesh;
+pub mod folder;
 pub mod history;
 pub mod node;
 pub mod passphrase;
@@ -67,6 +68,10 @@ pub struct Core {
     /// and whether amounts are hidden; kept across restarts in `prefs_file`.
     prefs: Mutex<prefs::Prefs>,
     prefs_file: Option<std::path::PathBuf>,
+    /// The data folder choice for the next start (folder.json), and where
+    /// this start's folder came from.
+    folder_file: Option<std::path::PathBuf>,
+    datadir_source: folder::Source,
     /// The Activity page's last full history read.
     history: history::Cache,
     updates: Updates,
@@ -1663,6 +1668,11 @@ pub struct SettingsView {
     /// The settings file, for the page to name.
     pub file: String,
     pub network: Network,
+    /// The data folder in use and where this start's choice came from.
+    pub datadir: String,
+    pub datadir_source: folder::Source,
+    /// The folder saved for the next start, when one is.
+    pub datadir_saved: Option<String>,
 }
 
 #[tauri::command]
@@ -1673,7 +1683,57 @@ fn node_settings(window: Window, core: State<'_, Arc<Core>>) -> Result<SettingsV
         settings: settings::read(&chain_dir)?,
         file: settings::path(&chain_dir).display().to_string(),
         network: core.config.network,
+        datadir: core.config.datadir.display().to_string(),
+        datadir_source: core.datadir_source,
+        datadir_saved: core
+            .folder_file
+            .as_deref()
+            .and_then(folder::read)
+            .map(|dir| dir.display().to_string()),
     })
+}
+
+/// Lets the user pick the data folder for the next start of B3 Hive and
+/// saves it. Returns the folder, or None when the dialog was dismissed.
+/// The running node is not moved: a folder takes effect at the next start.
+#[tauri::command]
+async fn datadir_choose(
+    app: AppHandle,
+    window: Window,
+    core: State<'_, Arc<Core>>,
+) -> Result<Option<String>, String> {
+    require_window(&window, MAIN)?;
+    let core = Arc::clone(&core);
+    blocking(move || {
+        let file = core
+            .folder_file
+            .as_deref()
+            .ok_or("B3 Hive has no config folder to keep the choice in.")?;
+        use tauri_plugin_dialog::DialogExt;
+        let mut dialog = app.dialog().file().set_title("Data folder for B3 Hive");
+        if let Some(main) = app.get_webview_window(MAIN) {
+            dialog = dialog.set_parent(&main);
+        }
+        let Some(picked) = dialog.blocking_pick_folder() else {
+            return Ok(None);
+        };
+        let dir = picked.into_path().map_err(|e| e.to_string())?;
+        folder::write(file, Some(&dir))?;
+        hive_log(&app, &format!("settings: data folder for the next start: {}", dir.display()));
+        Ok(Some(dir.display().to_string()))
+    })
+    .await
+}
+
+/// Forgets the chosen data folder: the next start uses the default again.
+#[tauri::command]
+fn datadir_reset(app: AppHandle, window: Window, core: State<'_, Arc<Core>>) -> Result<(), String> {
+    require_window(&window, MAIN)?;
+    if let Some(file) = core.folder_file.as_deref() {
+        folder::write(file, None)?;
+        hive_log(&app, "settings: data folder choice removed; the next start uses the default");
+    }
+    Ok(())
 }
 
 /// Saves the node settings and restarts b3coind so they take effect. Nothing
@@ -2385,33 +2445,47 @@ async fn blocking<T: Send + 'static>(
 /// moves the data folder for either. B3_HIVE_REGTEST_ARGS replaces the
 /// peerless defaults, to join a local test network such as a FlowMesh test
 /// market; mainnet refuses it.
-fn node_config(app: &tauri::App) -> Result<NodeConfig, Box<dyn std::error::Error>> {
+fn node_config(
+    app: &tauri::App,
+    saved_datadir: Option<PathBuf>,
+) -> Result<(NodeConfig, folder::Source), Box<dyn std::error::Error>> {
     let b3coind = match std::env::var_os("B3_HIVE_B3COIND") {
         Some(path) => PathBuf::from(path),
         None => packaged_sidecar("b3-hive-node")?,
     };
     let network = Network::from_setting(std::env::var("B3_HIVE_NETWORK").ok().as_deref())?;
-    let datadir = match (std::env::var_os("B3_HIVE_DATADIR"), network) {
-        (Some(dir), _) => PathBuf::from(dir),
-        (None, Network::Regtest) => app.path().app_data_dir()?.join("spike-regtest"),
-        (None, Network::Main) => legacy_datadir(
+    let default_datadir = match network {
+        Network::Regtest => app.path().app_data_dir()?.join("spike-regtest"),
+        Network::Main => legacy_datadir(
             std::env::consts::OS,
             &app.path().home_dir()?,
             &app.path().data_dir()?,
         ),
     };
+    // The folder chosen on the Settings page applies to mainnet only: the
+    // regtest development node keeps its own folder.
+    let saved_datadir = saved_datadir.filter(|_| network == Network::Main);
+    let (datadir, datadir_source) = folder::resolve(
+        std::env::args_os().skip(1),
+        std::env::var_os("B3_HIVE_DATADIR"),
+        saved_datadir,
+        default_datadir,
+    );
     let regtest_args: Vec<String> = std::env::var("B3_HIVE_REGTEST_ARGS")
         .map(|extra| extra.split_whitespace().map(str::to_owned).collect())
         .unwrap_or_default();
     if !regtest_args.is_empty() && network != Network::Regtest {
         return Err("B3_HIVE_REGTEST_ARGS needs B3_HIVE_NETWORK=regtest".into());
     }
-    Ok(NodeConfig {
-        b3coind,
-        datadir,
-        network,
-        regtest_args,
-    })
+    Ok((
+        NodeConfig {
+            b3coind,
+            datadir,
+            network,
+            regtest_args,
+        },
+        datadir_source,
+    ))
 }
 
 /// The legacy B3-CoinV2 client's data folder, which b3coind also defaults
@@ -2563,13 +2637,12 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
-            let config = node_config(app)?;
+            let config_dir = app.path().app_config_dir().ok();
+            let prefs_file = config_dir.as_deref().map(prefs::path);
+            let folder_file = config_dir.as_deref().map(folder::path);
+            let saved_datadir = folder_file.as_deref().and_then(folder::read);
+            let (config, datadir_source) = node_config(app, saved_datadir)?;
             let updates = updates(app)?;
-            let prefs_file = app
-                .path()
-                .app_config_dir()
-                .ok()
-                .map(|dir| prefs::path(&dir));
             // A mainnet folder without a chain waits for the setup wizard.
             // B3_HIVE_SETUP=1 shows the wizard on regtest too, for development.
             let fresh = bootstrap::is_fresh(&config.network.chain_dir(&config.datadir));
@@ -2592,6 +2665,8 @@ pub fn run() {
                 passphrase: Mutex::new(None),
                 prefs: Mutex::new(prefs_file.as_deref().map(prefs::read).unwrap_or_default()),
                 prefs_file,
+                folder_file,
+                datadir_source,
                 history: history::Cache::default(),
                 updates,
                 setup: Setup::default(),
@@ -2720,6 +2795,8 @@ pub fn run() {
             wallet_export_csv,
             node_settings,
             node_settings_apply,
+            datadir_choose,
+            datadir_reset,
             setup_info,
             setup_bootstrap,
             setup_cancel,

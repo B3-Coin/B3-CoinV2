@@ -75,6 +75,8 @@ fn main() {
             "wallet_export_csv",
             "node_settings",
             "node_settings_apply",
+            "datadir_choose",
+            "datadir_reset",
             "setup_info",
             "setup_bootstrap",
             "setup_cancel",
