@@ -95,6 +95,8 @@ const PAGE_METHODS: &[&str] = &[
 
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 const STDERR_TAIL: usize = 4096;
+/// How a Failed status for a locked data folder begins.
+const LOCKED_PREFIX: &str = "Another B3 client is using ";
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "phase", rename_all = "lowercase")]
@@ -114,6 +116,35 @@ pub enum NodeStatus {
     /// Not started: a fresh mainnet data folder waits for the setup
     /// wizard's choice between a bootstrap and syncing from peers.
     Setup,
+}
+
+/// How `Node::stop` ended. `asked` is whether the stop RPC was accepted;
+/// `after` is how long the process took to go away.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopOutcome {
+    NotRunning,
+    Exited { asked: bool, after: Duration },
+    Killed { asked: bool, after: Duration },
+}
+
+impl std::fmt::Display for StopOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StopOutcome::NotRunning => write!(f, "no node was running"),
+            StopOutcome::Exited { asked, after } => write!(
+                f,
+                "b3coind exited after {:.1}s ({})",
+                after.as_secs_f64(),
+                if *asked { "stop accepted" } else { "stop RPC refused or unanswered" }
+            ),
+            StopOutcome::Killed { asked, after } => write!(
+                f,
+                "b3coind did not exit within {:.0}s and was killed ({})",
+                after.as_secs_f64(),
+                if *asked { "stop accepted" } else { "stop RPC refused or unanswered" }
+            ),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -341,24 +372,48 @@ impl Node {
     }
 
     /// Asks b3coind to stop, waits for it to exit, and kills it after `timeout`.
-    pub fn stop(&self, timeout: Duration) {
+    pub fn stop(&self, timeout: Duration) -> StopOutcome {
         let mut guard = self.child.lock().unwrap();
-        let Some(child) = guard.as_mut() else { return };
+        let Some(child) = guard.as_mut() else {
+            return StopOutcome::NotRunning;
+        };
         *self.status.lock().unwrap() = NodeStatus::Stopping;
-        if let Some(client) = &self.client {
-            let _ = client.call("stop", json!([]));
-        }
-        let deadline = Instant::now() + timeout;
+        let asked = self
+            .client
+            .as_ref()
+            .is_some_and(|client| client.call("stop", json!([])).is_ok());
+        let started = Instant::now();
+        let deadline = started + timeout;
         while Instant::now() < deadline {
             if let Ok(Some(_)) = child.try_wait() {
                 *guard = None;
-                return;
+                return StopOutcome::Exited {
+                    asked,
+                    after: started.elapsed(),
+                };
             }
             thread::sleep(POLL_INTERVAL);
         }
         let _ = child.kill();
         let _ = child.wait();
         *guard = None;
+        StopOutcome::Killed {
+            asked,
+            after: started.elapsed(),
+        }
+    }
+
+    /// True for the start error b3coind prints when another process holds
+    /// the data directory: typically a previous B3 Hive still shutting down.
+    pub fn datadir_locked(error: &str) -> bool {
+        // b3coind's own words, or exit_message's reading of them.
+        error.contains("Cannot obtain a lock on directory") || error.starts_with(LOCKED_PREFIX)
+    }
+
+    /// True while a child process is still held, exited or not: `stop`
+    /// would have something to do.
+    pub fn child_running(&self) -> bool {
+        self.child.lock().unwrap().is_some()
     }
 
     /// True once the process has exited (or never started).
@@ -396,8 +451,13 @@ impl Node {
                 "b3coind exited ({exit}); see debug.log in {}",
                 self.datadir.display()
             )
+        } else if Self::datadir_locked(said) {
+            format!(
+                "{LOCKED_PREFIX}{}. A B3 Hive closed a moment ago may still be shutting its node down; \
+                 otherwise stop the other client (or start B3 Hive with its own data folder), then press Restart.",
+                self.datadir.display()
+            )
         } else {
-            // e.g. the data directory lock error when another node holds it.
             format!("b3coind exited ({exit}): {said}")
         }
     }

@@ -25,7 +25,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use tauri::{
@@ -39,7 +39,7 @@ use rpc::RpcError;
 use update::{HttpsFetcher, UpdateStatus, Updater};
 
 const START_TIMEOUT: Duration = Duration::from_secs(600);
-const STOP_TIMEOUT: Duration = Duration::from_secs(120);
+const STOP_TIMEOUT: Duration = Duration::from_secs(600);
 /// How often the running node's tip is read for the main window.
 const FOLLOW_INTERVAL: Duration = Duration::from_secs(2);
 const MAIN: &str = "main";
@@ -1703,7 +1703,9 @@ async fn node_settings_apply(
             return Err("Approve or reject the request in the approval window first.".into());
         }
         let _ = app.emit_to(MAIN, "node-status", NodeStatus::Stopping);
-        current.stop(STOP_TIMEOUT);
+        hive_log(&app, "node: stop requested to apply settings");
+        let outcome = current.stop(STOP_TIMEOUT);
+        hive_log(&app, &format!("node: {outcome}"));
         let written = settings::write(&chain_dir, &settings);
         // Started again even when the write failed, with the settings it had.
         if !core.exiting.load(Ordering::SeqCst) {
@@ -2452,20 +2454,109 @@ fn packaged_sidecar(name: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
 
 /// Starts b3coind and follows it on a thread of its own: init, then the tip,
 /// until it exits. Every status change goes to the main window.
+/// Appends one timestamped line to hive.log in the app's config folder:
+/// node starts, stops and kills, which b3coind's own debug.log cannot
+/// record once it is gone.
+fn hive_log(app: &AppHandle, line: &str) {
+    let Ok(dir) = app.path().app_config_dir() else { return };
+    let _ = std::fs::create_dir_all(&dir);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64);
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(dir.join("hive.log"))
+    {
+        use std::io::Write;
+        let _ = writeln!(file, "{} {line}", history::utc(now));
+    }
+}
+
+/// How long a start keeps retrying while another process holds the data
+/// folder: a B3 Hive closed just before may still be stopping its node.
+const LOCK_WAIT: Duration = Duration::from_secs(150);
+const LOCK_RETRY: Duration = Duration::from_secs(2);
+
 fn start_node(app: &AppHandle, config: &NodeConfig) -> Arc<Node> {
+    start_node_since(app, config, None)
+}
+
+/// `lock_wait` is set on a retry after the data folder was found locked:
+/// when it began, so the retries end after LOCK_WAIT.
+fn start_node_since(app: &AppHandle, config: &NodeConfig, lock_wait: Option<Instant>) -> Arc<Node> {
     let node = Node::start(config);
     let follower = Arc::clone(&node);
     let handle = app.clone();
+    let datadir = config.datadir.clone();
+    if lock_wait.is_none() {
+        hive_log(app, &format!("node: starting b3coind with data folder {}", datadir.display()));
+    }
     thread::spawn(move || {
+        let mut seen_ready = false;
         let emit = |status: &NodeStatus| {
             let _ = handle.emit_to(MAIN, "node-status", status);
         };
+        let mut logged = |status: &NodeStatus| {
+            match status {
+                NodeStatus::Ready { chain, blocks, .. } if !seen_ready => {
+                    seen_ready = true;
+                    hive_log(&handle, &format!("node: ready on {chain} at block {blocks}"));
+                }
+                // A retry's repeat of the lock failure is already on record.
+                NodeStatus::Failed { error } if lock_wait.is_none() || !Node::datadir_locked(error) => {
+                    hive_log(&handle, &format!("node: failed: {error}"));
+                }
+                _ => {}
+            }
+            emit(status);
+        };
         emit(&follower.status());
-        if let NodeStatus::Ready { .. } = follower.wait_ready(START_TIMEOUT, emit) {
-            follower.follow(FOLLOW_INTERVAL, emit);
+        match follower.wait_ready(START_TIMEOUT, &mut logged) {
+            NodeStatus::Ready { .. } => follower.follow(FOLLOW_INTERVAL, &mut logged),
+            NodeStatus::Failed { error } if Node::datadir_locked(&error) => {
+                // The holder is most likely the node of a B3 Hive closed a
+                // moment ago, which stops in the background: keep trying for
+                // a while, as the same node this window follows.
+                let began = lock_wait.unwrap_or_else(Instant::now);
+                let Some(core) = handle.try_state::<Arc<Core>>() else { return };
+                if began.elapsed() >= LOCK_WAIT || core.exiting.load(Ordering::SeqCst) {
+                    hive_log(&handle, "node: gave up waiting for the data folder lock");
+                    return;
+                }
+                if lock_wait.is_none() {
+                    hive_log(&handle, "node: data folder locked by another process; retrying");
+                }
+                emit(&NodeStatus::Starting {
+                    message: format!(
+                        "Waiting for another B3 client to release {} (a B3 Hive closed a moment ago may still be stopping)",
+                        datadir.display()
+                    ),
+                });
+                thread::sleep(LOCK_RETRY);
+                let mut current = core.node.lock().unwrap();
+                // Only while this window still follows the failed node: a
+                // restart or the setup wizard may have replaced it meanwhile.
+                if Arc::ptr_eq(&current, &follower) && !core.exiting.load(Ordering::SeqCst) {
+                    *current = start_node_since(&handle, &core.config, Some(began));
+                }
+            }
+            _ => {}
         }
     });
     node
+}
+
+/// Stops everything the app runs, in order, and records how the node went.
+fn shutdown(app: &AppHandle, core: &Core) {
+    core.setup.stop();
+    let node = core.node.lock().unwrap();
+    if node.child_running() {
+        hive_log(app, "node: stop requested by the app closing");
+        let outcome = node.stop(STOP_TIMEOUT);
+        hive_log(app, &format!("node: {outcome}"));
+    }
+    core.updates.stop();
 }
 
 pub fn run() {
@@ -2543,9 +2634,27 @@ pub fn run() {
                 }
             }
             // The main window is the app: closing it ends the app (and the
-            // node) even while the console or approval window is open.
-            if window.label() == MAIN && matches!(event, WindowEvent::Destroyed) {
-                window.app_handle().exit(0);
+            // node) even while the console or approval window is open. The
+            // window stays, showing "Stopping the node", until the node has
+            // exited; a second launch meanwhile would find the data folder
+            // locked, and a kill would leave the chain and wallet files
+            // mid-write.
+            if window.label() == MAIN {
+                if let WindowEvent::CloseRequested { api, .. } = event {
+                    api.prevent_close();
+                    let core = Arc::clone(&window.state::<Arc<Core>>());
+                    if core.exiting.swap(true, Ordering::SeqCst) {
+                        return; // Already stopping.
+                    }
+                    let app = window.app_handle().clone();
+                    let _ = app.emit_to(MAIN, "node-status", NodeStatus::Stopping);
+                    thread::spawn(move || {
+                        shutdown(&app, &core);
+                        app.exit(0);
+                    });
+                } else if matches!(event, WindowEvent::Destroyed) {
+                    window.app_handle().exit(0);
+                }
             }
         })
         .invoke_handler(tauri::generate_handler![
@@ -2627,10 +2736,10 @@ pub fn run() {
             if let RunEvent::Exit = event {
                 if let Some(core) = app.try_state::<Arc<Core>>() {
                     core.exiting.store(true, Ordering::SeqCst);
-                    core.setup.stop();
-                    let node = core.node.lock().unwrap();
-                    node.stop(STOP_TIMEOUT);
-                    core.updates.stop();
+                    // Nothing left to do after a close through the main
+                    // window; this is the path for every other exit.
+                    shutdown(app, &core);
+                    hive_log(app, "app: exit");
                 }
             }
         });
