@@ -913,7 +913,7 @@
           </div>
         </main>
 
-        <main class="view view--flow" id="view-book" hidden>
+        <main class="view view--data" id="view-book" hidden>
           <div class="stack">
             <div class="banner" id="book-result" role="status" hidden></div>
             <form class="card" id="book-form" novalidate>
@@ -951,8 +951,8 @@
           </div>
         </main>
 
-        <main class="view view--flow" id="view-wallets" hidden>
-          <div class="stack">
+        <main class="view" id="view-wallets" hidden>
+          <div class="stack cols-2">
             <div class="banner" id="wl-result" role="status" hidden></div>
             <div class="banner banner-info" id="wl-scan" role="status" hidden>
               <span class="spinner"></span>
@@ -1234,8 +1234,8 @@
           </div>
         </main>
 
-        <main class="view view--flow" id="view-settings" hidden>
-          <form class="stack" id="settings-form" novalidate>
+        <main class="view" id="view-settings" hidden>
+          <form class="stack cols-2" id="settings-form" novalidate>
             <div class="card">
               <div class="card-head">
                 <h2 class="row"><svg class="i" aria-hidden="true"><use href="/icons.svg#i-server" /></svg>Node</h2>
@@ -1348,7 +1348,7 @@
                 </div>
               </div>
             </div>
-            <div class="row">
+            <div class="row span-all">
               <button class="btn btn-primary" type="submit" id="settings-save">Save and restart</button>
               <button class="btn btn-secondary" type="button" id="settings-defaults">Fill in the defaults</button>
             </div>
@@ -1356,7 +1356,7 @@
           </form>
         </main>
 
-        <main class="view view--flow" id="view-updates" hidden>
+        <main class="view stack cols-2" id="view-updates" hidden>
           <div class="card">
             <div class="card-head">
               <h2 class="row"><svg class="i" aria-hidden="true"><use href="/icons.svg#i-shield" /></svg>B3 Hive releases</h2>
