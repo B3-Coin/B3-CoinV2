@@ -53,6 +53,10 @@ pub enum Request {
         /// Blocks after it confirms until it counts.
         activation_depth: i64,
         producers: crate::stake::Producers,
+        /// This validator's counting weight and the network's, in whole
+        /// B3, so the window can say how often the stake would make blocks.
+        active_weight: u64,
+        total_active_weight: u64,
     },
     /// Release stakes back into ordinary B3: exactly the chosen STAKE
     /// outputs, to one new address of this wallet.
@@ -81,6 +85,9 @@ pub enum Request {
         wallet: String,
         rotate: bool,
     },
+    /// Revoke this wallet's bound BLS finality key (revokefinalitykey): the
+    /// validator leaves the set at the next epoch boundary.
+    RevokeFinality { chain: String, wallet: String },
     /// Place a FlowMesh limit order or ladder, signed exactly as drafted.
     TradeOrder { order: crate::flowmesh::OrderDraft },
     /// Cancel this wallet's open FlowMesh order on one side.
@@ -112,7 +119,9 @@ impl Request {
             Request::SignPsbt { summary, .. } | Request::SendPsbt { summary, .. } => {
                 &summary.wallet
             }
-            Request::Stake { wallet, .. } | Request::BindFinality { wallet, .. } => wallet,
+            Request::Stake { wallet, .. }
+            | Request::BindFinality { wallet, .. }
+            | Request::RevokeFinality { wallet, .. } => wallet,
             Request::TradeOrder { order } => &order.wallet,
             Request::TradeCancel { cancel } => &cancel.wallet,
             Request::TradeDeposit { deposit } => &deposit.wallet,
@@ -269,6 +278,8 @@ mod tests {
             amount: "10".into(),
             activation_depth: 20,
             producers: Default::default(),
+            active_weight: 0,
+            total_active_weight: 1000,
         };
         assert_eq!(serde_json::to_value(&stake).unwrap()["kind"], "stake");
         assert_eq!(stake.wallet(), "w");

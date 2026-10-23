@@ -146,9 +146,8 @@
               <h2 id="confirm-title"></h2>
             </div>
             <div class="modal-body stack" id="confirm-text"></div>
-            <div class="modal-foot">
+            <div class="modal-foot" id="confirm-foot">
               <button class="btn btn-secondary" type="button" id="confirm-no">Cancel</button>
-              <button class="btn btn-primary" type="button" id="confirm-yes"></button>
             </div>
           </div>
         </div>
@@ -570,6 +569,7 @@
                         <span class="unit">B3</span>
                       </div>
                       <span class="help" id="stk-min"></span>
+                      <span class="help" id="stk-outlook" aria-live="polite"></span>
                     </div>
                   </div>
                   <div class="card-foot">
@@ -604,6 +604,7 @@
                     <p class="t-sm muted" id="fin-text"></p>
                     <div class="row mt-2">
                       <button class="btn btn-secondary" type="button" id="fin-bind">Bind finality key</button>
+                      <button class="btn btn-secondary" type="button" id="fin-revoke" title="Take this validator out of the validator set at the next epoch boundary: do this before going offline for long" hidden>Revoke finality key</button>
                     </div>
                   </div>
                 </div>

@@ -5,7 +5,8 @@ import { startTrade, stopTrade, tradeMaskChanged, tradeWalletChanged, tradeDecid
 import { pickAddress, sortOwn } from "./picker";
 import { single } from "./single";
 import { tabKeys, trapDialog } from "./a11y";
-import { confirmAction } from "./confirm";
+import { chooseAction, confirmAction } from "./confirm";
+import { LONG_WAIT_SECONDS, outlook, shareText, stakeOutlook, waitText } from "./outlook";
 
 // Mirrors NodeStatus in src-tauri/src/node.rs (serde tag "phase").
 type NodeStatus =
@@ -2357,7 +2358,9 @@ el("staking-go").addEventListener("click", (e) => {
 });
 
 // Which page asked for each waiting approval, so its outcome lands there.
-const draftPage = new Map<string, "send" | "stake" | "finality" | "release">();
+// "revoke-close": the revocation asked for when the window was closed; the
+// app closes once it is sent.
+const draftPage = new Map<string, "send" | "stake" | "finality" | "revoke" | "revoke-close" | "release">();
 
 // Mirrors stake::Status in src-tauri/src/stake.rs.
 type StakeEntry = {
@@ -2577,6 +2580,16 @@ function renderStake(s: StakeStatus): void {
       "This wallet's counting stake, out of all counting stake on the network",
     ),
   ];
+  const o = outlook(s.active_weight, s.total_active_weight);
+  if (o && !isMasked()) {
+    rows.push(
+      textRow(
+        "Blocks to expect",
+        `${shareText(o)}: one every ${waitText(o.secondsBetween).replace(/^about /, "")}`,
+        "Estimated from your share of the counting stake at one block a minute. It changes as stakes come and go, and no blocks are made while your node is offline.",
+      ),
+    );
+  }
   if (l.running) rows.push(textRow("Blocks produced", count(l.blocks_produced)));
   if (l.last_error) rows.push(textRow("Last error", l.last_error));
   if (s.validator_key) rows.push(textRow("Validator key", shorten(s.validator_key, 10, 8), s.validator_key));
@@ -2638,9 +2651,13 @@ function renderStake(s: StakeStatus): void {
     ? `At least ${formatAmount(s.min_stake, 2)}. It counts ${s.activation_depth} blocks after it confirms.`
     : "This network has no minimum stake configured.";
   el<HTMLButtonElement>("stk-review").disabled = s.phase === "legacy" || !s.min_stake;
+  renderStakeOutlook();
 
   const f = s.finality;
   const bind = el<HTMLButtonElement>("fin-bind");
+  const revoke = el<HTMLButtonElement>("fin-revoke");
+  revoke.hidden = !(f && f.bound && !f.revoked);
+  revoke.disabled = revoke.hidden || !!s.bind_pending;
   el("fin-text").title = "";
   if (s.bind_pending) {
     // A second binding before this one confirms could never confirm.
@@ -2673,6 +2690,30 @@ function renderStake(s: StakeStatus): void {
   }
 }
 
+/** Under the amount field: what the typed stake would earn, so a small
+ *  stake is understood as support for the network before it is locked. */
+function renderStakeOutlook(): void {
+  const help = el("stk-outlook");
+  const s = stakeStatus;
+  const amount = el<HTMLInputElement>("stk-amount").value;
+  const o = s && amount.trim() ? stakeOutlook(amount, s.active_weight, s.total_active_weight) : null;
+  if (!o) {
+    help.textContent =
+      s && amount.trim() && Math.floor(Number(amount)) === 0 && Number(amount) > 0
+        ? "Weight counts in whole B3: a stake under 1 B3 adds no weight, so it makes no blocks."
+        : "";
+    return;
+  }
+  const wait = waitText(o.secondsBetween);
+  help.textContent =
+    `With this stake you would make ${shareText(o)} of the network's blocks, one every ${wait.replace(/^about /, "")} on average, if the counting stake stays as it is.` +
+    (o.secondsBetween >= LONG_WAIT_SECONDS
+      ? " That is a small stake: it mostly supports the network. If you go offline for long, revoke the finality key first."
+      : "");
+}
+
+el("stk-amount").addEventListener("input", renderStakeOutlook);
+
 // Bumped whenever the wallet changes, so a slow reply for the old wallet is dropped.
 let stakeGeneration = 0;
 
@@ -2688,6 +2729,8 @@ function clearStake(): void {
     b.disabled = true;
   }
   el<HTMLButtonElement>("fin-bind").disabled = true;
+  el<HTMLButtonElement>("fin-revoke").hidden = true;
+  el("stk-outlook").textContent = "";
   el("stk-rows").replaceChildren();
   el("stk-steps").replaceChildren();
   el("stk-steps").hidden = true;
@@ -2807,6 +2850,43 @@ el("fin-bind").addEventListener("click", async () => {
   } catch (e) {
     stakeResult("danger", String(e));
   }
+});
+
+/** Asks the approval window to revoke the finality key. The app closes
+ *  afterwards when the revocation was asked for on closing. */
+async function revokeFinality(closing: boolean): Promise<void> {
+  try {
+    const id = await invoke<string>("finality_revoke_draft");
+    draftPage.set(id, closing ? "revoke-close" : "revoke");
+    stakeResult("success", "Waiting for your decision in the approval window.");
+  } catch (e) {
+    stakeResult("danger", String(e));
+    if (closing) await invoke("close_cancel").catch(() => undefined);
+  }
+}
+
+el("fin-revoke").addEventListener("click", () => void revokeFinality(false));
+
+// Closing the window while this wallet stakes with a bound finality key:
+// offline, a bound validator makes no blocks but its weight still counts
+// toward the finality quorum, so a long absence should revoke the key.
+await listen<{ wallet: string; frozen: boolean }>("close-asked", async (event) => {
+  const { wallet, frozen } = event.payload;
+  go("stake");
+  const lines = [
+    `Staking is on with ${walletName(wallet)}, and its finality key is bound.`,
+    "Going offline for long? Revoke the finality key first. While your validator stays bound, its weight counts toward the votes that make blocks final; offline, it cannot vote, so the others are held back. It makes no blocks while offline either.",
+    frozen
+      ? "Revoking sends a small transaction, approved in its own window. The producer set is frozen until the coming network upgrade, so the revocation takes effect only after it. Bind a new key when you are back. For a short break, keep the key."
+      : "Revoking sends a small transaction, approved in its own window, and takes effect at the next epoch boundary. Bind a new key when you are back; staking needs one. For a short break, keep the key.",
+  ];
+  const choice = await chooseAction("Revoke the finality key before closing?", lines, [
+    { label: "Revoke the key and close" },
+    { label: "Keep the key and close" },
+  ]);
+  if (choice === 0) await revokeFinality(true);
+  else if (choice === 1) await invoke("close_now", { revoked: false }).catch(() => undefined);
+  else await invoke("close_cancel").catch(() => undefined);
 });
 
 // An encrypted wallet unlocks in the passphrase window, only to start.
@@ -3521,13 +3601,22 @@ await listen<DraftResult>("draft-result", (event) => {
           ? `Stake sent. Transaction ${r.txid}. It counts once it confirms and matures.`
           : page === "release"
             ? `Release sent. Transaction ${r.txid}. The B3 is ordinary coins in this wallet once it confirms.${stakingAfterRelease()}`
-            : `Finality key sent. Transaction ${r.txid}. Start staking once it confirms.`,
+            : page === "revoke" || page === "revoke-close"
+              ? `Finality key revocation sent. Transaction ${r.txid}. Your validator leaves the validator set at the next epoch boundary; bind a new key to stake again.`
+              : `Finality key sent. Transaction ${r.txid}. Start staking once it confirms.`,
       );
       el<HTMLFormElement>("stk-form").reset();
+      renderStakeOutlook();
     } else if (r.outcome === "rejected") {
       stakeResult("warning", "Rejected. Nothing was sent.");
     } else if (r.outcome === "failed") {
       stakeResult("danger", `Not sent: ${r.error}`);
+    }
+    if (page === "revoke-close") {
+      // The app closes only once the revocation is on its way; otherwise it
+      // stays open with the result on the Stake page.
+      if (r.outcome === "sent") void invoke("close_now", { revoked: true }).catch(() => undefined);
+      else void invoke("close_cancel").catch(() => undefined);
     }
     void refreshStake();
     void refreshWallet();

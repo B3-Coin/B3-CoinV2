@@ -56,6 +56,9 @@ pub struct Core {
     config: NodeConfig,
     /// Set once the app is exiting, so a late restart cannot leave a node behind.
     exiting: AtomicBool,
+    /// The main window was asked to close and the page is being asked
+    /// about the finality key; closing again does not wait for the answer.
+    close_pending: AtomicBool,
     drafts: Mutex<DraftStore>,
     /// FlowMesh requests the user acknowledged as uncertain, so new ones may
     /// be drafted. Acknowledging never retries or cancels them.
@@ -860,15 +863,15 @@ async fn stake_draft(
         let node = core.node();
         let (client, name) = page_wallet(&core, &node)?;
         let amount = stake::check_stake(client, &name, &amount)?;
-        let depth = stake::status(client, &name)
-            .map_err(|e| e.to_string())?
-            .activation_depth;
+        let status = stake::status(client, &name).map_err(|e| e.to_string())?;
         let request = Request::Stake {
             chain: node.chain().unwrap_or_default(),
             wallet: name,
             amount,
-            activation_depth: depth,
-            producers: stake::producers(client),
+            activation_depth: status.activation_depth,
+            producers: status.producers,
+            active_weight: status.active_weight,
+            total_active_weight: status.total_active_weight,
         };
         core.drafts
             .lock()
@@ -1036,6 +1039,67 @@ async fn finality_draft(
     .await?;
     open_approval(&app).map_err(|e| e.to_string())?;
     Ok(id)
+}
+
+/// Asks the approval window to revoke this wallet's bound finality key.
+#[tauri::command]
+async fn finality_revoke_draft(
+    app: AppHandle,
+    window: Window,
+    core: State<'_, Arc<Core>>,
+) -> Result<String, String> {
+    require_window(&window, MAIN)?;
+    let core = Arc::clone(&core);
+    let id = blocking(move || {
+        let node = core.node();
+        let (client, name) = page_wallet(&core, &node)?;
+        let status = stake::status(client, &name).map_err(|e| e.to_string())?;
+        let bound = status
+            .finality
+            .is_some_and(|f| f.bound && !f.revoked);
+        if !bound {
+            return Err("This wallet's finality key is not bound, so there is nothing to revoke.".into());
+        }
+        let request = Request::RevokeFinality {
+            chain: node.chain().unwrap_or_default(),
+            wallet: name,
+        };
+        core.drafts
+            .lock()
+            .unwrap()
+            .insert(request)
+            .map_err(|e| e.to_string())
+    })
+    .await?;
+    open_approval(&app).map_err(|e| e.to_string())?;
+    Ok(id)
+}
+
+/// The page's answer to the question asked when the window is closed with
+/// a bound, staking validator: close now, with the key kept or its
+/// revocation sent.
+#[tauri::command]
+fn close_now(app: AppHandle, window: Window, core: State<'_, Arc<Core>>, revoked: bool) -> Result<(), String> {
+    require_window(&window, MAIN)?;
+    hive_log(
+        &app,
+        if revoked {
+            "app: closing, finality key revocation sent"
+        } else {
+            "app: closing, finality key kept"
+        },
+    );
+    begin_exit(&app, &core);
+    Ok(())
+}
+
+/// The user decided not to close after all.
+#[tauri::command]
+fn close_cancel(app: AppHandle, window: Window, core: State<'_, Arc<Core>>) -> Result<(), String> {
+    require_window(&window, MAIN)?;
+    core.close_pending.store(false, Ordering::SeqCst);
+    hive_log(&app, "app: closing cancelled");
+    Ok(())
 }
 
 /// Starts staking with an unencrypted wallet. An encrypted wallet starts it
@@ -2110,6 +2174,7 @@ fn execute_sent(client: &rpc::Client, request: Request) -> Result<String, String
         }
         Request::Stake { wallet, amount, .. } => stake::create(client, &wallet, &amount),
         Request::BindFinality { wallet, .. } => stake::bind(client, &wallet),
+        Request::RevokeFinality { wallet, .. } => stake::revoke(client, &wallet),
         Request::SignPsbt { .. }
         | Request::SendPsbt { .. }
         | Request::TradeOrder { .. }
@@ -2632,6 +2697,30 @@ fn start_node_since(app: &AppHandle, config: &NodeConfig, lock_wait: Option<Inst
 }
 
 /// Stops everything the app runs, in order, and records how the node went.
+/// Starts the app's exit: the window stays, showing "Stopping the node",
+/// until the node has exited. Called once; later calls do nothing.
+fn begin_exit(app: &AppHandle, core: &Arc<Core>) {
+    if core.exiting.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let _ = app.emit_to(MAIN, "node-status", NodeStatus::Stopping);
+    let app = app.clone();
+    let core = Arc::clone(core);
+    thread::spawn(move || {
+        shutdown(&app, &core);
+        app.exit(0);
+    });
+}
+
+/// Whether closing should first ask about the finality key: the node stakes
+/// with the page's wallet and that wallet's key is bound. A node that cannot
+/// be asked, or is not staking, lets the app close at once.
+fn close_question(core: &Core) -> Option<stake::CloseAsk> {
+    let node = core.node();
+    let (client, name) = page_wallet(core, &node).ok()?;
+    stake::close_ask(client, &name)
+}
+
 fn shutdown(app: &AppHandle, core: &Core) {
     core.setup.stop();
     let node = core.node.lock().unwrap();
@@ -2672,6 +2761,7 @@ pub fn run() {
                 node: Mutex::new(node),
                 config,
                 exiting: AtomicBool::new(false),
+                close_pending: AtomicBool::new(false),
                 drafts: Mutex::new(DraftStore::default()),
                 trade_acknowledged: Acknowledged::default(),
                 wallet: Mutex::new(None),
@@ -2731,14 +2821,24 @@ pub fn run() {
                 if let WindowEvent::CloseRequested { api, .. } = event {
                     api.prevent_close();
                     let core = Arc::clone(&window.state::<Arc<Core>>());
-                    if core.exiting.swap(true, Ordering::SeqCst) {
+                    let app = window.app_handle().clone();
+                    if core.exiting.load(Ordering::SeqCst) {
                         return; // Already stopping.
                     }
-                    let app = window.app_handle().clone();
-                    let _ = app.emit_to(MAIN, "node-status", NodeStatus::Stopping);
-                    thread::spawn(move || {
-                        shutdown(&app, &core);
-                        app.exit(0);
+                    // A validator staking with a bound finality key is asked
+                    // whether to revoke the key first (close-asked); the page
+                    // answers with close_now or close_cancel. Closing again
+                    // while the question is up closes without waiting.
+                    if core.close_pending.swap(true, Ordering::SeqCst) {
+                        begin_exit(&app, &core);
+                        return;
+                    }
+                    thread::spawn(move || match close_question(&core) {
+                        Some(ask) => {
+                            hive_log(&app, "app: close asked: staking with a bound finality key");
+                            let _ = app.emit_to(MAIN, "close-asked", ask);
+                        }
+                        None => begin_exit(&app, &core),
                     });
                 } else if matches!(event, WindowEvent::Destroyed) {
                     window.app_handle().exit(0);
@@ -2779,6 +2879,9 @@ pub fn run() {
             psbt_draft,
             psbt_save,
             finality_draft,
+            finality_revoke_draft,
+            close_now,
+            close_cancel,
             stake_start,
             stake_stop,
             open_console,

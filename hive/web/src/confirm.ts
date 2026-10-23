@@ -3,23 +3,27 @@
 import { el } from "../shared/ui";
 import { trapDialog } from "./a11y";
 
-let answer: ((yes: boolean) => void) | null = null;
+export type Choice = { label: string; danger?: boolean };
+
+let answer: ((choice: number | null) => void) | null = null;
 let release: (() => void) | null = null;
 let returnFocus: HTMLElement | null = null;
 
-function finish(yes: boolean): void {
+function finish(choice: number | null): void {
   el("confirm-backdrop").hidden = true;
+  for (const b of el("confirm-foot").querySelectorAll(".confirm-choice")) b.remove();
   release?.();
   release = null;
   const done = answer;
   answer = null;
   returnFocus?.focus();
-  done?.(yes);
+  done?.(choice);
 }
 
-/** Resolves true only when the user picks `yes`. */
-export function confirmAction(title: string, lines: string[], yes: string, danger = false): Promise<boolean> {
-  if (answer) finish(false);
+/** Puts the question with its choices after Cancel. Resolves to the index
+ *  of the choice taken, or null for Cancel, Escape or a click outside. */
+export function chooseAction(title: string, lines: string[], choices: Choice[]): Promise<number | null> {
+  if (answer) finish(null);
   returnFocus = document.activeElement as HTMLElement | null;
   el("confirm-title").textContent = title;
   el("confirm-text").replaceChildren(
@@ -29,20 +33,31 @@ export function confirmAction(title: string, lines: string[], yes: string, dange
       return p;
     }),
   );
-  const button = el<HTMLButtonElement>("confirm-yes");
-  button.textContent = yes;
-  button.className = `btn ${danger ? "btn-danger" : "btn-primary"}`;
+  el("confirm-foot").append(
+    ...choices.map((c, i) => {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = `btn confirm-choice ${c.danger ? "btn-danger" : i === 0 ? "btn-primary" : "btn-secondary"}`;
+      button.textContent = c.label;
+      button.addEventListener("click", () => finish(i));
+      return button;
+    }),
+  );
   el("confirm-backdrop").hidden = false;
   release = trapDialog(el("confirm-backdrop"));
   el("confirm-no").focus();
   return new Promise((resolve) => (answer = resolve));
 }
 
-el("confirm-yes").addEventListener("click", () => finish(true));
-el("confirm-no").addEventListener("click", () => finish(false));
+/** Resolves true only when the user picks `yes`. */
+export async function confirmAction(title: string, lines: string[], yes: string, danger = false): Promise<boolean> {
+  return (await chooseAction(title, lines, [{ label: yes, danger }])) === 0;
+}
+
+el("confirm-no").addEventListener("click", () => finish(null));
 el("confirm-backdrop").addEventListener("click", (e) => {
-  if (e.target === el("confirm-backdrop")) finish(false);
+  if (e.target === el("confirm-backdrop")) finish(null);
 });
 el("confirm-backdrop").addEventListener("keydown", (e) => {
-  if (e.key === "Escape") finish(false);
+  if (e.key === "Escape") finish(null);
 });

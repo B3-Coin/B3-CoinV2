@@ -3,6 +3,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { count, el, formatAmount, initTheme, shorten, sumAmounts } from "../shared/ui";
 import { formatB3, formatPrice, formatQuantity, quantityPlaces, type Units } from "../src/tradefmt";
+import { LONG_WAIT_SECONDS, shareText, stakeOutlook, waitText } from "../src/outlook";
 
 type OutputLine = { address: string; amount: string; change: boolean; mine: boolean };
 type Summary = { chain: string; wallet: string; outputs: OutputLine[]; fee: string; inputs: number };
@@ -104,8 +105,18 @@ type Request =
   | { kind: "release"; summary: Summary; producers: Producers }
   | { kind: "sign_psbt"; summary: PsbtSummary }
   | { kind: "send_psbt"; summary: PsbtSummary }
-  | { kind: "stake"; chain: string; wallet: string; amount: string; activation_depth: number; producers: Producers }
+  | {
+      kind: "stake";
+      chain: string;
+      wallet: string;
+      amount: string;
+      activation_depth: number;
+      producers: Producers;
+      active_weight: number;
+      total_active_weight: number;
+    }
   | { kind: "bind_finality"; chain: string; wallet: string; rotate: boolean }
+  | { kind: "revoke_finality"; chain: string; wallet: string }
   | { kind: "trade_order"; order: OrderDraft }
   | { kind: "trade_cancel"; cancel: CancelDraft }
   | { kind: "trade_deposit"; deposit: DepositDraft }
@@ -241,12 +252,17 @@ function showPsbt(kind: "sign_psbt" | "send_psbt", s: PsbtSummary): void {
 const FEE_BOUND = "At most 0.1 B3";
 const FEE_LATER = "The node picks the network fee when it builds the transaction, at most 0.1 B3 and usually far less; Activity shows it once sent.";
 
-function showAction(r: Extract<Request, { kind: "stake" | "bind_finality" }>): void {
+function showAction(r: Extract<Request, { kind: "stake" | "bind_finality" | "revoke_finality" }>): void {
   el("from").textContent = `From ${walletName(r.wallet)} on ${r.chain}`;
   const fee = row("Network fee", FEE_BOUND, undefined, false);
   if (r.kind === "stake") {
     el("title").textContent = `Stake ${formatAmount(r.amount)}?`;
     const enters = r.producers.stake_enters_at;
+    // What the stake would earn, so a small one is locked knowingly: with
+    // it, the validator holds a share of the counting stake and makes about
+    // that share of the blocks.
+    const o = stakeOutlook(r.amount, r.active_weight, r.total_active_weight);
+    const small = o !== null && o.secondsBetween >= LONG_WAIT_SECONDS;
     el("action-text").textContent =
       `The amount is locked as a stake for this wallet's validator. It stays in this wallet, but ordinary payments do not spend it. It becomes active ${r.activation_depth} blocks after it confirms` +
       (enters !== null
@@ -254,9 +270,31 @@ function showAction(r: Extract<Request, { kind: "stake" | "bind_finality" }>): v
         : r.producers.frozen
           ? `. ${FROZEN_SET}, so it makes blocks only after that.`
           : ", and makes blocks once the validator set next rotates to include it.") +
+      (o
+        ? ` With it your validator would make ${shareText(o)} of the network's blocks, one every ${waitText(o.secondsBetween).replace(/^about /, "")} on average, if the counting stake stays as it is.`
+        : "") +
+      (small
+        ? " That is a small stake: it mostly supports the network. A validator that goes offline for long should revoke its finality key first, on the Stake page, so its weight does not hold the finality votes back while it cannot vote."
+        : "") +
       ` ${FEE_LATER}`;
-    el("action-rows").replaceChildren(row("Stake", formatAmount(r.amount, 9)), fee, row("Network", r.chain, undefined, false));
+    el("action-rows").replaceChildren(
+      row("Stake", formatAmount(r.amount, 9)),
+      ...(o
+        ? [
+            explained("Share of blocks", shareText(o), "Estimated from your share of the counting stake; it changes as stakes come and go."),
+            explained("One block every", waitText(o.secondsBetween).replace(/^about /, ""), "On average, at one block a minute, while your node is online."),
+          ]
+        : []),
+      fee,
+      row("Network", r.chain, undefined, false),
+    );
     el("approve").textContent = "Stake now";
+  } else if (r.kind === "revoke_finality") {
+    el("title").textContent = "Revoke the finality key?";
+    el("action-text").textContent =
+      `Sends a small transaction that withdraws this validator's bound BLS finality key. From the next epoch boundary your validator is out of the validator set: it makes no blocks, and its weight no longer counts toward the votes that make blocks final, so the other validators are not held back while yours is offline. Your stakes stay as they are. Bind a new key when you are back; staking needs one. ${FEE_LATER}`;
+    el("action-rows").replaceChildren(fee, row("Network", r.chain, undefined, false));
+    el("approve").textContent = "Revoke key";
   } else {
     el("title").textContent = r.rotate ? "Rotate the finality key?" : "Bind the finality key?";
     el("action-text").textContent = r.rotate

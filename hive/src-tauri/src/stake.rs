@@ -236,6 +236,49 @@ pub fn bind(client: &Client, wallet: &str) -> Result<String, String> {
     txid(&r)
 }
 
+/// Revokes this wallet's bound finality key (a zero-key transition), so the
+/// validator leaves the validator set at the next epoch boundary: it makes
+/// no blocks and its weight stops counting toward finality, which is what a
+/// validator going offline for long should want. Returns the txid.
+pub fn revoke(client: &Client, wallet: &str) -> Result<String, String> {
+    if let Some(txid) = waiting_bind(client, wallet).map_err(|e| e.to_string())? {
+        return Err(format!(
+            "A finality key binding is waiting to confirm (transaction {txid}). Revoke only after it confirms."
+        ));
+    }
+    let r = client
+        .call_wallet(wallet, "revokefinalitykey", json!([]))
+        .map_err(|e| e.to_string())?;
+    txid(&r)
+}
+
+/// What closing the app should ask about: staking runs with this wallet's
+/// validator and its finality key is bound, so going offline for long
+/// leaves a bound validator that cannot sign.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct CloseAsk {
+    pub wallet: String,
+    /// The producer set is frozen: a revocation takes effect only after
+    /// the network upgrade that unfreezes it.
+    pub frozen: bool,
+}
+
+pub fn close_ask(client: &Client, wallet: &str) -> Option<CloseAsk> {
+    let s = status(client, wallet).ok()?;
+    close_ask_for(&s).then(|| CloseAsk {
+        wallet: wallet.to_owned(),
+        frozen: s.producers.frozen,
+    })
+}
+
+pub(crate) fn close_ask_for(s: &Status) -> bool {
+    s.staking.running
+        && s.staking.ours
+        && s.finality
+            .as_ref()
+            .is_some_and(|f| f.member || (f.bound && !f.revoked))
+}
+
 fn txid(reply: &Value) -> Result<String, String> {
     reply["txid"]
         .as_str()
@@ -597,5 +640,30 @@ mod tests {
         let mut other = info.clone();
         other["staking"]["validator_key"] = json!("someone-else");
         assert!(!parse_status(&other, None).unwrap().staking.ours);
+    }
+
+    #[test]
+    fn closing_asks_only_while_staking_with_a_bound_key() {
+        let info = json!({
+            "validator_key": "vk", "tip_height": 1, "next_block_phase": "modern_pos",
+            "activation_depth": 20, "active_weight": 0, "total_active_weight": 10,
+            "staking": {"running": true, "state": "staking", "validator_key": "vk",
+                        "finality_signing": true, "blocks_produced": 0},
+            "stakes": [], "active": 0, "pending": 0, "unconfirmed": 0,
+        });
+        let bound = json!({"binding": {"bound": true, "revoked": false}, "validator_set": {"member": false}});
+        let revoked = json!({"binding": {"bound": true, "revoked": true}, "validator_set": {"member": false}});
+        let member = json!({"binding": {"bound": false}, "validator_set": {"member": true, "weight": 5}});
+        assert!(close_ask_for(&parse_status(&info, Some(&bound)).unwrap()));
+        assert!(!close_ask_for(&parse_status(&info, Some(&revoked)).unwrap()));
+        // In the set in force, the key counts whatever the binding says.
+        assert!(close_ask_for(&parse_status(&info, Some(&member)).unwrap()));
+        assert!(!close_ask_for(&parse_status(&info, None).unwrap()));
+        let mut off = info.clone();
+        off["staking"]["running"] = json!(false);
+        assert!(!close_ask_for(&parse_status(&off, Some(&bound)).unwrap()));
+        let mut other = info.clone();
+        other["staking"]["validator_key"] = json!("someone-else");
+        assert!(!close_ask_for(&parse_status(&other, Some(&bound)).unwrap()));
     }
 }

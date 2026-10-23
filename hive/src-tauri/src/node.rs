@@ -72,6 +72,7 @@ const PAGE_METHODS: &[&str] = &[
     "getfinalitystatus",
     "createstake",
     "bindfinalitykey",
+    "revokefinalitykey",
     "startstaking",
     "stopstaking",
     "decoderawtransaction",
