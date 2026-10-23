@@ -619,7 +619,18 @@
               <div class="empty">
                 <strong>No FlowMesh market is available</strong>
                 <p class="t-sm muted">Markets appear here once FlowMesh is active on the chain and a token/B3 market is established. This node also needs a trading endpoint, or its own FlowMesh engine.</p>
+                <button class="btn btn-secondary mt-2" type="button" id="tr-demo-start-empty">Show a demo market</button>
               </div>
+            </div>
+            <div class="card" id="tr-demo-offer" hidden>
+              <div class="card-pad row">
+                <span class="t-sm muted">See how a market page looks and works with made-up numbers. Nothing in the demo is real and nothing can be sent from it.</span>
+                <button class="btn btn-secondary" type="button" id="tr-demo-start">Show a demo market</button>
+              </div>
+            </div>
+            <div class="banner banner-warning tr-demo" id="tr-demo" role="status" hidden>
+              <span><strong>Demo market.</strong> These numbers are made up and move on their own. FlowMesh has no market on mainnet yet; this shows how a market page works. Nothing here is real and nothing can be sent.</span>
+              <button class="btn btn-secondary btn-sm" type="button" id="tr-demo-leave">Leave the demo</button>
             </div>
             <div class="card tr-head" id="tr-head" hidden>
               <div class="tr-ticker">

@@ -24,11 +24,12 @@ import {
   spread,
   type Units,
 } from "./tradefmt";
+import { DEMO_MARKET_ID, DEMO_STEP_MS, demoDeposits, demoRequests, demoSummary, demoView } from "./demo";
 
 // Mirrors src-tauri/src/flowmesh.rs.
-type MarketSummary = { market_id: string; base_asset_id: string; vault_id: string; running: boolean; paused: boolean; halt: string; error: string };
-type Metadata = { decimals: number | null; ticker: string; name: string; test_only: boolean };
-type Verification = {
+export type MarketSummary = { market_id: string; base_asset_id: string; vault_id: string; running: boolean; paused: boolean; halt: string; error: string };
+export type Metadata = { decimals: number | null; ticker: string; name: string; test_only: boolean };
+export type Verification = {
   source: string;
   endpoint: string;
   certificate_verified: boolean;
@@ -36,7 +37,7 @@ type Verification = {
   history_endpoint_reported: boolean;
   event_gap: boolean;
 };
-type Status = {
+export type Status = {
   certified: boolean;
   head: string;
   next_sequence: number;
@@ -51,9 +52,9 @@ type Status = {
   error: string;
   pending_actions: number;
 };
-type Point = { price: string; quantity: string };
-type Order = { side: "bid" | "ask"; status: string; filled: string; remaining: string; reserved: string; points: Point[] };
-type Account = {
+export type Point = { price: string; quantity: string };
+export type Order = { side: "bid" | "ask"; status: string; filled: string; remaining: string; reserved: string; points: Point[] };
+export type Account = {
   account_id: string;
   next_sequence: number;
   base_available: string;
@@ -62,10 +63,10 @@ type Account = {
   b3_reserved: string;
   orders: Order[];
 };
-type Level = { low: string; high: string; size: string; cumulative: string; curves: number; own: string };
-type Side = { available: boolean; more: boolean; levels: Level[] };
-type Clearing = { cleared: boolean; price: string; volume: string };
-type Book = {
+export type Level = { low: string; high: string; size: string; cumulative: string; curves: number; own: string };
+export type Side = { available: boolean; more: boolean; levels: Level[] };
+export type Clearing = { cleared: boolean; price: string; volume: string };
+export type Book = {
   available: boolean;
   reason: string;
   head: string;
@@ -75,8 +76,8 @@ type Book = {
   asks: Side | null;
   standing: Clearing | null;
 };
-type Tick = { sequence: number; kind: string; cleared: boolean; price: string; volume: string };
-type Trade = {
+export type Tick = { sequence: number; kind: string; cleared: boolean; price: string; volume: string };
+export type Trade = {
   sequence: number;
   price: string;
   quantity: string;
@@ -86,9 +87,9 @@ type Trade = {
   own_sold: string | null;
   observed_ms: number | null;
 };
-type Outcome = { status: string | null; text: string; code: string; fill_quantity: string | null; fill_price: string | null };
-type Receipt = { action_id: string; accepted: boolean; state: string; stage: string; reason: string; outcome: Outcome };
-type TradeRequest = {
+export type Outcome = { status: string | null; text: string; code: string; fill_quantity: string | null; fill_price: string | null };
+export type Receipt = { action_id: string; accepted: boolean; state: string; stage: string; reason: string; outcome: Outcome };
+export type TradeRequest = {
   action_id: string;
   kind: "order" | "cancel" | "withdraw" | "deposit" | "other";
   side: "bid" | "ask" | null;
@@ -108,7 +109,7 @@ type TradeRequest = {
 /** Mirrors flowmesh::Deposit. asset, amount and vault_id are null when the
  *  output could not be read; such a deposit is shown, and the node checks
  *  its market when admission is asked. */
-type Deposit = {
+export type Deposit = {
   txid: string;
   vout: number;
   confirmations: number;
@@ -121,10 +122,10 @@ type Deposit = {
 /** Mirrors flowmesh::Payout: a certified withdrawal whose payout waits to
  *  be published. destination is null when Hive cannot tell which address
  *  it pays. */
-type Payout = { effect_id: string; asset: "b3" | "token"; amount: string; sequence: number; destination: string | null };
+export type Payout = { effect_id: string; asset: "b3" | "token"; amount: string; sequence: number; destination: string | null };
 /** Mirrors flowmesh::Checkpoint: the next certified entry waiting for its
  *  checkpoint on the B3 chain, while a withdrawal of this wallet's waits. */
-type Checkpoint = { checkpoint_id: string; sequence: number; waiting: number };
+export type Checkpoint = { checkpoint_id: string; sequence: number; waiting: number };
 /** A deposit counts once it is this deep (flowmesh::DEPOSIT_CONFIRMATIONS). */
 const DEPOSIT_CONFIRMATIONS = 31;
 /** The core's DraftResult variants only trading drafts produce. */
@@ -138,7 +139,7 @@ export type TradeResult =
   | { outcome: "rejected"; id: string }
   | { outcome: "failed"; id: string; error: string }
   | { outcome: "sent" | "signed"; id: string };
-type MarketView = {
+export type MarketView = {
   market_id: string;
   base_asset_id: string;
   unchanged: boolean;
@@ -181,6 +182,9 @@ let active = false;
 let generation = 0;
 let markets: MarketSummary[] = [];
 let marketId: string | null = null;
+/** A demo market with made-up numbers is shown (demo.ts): every action is
+ *  blocked and no read reaches the node until it is left. */
+let demo = false;
 
 type Market = {
   metadata: Metadata | null;
@@ -316,6 +320,9 @@ export function tradeWalletChanged(): void {
 
 async function loadMarkets(): Promise<void> {
   const mine = ++generation;
+  demo = false;
+  el("tr-demo").hidden = true;
+  el("tr-demo-offer").hidden = true;
   showError("");
   try {
     const list = await invoke<MarketSummary[]>("trade_markets");
@@ -325,14 +332,81 @@ async function loadMarkets(): Promise<void> {
     if (mine !== generation) return;
     showError(String(e));
     el("tr-head").hidden = el("tr-body").hidden = true;
+    el("tr-demo-offer").hidden = false;
     return;
   }
   el("tr-empty").hidden = markets.length > 0;
+  el("tr-demo-offer").hidden = markets.length > 0;
   el("tr-head").hidden = el("tr-body").hidden = markets.length === 0;
   if (!markets.length) return;
   if (!marketId || !markets.some((m) => m.market_id === marketId)) marketId = markets[0].market_id;
   renderPicker();
   void follow(marketId, mine);
+}
+
+/** Shows the demo market in place of the node's: made-up numbers that move
+ *  every DEMO_STEP_MS, labelled as such, with every action blocked. */
+function startDemo(): void {
+  if (!active) return;
+  const mine = ++generation;
+  epoch++;
+  demo = true;
+  showError("");
+  markets = [demoSummary()];
+  marketId = DEMO_MARKET_ID;
+  market = blank();
+  drafts.clear();
+  requests = demoRequests();
+  requestsRead = Date.now();
+  deposits = demoDeposits();
+  depositsRead = Date.now();
+  depositsError = null;
+  payouts = [];
+  payoutsError = null;
+  checkpoint = null;
+  clearForm();
+  clearFunding();
+  showResult("", "");
+  showFundResult("", "");
+  el("tr-empty").hidden = true;
+  el("tr-demo-offer").hidden = true;
+  el("tr-demo").hidden = false;
+  el("tr-head").hidden = el("tr-body").hidden = false;
+  renderPicker();
+  apply(demoView(true));
+  renderDeposits();
+  void demoLoop(mine);
+}
+
+async function demoLoop(mine: number): Promise<void> {
+  while (active && demo && mine === generation) {
+    await sleep(DEMO_STEP_MS);
+    if (!active || !demo || mine !== generation) return;
+    apply(demoView(false));
+  }
+}
+
+/** Back to the node's markets, if any. */
+function leaveDemo(): void {
+  if (!demo) return;
+  demo = false;
+  epoch++;
+  market = blank();
+  requests = [];
+  deposits = [];
+  marketId = null;
+  el("tr-demo").hidden = true;
+  el("tr-head").hidden = el("tr-body").hidden = true;
+  void loadMarkets();
+}
+
+/** True, after saying so, when an action is asked for in the demo. */
+function demoBlocked(where: "order" | "funds" = "order"): boolean {
+  if (!demo) return false;
+  const text = "This is a demo market with made-up numbers: nothing can be sent from it.";
+  if (where === "funds") showFundResult("warning", text);
+  else showResult("warning", text);
+  return true;
 }
 
 function selectMarket(id: string): void {
@@ -538,7 +612,9 @@ function renderHead(): void {
 
   const v = market.verification;
   const parts: string[] = [];
-  if (v) {
+  if (v?.source === "demo") {
+    parts.push("Demo: made-up numbers, not a FlowMesh market");
+  } else if (v) {
     parts.push(v.source === "local_engine" ? "This node's FlowMesh engine" : `Trading endpoint ${v.endpoint}`);
     parts.push(v.certificate_verified ? "certificate verified" : "certificate not verified");
     if (v.account_state_verified) parts.push("balances verified from state");
@@ -1244,6 +1320,7 @@ function showResult(kind: string, text: string): void {
 }
 
 async function reviewOrder(): Promise<void> {
+  if (demoBlocked()) return;
   const u = units();
   if (!u || gate() !== null || !marketId) return renderGate();
   const steps = readSteps(u);
@@ -1275,6 +1352,7 @@ async function reviewOrder(): Promise<void> {
 }
 
 async function cancelOrder(s: "bid" | "ask"): Promise<void> {
+  if (demoBlocked()) return;
   if (gate() !== null || !marketId) return renderGate();
   if (preparing) return;
   preparing = true;
@@ -1464,6 +1542,7 @@ function clearFunding(): void {
 }
 
 async function reviewFunding(): Promise<void> {
+  if (demoBlocked("funds")) return;
   const amount = fundAmount();
   if (fundGate() !== null || !marketId || typeof amount !== "bigint") return renderFunding();
   if (preparing) return;
@@ -1507,7 +1586,7 @@ function withdrawText(r: Receipt): [string, string] {
 async function loadDeposits(): Promise<void> {
   const mine = generation;
   const id = marketId;
-  if (!id) return;
+  if (!id || demo) return;
   depositsRead = Date.now();
   const [dep, pay] = await Promise.allSettled([
     invoke<Deposit[]>("trade_deposits", { marketId: id }),
@@ -1535,7 +1614,7 @@ async function loadDeposits(): Promise<void> {
 }
 
 async function admit(d: Deposit, button: HTMLButtonElement): Promise<void> {
-  if (!marketId) return;
+  if (!marketId || demoBlocked("funds")) return;
   button.disabled = true;
   const key = `${d.txid}:${d.vout}`;
   // As the other reads: a reply for a market no longer shown is dropped.
@@ -1587,7 +1666,7 @@ function depositAmount(d: { asset: "b3" | "token" | null; amount: string | null 
 }
 
 async function reviewPayout(p: Payout, destination: string): Promise<void> {
-  if (!marketId || preparing) return;
+  if (!marketId || preparing || demoBlocked("funds")) return;
   preparing = true;
   showFundResult("", "");
   const at = epoch;
@@ -1604,7 +1683,7 @@ async function reviewPayout(p: Payout, destination: string): Promise<void> {
 }
 
 async function reviewCheckpoint(c: Checkpoint): Promise<void> {
-  if (!marketId || preparing) return;
+  if (!marketId || preparing || demoBlocked("funds")) return;
   preparing = true;
   showFundResult("", "");
   const at = epoch;
@@ -1774,7 +1853,7 @@ const REQUESTS_NOTE = el("tr-requests-note").textContent ?? "";
 async function loadRequests(): Promise<void> {
   const id = marketId;
   const at = epoch;
-  if (!active || !id || requestsLoadingEpoch === at) return;
+  if (!active || !id || demo || requestsLoadingEpoch === at) return;
   requestsLoadingEpoch = at;
   try {
     const list = await invoke<TradeRequest[]>("trade_requests", { marketId: id });
@@ -1895,6 +1974,7 @@ function renderRequests(): void {
             ack.title = "This request may still be certified later. Check Your orders and balances first.";
             return;
           }
+          if (demoBlocked()) return;
           ack.disabled = true;
           try {
             await invoke("trade_acknowledge", { marketId, actionId: r.action_id });
@@ -2065,3 +2145,7 @@ setInterval(() => {
 export function tradeMaskChanged(): void {
   if (active) render();
 }
+
+// The demo market: offered while the node has none, left with one click.
+for (const id of ["tr-demo-start", "tr-demo-start-empty"]) el(id).addEventListener("click", startDemo);
+el("tr-demo-leave").addEventListener("click", leaveDemo);

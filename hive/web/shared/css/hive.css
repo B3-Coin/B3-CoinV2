@@ -369,3 +369,7 @@ button.tr-book-row { width: 100%; text-align: left; }
 #chain.is-stale .details,
 #chain.is-stale #sync-badge { opacity: 0.55; }
 .card-stale { margin: 0; padding: var(--space-2) var(--space-4) 0; }
+
+/* The demo market's banner keeps its button beside the text. */
+.tr-demo { display: flex; align-items: center; justify-content: space-between; gap: var(--space-3); flex-wrap: wrap; }
+#tr-demo-offer .row { justify-content: space-between; flex-wrap: wrap; gap: var(--space-3); }
