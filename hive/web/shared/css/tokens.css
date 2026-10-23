@@ -183,3 +183,9 @@
   --shadow-lg:  0 16px 40px rgb(24 20 12 / 0.16);
   --ring-inset: none;
 }
+
+/* On a desktop window the 560px form measure reads as a strip beside the
+   rail; forms and settings get more room, the pair view with them. */
+@media (min-width: 1024px) {
+  :root { --w-flow: 760px; }
+}
