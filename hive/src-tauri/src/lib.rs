@@ -1054,11 +1054,11 @@ async fn finality_revoke_draft(
         let node = core.node();
         let (client, name) = page_wallet(&core, &node)?;
         let status = stake::status(client, &name).map_err(|e| e.to_string())?;
-        let bound = status
-            .finality
-            .is_some_and(|f| f.bound && !f.revoked);
+        let bound = status.finality.is_some_and(|f| f.bound && !f.revoked);
         if !bound {
-            return Err("This wallet's finality key is not bound, so there is nothing to revoke.".into());
+            return Err(
+                "This wallet's finality key is not bound, so there is nothing to revoke.".into(),
+            );
         }
         let request = Request::RevokeFinality {
             chain: node.chain().unwrap_or_default(),
@@ -1079,7 +1079,12 @@ async fn finality_revoke_draft(
 /// a bound, staking validator: close now, with the key kept or its
 /// revocation sent.
 #[tauri::command]
-fn close_now(app: AppHandle, window: Window, core: State<'_, Arc<Core>>, revoked: bool) -> Result<(), String> {
+fn close_now(
+    app: AppHandle,
+    window: Window,
+    core: State<'_, Arc<Core>>,
+    revoked: bool,
+) -> Result<(), String> {
     require_window(&window, MAIN)?;
     hive_log(
         &app,
@@ -1784,7 +1789,13 @@ async fn datadir_choose(
         };
         let dir = picked.into_path().map_err(|e| e.to_string())?;
         folder::write(file, Some(&dir))?;
-        hive_log(&app, &format!("settings: data folder for the next start: {}", dir.display()));
+        hive_log(
+            &app,
+            &format!(
+                "settings: data folder for the next start: {}",
+                dir.display()
+            ),
+        );
         Ok(Some(dir.display().to_string()))
     })
     .await
@@ -1796,7 +1807,10 @@ fn datadir_reset(app: AppHandle, window: Window, core: State<'_, Arc<Core>>) -> 
     require_window(&window, MAIN)?;
     if let Some(file) = core.folder_file.as_deref() {
         folder::write(file, None)?;
-        hive_log(&app, "settings: data folder choice removed; the next start uses the default");
+        hive_log(
+            &app,
+            "settings: data folder choice removed; the next start uses the default",
+        );
     }
     Ok(())
 }
@@ -2607,7 +2621,9 @@ fn packaged_sidecar(name: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
 /// node starts, stops and kills, which b3coind's own debug.log cannot
 /// record once it is gone.
 fn hive_log(app: &AppHandle, line: &str) {
-    let Ok(dir) = app.path().app_config_dir() else { return };
+    let Ok(dir) = app.path().app_config_dir() else {
+        return;
+    };
     let _ = std::fs::create_dir_all(&dir);
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2639,7 +2655,13 @@ fn start_node_since(app: &AppHandle, config: &NodeConfig, lock_wait: Option<Inst
     let handle = app.clone();
     let datadir = config.datadir.clone();
     if lock_wait.is_none() {
-        hive_log(app, &format!("node: starting b3coind with data folder {}", datadir.display()));
+        hive_log(
+            app,
+            &format!(
+                "node: starting b3coind with data folder {}",
+                datadir.display()
+            ),
+        );
     }
     thread::spawn(move || {
         let mut seen_ready = false;
@@ -2650,10 +2672,15 @@ fn start_node_since(app: &AppHandle, config: &NodeConfig, lock_wait: Option<Inst
             match status {
                 NodeStatus::Ready { chain, blocks, .. } if !seen_ready => {
                     seen_ready = true;
-                    hive_log(&handle, &format!("node: ready on {chain} at block {blocks}"));
+                    hive_log(
+                        &handle,
+                        &format!("node: ready on {chain} at block {blocks}"),
+                    );
                 }
                 // A retry's repeat of the lock failure is already on record.
-                NodeStatus::Failed { error } if lock_wait.is_none() || !Node::datadir_locked(error) => {
+                NodeStatus::Failed { error }
+                    if lock_wait.is_none() || !Node::datadir_locked(error) =>
+                {
                     hive_log(&handle, &format!("node: failed: {error}"));
                 }
                 _ => {}
@@ -2668,13 +2695,18 @@ fn start_node_since(app: &AppHandle, config: &NodeConfig, lock_wait: Option<Inst
                 // moment ago, which stops in the background: keep trying for
                 // a while, as the same node this window follows.
                 let began = lock_wait.unwrap_or_else(Instant::now);
-                let Some(core) = handle.try_state::<Arc<Core>>() else { return };
+                let Some(core) = handle.try_state::<Arc<Core>>() else {
+                    return;
+                };
                 if began.elapsed() >= LOCK_WAIT || core.exiting.load(Ordering::SeqCst) {
                     hive_log(&handle, "node: gave up waiting for the data folder lock");
                     return;
                 }
                 if lock_wait.is_none() {
-                    hive_log(&handle, "node: data folder locked by another process; retrying");
+                    hive_log(
+                        &handle,
+                        "node: data folder locked by another process; retrying",
+                    );
                 }
                 emit(&NodeStatus::Starting {
                     message: format!(

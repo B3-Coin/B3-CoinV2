@@ -653,9 +653,12 @@ mod tests {
         });
         let bound = json!({"binding": {"bound": true, "revoked": false}, "validator_set": {"member": false}});
         let revoked = json!({"binding": {"bound": true, "revoked": true}, "validator_set": {"member": false}});
-        let member = json!({"binding": {"bound": false}, "validator_set": {"member": true, "weight": 5}});
+        let member =
+            json!({"binding": {"bound": false}, "validator_set": {"member": true, "weight": 5}});
         assert!(close_ask_for(&parse_status(&info, Some(&bound)).unwrap()));
-        assert!(!close_ask_for(&parse_status(&info, Some(&revoked)).unwrap()));
+        assert!(!close_ask_for(
+            &parse_status(&info, Some(&revoked)).unwrap()
+        ));
         // In the set in force, the key counts whatever the binding says.
         assert!(close_ask_for(&parse_status(&info, Some(&member)).unwrap()));
         assert!(!close_ask_for(&parse_status(&info, None).unwrap()));

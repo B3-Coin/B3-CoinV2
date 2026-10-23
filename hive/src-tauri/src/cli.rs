@@ -47,7 +47,9 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> CommandLine {
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         let Some(text) = arg.to_str() else { continue };
-        let Some(option) = text.strip_prefix('-') else { continue };
+        let Some(option) = text.strip_prefix('-') else {
+            continue;
+        };
         let option = option.strip_prefix('-').unwrap_or(option);
         if option.is_empty() {
             continue;
@@ -67,7 +69,7 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> CommandLine {
                     line.datadir = Some(PathBuf::from(v));
                 }
             }
-            "regtest" => line.regtest = value.is_none_or(|v| v != "0"),
+            "regtest" => line.regtest = value.as_deref() != Some("0"),
             name if OWNED.contains(&name) => line.refused.push(format!("-{name}")),
             // B3-Qt's own and the help options mean nothing here.
             "?" | "h" | "help" | "help-debug" | "version" | "lang" | "min" | "resetguisettings"
@@ -105,9 +107,19 @@ mod tests {
 
     #[test]
     fn qt_style_options_are_forwarded_and_the_folder_taken() {
-        let line = parse(os(&["-datadir=D:\\b3", "-port=5649", "--listen=0", "-debug", "-Upnp=1", "plain"]));
+        let line = parse(os(&[
+            "-datadir=D:\\b3",
+            "-port=5649",
+            "--listen=0",
+            "-debug",
+            "-Upnp=1",
+            "plain",
+        ]));
         assert_eq!(line.datadir, Some(PathBuf::from("D:\\b3")));
-        assert_eq!(line.forwarded, ["-port=5649", "-listen=0", "-debug", "-upnp=1"]);
+        assert_eq!(
+            line.forwarded,
+            ["-port=5649", "-listen=0", "-debug", "-upnp=1"]
+        );
         assert!(line.refused.is_empty());
         assert!(!line.regtest);
         assert!(line.error().is_none());

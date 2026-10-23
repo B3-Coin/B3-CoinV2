@@ -84,7 +84,12 @@ mod tests {
         let default = PathBuf::from("default");
         let saved = Some(PathBuf::from("saved"));
         assert_eq!(
-            resolve(Some("arg".into()), Some("env".into()), saved.clone(), default.clone()),
+            resolve(
+                Some("arg".into()),
+                Some("env".into()),
+                saved.clone(),
+                default.clone()
+            ),
             (PathBuf::from("arg"), Source::Argument)
         );
         assert_eq!(

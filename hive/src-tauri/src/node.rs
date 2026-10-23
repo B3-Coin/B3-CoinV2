@@ -138,13 +138,21 @@ impl std::fmt::Display for StopOutcome {
                 f,
                 "b3coind exited after {:.1}s ({})",
                 after.as_secs_f64(),
-                if *asked { "stop accepted" } else { "stop RPC refused or unanswered" }
+                if *asked {
+                    "stop accepted"
+                } else {
+                    "stop RPC refused or unanswered"
+                }
             ),
             StopOutcome::Killed { asked, after } => write!(
                 f,
                 "b3coind did not exit within {:.0}s and was killed ({})",
                 after.as_secs_f64(),
-                if *asked { "stop accepted" } else { "stop RPC refused or unanswered" }
+                if *asked {
+                    "stop accepted"
+                } else {
+                    "stop RPC refused or unanswered"
+                }
             ),
         }
     }
@@ -802,7 +810,11 @@ mod tests {
         let page = Credentials::generate(PAGE_USER).unwrap();
         let console = Credentials::generate(CONSOLE_USER).unwrap();
         let args = node_args(&config, &page, &console, 5000);
-        let at = |needle: &str| args.iter().position(|a| a == needle).unwrap_or_else(|| panic!("{needle} missing"));
+        let at = |needle: &str| {
+            args.iter()
+                .position(|a| a == needle)
+                .unwrap_or_else(|| panic!("{needle} missing"))
+        };
         assert!(at("-port=5649") < at("-listen=0"));
         assert!(at("-listen=0") < at("-datadir=/home/u/.B3-CoinV2"));
     }

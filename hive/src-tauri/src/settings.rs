@@ -39,7 +39,9 @@ pub struct NodeSettings {
     pub port: Option<u16>,
 }
 
-const KEYS: [&str; 7] = ["dbcache", "par", "listen", "natpmp", "proxy", "onion", "port"];
+const KEYS: [&str; 7] = [
+    "dbcache", "par", "listen", "natpmp", "proxy", "onion", "port",
+];
 
 pub fn path(chain_dir: &Path) -> PathBuf {
     chain_dir.join(FILE)
