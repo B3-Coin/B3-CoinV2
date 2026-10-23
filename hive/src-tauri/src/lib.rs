@@ -6,6 +6,7 @@
 pub mod book;
 pub mod bootstrap;
 pub mod chain;
+pub mod cli;
 pub mod console;
 pub mod drafts;
 pub mod flowmesh;
@@ -2448,12 +2449,19 @@ async fn blocking<T: Send + 'static>(
 fn node_config(
     app: &tauri::App,
     saved_datadir: Option<PathBuf>,
-) -> Result<(NodeConfig, folder::Source), Box<dyn std::error::Error>> {
+) -> Result<(NodeConfig, folder::Source, Option<String>), Box<dyn std::error::Error>> {
     let b3coind = match std::env::var_os("B3_HIVE_B3COIND") {
         Some(path) => PathBuf::from(path),
         None => packaged_sidecar("b3-hive-node")?,
     };
-    let network = Network::from_setting(std::env::var("B3_HIVE_NETWORK").ok().as_deref())?;
+    // B3-Qt's node options on the command line go to b3coind; -regtest and
+    // -datadir are taken here, and the options B3 Hive owns are refused.
+    let command_line = cli::parse(std::env::args_os().skip(1));
+    let network = if command_line.regtest {
+        Network::Regtest
+    } else {
+        Network::from_setting(std::env::var("B3_HIVE_NETWORK").ok().as_deref())?
+    };
     let default_datadir = match network {
         Network::Regtest => app.path().app_data_dir()?.join("spike-regtest"),
         Network::Main => legacy_datadir(
@@ -2466,7 +2474,7 @@ fn node_config(
     // regtest development node keeps its own folder.
     let saved_datadir = saved_datadir.filter(|_| network == Network::Main);
     let (datadir, datadir_source) = folder::resolve(
-        std::env::args_os().skip(1),
+        command_line.datadir.clone(),
         std::env::var_os("B3_HIVE_DATADIR"),
         saved_datadir,
         default_datadir,
@@ -2483,8 +2491,10 @@ fn node_config(
             datadir,
             network,
             regtest_args,
+            extra_args: command_line.forwarded.clone(),
         },
         datadir_source,
+        command_line.error(),
     ))
 }
 
@@ -2641,7 +2651,7 @@ pub fn run() {
             let prefs_file = config_dir.as_deref().map(prefs::path);
             let folder_file = config_dir.as_deref().map(folder::path);
             let saved_datadir = folder_file.as_deref().and_then(folder::read);
-            let (config, datadir_source) = node_config(app, saved_datadir)?;
+            let (config, datadir_source, command_line_error) = node_config(app, saved_datadir)?;
             let updates = updates(app)?;
             // A mainnet folder without a chain waits for the setup wizard.
             // B3_HIVE_SETUP=1 shows the wizard on regtest too, for development.
@@ -2650,7 +2660,10 @@ pub fn run() {
                 Network::Main => fresh,
                 Network::Regtest => fresh && std::env::var("B3_HIVE_SETUP").as_deref() == Ok("1"),
             };
-            let node = if wizard {
+            let node = if let Some(error) = command_line_error {
+                hive_log(app.handle(), &format!("node: not started: {error}"));
+                Node::failed(&config, error)
+            } else if wizard {
                 Node::waiting_for_setup(&config)
             } else {
                 start_node(app.handle(), &config)

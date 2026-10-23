@@ -53,6 +53,7 @@ impl TestNode {
             datadir: datadir.clone(),
             network: Network::Regtest,
             regtest_args: vec![],
+            extra_args: vec![],
         });
         let status = node.wait_ready(Duration::from_secs(300), |_| {});
         Some((TestNode { node, datadir }, status))
@@ -352,6 +353,7 @@ fn node_settings_take_effect_after_a_restart() {
         datadir: test.datadir.clone(),
         network: Network::Regtest,
         regtest_args: vec![],
+        extra_args: vec![],
     });
     let status = again.wait_ready(Duration::from_secs(300), |_| {});
     assert!(

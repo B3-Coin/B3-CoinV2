@@ -187,6 +187,9 @@ pub struct NodeConfig {
     /// network. They replace the peerless defaults and come before Hive's
     /// own RPC settings, which therefore still apply.
     pub regtest_args: Vec<String>,
+    /// Node options from B3 Hive's own command line (cli.rs), handed to
+    /// b3coind before Hive's own, on any network.
+    pub extra_args: Vec<String>,
 }
 
 pub struct Node {
@@ -236,6 +239,21 @@ impl Node {
                 port: 0,
             }),
         }
+    }
+
+    /// A node that was not started because of `error`, such as a command
+    /// line B3 Hive cannot honour; the window shows it with Restart off.
+    pub fn failed(config: &NodeConfig, error: String) -> Arc<Node> {
+        Arc::new(Node {
+            child: Mutex::new(None),
+            client: None,
+            patient: None,
+            console: None,
+            status: Mutex::new(NodeStatus::Failed { error }),
+            stderr_tail: Arc::new(Mutex::new(Vec::new())),
+            datadir: config.datadir.clone(),
+            port: 0,
+        })
     }
 
     /// A node that waits for the setup wizard; nothing runs yet.
@@ -562,6 +580,7 @@ fn node_args(
             .chain(config.regtest_args.iter().cloned())
             .collect(),
     };
+    args.extend(config.extra_args.iter().cloned());
     args.extend([
         format!("-datadir={}", config.datadir.display()),
         "-server=1".into(),
@@ -620,6 +639,7 @@ mod tests {
             datadir: "/tmp/hive".into(),
             network: Network::Regtest,
             regtest_args: vec![],
+            extra_args: vec![],
         };
         let credentials = Credentials::generate(PAGE_USER).unwrap();
         let console = Credentials::generate(CONSOLE_USER).unwrap();
@@ -722,6 +742,7 @@ mod tests {
             datadir: "/tmp/hive".into(),
             network: Network::Regtest,
             regtest_args: vec!["-connect=127.0.0.1:12000".into(), "-rpcport=1".into()],
+            extra_args: vec![],
         };
         let page = Credentials::generate(PAGE_USER).unwrap();
         let console = Credentials::generate(CONSOLE_USER).unwrap();
@@ -748,6 +769,7 @@ mod tests {
             datadir: "/home/u/.B3-CoinV2".into(),
             network: Network::Main,
             regtest_args: vec![],
+            extra_args: vec![],
         };
         let page = Credentials::generate(PAGE_USER).unwrap();
         let console = Credentials::generate(CONSOLE_USER).unwrap();
@@ -765,6 +787,23 @@ mod tests {
         // RPC stays on loopback with the per-launch logins.
         assert!(args.contains(&"-rpcbind=127.0.0.1".to_owned()));
         assert!(args.contains(&"-rpcwhitelistdefault=0".to_owned()));
+    }
+
+    #[test]
+    fn command_line_options_come_before_hives_own() {
+        let config = NodeConfig {
+            b3coind: "b3coind".into(),
+            datadir: "/home/u/.B3-CoinV2".into(),
+            network: Network::Main,
+            regtest_args: vec![],
+            extra_args: vec!["-port=5649".into(), "-listen=0".into()],
+        };
+        let page = Credentials::generate(PAGE_USER).unwrap();
+        let console = Credentials::generate(CONSOLE_USER).unwrap();
+        let args = node_args(&config, &page, &console, 5000);
+        let at = |needle: &str| args.iter().position(|a| a == needle).unwrap_or_else(|| panic!("{needle} missing"));
+        assert!(at("-port=5649") < at("-listen=0"));
+        assert!(at("-listen=0") < at("-datadir=/home/u/.B3-CoinV2"));
     }
 
     #[test]
@@ -803,6 +842,7 @@ mod tests {
             datadir: dir.clone(),
             network: Network::Regtest,
             regtest_args: vec![],
+            extra_args: vec![],
         });
         assert!(matches!(node.status(), NodeStatus::Failed { .. }));
         assert!(node.has_exited());

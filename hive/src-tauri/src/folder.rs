@@ -47,15 +47,15 @@ pub fn write(path: &Path, datadir: Option<&Path>) -> Result<(), String> {
 }
 
 /// The data folder for this start and where the choice came from, in order
-/// of precedence: a `--datadir` argument, B3_HIVE_DATADIR, the saved choice,
-/// then `default`.
+/// of precedence: a `-datadir` argument (cli.rs), B3_HIVE_DATADIR, the saved
+/// choice, then `default`.
 pub fn resolve(
-    args: impl IntoIterator<Item = std::ffi::OsString>,
+    argument: Option<PathBuf>,
     environment: Option<std::ffi::OsString>,
     saved: Option<PathBuf>,
     default: PathBuf,
 ) -> (PathBuf, Source) {
-    if let Some(dir) = argument(args) {
+    if let Some(dir) = argument {
         return (dir, Source::Argument);
     }
     if let Some(dir) = environment {
@@ -65,22 +65,6 @@ pub fn resolve(
         return (dir, Source::Preference);
     }
     (default, Source::Default)
-}
-
-/// `--datadir=<path>` or `--datadir <path>` among the arguments.
-fn argument(args: impl IntoIterator<Item = std::ffi::OsString>) -> Option<PathBuf> {
-    let mut args = args.into_iter();
-    while let Some(arg) = args.next() {
-        if arg == "--datadir" {
-            return args.next().map(PathBuf::from);
-        }
-        if let Some(value) = arg.to_str().and_then(|s| s.strip_prefix("--datadir=")) {
-            if !value.is_empty() {
-                return Some(PathBuf::from(value));
-            }
-        }
-    }
-    None
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -95,34 +79,24 @@ pub enum Source {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ffi::OsString;
-
-    fn os(items: &[&str]) -> Vec<OsString> {
-        items.iter().map(OsString::from).collect()
-    }
-
     #[test]
     fn argument_outranks_environment_outranks_choice_outranks_default() {
         let default = PathBuf::from("default");
         let saved = Some(PathBuf::from("saved"));
         assert_eq!(
-            resolve(os(&["--datadir=arg"]), Some("env".into()), saved.clone(), default.clone()),
+            resolve(Some("arg".into()), Some("env".into()), saved.clone(), default.clone()),
             (PathBuf::from("arg"), Source::Argument)
         );
         assert_eq!(
-            resolve(os(&["--datadir", "arg two"]), None, None, default.clone()),
-            (PathBuf::from("arg two"), Source::Argument)
-        );
-        assert_eq!(
-            resolve(os(&["--other"]), Some("env".into()), saved.clone(), default.clone()),
+            resolve(None, Some("env".into()), saved.clone(), default.clone()),
             (PathBuf::from("env"), Source::Environment)
         );
         assert_eq!(
-            resolve(os(&[]), None, saved, default.clone()),
+            resolve(None, None, saved, default.clone()),
             (PathBuf::from("saved"), Source::Preference)
         );
         assert_eq!(
-            resolve(os(&["--datadir="]), None, None, default.clone()),
+            resolve(None, None, None, default.clone()),
             (default, Source::Default)
         );
     }
