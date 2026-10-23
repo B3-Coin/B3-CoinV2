@@ -94,6 +94,8 @@ const PAGE_METHODS: &[&str] = &[
 ];
 
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
+/// How often a refused `stop` is asked again while the node loads.
+const STOP_RETRY: Duration = Duration::from_secs(1);
 const STDERR_TAIL: usize = 4096;
 /// How a Failed status for a locked data folder begins.
 const LOCKED_PREFIX: &str = "Another B3 client is using ";
@@ -378,12 +380,20 @@ impl Node {
             return StopOutcome::NotRunning;
         };
         *self.status.lock().unwrap() = NodeStatus::Stopping;
-        let asked = self
-            .client
-            .as_ref()
-            .is_some_and(|client| client.call("stop", json!([])).is_ok());
+        // b3coind refuses every RPC, `stop` included, while it loads (the
+        // block index and the trackers take minutes on mainnet), and refuses
+        // nothing once loaded. Keep asking until it accepts, so a close
+        // during the load still ends in its own orderly shutdown rather
+        // than a kill at the deadline.
+        let ask = || {
+            self.client
+                .as_ref()
+                .is_some_and(|client| client.call("stop", json!([])).is_ok())
+        };
+        let mut asked = ask();
         let started = Instant::now();
         let deadline = started + timeout;
+        let mut next_ask = started + STOP_RETRY;
         while Instant::now() < deadline {
             if let Ok(Some(_)) = child.try_wait() {
                 *guard = None;
@@ -393,6 +403,10 @@ impl Node {
                 };
             }
             thread::sleep(POLL_INTERVAL);
+            if !asked && Instant::now() >= next_ask {
+                asked = ask();
+                next_ask = Instant::now() + STOP_RETRY;
+            }
         }
         let _ = child.kill();
         let _ = child.wait();
