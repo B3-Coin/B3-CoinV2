@@ -287,6 +287,9 @@ jobs:
           name: hive-node-windows
           path: hive/node
       - name: Build the installer
+        # The runner's default shell is PowerShell; the staging script and
+        # its STRIP variable are bash.
+        shell: bash
         run: |
           STRIP=none scripts/stage-sidecar.sh b3-hive-node node/b3-hive-node.exe x86_64-pc-windows-msvc
           STRIP=none scripts/stage-sidecar.sh b3-hive-update node/b3-hive-update.exe x86_64-pc-windows-msvc
