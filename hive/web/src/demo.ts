@@ -35,8 +35,10 @@ let state: State | null = null;
 
 function clearing(s: State, sequence: number, observed_ms: number): void {
   const r = s.random();
-  // A random walk pulled back toward 2.5 B3, in whole ticks.
-  const pull = s.price > 25n ? -0.08 : s.price < 25n ? 0.08 : 0;
+  // A random walk pulled back toward 2.5 B3, in whole ticks: the further
+  // away, the harder, so the chart wanders without drifting off.
+  const away = Number(s.price - 25n);
+  const pull = Math.max(-0.25, Math.min(0.25, -away * 0.05));
   const move = r < 0.3 + pull ? -1n : r > 0.7 + pull ? 1n : 0n;
   s.price = s.price + move * TICK;
   if (s.price < 5n) s.price = 5n;
