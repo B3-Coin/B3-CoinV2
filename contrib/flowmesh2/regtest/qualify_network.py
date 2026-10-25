@@ -3,8 +3,8 @@
 
 This program has no mainnet mode. Synthetic assets and owned local chains only.
 """
-# TODO(rebirth:M0-QUAL-01) default tool and build paths are machine-bound
-# (/home/josh/...); the gates must run on a second machine from documented tools.
+# TODO(rebirth:M0-QUAL-01) the gates are qualified on one host only; they must
+# pass on a second machine from the tools setup_tools.sh documents.
 import argparse
 import json
 import os
@@ -13,6 +13,7 @@ import subprocess
 import sys
 import time
 
+import tool_paths
 from qualify_regtest import sha256, source_manifest
 
 
@@ -21,12 +22,9 @@ def main():
     parser.add_argument('--source-root', required=True)
     parser.add_argument('--build-dir', required=True)
     parser.add_argument('--evidence-dir', required=True)
-    parser.add_argument('--b3-node-build', default='/home/josh/B3-builds/regtest-b3-node')
-    parser.add_argument('--tools', default='/home/josh/B3-tools/foundry-v1.8.5')
-    parser.add_argument('--solc', default='/home/josh/B3-tools/solc-0.8.35')
-    parser.add_argument('--asan-build', default='/home/josh/B3-builds/audit-asan-20261018T071928Z-dy81br')
-    parser.add_argument('--tsan-build', default='/home/josh/B3-builds/audit-tsan-20261018T072648Z-XWPNXT')
+    tool_paths.add(parser, 'b3_node_build', 'tools', 'solc', 'asan_build', 'tsan_build')
     args = parser.parse_args()
+    tool_paths.resolve(parser, args, 'b3_node_build', 'tools', 'solc', 'asan_build', 'tsan_build')
     source, build = Path(args.source_root).resolve(strict=True), Path(args.build_dir).resolve(strict=True)
     evidence = Path(args.evidence_dir).resolve()
     if evidence == source or source in evidence.parents or evidence.exists():

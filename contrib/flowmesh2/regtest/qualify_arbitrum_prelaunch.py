@@ -17,6 +17,7 @@ import sys
 import time
 import re
 
+import tool_paths
 from arbitrum_assets import capture_asset_pin
 from arbitrum_plan import build_disabled_plan, validate_disabled_plan
 from arbitrum_rpc import strict_json
@@ -291,12 +292,11 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     for flag in ('source-root', 'build-dir', 'evidence-dir', 'provider-config', 'finality-state', 'fork-provider'):
         parser.add_argument('--' + flag, required=True)
-    parser.add_argument('--b3-node-build', default='/home/josh/B3-builds/regtest-b3-node')
-    parser.add_argument('--tools', default='/home/josh/B3-tools/foundry-v1.8.5')
-    parser.add_argument('--solc', default='/home/josh/B3-tools/solc-0.8.35')
+    tool_paths.add(parser, 'b3_node_build', 'tools', 'solc')
     parser.add_argument('--asan-build', required=True)
     parser.add_argument('--tsan-build', required=True)
     args = parser.parse_args(argv)
+    tool_paths.resolve(parser, args, 'b3_node_build', 'tools', 'solc')
     try:
         config = load_public_report(args.provider_config, 65536)
         env = qualification_environment(config)

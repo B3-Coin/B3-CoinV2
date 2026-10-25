@@ -9,6 +9,8 @@ import subprocess
 import sys
 import time
 
+import tool_paths
+
 
 def sha256(path):
     digest = hashlib.sha256()
@@ -36,11 +38,10 @@ def main():
     parser.add_argument('--source-root', required=True)
     parser.add_argument('--build-dir', required=True)
     parser.add_argument('--evidence-dir', required=True)
-    parser.add_argument('--b3-node-build', default='/home/josh/B3-builds/regtest-b3-node')
-    parser.add_argument('--tools', default='/home/josh/B3-tools/foundry-v1.8.5')
-    parser.add_argument('--solc', default='/home/josh/B3-tools/solc-0.8.35')
+    tool_paths.add(parser, 'b3_node_build', 'tools', 'solc')
     parser.add_argument('--agreement', choices=('pbft-fixed-view', 'pbft-view-change'), default='pbft-view-change')
     args = parser.parse_args()
+    tool_paths.resolve(parser, args, 'b3_node_build', 'tools', 'solc')
     source = Path(args.source_root).resolve(strict=True)
     build = Path(args.build_dir).resolve(strict=True)
     evidence = Path(args.evidence_dir).resolve()

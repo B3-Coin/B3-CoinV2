@@ -10,7 +10,7 @@ direct quorum coordinator is an explicit fixture, not autonomous networking.
 
 Run from the source checkout on Linux/WSL with a fresh evidence directory:
   python3 contrib/flowmesh2/nitro_regtest/run_roundtrip.py \
-    --source-root /home/josh/B3-rebirth \
+    --source-root /path/to/source \
     --worker /path/to/fm2-regtest-node --native-checker /path/to/b3-bridge-arbitrumcheck \
     --runtime /path/to/owned-root-nitro-runtime --tools /path/to/foundry \
     --solc /path/to/solc-0.8.35 --evidence-dir /fresh/private/evidence \

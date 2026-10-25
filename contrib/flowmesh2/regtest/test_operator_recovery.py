@@ -13,6 +13,7 @@ import subprocess
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import tool_paths
 from custody import Q_ASSET, CustodyError, atomic_json, expect
 from local_process import raw_hex, wait_until
 from operator_wrapper import private_json
@@ -317,12 +318,9 @@ def main():
     parser.add_argument('--source-root', required=True)
     parser.add_argument('--evidence-dir', required=True)
     parser.add_argument('--agreement', choices=('pbft-fixed-view', 'pbft-view-change'), default='pbft-fixed-view')
-    parser.add_argument('--worker', default='/home/josh/B3-builds/fm2-regtest/bin/fm2-regtest-node')
-    parser.add_argument('--b3coind', default='/home/josh/B3-builds/regtest-b3-node/bin/b3coind')
-    parser.add_argument('--b3coin-cli', default='/home/josh/B3-builds/regtest-b3-node/bin/b3coin-cli')
-    parser.add_argument('--tools', default='/home/josh/B3-tools/foundry-v1.8.5')
-    parser.add_argument('--solc', default='/home/josh/B3-tools/solc-0.8.35')
+    tool_paths.add(parser, 'worker', 'b3coind', 'b3coin_cli', 'tools', 'solc')
     args = parser.parse_args()
+    tool_paths.resolve(parser, args, 'worker', 'b3coind', 'b3coin_cli', 'tools', 'solc')
     fixture = None
     try:
         fixture = RecoveryFixture(args)

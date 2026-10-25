@@ -6,6 +6,7 @@ from pathlib import Path
 import subprocess
 import sys
 
+import tool_paths
 from custody import (CHAIN_ID, Q_ASSET, TEST_MNEMONIC, CustodyDriver, CustodyError,
                      LocalRpc, atomic_json, expect)
 from custody_policy import pin_custody
@@ -16,9 +17,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--source-root', required=True)
     parser.add_argument('--evidence-dir', required=True)
-    parser.add_argument('--tools', default='/home/josh/B3-tools/foundry-v1.8.5')
-    parser.add_argument('--solc', default='/home/josh/B3-tools/solc-0.8.35')
+    tool_paths.add(parser, 'tools', 'solc')
     args = parser.parse_args()
+    tool_paths.resolve(parser, args, 'tools', 'solc')
     source, evidence = Path(args.source_root).resolve(strict=True), Path(args.evidence_dir).resolve()
     if evidence == source or source in evidence.parents or (evidence.exists() and any(evidence.iterdir())):
         raise CustodyError('proxy test requires fresh evidence outside source; never erase existing history')

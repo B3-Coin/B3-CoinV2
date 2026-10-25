@@ -11,6 +11,12 @@ Run the complete release gates
     --build-dir ~/B3-builds/rebirth-20261018T065433Z-xaWC1q \
     --evidence-dir "$HOME/B3-evidence/network-$(date -u +%Y%m%dT%H%M%SZ)"
 
+Tool and build paths come from the arguments (--tools, --solc, --b3-node-build,
+--b3coind, --b3coin-cli, --worker, --asan-build, --tsan-build) or, when an
+argument is absent, from FM2_TOOLS, FM2_SOLC, FM2_B3_NODE_BUILD,
+FM2_REGTEST_BUILD, FM2_ASAN_BUILD and FM2_TSAN_BUILD (tool_paths.py). A path
+given by neither stops the gate with a message naming both.
+
 The evidence directory must be new and outside the source. Failed runs retain
 all original state. The runner starts only its own isolated B3 regtest and
 unforked Anvil chain31337 processes. There is no mainnet option.
