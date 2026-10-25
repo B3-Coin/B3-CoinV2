@@ -44,10 +44,12 @@
  *   proposal by TakeForSlot; still in the pool until a slot commits);
  * - terminal: INCLUDED (a certified slot executed it), NONCE_USED (another
  *   action used its nonce), NONCE_TOO_LOW (the account's window moved past
- *   its nonce) and EXPIRED (height > ref_slot + max_delay, so no later slot
+ *   its nonce), EXPIRED (height > ref_slot + max_delay, so no later slot
  *   can include it; the same rule VerifyExpired and the read service use,
- *   O-63). Every live entry ends in exactly one terminal status or stays
- *   live; nothing is dropped silently (DUR-6).
+ *   O-63) and EXCLUDED (this node's Preview refused every candidate holding
+ *   it on the head it was taken for, an engine error it causes, O-34;
+ *   M4-ADM-03). Every live entry ends in exactly one terminal status or
+ *   stays live; nothing is dropped silently (DUR-6).
  *
  * Invariants kept by every method (checked by the tests):
  * - at most one live entry per ActionId and per (account, nonce), so the
@@ -103,6 +105,7 @@ inline constexpr std::string_view POOL_ORIGINAL_MALFORMED{"committed original do
 inline constexpr std::string_view POOL_OUTCOME_MISSING{"committed original without exactly one action outcome"};   //!< (INVALID_INPUT)
 inline constexpr std::string_view POOL_ACCOUNT_MISSING{"a live entry's account is absent at the committed head"};  //!< (INVARIANT)
 inline constexpr std::string_view POOL_APPLIED_MISMATCH{"APPLIED token of another slot, header or state root"};     //!< (VERIFY_FAILED)
+inline constexpr std::string_view POOL_NOT_IN_PROPOSAL{"no live entry in the proposal of that slot"};               //!< (INVALID_INPUT)
 
 struct PoolLimits {
     size_t capacity{0};          //!< live (PENDING or IN_PROPOSAL) entries; Insert answers POOL_FULL beyond
@@ -121,9 +124,10 @@ enum class PoolStatus : uint8_t {
     NONCE_USED = 4,    //!< terminal: another action used its nonce
     NONCE_TOO_LOW = 5, //!< terminal: the account's window moved past its nonce
     EXPIRED = 6,       //!< terminal: height > ref_slot + max_delay
+    EXCLUDED = 7,      //!< terminal: the engine refused every candidate holding it (M4-ADM-03); local, not certified
 };
 bool IsKnown(PoolStatus status);
-//! True for INCLUDED, NONCE_USED, NONCE_TOO_LOW and EXPIRED.
+//! True for INCLUDED, NONCE_USED, NONCE_TOO_LOW, EXPIRED and EXCLUDED.
 bool IsTerminal(PoolStatus status);
 //! Registry name; "UNKNOWN" for an unregistered value.
 std::string_view ToString(PoolStatus status);
@@ -243,6 +247,19 @@ public:
     Result<TakenSlot> TakeForSlot(uint64_t next_height, size_t max, const WithholdFilter& withhold = {})
         EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
 
+    /** M4-ADM-03: the proposal of `next_height` leaves out `id`, because the
+     * engine refused every candidate holding it (state::PreviewExcludingRefused).
+     * The entry becomes terminal EXCLUDED, recorded at the pool's head height,
+     * and no later TakeForSlot takes it. Like every terminal record other
+     * than INCLUDED it is no duplicate: Insert of the same ActionId replaces
+     * it, so a client may send the action again once the state has changed.
+     * Refused, changing nothing: ORDER_VIOLATION POOL_TAKE_HEIGHT unless
+     * next_height is the pool's head height + 1; INVALID_INPUT
+     * POOL_NOT_IN_PROPOSAL unless `id` is live and IN_PROPOSAL for next_height.
+     * The terminal_capacity bound holds after the call.
+     */
+    Result<void> Exclude(const ActionId& id, uint64_t next_height) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+
     /** The state owner committed `head` (after B-APPLIED and read
      * publication), whose slot emitted `outcomes` (in emission order) from
      * `body` (the certified canonical body); `applied` is the slot's
@@ -300,6 +317,8 @@ private:
     };
 
     void EraseLive(std::map<ActionId, Entry>::iterator it) EXCLUSIVE_LOCKS_REQUIRED(m_mutex);
+    //! Drop the oldest terminal records other than INCLUDED while there are more than terminal_capacity; returns how many.
+    size_t EvictOverCapacity() EXCLUSIVE_LOCKS_REQUIRED(m_mutex);
 
     const PoolLimits m_limits;
     const ProfileParams m_profile;

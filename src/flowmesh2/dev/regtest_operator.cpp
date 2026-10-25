@@ -1261,6 +1261,7 @@ struct RegtestOperator::Impl {
     {
         Need(observed.has_value(), "trusted observed batch required");
         auto inputs{*observed};
+        std::optional<admission::TakenSlot> taken;
         if (request.exists("actions")) inputs.body.originals = Frames(request["actions"], profile.max_actions_per_slot, ActionV2::MaxEncodedSize(profile));
         else {
             const size_t maximum{request.exists("max_actions") ? Number<size_t>(request, "max_actions") : profile.max_actions_per_slot};
@@ -1269,9 +1270,22 @@ struct RegtestOperator::Impl {
                  "candidate selection budget exceeds the configured profile");
             std::map<AccountId, size_t> counts;
             const admission::WithholdFilter fair{[&](const ActionV2& action) { return counts[action.Account()]++ >= per_account; }};
-            inputs.body.originals = Must(pool->TakeForSlot(owner->Head()->Header().height + 1, maximum, fair)).originals;
+            taken = Must(pool->TakeForSlot(owner->Head()->Header().height + 1, maximum, fair));
+            inputs.body.originals = taken->originals;
         }
-        const auto candidate{Must(owner->Preview(state::ParentRef::Committed(*owner->Head()), inputs))};
+        // Pool-selected actions the engine refuses are left out and become
+        // terminal EXCLUDED (M4-ADM-03); explicitly listed actions are previewed as given.
+        std::optional<state::Candidate> selected;
+        size_t excluded{0};
+        if (taken) {
+            auto selection{Must(state::PreviewExcludingRefused(*owner, state::ParentRef::Committed(*owner->Head()), inputs))};
+            for (const size_t position : selection.excluded) Must(pool->Exclude(taken->ids[position], taken->height));
+            excluded = selection.excluded.size();
+            selected.emplace(std::move(selection.candidate));
+        } else {
+            selected.emplace(Must(owner->Preview(state::ParentRef::Committed(*owner->Head()), inputs)));
+        }
+        const state::Candidate& candidate{*selected};
         UniValue out{UniValue::VOBJ}; out.pushKV("header", HexStr(candidate.Header().Encode())); out.pushKV("body", HexStr(candidate.Body().Encode()));
         const uint64_t view{pbft ? pbft->CurrentView() : 0};
         out.pushKV("hash", HexStr(candidate.Header().Hash())); out.pushKV("commit_digest", HexStr(VersionedCommitDigest(candidate.Header(), view)));
@@ -1279,6 +1293,7 @@ struct RegtestOperator::Impl {
         UniValue actions{UniValue::VARR};
         for (const auto& value : candidate.Body().originals) actions.push_back(HexStr(value));
         out.pushKV("actions", actions);
+        out.pushKV("excluded", excluded);
         return out;
     }
     template <class Call> void RunAgreement(Call call, bool timeout = false)

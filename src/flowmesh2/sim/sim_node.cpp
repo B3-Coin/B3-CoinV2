@@ -10,6 +10,7 @@
 #include <flowmesh2/core/hashes.h>
 #include <flowmesh2/core/state_root.h>
 
+#include <cstddef>
 #include <limits>
 #include <optional>
 #include <string>
@@ -310,10 +311,22 @@ Result<SealReport> SimNode::SealNext(const std::shared_ptr<const state::HeadView
         inputs.body.facts.push_back(std::move(bytes).value());
     }
     inputs.body.originals = taken->originals;
-    // An engine error that one action causes (O-34) is not fenced: the slot is
-    // retried, and excluding that action is M4-ADM-03.
-    Result<state::Candidate> candidate{m_owner->Preview(state::ParentRef::Committed(*head), inputs)};
-    if (!candidate.has_value()) return FenceOn(candidate.error());
+    // An action the engine refuses (an O-34 error) is left out and becomes
+    // terminal EXCLUDED, so it never stalls the slot (M4-ADM-03). An error of
+    // the facts or the slot alone is returned unfenced and the slot retried.
+    Result<state::PreviewSelection> selected{state::PreviewExcludingRefused(*m_owner, state::ParentRef::Committed(*head), inputs)};
+    if (!selected.has_value()) return FenceOn(selected.error());
+    for (const size_t position : selected->excluded) {
+        const ActionId& excluded{taken->ids[position]};
+        if (const Result<void> marked{m_pool->Exclude(excluded, height)}; !marked.has_value()) return FenceOn(marked.error());
+        m_trace.Record("pool.exclude", "slot=" + std::to_string(height) + ",action=" + excluded.id.GetHex());
+    }
+    for (auto position{selected->excluded.rbegin()}; position != selected->excluded.rend(); ++position) {
+        taken->ids.erase(taken->ids.begin() + static_cast<std::ptrdiff_t>(*position));
+        taken->originals.erase(taken->originals.begin() + static_cast<std::ptrdiff_t>(*position));
+    }
+    inputs.body.originals = taken->originals;
+    std::optional<state::Candidate> candidate{std::move(selected->candidate)};
     m_trace.Record("state.preview", "slot=" + std::to_string(height) + ",header=" + candidate->Header().Hash().GetHex());
 
     // 4. The plan's authority bump (N11), between Preview and Propose.

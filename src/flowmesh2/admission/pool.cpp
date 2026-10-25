@@ -28,6 +28,7 @@ bool IsKnown(PoolStatus status)
     case PoolStatus::NONCE_USED:
     case PoolStatus::NONCE_TOO_LOW:
     case PoolStatus::EXPIRED:
+    case PoolStatus::EXCLUDED:
         return true;
     }
     return false;
@@ -40,6 +41,7 @@ bool IsTerminal(PoolStatus status)
     case PoolStatus::NONCE_USED:
     case PoolStatus::NONCE_TOO_LOW:
     case PoolStatus::EXPIRED:
+    case PoolStatus::EXCLUDED:
         return true;
     case PoolStatus::PENDING:
     case PoolStatus::IN_PROPOSAL:
@@ -57,6 +59,7 @@ std::string_view ToString(PoolStatus status)
     case PoolStatus::NONCE_USED: return "NONCE_USED";
     case PoolStatus::NONCE_TOO_LOW: return "NONCE_TOO_LOW";
     case PoolStatus::EXPIRED: return "EXPIRED";
+    case PoolStatus::EXCLUDED: return "EXCLUDED";
     }
     return "UNKNOWN";
 }
@@ -114,7 +117,7 @@ InsertReply ActionPool::Insert(const VerifiedAction& action, uint64_t snapshot_h
     if (m_live.size() >= m_limits.capacity) return InsertReply{InsertResult::POOL_FULL, std::nullopt, std::nullopt};
 
     if (terminal != m_terminal.end()) {
-        // A NONCE_USED, NONCE_TOO_LOW or EXPIRED record of a re-admitted action; its
+        // A NONCE_USED, NONCE_TOO_LOW, EXPIRED or EXCLUDED record of a re-admitted action; its
         // order entries become stale and are skipped at eviction.
         m_terminal.erase(terminal);
         --m_other_count;
@@ -194,6 +197,43 @@ Result<TakenSlot> ActionPool::TakeForSlot(uint64_t next_height, size_t max, cons
         taken.originals.push_back(it->second.original);
     }
     return Ok(std::move(taken));
+}
+
+Result<void> ActionPool::Exclude(const ActionId& id, uint64_t next_height)
+{
+    LOCK(m_mutex);
+    if (m_head_height == UINT64_MAX || next_height != m_head_height + 1) return Error{ErrorCode::ORDER_VIOLATION, POOL_TAKE_HEIGHT};
+    const auto live{m_live.find(id)};
+    if (live == m_live.end() || live->second.status != PoolStatus::IN_PROPOSAL || live->second.proposal_height != next_height) {
+        return Error{ErrorCode::INVALID_INPUT, POOL_NOT_IN_PROPOSAL};
+    }
+    Terminal record;
+    record.status = PoolStatus::EXCLUDED;
+    record.pending = live->second.ref;
+    record.height = m_head_height;
+    EraseLive(live);
+    // Live entries and terminal records are disjoint, so there is no record to replace.
+    m_terminal.emplace(id, std::move(record));
+    m_other_order.emplace_back(m_head_height, id);
+    ++m_other_count;
+    EvictOverCapacity();
+    return Ok();
+}
+
+size_t ActionPool::EvictOverCapacity()
+{
+    size_t evicted{0};
+    while (!m_other_order.empty() && m_other_count > m_limits.terminal_capacity) {
+        const auto [record_height, id] = m_other_order.front();
+        m_other_order.pop_front();
+        const auto it{m_terminal.find(id)};
+        if (it != m_terminal.end() && it->second.status != PoolStatus::INCLUDED && it->second.height == record_height) {
+            m_terminal.erase(it);
+            --m_other_count;
+            ++evicted;
+        }
+    }
+    return evicted;
 }
 
 Result<CommitReport> ActionPool::OnCommitted(const DurableApplied& applied, const state::HeadView& head,

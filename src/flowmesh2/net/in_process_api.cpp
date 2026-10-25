@@ -271,6 +271,8 @@ Result<ActionStatusReply> InProcessApi::GetAction(const ActionV2& original) cons
     reply.status = ApiActionStatus::UNKNOWN;
     if (pooled && pooled->status == admission::PoolStatus::INCLUDED) {
         reply.reason = API_UNKNOWN_INCLUDED_AFTER_LEASE;
+    } else if (pooled && pooled->status == admission::PoolStatus::EXCLUDED) {
+        reply.reason = API_UNKNOWN_EXCLUDED; // local and definite (M4-ADM-03), never certified
     } else if (pooled && admission::IsTerminal(pooled->status)) {
         reply.reason = API_UNKNOWN_TERMINAL_UNPROVEN;
     } else if (lease_reply) {

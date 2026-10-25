@@ -11,6 +11,8 @@
 #include <flowmesh2/core/merkle.h>
 #include <flowmesh2/agreement/pbft.h>
 
+#include <algorithm>
+#include <numeric>
 #include <utility>
 #include <vector>
 
@@ -231,6 +233,76 @@ Result<void> StateOwner::Restore(const HeadView& /*base*/, std::span<const stora
 {
     // Snapshot plus exactly-once replay of the DECISION records after it (plan section 3.7).
     return NotImplemented("M4-STO-03"); // TODO(rebirth:M4-STO-03)
+}
+
+bool IsInputRefusal(ErrorCode code)
+{
+    switch (code) {
+    case ErrorCode::NOT_IMPLEMENTED:
+    case ErrorCode::UNSUPPORTED:
+    case ErrorCode::DECODE:
+    case ErrorCode::OVERSIZE:
+    case ErrorCode::ARITHMETIC_OVERFLOW:
+    case ErrorCode::VERIFY_FAILED:
+    case ErrorCode::INVALID_INPUT:
+        return true;
+    case ErrorCode::UNSUPPORTED_NETWORK:
+    case ErrorCode::INVARIANT:
+    case ErrorCode::ORDER_VIOLATION:
+    case ErrorCode::EQUIVOCATION_REFUSED:
+    case ErrorCode::STORAGE_FATAL:
+    case ErrorCode::FENCED:
+    case ErrorCode::AUTHORITY_CHANGED:
+    case ErrorCode::STALE_PARENT:
+    case ErrorCode::BUSY:
+    case ErrorCode::NEED_DATA:
+        return false;
+    }
+    return false;
+}
+
+Result<PreviewSelection> PreviewExcludingRefused(const StateOwner& owner, const ParentRef& parent, const SlotInputs& inputs)
+{
+    Result<Candidate> full{owner.Preview(parent, inputs)};
+    if (full.has_value()) return Ok(PreviewSelection{std::move(full).value(), {}});
+    if (!IsInputRefusal(full.error().code) || inputs.body.originals.empty()) return full.error();
+
+    std::vector<size_t> kept(inputs.body.originals.size());
+    std::iota(kept.begin(), kept.end(), size_t{0});
+    SlotInputs trial{inputs};
+    const auto preview = [&](size_t count) {
+        trial.body.originals.clear();
+        for (size_t i{0}; i < count; ++i) trial.body.originals.push_back(inputs.body.originals[kept[i]]);
+        return owner.Preview(parent, trial);
+    };
+    // The facts and the slot alone must preview, or no action is to blame.
+    if (const Result<Candidate> none{preview(0)}; !none.has_value()) return full.error();
+
+    std::vector<size_t> excluded;
+    while (true) {
+        // Prefix `low` of `kept` previews and prefix `high` fails with an input refusal.
+        size_t low{0}, high{kept.size()};
+        while (high - low > 1) {
+            const size_t middle{low + (high - low) / 2};
+            const Result<Candidate> tried{preview(middle)};
+            if (tried.has_value()) {
+                low = middle;
+            } else if (IsInputRefusal(tried.error().code)) {
+                high = middle;
+            } else {
+                return tried.error();
+            }
+        }
+        excluded.push_back(kept[high - 1]);
+        kept.erase(kept.begin() + static_cast<std::ptrdiff_t>(high - 1));
+        Result<Candidate> again{preview(kept.size())};
+        if (again.has_value()) {
+            std::sort(excluded.begin(), excluded.end());
+            return Ok(PreviewSelection{std::move(again).value(), std::move(excluded)});
+        }
+        // `kept` is never empty here: prefix 0 previews.
+        if (!IsInputRefusal(again.error().code)) return again.error();
+    }
 }
 
 } // namespace flowmesh2::state

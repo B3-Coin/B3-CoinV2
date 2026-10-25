@@ -102,6 +102,7 @@ std::string_view ToString(ApiActionStatus status);
 inline constexpr std::string_view API_UNKNOWN_NOTHING_PUBLISHED{"nothing published yet and not in this node's pool"};
 inline constexpr std::string_view API_UNKNOWN_INCLUDED_AFTER_LEASE{"included in a slot after the lease's head; ask again"};
 inline constexpr std::string_view API_UNKNOWN_TERMINAL_UNPROVEN{"this node's pool dropped it, but the lease proves nothing"};
+inline constexpr std::string_view API_UNKNOWN_EXCLUDED{"this node's proposals excluded it: the engine refused every candidate holding it"};
 
 //! The answer of GetAction (see the file comment).
 struct ActionStatusReply {

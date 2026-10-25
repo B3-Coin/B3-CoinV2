@@ -75,8 +75,10 @@
  *     FACTS gives the batch;
  *  2. ActionPool::TakeForSlot(head + 1, max_actions_per_slot, the plan's
  *     withhold filter);
- *  3. StateOwner::Preview(committed head, {batch authority, anchor, range,
- *     fact bytes, taken originals});
+ *  3. state::PreviewExcludingRefused(committed head, {batch authority,
+ *     anchor, range, fact bytes, taken originals}); every original it leaves
+ *     out becomes terminal EXCLUDED in the pool (ActionPool::Exclude, traced
+ *     as pool.exclude) and leaves the slot (M4-ADM-03);
  *  4. the plan's authority bump, if this is its slot;
  *  5. DevSingleSeatCertifier::Propose(candidate, batch authority) and
  *     TakeDecision (B-INTENT, sign, B-VOTE, B-DECISION); then the plan's
@@ -88,9 +90,10 @@
  * Any failure returns its error and nothing after it runs. Before Apply
  * moved the head, STORAGE_FATAL, FENCED, AUTHORITY_CHANGED,
  * EQUIVOCATION_REFUSED, INVARIANT and ORDER_VIOLATION also fence the node
- * (Admission::Fence); BUSY, NEED_DATA and a refusal of the slot's inputs
- * (for example an engine error one action causes, O-34) do not, and the
- * slot is tried again. After Apply moved the head, EVERY error of steps 7
+ * (Admission::Fence); BUSY, NEED_DATA and a refusal of the facts or the
+ * slot alone (an O-34 error no action causes) do not, and the slot is tried
+ * again. An engine error that one action causes no longer reaches here:
+ * step 3 excludes that action. After Apply moved the head, EVERY error of steps 7
  * to 9 fences the node, because the commit log, the read service or the
  * pool would disagree with the head on every later call (O-90). A fenced
  * node's new submissions get HALTED, reads stay live on the last
@@ -149,7 +152,7 @@ struct SealedSlot {
     std::vector<OutcomeV2> outcomes;             //!< emission order
     std::shared_ptr<const read::SlotView> view;
     admission::CommitReport pool_report;
-    std::vector<ActionId> taken;                 //!< what TakeForSlot handed to the proposal
+    std::vector<ActionId> taken;                 //!< what TakeForSlot handed to the proposal, less the excluded (M4-ADM-03)
 };
 
 //! What one successful SealSlot did.

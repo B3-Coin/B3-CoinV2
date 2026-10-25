@@ -123,7 +123,8 @@ BOOST_AUTO_TEST_CASE(create_limits_and_registries)
     // Registries: integers and names are append-only.
     const std::vector<std::pair<PoolStatus, std::string_view>> statuses{
         {PoolStatus::PENDING, "PENDING"}, {PoolStatus::IN_PROPOSAL, "IN_PROPOSAL"}, {PoolStatus::INCLUDED, "INCLUDED"},
-        {PoolStatus::NONCE_USED, "NONCE_USED"}, {PoolStatus::NONCE_TOO_LOW, "NONCE_TOO_LOW"}, {PoolStatus::EXPIRED, "EXPIRED"}};
+        {PoolStatus::NONCE_USED, "NONCE_USED"}, {PoolStatus::NONCE_TOO_LOW, "NONCE_TOO_LOW"}, {PoolStatus::EXPIRED, "EXPIRED"},
+        {PoolStatus::EXCLUDED, "EXCLUDED"}};
     for (size_t i{0}; i < statuses.size(); ++i) {
         BOOST_CHECK_EQUAL(static_cast<int>(statuses[i].first), static_cast<int>(i + 1));
         BOOST_CHECK(admission::IsKnown(statuses[i].first));
@@ -131,9 +132,9 @@ BOOST_AUTO_TEST_CASE(create_limits_and_registries)
         BOOST_CHECK_EQUAL(admission::IsTerminal(statuses[i].first), i >= 2);
     }
     BOOST_CHECK(!admission::IsKnown(static_cast<PoolStatus>(0)));
-    BOOST_CHECK(!admission::IsKnown(static_cast<PoolStatus>(7)));
-    BOOST_CHECK(!admission::IsTerminal(static_cast<PoolStatus>(7)));
-    BOOST_CHECK_EQUAL(admission::ToString(static_cast<PoolStatus>(7)), "UNKNOWN");
+    BOOST_CHECK(!admission::IsKnown(static_cast<PoolStatus>(8)));
+    BOOST_CHECK(!admission::IsTerminal(static_cast<PoolStatus>(8)));
+    BOOST_CHECK_EQUAL(admission::ToString(static_cast<PoolStatus>(8)), "UNKNOWN");
     const std::vector<std::pair<InsertResult, std::string_view>> results{{InsertResult::INSERTED, "INSERTED"},
                                                                          {InsertResult::DUPLICATE, "DUPLICATE"},
                                                                          {InsertResult::NONCE_PENDING, "NONCE_PENDING"},
@@ -443,6 +444,75 @@ BOOST_AUTO_TEST_CASE(in_proposal_returns_to_pending_when_another_slot_commits)
     BOOST_CHECK_EQUAL(status.height, 0U);
     PoolRig::Sealed next{r.Seal()};
     BOOST_CHECK_EQUAL(next.report.included, 1U);
+}
+
+BOOST_AUTO_TEST_CASE(exclude_ends_an_in_proposal_entry_and_refusals_change_nothing)
+{
+    // M4-ADM-03: the node's proposal leaves out an action the engine refuses.
+    PoolRig r;
+    r.Fund();
+    SlotFixture& a{r.Actions()};
+    const auto x{SmallPlace(a, "alice", 1)};
+    const auto y{SmallPlace(a, "bob", 1)};
+    BOOST_REQUIRE(r.Insert(x).result == InsertResult::INSERTED);
+    BOOST_REQUIRE(r.Insert(y).result == InsertResult::INSERTED);
+    const std::vector<ActionId> ids{IdOfBytes(x), IdOfBytes(y)};
+
+    // Refusals: not yet taken, another height, an unknown id.
+    const PoolSnapshot pending{SnapshotOf(*r.pool, ids)};
+    RequireFailure(r.pool->Exclude(ids[0], 2), ErrorCode::INVALID_INPUT, admission::POOL_NOT_IN_PROPOSAL, "PENDING entry");
+    BOOST_CHECK(SnapshotOf(*r.pool, ids) == pending);
+    RequireOk(r.pool->TakeForSlot(2, 10), "TakeForSlot");
+    const PoolSnapshot taken{SnapshotOf(*r.pool, ids)};
+    RequireFailure(r.pool->Exclude(ids[0], 1), ErrorCode::ORDER_VIOLATION, admission::POOL_TAKE_HEIGHT, "height = head");
+    RequireFailure(r.pool->Exclude(ids[0], 3), ErrorCode::ORDER_VIOLATION, admission::POOL_TAKE_HEIGHT, "height = head + 2");
+    RequireFailure(r.pool->Exclude(ActionId{uint256::ONE}, 2), ErrorCode::INVALID_INPUT, admission::POOL_NOT_IN_PROPOSAL, "unknown id");
+    BOOST_CHECK(SnapshotOf(*r.pool, ids) == taken);
+
+    RequireOk(r.pool->Exclude(ids[0], 2), "Exclude");
+    const admission::PoolEntryStatus excluded{RequireStatus(*r.pool, ids[0])};
+    BOOST_CHECK(excluded.status == PoolStatus::EXCLUDED);
+    BOOST_CHECK_EQUAL(excluded.height, 1U); // the pool's head when it was excluded
+    BOOST_CHECK(!excluded.included.has_value());
+    BOOST_CHECK_EQUAL(r.pool->Size(), 1U);
+    BOOST_CHECK_EQUAL(r.pool->TerminalRecords(), 1U);
+    BOOST_CHECK(!r.pool->FindById(ids[0]).has_value()); // only INCLUDED is a known terminal action
+    RequireFailure(r.pool->Exclude(ids[0], 2), ErrorCode::INVALID_INPUT, admission::POOL_NOT_IN_PROPOSAL, "twice");
+
+    // Never taken again; the slot commits without it and the record stays.
+    Result<admission::TakenSlot> again{r.pool->TakeForSlot(2, 10)};
+    RequireOk(again, "TakeForSlot again");
+    BOOST_CHECK(again->originals == std::vector<std::vector<unsigned char>>{y});
+    PoolRig::Sealed sealed{r.Seal()};
+    BOOST_CHECK_EQUAL(sealed.report.included, 1U);
+    BOOST_CHECK(RequireStatus(*r.pool, ids[0]).status == PoolStatus::EXCLUDED);
+
+    // Like EXPIRED, an EXCLUDED record is no duplicate: the client may send the action again.
+    BOOST_CHECK(r.Insert(x).result == InsertResult::INSERTED);
+    BOOST_CHECK(RequireStatus(*r.pool, ids[0]).status == PoolStatus::PENDING);
+    BOOST_CHECK_EQUAL(r.pool->TerminalRecords(), 0U);
+}
+
+BOOST_AUTO_TEST_CASE(excluded_records_respect_the_terminal_capacity)
+{
+    PoolRig r{OptionsFor(ProfileWith(100, 2), PoolLimits{8, 2, 1})};
+    r.Fund();
+    SlotFixture& a{r.Actions()};
+    const auto x{SmallPlace(a, "alice", 1)};
+    const auto y{SmallPlace(a, "bob", 1)};
+    BOOST_REQUIRE(r.Insert(x).result == InsertResult::INSERTED);
+    BOOST_REQUIRE(r.Insert(y).result == InsertResult::INSERTED);
+    RequireOk(r.pool->TakeForSlot(2, 10), "TakeForSlot");
+    RequireOk(r.pool->Exclude(IdOfBytes(x), 2), "Exclude x");
+    RequireOk(r.pool->Exclude(IdOfBytes(y), 2), "Exclude y");
+    BOOST_CHECK_EQUAL(r.pool->TerminalRecords(), 1U);
+    BOOST_CHECK(!r.pool->Status(IdOfBytes(x)).has_value()); // the oldest record went first
+    BOOST_CHECK(RequireStatus(*r.pool, IdOfBytes(y)).status == PoolStatus::EXCLUDED);
+    // Retention ends it like any other terminal record (s = 1, h = 3).
+    r.Seal();
+    PoolRig::Sealed slot3{r.Seal()};
+    BOOST_CHECK_EQUAL(slot3.report.evicted, 1U);
+    BOOST_CHECK_EQUAL(r.pool->TerminalRecords(), 0U);
 }
 
 BOOST_AUTO_TEST_CASE(on_committed_refusals_change_nothing)

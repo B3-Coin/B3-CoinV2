@@ -18,10 +18,12 @@
 #include <flowmesh2/storage/record.h>
 #include <sync.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <span>
 #include <string_view>
+#include <vector>
 
 /** The single-writer state owner (slice R9; ARCHITECTURE.md sections 3, 4
  * and 8; [CC] ownership boundary 2).
@@ -169,6 +171,40 @@ private:
     mutable Mutex m_mutex;
     std::shared_ptr<const HeadView> m_head GUARDED_BY(m_mutex);
 };
+
+/** True for the errors a Preview can give because of the slot's inputs
+ * (DECODE, OVERSIZE, ARITHMETIC_OVERFLOW, VERIFY_FAILED, INVALID_INPUT,
+ * NOT_IMPLEMENTED, UNSUPPORTED). False for every error about the node, the
+ * call or the head (STALE_PARENT, ORDER_VIOLATION, INVARIANT, BUSY, ...).
+ */
+bool IsInputRefusal(ErrorCode code);
+
+//! A candidate and the originals PreviewExcludingRefused left out.
+struct PreviewSelection {
+    Candidate candidate;
+    std::vector<size_t> excluded; //!< ascending indexes into inputs.body.originals
+};
+
+/** M4-ADM-03: Preview that leaves out the originals the engine refuses, so
+ * one action (an O-34 error, for example a 257th asset in one account) does
+ * not stall sealing. Pure, like Preview.
+ *
+ * 1. Preview(parent, inputs); success gives the candidate, nothing excluded.
+ * 2. Any error that is not IsInputRefusal is returned. So is the error when
+ *    there are no originals, or when the same inputs without originals fail
+ *    too: then the facts or the slot are refused, and no action is blamed.
+ * 3. Else, while Preview of the kept originals fails with an input refusal:
+ *    bisect over the kept originals in their given order for a prefix that
+ *    previews and the same prefix plus one original that does not (prefix 0
+ *    previews, the whole list does not), and leave that one original out.
+ *    The first kept list that previews gives the candidate.
+ * Every original left out made a valid prefix of the others invalid on this
+ * parent; it is never one that was valid with every kept original before it.
+ * A non-refusal error in between is returned. Cost: at most
+ * 2 + excluded * (ceil(log2 n) + 1) Previews for n originals, and only one
+ * when nothing is refused.
+ */
+Result<PreviewSelection> PreviewExcludingRefused(const StateOwner& owner, const ParentRef& parent, const SlotInputs& inputs);
 
 } // namespace flowmesh2::state
 
