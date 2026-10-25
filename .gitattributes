@@ -1,1 +1,5 @@
 src/clientversion.cpp export-subst
+# The flowmesh2 guards pin SHA-256 hashes of checked-out C1 files
+# (contrib/flowmesh2/check_guards.py rule 6). Keep LF in every working tree,
+# including Windows checkouts with core.autocrlf=true.
+src/flowmesh2/** text eol=lf
