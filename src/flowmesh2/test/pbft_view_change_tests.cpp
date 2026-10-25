@@ -42,6 +42,15 @@ private:
     std::deque<ViewFrame>& m_frames;
 };
 
+//! A journal reopened from what a crashed one made durable.
+std::unique_ptr<storage::MemoryJournal> Reopened(storage::JournalRole role, const storage::MemoryJournal& crashed,
+                                                 storage::BarrierObserver* observer)
+{
+    auto journal{storage::MemoryJournal::Reopen(role, crashed.InstanceId(), crashed.DurableImage(), {}, observer)};
+    RequireOk(journal, "reopen a crashed journal");
+    return std::move(journal).value();
+}
+
 struct ViewReplica {
     ProfileParams profile{StableQViewRegtestProfile(ChainType::REGTEST).value()};
     SeatSet seats{TestSeats({"s0", "s1", "s2", "s3"})};
@@ -82,6 +91,26 @@ struct ViewReplica {
         auto created{PbftAgreement::Create(profile, config, context)};
         RequireOk(created, "full view PBFT factory");
         agreement = std::move(*created);
+    }
+
+    //! The seat after a crash: its three journals reopened from what they made
+    //! durable, its logs and head rebuilt from them alone, and a new agreement on
+    //! the same chain. Nothing else survives.
+    ViewReplica(uint32_t self, std::deque<ViewFrame>& frames, ViewReplica& crashed)
+        : adapter{std::move(crashed.adapter)},
+          signer_journal{Reopened(storage::JournalRole::SIGNER, *crashed.signer_journal, &observer)},
+          commit_journal{Reopened(storage::JournalRole::COMMIT, *crashed.commit_journal, &observer)},
+          control_journal{Reopened(storage::JournalRole::SIGNER, *crashed.control_journal, &observer)},
+          signer_log{storage::SignerLog::Create(*signer_journal, profile).value()},
+          commit_log{storage::CommitLog::Create(*commit_journal, profile).value()},
+          control_log{storage::ControlLog::Create(*control_journal, {TestDomain(), ProfileHash(profile), seats.Root(), 0, self, 4, seats.Keys()[self].Key()}).value()},
+          signer{storage::SeatSigner::FromIKM(AgreementRig::SeatIkm("s" + std::to_string(self)), signer_log, control_log).value()},
+          owner{state::StateOwner::Create(profile, genesis, commit_journal->InstanceId()).value()}, sink{self, frames}
+    {
+        const auto records{commit_journal->ReadAll()};
+        RequireOk(records, "reopened commit journal");
+        RequireOk(owner->RestoreVerifiedGenesis(genesis, *records, seats), "head from the commit journal");
+        RestartAgreement(self);
     }
 
     state::Candidate Candidate(std::vector<std::vector<unsigned char>> originals = {}) const
@@ -144,6 +173,13 @@ struct ViewReplica {
     }
 };
 
+struct ViewNetwork;
+struct PreparedSplit {
+    uint256 a; //!< prepared in view 0 by seats 0, 1 and 2, never committed
+    state::Candidate b; //!< the only value seat 3, the view-1 leader, was offered
+};
+PreparedSplit PrepareAOnly(ViewNetwork& network);
+
 struct ViewNetwork {
     std::deque<ViewFrame> frames;
     std::array<std::unique_ptr<ViewReplica>, 4> nodes;
@@ -152,6 +188,8 @@ struct ViewNetwork {
         for (uint32_t i{0}; i < 4; ++i) nodes[i] = std::make_unique<ViewReplica>(i, frames);
     }
     std::vector<ViewFrame> history;
+    //! Seat `seat` crashes and restarts from its journals (M4-STO-07).
+    void Restart(uint32_t seat) { nodes[seat] = std::make_unique<ViewReplica>(seat, frames, *nodes[seat]); }
     void Drain(const std::set<uint32_t>& offline = {}, std::function<bool(const ViewFrame&)> filter = {})
     {
         size_t work{0};
@@ -169,9 +207,97 @@ struct ViewNetwork {
     }
 };
 
+/** Slot 2 after a certified slot 1: leader 2 proposes A, seats 0, 1 and 2
+ * durably prepare it in view 0 and no COMMIT is delivered; seat 3 hears
+ * none of it. B is a different body for the same slot that only seat 3 has
+ * (it offers it once the view change starts). A view-1 NEW_VIEW from seat 3
+ * must select A, which only the prepared QCs of seats 0 and 1 can tell it.
+ */
+PreparedSplit PrepareAOnly(ViewNetwork& network)
+{
+    auto funding{network.nodes[1]->Candidate()};
+    RequireOk(network.nodes[1]->agreement->Propose(funding, network.nodes[1]->authority), "certified trusted funding first");
+    network.Drain();
+    SlotFixture actions{network.nodes[0]->profile};
+    const auto original_a{actions.Cancel("alice", 1, OrderId{LabelHash("prepared cancel A")})};
+    const auto original_b{actions.Cancel("alice", 1, OrderId{LabelHash("fresh cancel B")})};
+    auto a{network.nodes[2]->Candidate({original_a})};
+    auto b{network.nodes[3]->Candidate({original_b})};
+    BOOST_REQUIRE(a.Header().Hash() != b.Header().Hash());
+    RequireOk(network.nodes[2]->agreement->Propose(a, network.nodes[2]->authority), "original leader A");
+    network.Drain({}, [&](const ViewFrame& frame) {
+        if (frame.to == 3 || frame.from == 3) return false;
+        const auto decoded{DecodeMessage(frame.bytes, network.nodes[0]->profile).value()};
+        const auto* vote{std::get_if<Vote>(&decoded)};
+        return !vote || vote->phase != storage::VotePhase::COMMIT;
+    });
+    for (uint32_t i : {0U, 1U, 2U}) {
+        BOOST_REQUIRE(network.nodes[i]->commit_log.PreparedAt(0, 2, 0));
+        BOOST_REQUIRE(!network.nodes[i]->commit_log.DecisionAt(2));
+    }
+    return {a.Header().Hash(), std::move(b)};
+}
+
+//! Seats 0, 1 and 3 decided A at slot 2 (seat 2 stayed offline).
+void RequireADecided(ViewNetwork& network, const PreparedSplit& split)
+{
+    for (uint32_t i : {0U, 1U, 3U}) {
+        BOOST_CHECK_EQUAL(network.nodes[i]->owner->Head()->Header().height, 2U);
+        BOOST_CHECK(network.nodes[i]->owner->Head()->Header().Hash() == split.a);
+        BOOST_CHECK(network.nodes[i]->owner->Head()->Header().Hash() != split.b.Header().Hash());
+    }
+}
+
+//! A restarted seat holds its view-0 preparation of A again, from its commit journal.
+void RequirePreparedAfterRestart(ViewNetwork& network, uint32_t seat, const PreparedSplit& split)
+{
+    const auto& log{network.nodes[seat]->commit_log};
+    const auto prepared{log.PreparedAt(0, 2, 0)};
+    BOOST_CHECK_MESSAGE(prepared && prepared->header_hash == split.a, "seat " << seat << " lost its prepared QC in the restart");
+    BOOST_CHECK_MESSAGE(log.HighestDurablePreparedViewAt(0, 2) == std::optional<uint64_t>{0}, "seat " << seat << " has no durable preparation");
+    BOOST_CHECK_EQUAL(network.nodes[seat]->owner->Head()->Header().height, 1U);
+}
+
 } // namespace
 
 BOOST_AUTO_TEST_SUITE(pbft_view_change_tests)
+
+BOOST_AUTO_TEST_CASE(seats_restarted_before_a_view_change_report_the_prepared_qc_from_their_journals)
+{
+    ViewNetwork network;
+    const PreparedSplit split{PrepareAOnly(network)};
+    for (uint32_t i : {0U, 1U}) {
+        network.Restart(i);
+        RequirePreparedAfterRestart(network, i, split);
+    }
+    RequireOk(network.nodes[3]->agreement->Propose(split.b, network.nodes[3]->authority), "future leader only knows fresh B");
+    network.Drain({2});
+    for (uint32_t i : {0U, 1U, 3U}) RequireOk(network.nodes[i]->agreement->OnTimeout(0), "timer baseline");
+    for (uint32_t i : {0U, 1U, 3U}) RequireOk(network.nodes[i]->agreement->OnTimeout(500), "prepared leader loss");
+    network.Drain({2});
+    RequireADecided(network, split);
+}
+
+BOOST_AUTO_TEST_CASE(seats_restarted_in_a_view_change_resend_the_report_of_their_prepared_qc)
+{
+    ViewNetwork network;
+    const PreparedSplit split{PrepareAOnly(network)};
+    RequireOk(network.nodes[3]->agreement->Propose(split.b, network.nodes[3]->authority), "future leader only knows fresh B");
+    network.Drain({2});
+    for (uint32_t i : {0U, 1U, 3U}) RequireOk(network.nodes[i]->agreement->OnTimeout(0), "timer baseline");
+    for (uint32_t i : {0U, 1U, 3U}) RequireOk(network.nodes[i]->agreement->OnTimeout(500), "enter view 1");
+    // Seats 0 and 1 crash in CHANGING before any of their view-1 reports leaves.
+    std::erase_if(network.frames, [](const ViewFrame& frame) { return frame.from == 0 || frame.from == 1; });
+    for (uint32_t i : {0U, 1U}) {
+        network.Restart(i);
+        RequirePreparedAfterRestart(network, i, split);
+        BOOST_CHECK(network.nodes[i]->agreement->ChangingView());
+        BOOST_CHECK_EQUAL(network.nodes[i]->agreement->CurrentView(), 1U);
+        RequireOk(network.nodes[i]->agreement->OnTimeout(1'000'000), "restart retry report");
+    }
+    network.Drain({2});
+    RequireADecided(network, split);
+}
 
 BOOST_AUTO_TEST_CASE(silent_initial_leader_moves_without_user_resubmission)
 {
