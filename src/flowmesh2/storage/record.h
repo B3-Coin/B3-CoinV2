@@ -161,6 +161,16 @@ struct ScanResult {
  */
 Result<ScanResult> ScanRecords(std::span<const unsigned char> bytes, JournalRole role, uint64_t instance_id);
 
+/** ScanRecords of a segment after the first (M4-STO-06): the image's first
+ * record must continue `prev` (the chain after the previous segment's last
+ * record, which also binds the instance) and is numbered `first_seq`.
+ * `end_offset` is relative to `bytes`; `last_chain` is `prev` when the image
+ * holds no record. ScanRecords is ScanRecordsFrom(bytes, role,
+ * JournalGenesisChain(role, instance_id), 1). INVALID_INPUT for an unknown
+ * role or a zero first_seq.
+ */
+Result<ScanResult> ScanRecordsFrom(std::span<const unsigned char> bytes, JournalRole role, const uint256& prev, uint64_t first_seq);
+
 } // namespace flowmesh2::storage
 
 #endif // B3_FLOWMESH2_STORAGE_RECORD_H

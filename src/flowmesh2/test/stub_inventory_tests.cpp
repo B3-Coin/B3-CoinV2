@@ -39,8 +39,7 @@
  * branches of WITHDRAW and the spot/futures transfers (engine PhaseOf) as
  * well. Slice R8 adds the file journal's reopen and read-back and the logs'
  * recovery over a journal with history (M4-STO-01), segment rollover
- * (M4-STO-06; the probe also appends past the end of a one-page segment),
- * the group-commit writer (M4-STO-02), snapshots (M4-STO-03) and the view
+ * (M4-STO-06, since finished), the group-commit writer (M4-STO-02), snapshots (M4-STO-03) and the view
  * state records (M4-STO-07), and extends M4-STO-05 to probe the signer
  * log's folded signing as well. Slice R9 adds the state owner's pipelined
  * Preview over an uncommitted candidate (M4-AGR-10), and extends M4-STO-03
@@ -111,7 +110,6 @@
 #include <flowmesh2/state/replay.h>
 #include <flowmesh2/state/state_owner.h>
 #include <flowmesh2/storage/commit_log.h>
-#include <flowmesh2/storage/file_journal.h>
 #include <flowmesh2/storage/log_writer.h>
 #include <flowmesh2/storage/memory_journal.h>
 #include <flowmesh2/storage/signer_log.h>
@@ -505,17 +503,6 @@ FM2_STUB_CASE(M9_FUT_04, "M9-FUT-04")
     profile.futures_enabled = true;
     futures::FuturesDomain domain{RegtestProfile()};
     return FirstDeviation("M9-FUT-04", {Observe(engine::RunFuturesPhase(state, profile)), Observe(domain.Sweep(1))});
-}
-
-// ---- Slice R8: storage/file_journal ----
-
-FM2_STUB_CASE(M4_STO_06, "M4-STO-06")
-{
-    // Rollover itself, and an append that no longer fits in the segment.
-    const TestDir dir{"stub_m4_sto_06"};
-    auto journal{storage::FileJournal::CreateNew(dir.path, storage::JournalRole::COMMIT, 1, storage::SEGMENT_PAGE_BYTES).value()};
-    const std::vector<unsigned char> too_big(storage::SEGMENT_PAGE_BYTES);
-    return FirstDeviation("M4-STO-06", {Observe(journal->Rollover()), Observe(journal->Append(storage::RecordType::DECISION, too_big))});
 }
 
 // ---- Slice R8: storage logs, writer and snapshots ----

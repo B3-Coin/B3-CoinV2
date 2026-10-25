@@ -125,8 +125,15 @@ Result<EncodedRecord> EncodeRecord(const uint256& prev, RecordType type, std::sp
 Result<ScanResult> ScanRecords(std::span<const unsigned char> bytes, JournalRole role, uint64_t instance_id)
 {
     if (!IsKnown(role)) return Error{ErrorCode::INVALID_INPUT, "unknown journal role"};
+    return ScanRecordsFrom(bytes, role, JournalGenesisChain(role, instance_id), 1);
+}
+
+Result<ScanResult> ScanRecordsFrom(std::span<const unsigned char> bytes, JournalRole role, const uint256& prev, uint64_t first_seq)
+{
+    if (!IsKnown(role)) return Error{ErrorCode::INVALID_INPUT, "unknown journal role"};
+    if (first_seq == 0) return Error{ErrorCode::INVALID_INPUT, "first sequence number zero"};
     ScanResult out;
-    out.last_chain = JournalGenesisChain(role, instance_id);
+    out.last_chain = prev;
     size_t pos{0};
     while (pos < bytes.size()) {
         const std::span<const unsigned char> rest{bytes.subspan(pos)};
@@ -152,7 +159,7 @@ Result<ScanResult> ScanRecords(std::span<const unsigned char> bytes, JournalRole
         if (!IsKnown(type)) return Error{ErrorCode::DECODE, RECORD_TYPE};
         if (!RoleAccepts(role, type)) return Error{ErrorCode::ORDER_VIOLATION, RECORD_ROLE};
         if (NextChain(out.last_chain, type, payload) != chain) return Error{ErrorCode::VERIFY_FAILED, RECORD_CHAIN};
-        out.records.push_back(JournalRecord{out.records.size() + 1, type, std::vector<unsigned char>(payload.begin(), payload.end()), chain});
+        out.records.push_back(JournalRecord{first_seq + out.records.size(), type, std::vector<unsigned char>(payload.begin(), payload.end()), chain});
         out.last_chain = chain;
         pos += RECORD_OVERHEAD_BYTES + len;
         out.end_offset = pos;

@@ -26,14 +26,19 @@
 #include <flowmesh2/state/replay.h>
 #include <flowmesh2/state/state_owner.h>
 #include <flowmesh2/storage/commit_log.h>
+#include <flowmesh2/storage/file_journal.h>
+#include <flowmesh2/storage/journal.h>
 #include <flowmesh2/storage/record.h>
 #include <flowmesh2/storage/signer_log.h>
 #include <flowmesh2/test/util/require.h>
 #include <flowmesh2/test/util/slot_fixtures.h>
+#include <flowmesh2/test/util/storage_fixtures.h>
+#include <util/fs.h>
 
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <iterator>
 #include <memory>
 #include <optional>
 #include <string>
@@ -381,6 +386,88 @@ BOOST_AUTO_TEST_CASE(a_fact_error_never_excludes_an_action)
     BOOST_CHECK(!admission::IsTerminal(status->status));
     const std::vector<std::string> steps{rig.StepsFrom(events)};
     BOOST_CHECK(std::count(steps.begin(), steps.end(), "pool.exclude") == 0);
+}
+
+BOOST_AUTO_TEST_CASE(a_commit_journal_across_segments_reopens_and_replays_after_every_barrier)
+{
+    // M4-STO-06 at node level: a simulated node's commit journal, written
+    // record by record (one barrier each, as the node does) into file
+    // segments too small for it, so it rolls over several times. After every
+    // barrier a copy of the directory stands for a crash at that point: it
+    // reopens with exactly the acknowledged records, byte-equal to the
+    // node's, and they replay. The whole journal replays to the live head.
+    NodeRig rig;
+    RequireOk(rig.node->SealSlot(), "SealSlot 1");
+    SimClient alice{ClientOf(rig, "alice")};
+    Deposits block{SIM_BASE_HEIGHT + 2, {}};
+    block.Add(alice.Account(), SimAsset("rUSD"), 1'000'000);
+    RequireOk(rig.node->Chain().AppendBlock(SimBlockHash(block.height), std::move(block.facts)), "AppendBlock");
+    for (uint64_t slot{2}; slot <= 12; ++slot) {
+        if (slot >= 3 && slot <= 7) {
+            AdmitOk(rig, alice.Place("seg-" + std::to_string(slot), slot - 2, SimMarketM1(), Side::BUY, TimeInForce::GTC, 250, 1, slot - 1),
+                    "Alice's PLACE");
+        }
+        RequireOk(rig.node->SealSlot(), "SealSlot " + std::to_string(slot));
+    }
+    const Result<std::vector<storage::JournalRecord>> live{rig.node->CommitJournal().ReadAll()};
+    RequireOk(live, "commit ReadAll");
+    BOOST_REQUIRE_GE(live->size(), 20U);
+
+    // Segments of whole pages that hold at least two of the largest records.
+    size_t largest{0};
+    for (const storage::JournalRecord& record : *live) largest = std::max(largest, storage::RECORD_OVERHEAD_BYTES + record.payload.size());
+    uint64_t segment{storage::SEGMENT_PAGE_BYTES};
+    while (segment < 2 * largest + 512) segment += storage::SEGMENT_PAGE_BYTES;
+
+    const TestDir root{"sim_commit_segments"};
+    const fs::path dir{root.Sub("journal")};
+    const uint64_t instance{rig.node->CommitJournal().InstanceId()};
+    std::vector<fs::path> crashes;
+    {
+        Result<std::unique_ptr<storage::FileJournal>> created{
+            storage::FileJournal::CreateNew(dir, storage::JournalRole::COMMIT, instance, segment)};
+        RequireOk(created, "FileJournal::CreateNew");
+        storage::FileJournal& journal{**created};
+        for (size_t i{0}; i < live->size(); ++i) {
+            const Result<uint64_t> appended{journal.Append((*live)[i].type, (*live)[i].payload)};
+            RequireOk(appended, "Append of record " + std::to_string(i + 1));
+            BOOST_REQUIRE_EQUAL(*appended, i + 1);
+            const Result<uint64_t> barrier{journal.Barrier()};
+            RequireOk(barrier, "Barrier after record " + std::to_string(i + 1));
+            if (i % 4 == 3) RequireOk(journal.Rollover(), "Rollover after record " + std::to_string(i + 1));
+            const fs::path copy{root.Sub("after-" + std::to_string(i + 1))};
+            for (const auto& entry : fs::directory_iterator{dir}) fs::copy_file(entry.path(), copy / fs::u8path(entry.path().filename().string()), fs::copy_options::none);
+            crashes.push_back(copy);
+        }
+    }
+    const size_t files{static_cast<size_t>(std::distance(fs::directory_iterator{dir}, fs::directory_iterator{}))};
+    BOOST_CHECK_GE(files, 3U);
+
+    const Result<std::unique_ptr<storage::FileJournal>> reopened{storage::FileJournal::OpenExisting(dir, storage::JournalRole::COMMIT, instance)};
+    RequireOk(reopened, "OpenExisting");
+    const Result<std::vector<storage::JournalRecord>> read{(*reopened)->ReadAll()};
+    RequireOk(read, "ReadAll after reopen");
+    BOOST_CHECK(*read == *live); // sequence, type, payload and chain
+    const std::shared_ptr<const state::HeadView> head{rig.node->Owner().Head()};
+    const Result<state::ReplayResult> replay{state::ReplayDecisions(rig.node->Genesis(), *read)};
+    RequireOk(replay, "ReplayDecisions over the reopened journal");
+    BOOST_CHECK(replay->head.Header() == head->Header());
+    BOOST_CHECK(replay->head.HeaderHash() == head->HeaderHash());
+    BOOST_CHECK(replay->head.CertHash() == head->CertHash());
+    BOOST_CHECK(replay->head.State() == head->State());
+
+    for (size_t k{1}; k <= crashes.size(); ++k) {
+        const std::string what{"crash after barrier " + std::to_string(k)};
+        const Result<std::unique_ptr<storage::FileJournal>> opened{
+            storage::FileJournal::OpenExisting(crashes[k - 1], storage::JournalRole::COMMIT, instance)};
+        RequireOk(opened, what + ": OpenExisting");
+        BOOST_CHECK((*opened)->Status() == (storage::JournalStatus{k, k, false}));
+        const Result<std::vector<storage::JournalRecord>> prefix{(*opened)->ReadAll()};
+        RequireOk(prefix, what + ": ReadAll");
+        BOOST_CHECK(std::equal(prefix->begin(), prefix->end(), live->begin(), live->begin() + static_cast<std::ptrdiff_t>(k)) &&
+                    prefix->size() == k);
+        RequireOk(state::ReplayDecisions(rig.node->Genesis(), *prefix), what + ": ReplayDecisions");
+    }
 }
 
 BOOST_AUTO_TEST_SUITE_END()

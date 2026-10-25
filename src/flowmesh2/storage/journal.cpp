@@ -30,10 +30,12 @@ Result<uint64_t> Journal::Append(RecordType type, std::span<const unsigned char>
         if (!encoded.has_value()) return encoded.error();
         ++m_append_calls;
         const uint64_t offset{m_unwritten_offset + m_unwritten.size()};
-        if (Result<void> admitted{AdmitAppend(m_append_calls, offset, encoded->bytes.size())}; !admitted.has_value()) {
-            if (admitted.error().code == ErrorCode::STORAGE_FATAL) m_fatal = true;
-            return admitted.error();
+        const Result<uint64_t> padding{AdmitAppend(m_append_calls, offset, encoded->bytes.size())};
+        if (!padding.has_value()) {
+            if (padding.error().code == ErrorCode::STORAGE_FATAL) m_fatal = true;
+            return padding.error();
         }
+        m_unwritten.insert(m_unwritten.end(), static_cast<size_t>(*padding), 0);
         m_unwritten.insert(m_unwritten.end(), encoded->bytes.begin(), encoded->bytes.end());
         m_chain = encoded->chain;
         seq = ++m_appended_seq;

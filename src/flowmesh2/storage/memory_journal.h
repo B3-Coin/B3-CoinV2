@@ -65,7 +65,7 @@ public:
 private:
     MemoryJournal(JournalRole role, uint64_t instance_id, MemoryJournalFaults faults, BarrierObserver* observer);
 
-    Result<void> AdmitAppend(uint64_t append_number, uint64_t offset, size_t size) const override;
+    Result<uint64_t> AdmitAppend(uint64_t append_number, uint64_t offset, size_t size) const override;
     Result<void> Persist(uint64_t barrier_number, uint64_t offset, std::span<const unsigned char> bytes) override
         EXCLUSIVE_LOCKS_REQUIRED(!m_image_mutex);
 

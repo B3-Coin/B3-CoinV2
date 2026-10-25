@@ -172,11 +172,13 @@ protected:
     /** Called with the journal lock held, before a framed record of `size`
      * bytes is queued at byte `offset` of the journal image; `append_number`
      * counts the Append calls that got this far (1-based). A pure check of
-     * the implementation's limits: no I/O, no lock, no callback. Any error
-     * refuses the append and consumes nothing; STORAGE_FATAL also makes the
-     * journal fatal.
+     * the implementation's limits: no I/O, no lock, no callback. Returns the
+     * number of zero bytes to queue before the record (the file journal's
+     * segment padding, M4-STO-06; 0 otherwise), so the record starts at
+     * offset + padding. Any error refuses the append and consumes nothing;
+     * STORAGE_FATAL also makes the journal fatal.
      */
-    virtual Result<void> AdmitAppend(uint64_t append_number, uint64_t offset, size_t size) const = 0;
+    virtual Result<uint64_t> AdmitAppend(uint64_t append_number, uint64_t offset, size_t size) const = 0;
 
     /** Called by Barrier WITHOUT the journal lock: write `bytes` at byte
      * `offset` of the journal image and make the image durable up to

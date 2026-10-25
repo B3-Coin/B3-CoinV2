@@ -112,10 +112,10 @@ class RecoveryFixture(Roundtrip):
         if corrupt:
             segment = directory / 'state/signer/00000000.seg'
             with segment.open('r+b') as stream:
-                stream.seek(9)  # first framed record payload: CRC/hash chain must fail
+                stream.seek(64 + 9)  # after the 64-byte segment header: first record payload, CRC/hash chain must fail
                 old = stream.read(1)
                 expect(len(old) == 1, 'corruption fixture needs an actual framed signer record')
-                stream.seek(9)
+                stream.seek(64 + 9)
                 stream.write(bytes([old[0] ^ 1]))
                 stream.flush()
                 os.fsync(stream.fileno())

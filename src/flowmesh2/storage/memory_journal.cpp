@@ -34,12 +34,12 @@ Result<std::vector<JournalRecord>> MemoryJournal::ReadAll() const
     return Ok(std::move(scanned->records));
 }
 
-Result<void> MemoryJournal::AdmitAppend(uint64_t append_number, uint64_t /*offset*/, size_t /*size*/) const
+Result<uint64_t> MemoryJournal::AdmitAppend(uint64_t append_number, uint64_t /*offset*/, size_t /*size*/) const
 {
     if (m_faults.fail_append != 0 && append_number == m_faults.fail_append) {
         return Error{ErrorCode::STORAGE_FATAL, MEMORY_JOURNAL_APPEND_FAULT};
     }
-    return Ok();
+    return Ok(uint64_t{0}); // one unbounded image, never padded
 }
 
 Result<void> MemoryJournal::Persist(uint64_t barrier_number, uint64_t offset, std::span<const unsigned char> bytes)
