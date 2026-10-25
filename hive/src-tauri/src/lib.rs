@@ -21,10 +21,11 @@ pub mod rpc;
 pub mod settings;
 pub mod stake;
 pub mod update;
+pub mod v2api;
 pub mod wallet;
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -80,6 +81,17 @@ pub struct Core {
     history: history::Cache,
     updates: Updates,
     setup: Setup,
+    /// The FlowMesh V2 regtest API the Trade page reads, for this session only.
+    v2: V2State,
+}
+
+/// The FlowMesh V2 regtest API connection (v2api.rs) and its event watch.
+/// Each connect, disconnect or new watch bumps `generation`, which ends the
+/// watch thread that was started under an older one.
+#[derive(Default)]
+struct V2State {
+    endpoint: Mutex<Option<Arc<v2api::Endpoint>>>,
+    generation: Arc<AtomicU64>,
 }
 
 /// The setup wizard's state: the explorer's last offers, and the bootstrap
@@ -511,6 +523,153 @@ async fn trade_markets(
         flowmesh::markets(client, &name).map_err(|e| e.to_string())
     })
     .await
+}
+
+/// Connects the Trade page to a FlowMesh V2 regtest API on this machine:
+/// the address, its certificate file and the certificate's SHA-256 pin, as
+/// the operator publishes them. Read-only; nothing is kept after B3 Hive
+/// closes.
+#[tauri::command]
+async fn v2_connect(
+    window: Window,
+    core: State<'_, Arc<Core>>,
+    url: String,
+    certificate: String,
+    certificate_sha256: String,
+) -> Result<v2api::Info, String> {
+    require_window(&window, MAIN)?;
+    let core = Arc::clone(&core);
+    blocking(move || {
+        let endpoint = v2api::Endpoint::new(
+            &url,
+            std::path::Path::new(&certificate),
+            &certificate_sha256,
+        )?;
+        let info = endpoint.info()?;
+        core.v2.generation.fetch_add(1, Ordering::SeqCst);
+        *core.v2.endpoint.lock().unwrap() = Some(Arc::new(endpoint));
+        Ok(info)
+    })
+    .await
+}
+
+#[tauri::command]
+fn v2_disconnect(window: Window, core: State<'_, Arc<Core>>) -> Result<(), String> {
+    require_window(&window, MAIN)?;
+    core.v2.generation.fetch_add(1, Ordering::SeqCst);
+    *core.v2.endpoint.lock().unwrap() = None;
+    Ok(())
+}
+
+fn v2_endpoint(core: &Core) -> Result<Arc<v2api::Endpoint>, String> {
+    core.v2
+        .endpoint
+        .lock()
+        .unwrap()
+        .clone()
+        .ok_or_else(|| "B3 Hive is not connected to a FlowMesh V2 API.".to_owned())
+}
+
+#[tauri::command]
+async fn v2_info(window: Window, core: State<'_, Arc<Core>>) -> Result<v2api::Info, String> {
+    require_window(&window, MAIN)?;
+    let endpoint = v2_endpoint(&core)?;
+    blocking(move || endpoint.info()).await
+}
+
+#[tauri::command]
+async fn v2_totals(window: Window, core: State<'_, Arc<Core>>) -> Result<v2api::Totals, String> {
+    require_window(&window, MAIN)?;
+    let endpoint = v2_endpoint(&core)?;
+    blocking(move || endpoint.totals()).await
+}
+
+#[tauri::command]
+async fn v2_account(
+    window: Window,
+    core: State<'_, Arc<Core>>,
+    account: String,
+) -> Result<v2api::Account, String> {
+    require_window(&window, MAIN)?;
+    let endpoint = v2_endpoint(&core)?;
+    blocking(move || endpoint.account(&account)).await
+}
+
+#[derive(Clone, Serialize)]
+struct V2Event {
+    height: u64,
+    totals: Option<v2api::Totals>,
+    error: Option<String>,
+}
+
+/// Follows the API's certified-state events from `after`, sending each to
+/// the main window as `v2-certified-state`. The API closes a stream after a
+/// few seconds; the watch reopens it from the last height until the page
+/// connects elsewhere, disconnects or starts a new watch.
+#[tauri::command]
+fn v2_watch(
+    app: AppHandle,
+    window: Window,
+    core: State<'_, Arc<Core>>,
+    after: u64,
+) -> Result<(), String> {
+    require_window(&window, MAIN)?;
+    let endpoint = v2_endpoint(&core)?;
+    let generation = Arc::clone(&core.v2.generation);
+    let mine = generation.fetch_add(1, Ordering::SeqCst) + 1;
+    thread::spawn(move || {
+        let current = || generation.load(Ordering::SeqCst) == mine;
+        let mut cursor = after;
+        while current() {
+            let result = endpoint.events(cursor, |height, totals| {
+                if current() {
+                    let _ = app.emit_to(
+                        MAIN,
+                        "v2-certified-state",
+                        V2Event {
+                            height,
+                            totals: Some(totals),
+                            error: None,
+                        },
+                    );
+                }
+                current()
+            });
+            match result {
+                Ok(last) => cursor = last,
+                Err(error) => {
+                    if current() {
+                        let _ = app.emit_to(
+                            MAIN,
+                            "v2-certified-state",
+                            V2Event {
+                                height: cursor,
+                                totals: None,
+                                error: Some(error),
+                            },
+                        );
+                    }
+                    // A refused or failed stream is retried, but not in a
+                    // tight loop.
+                    for _ in 0..20 {
+                        if !current() {
+                            break;
+                        }
+                        thread::sleep(Duration::from_millis(100));
+                    }
+                }
+            }
+        }
+    });
+    Ok(())
+}
+
+/// The Trade page was left: the watch ends; the connection stays.
+#[tauri::command]
+fn v2_unwatch(window: Window, core: State<'_, Arc<Core>>) -> Result<(), String> {
+    require_window(&window, MAIN)?;
+    core.v2.generation.fetch_add(1, Ordering::SeqCst);
+    Ok(())
 }
 
 /// One market's verified view for the page wallet. With `known_head` and
@@ -2805,6 +2964,7 @@ pub fn run() {
                 history: history::Cache::default(),
                 updates,
                 setup: Setup::default(),
+                v2: V2State::default(),
             }));
             Ok(())
         })
@@ -2892,6 +3052,13 @@ pub fn run() {
             stake_status,
             trade_markets,
             trade_market,
+            v2_connect,
+            v2_disconnect,
+            v2_info,
+            v2_totals,
+            v2_account,
+            v2_watch,
+            v2_unwatch,
             trade_order_draft,
             trade_cancel_draft,
             trade_requests,

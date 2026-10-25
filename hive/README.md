@@ -20,7 +20,8 @@ not a release.
   approval window decides it, so a page can never send on its own. `stake.rs`,
   `flowmesh.rs`, `wallet.rs`, `receive.rs`, `psbt.rs`, `settings.rs`,
   `folder.rs`, `cli.rs`, `update.rs` and `bootstrap.rs` each cover one page
-  or one job.
+  or one job. `v2api.rs` reads a FlowMesh V2 regtest operator's HTTPS API
+  for the Trade page (below).
 - **Windows the core opens**: the approval window shows exactly what a
   request does and sends it only when approved (a locked wallet unlocks for
   that one request and locks again); the passphrase window unlocks a wallet
@@ -68,6 +69,33 @@ wallet stakes with a bound finality key, closing asks whether to revoke the
 key first, because an offline validator still counts toward the finality
 quorum.
 
+## The FlowMesh V2 regtest card
+
+The Trade page has a read-only card for a FlowMesh V2 regtest operator's
+HTTPS API (`contrib/flowmesh2/regtest/https_api.py`). Give it the API
+address, the certificate file and the certificate's SHA-256 pin, as the
+operator writes them. Only `https://127.0.0.1:<port>` and
+`https://[::1]:<port>` are accepted. The certificate file must hash to the
+pin, and it is the only certificate the TLS session trusts.
+
+The card shows the operator's status, its markets with their lot and tick
+sizes, the per-asset totals and one account's balances. The certified-state
+stream keeps the totals live, and data older than 3 s is marked stale. The
+V2 API has no order book, clearing or trade route, so the card shows none
+of them; the V1 book above is unchanged. The operator checks its own
+certificate and proofs; B3 Hive does not check them itself yet, and the card
+says so. Nothing is kept after B3 Hive closes.
+
+Signing is not built: `/v1/submit` takes a signed V2 action frame, and B3
+Hive has no V2 signer and no crate that could make one (see the open
+questions below).
+
+To try it without an operator, `scripts/v2-api-fixture.py DIR [SECONDS]`
+serves the real gateway code with made-up replies and writes the address,
+certificate and pin to `DIR/fixture.json`.
+`HIVE_V2_API_FIXTURE=DIR/fixture.json cargo test v2api` runs the client
+against it.
+
 ## Building
 
 Needs a Rust toolchain (stable), Node 22 and, on Linux, Tauri's packages
@@ -109,7 +137,7 @@ Linux and Windows packages as unsigned artifacts.
   scans the sources and fails when a page calls an RPC the whitelist does not
   allow.
 - `npm test`: the pages' pure functions (number formatting, the trading
-  formats, the staking outlook).
+  formats, the staking outlook, the V2 card's text).
 - `B3_HIVE_B3COIND=/path/to/b3coind cargo test --test node_regtest -- --ignored --test-threads=1`:
   the core against a real regtest node, no peers: start and stop, the page
   login's limits, drafted sends submitted exactly once, wallets, passphrases,
@@ -123,8 +151,25 @@ Linux and Windows packages as unsigned artifacts.
 - Automation (autostake, scheduled consolidation) is left out on purpose.
 - Remote access is not supported: the app targets the user's own machine.
 - The Trade page follows FlowMesh V1 as it is; the demo market shows how a
-  market page works while mainnet has none.
+  market page works while mainnet has none. The FlowMesh V2 card is
+  read-only and regtest-only.
 - The Receive page makes labelled addresses and payment links, but has no
   list of past requests: the node has no RPC for Qt's requested-payments
   history.
 - English only.
+
+## Open product questions
+
+These are not decided here. Each needs a ruling from the project owners.
+
+- **Supported platforms**: which operating systems and versions get
+  packages, and which of them are tested before a release.
+- **Front-end framework and dependency policy**: whether the pages stay
+  plain TypeScript, and which new Rust crates or npm packages may be added.
+  A FlowMesh V2 signer (BIP340 over the V2 action frame) needs a
+  secp256k1 crate or a node RPC that signs frames.
+- **First translation languages**: the app is English only.
+- **Remote access**: whether B3 Hive may reach a node or a FlowMesh API on
+  another machine, and how that connection is authenticated.
+- **Plugins**: whether third parties may extend the app, and how a plugin
+  would be reviewed and isolated.

@@ -25,6 +25,7 @@ import {
   type Units,
 } from "./tradefmt";
 import { DEMO_MARKET_ID, DEMO_STEP_MS, demoDeposits, demoRequests, demoSummary, demoView } from "./demo";
+import { startV2, stopV2 } from "./v2market";
 
 // Mirrors src-tauri/src/flowmesh.rs.
 export type MarketSummary = { market_id: string; base_asset_id: string; vault_id: string; running: boolean; paused: boolean; halt: string; error: string };
@@ -283,11 +284,13 @@ const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 export function startTrade(): void {
   if (active) return;
   active = true;
+  startV2();
   void loadMarkets();
 }
 
 /** The page was left: its reads stop. */
 export function stopTrade(): void {
+  stopV2();
   active = false;
   generation++;
 }

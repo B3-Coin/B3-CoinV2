@@ -633,6 +633,70 @@
               <span><strong>Demo market.</strong> These numbers are made up and move on their own. FlowMesh has no market on mainnet yet; this shows how a market page works. Nothing here is real and nothing can be sent.</span>
               <button class="btn btn-secondary btn-sm" type="button" id="tr-demo-leave">Leave the demo</button>
             </div>
+            <div class="card" id="v2-card">
+              <div class="card-head">
+                <h2 class="row"><svg class="i" aria-hidden="true"><use href="/icons.svg#i-key" /></svg>FlowMesh V2 regtest API</h2>
+                <span class="badge" id="v2-badge">Not connected</span>
+              </div>
+              <div class="card-pad stack">
+                <p class="t-sm muted">Read-only. This reads a FlowMesh V2 regtest operator on this machine through its HTTPS API. It is not a mainnet market. The operator checks its own certificate and proofs; B3 Hive shows what the operator reports and does not check them itself yet. Nothing can be sent from here.</p>
+                <form class="stack" id="v2-form" autocomplete="off">
+                  <div class="field">
+                    <label for="v2-url">API address</label>
+                    <input class="input input-mono" id="v2-url" spellcheck="false" placeholder="https://127.0.0.1:port" />
+                  </div>
+                  <div class="field">
+                    <label for="v2-cert">Certificate file</label>
+                    <input class="input input-mono" id="v2-cert" spellcheck="false" placeholder="…/public-api/public-api.crt" />
+                  </div>
+                  <div class="field">
+                    <label for="v2-pin">Certificate SHA-256</label>
+                    <input class="input input-mono" id="v2-pin" spellcheck="false" placeholder="64 hexadecimal characters" />
+                  </div>
+                  <div class="btn-row">
+                    <button class="btn btn-secondary" type="submit" id="v2-connect">Connect</button>
+                    <button class="btn btn-secondary" type="button" id="v2-disconnect" hidden>Disconnect</button>
+                  </div>
+                </form>
+                <div class="banner banner-danger" id="v2-error" role="alert" hidden></div>
+              </div>
+              <div id="v2-view" hidden>
+                <div class="card-pad">
+                  <p class="t-sm tnum" id="v2-status"></p>
+                  <p class="t-sm muted tnum" id="v2-live"></p>
+                </div>
+                <div class="table-wrap">
+                  <table class="tbl tbl-compact">
+                    <thead><tr><th>Market</th><th>Base</th><th>Quote</th><th class="num" title="Base atoms in one lot">Lot (atoms)</th><th class="num" title="Quote atoms in one price tick">Tick (atoms)</th></tr></thead>
+                    <tbody id="v2-markets"></tbody>
+                  </table>
+                </div>
+                <p class="card-pad t-sm muted">The V2 API serves no order book, clearings or trades, so none are shown. Its routes are status, totals, account and withdrawal proofs, the certified-state stream and signed submission.</p>
+                <div class="table-wrap">
+                  <table class="tbl tbl-compact">
+                    <thead><tr><th>Asset</th><th class="num">Deposits</th><th class="num">Available</th><th class="num">Reserved</th><th class="num">Pending</th><th class="num">Fees held</th><th class="num">Liabilities</th></tr></thead>
+                    <tbody id="v2-totals"></tbody>
+                  </table>
+                </div>
+                <p class="card-pad t-sm muted tnum" id="v2-totals-note"></p>
+                <form class="card-pad stack" id="v2-account-form" autocomplete="off">
+                  <div class="field">
+                    <label for="v2-account">Account</label>
+                    <input class="input input-mono" id="v2-account" spellcheck="false" placeholder="64 hexadecimal characters" />
+                  </div>
+                  <div class="btn-row">
+                    <button class="btn btn-secondary" type="submit">Look up</button>
+                  </div>
+                  <p class="t-sm tnum" id="v2-account-status"></p>
+                </form>
+                <div class="table-wrap" id="v2-balances-wrap" hidden>
+                  <table class="tbl tbl-compact">
+                    <thead><tr><th>Asset</th><th class="num">Available</th><th class="num">Reserved</th></tr></thead>
+                    <tbody id="v2-balances"></tbody>
+                  </table>
+                </div>
+              </div>
+            </div>
             <div class="card tr-head" id="tr-head" hidden>
               <div class="tr-ticker">
                 <div class="tr-pair">
