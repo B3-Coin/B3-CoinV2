@@ -277,6 +277,11 @@ Result<StateRootsV0> EngineState::Commit() const
     return ledger::CommitTradingStateV0(ledger, markets, orders);
 }
 
+Result<StateRootsV1> EngineState::CommitV1() const
+{
+    return NotImplemented("M2-LED-02"); // TODO(rebirth:M2-LED-02)
+}
+
 Result<void> EngineState::CheckInvariants() const
 {
     const Result<void> conserved{ledger.CheckConservation()};

@@ -113,6 +113,17 @@ Result<void> VerifyAccountLeaf(const SlotHeaderV2& header, const AccountLeafV0& 
     return Ok();
 }
 
+Result<void> VerifyAccountProofV1(const SlotHeaderV2& header, const AccountProofV1& proof, const StateRootsV1& roots,
+                                  const ProfileParams& profile)
+{
+    if (Result<void> ok{CheckProfile(header, profile)}; !ok.has_value()) return ok.error();
+    if (header.commitment_version != COMMITMENT_VERSION_SMT) return Failed(V1_NOT_COMMITTED);
+    if (roots.Root() != header.state_root) return Failed(LEAF_STATE_ROOTS);
+    if (proof.leaf.has_value() && !proof.leaf->IsCanonical(profile)) return Failed(LEAF_NOT_CANONICAL);
+    if (!proof.VerifiesUnder(roots.accounts)) return Failed(LEAF_PROOF);
+    return Ok();
+}
+
 Result<void> VerifyWithdrawal(const SlotHeaderV2& header, const WithdrawalRecord& record, const StateRootsV0& roots,
                               const MerkleProof& proof, const ProfileParams& profile)
 {

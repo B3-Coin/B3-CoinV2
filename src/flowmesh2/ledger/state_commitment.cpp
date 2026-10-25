@@ -126,11 +126,6 @@ Result<WithdrawalWitness> ProveWithdrawal(const LedgerState& ledger, const Actio
     return Ok(WithdrawalWitness{found->second, std::move(proof).value()});
 }
 
-Result<uint256> CommitV1(const LedgerState&)
-{
-    return NotImplemented("M2-LED-02"); // TODO(rebirth:M2-LED-02)
-}
-
 Result<uint256> LiabilitySumRoot(const LedgerState&, const AssetId&)
 {
     return NotImplemented("M2-LED-03"); // TODO(rebirth:M2-LED-03)

@@ -146,6 +146,21 @@
       "id": 29,
       "name": "TEST_ASSET",
       "text": "B3/FM2/TEST_ASSET"
+    },
+    {
+      "id": 30,
+      "name": "SMT_KEY",
+      "text": "B3/FM2/SMT_KEY"
+    },
+    {
+      "id": 31,
+      "name": "SMT_LEAF",
+      "text": "B3/FM2/SMT_LEAF"
+    },
+    {
+      "id": 32,
+      "name": "SMT_NODE",
+      "text": "B3/FM2/SMT_NODE"
     }
   ]
 }

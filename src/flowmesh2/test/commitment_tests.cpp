@@ -300,7 +300,6 @@ BOOST_AUTO_TEST_CASE(commit_refuses_bad_markets_and_repeated_keys)
 BOOST_AUTO_TEST_CASE(stubs_return_not_implemented)
 {
     const LedgerState ledger{WalkingSkeletonAfterSlot3()};
-    RequireStub(CommitV1(ledger), "M2-LED-02");
     RequireStub(LiabilitySumRoot(ledger, RUSD), "M2-LED-03");
     RequireStub(ExitValue(ledger, ALICE, RUSD), "M2-LED-04");
 }

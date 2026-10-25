@@ -4,6 +4,8 @@
 
 #include <flowmesh2/read/views.h>
 
+#include <flowmesh2/ledger/state_commitment.h>
+
 #include <flowmesh2/core/codec.h>
 #include <flowmesh2/ledger/ledger.h>
 
@@ -63,15 +65,14 @@ CommitIdentity CommitOf(const SlotHeaderV2& header)
 }
 
 SlotView::SlotView(CertifiedEnvelope envelope, const uint256& header_hash, StateRootsV0 roots, std::vector<OutcomeV2> outcomes,
-                   MerkleTree outcome_tree, std::vector<AccountLeafV0> accounts, MerkleTree account_tree,
-                   std::map<ActionId, uint32_t> actions, std::map<OrderId, std::vector<FillRef>> fills)
+                   MerkleTree outcome_tree, std::shared_ptr<const state::CoreState> state, std::map<ActionId, uint32_t> actions,
+                   std::map<OrderId, std::vector<FillRef>> fills)
     : m_envelope{std::move(envelope)},
       m_header_hash{header_hash},
       m_roots{roots},
       m_outcomes{std::move(outcomes)},
       m_outcome_tree{std::move(outcome_tree)},
-      m_accounts{std::move(accounts)},
-      m_account_tree{std::move(account_tree)},
+      m_state{std::move(state)},
       m_actions{std::move(actions)},
       m_fills{std::move(fills)}
 {
@@ -100,22 +101,11 @@ Result<std::shared_ptr<const SlotView>> SlotView::Build(const state::HeadView& h
     if (!roots.has_value()) return Error{ErrorCode::INVARIANT, roots.error().detail};
     if (roots->Root() != header.state_root) return Error{ErrorCode::INVARIANT, VIEW_STATE_ROOT};
 
-    // v0 account leaves in ascending AccountId (the ledger's map order, which is
-    // the accounts tree's order) and every level of their tree.
-    // TODO(rebirth:M2-LED-02) the SMT of commitment v1 replaces these O(state) v0 levels.
-    const ledger::LedgerState& ledger{head.State().engine.ledger};
-    std::vector<AccountLeafV0> accounts;
-    std::vector<uint256> account_values;
-    accounts.reserve(ledger.Accounts().size());
-    account_values.reserve(ledger.Accounts().size());
-    for (const auto& entry : ledger.Accounts()) {
-        Result<AccountLeafV0> leaf{ledger.Leaf(entry.first)};
-        if (!leaf.has_value()) return Error{ErrorCode::INVARIANT, leaf.error().detail};
-        account_values.push_back(leaf->LeafValue());
-        accounts.push_back(std::move(leaf).value());
-    }
-    MerkleTree account_tree{MerkleTree::Build(account_values)};
-    if (account_tree.Root() != roots->accounts) return Error{ErrorCode::INVARIANT, VIEW_ACCOUNTS_ROOT};
+    // The account proofs come from the ledger's own levels (M2-LED-02): the
+    // view shares the head's state and copies no leaf.
+    const Result<uint256> accounts_root{head.State().engine.ledger.AccountsRootV0()};
+    if (!accounts_root.has_value()) return Error{ErrorCode::INVARIANT, accounts_root.error().detail};
+    if (*accounts_root != roots->accounts) return Error{ErrorCode::INVARIANT, VIEW_ACCOUNTS_ROOT};
 
     // Indexes: actions by ActionId, fills by both orders.
     std::map<ActionId, uint32_t> actions;
@@ -133,8 +123,8 @@ Result<std::shared_ptr<const SlotView>> SlotView::Build(const state::HeadView& h
     }
 
     return Ok(std::shared_ptr<const SlotView>{new SlotView{CertifiedEnvelope{header, cert}, head.HeaderHash(), *roots,
-                                                           std::move(outcomes), std::move(outcome_tree), std::move(accounts),
-                                                           std::move(account_tree), std::move(actions), std::move(fills)}});
+                                                           std::move(outcomes), std::move(outcome_tree), head.StatePtr(),
+                                                           std::move(actions), std::move(fills)}});
 }
 
 Result<OutcomeWitness> SlotView::Outcome(uint32_t index) const
@@ -161,21 +151,11 @@ std::span<const FillRef> SlotView::FillsOf(const OrderId& order) const
 
 std::optional<AccountWitness> SlotView::Account(const AccountId& account) const
 {
-    // Binary search in the sorted leaves; the position is the leaf's index in the tree.
-    size_t low{0};
-    size_t high{m_accounts.size()};
-    while (low < high) {
-        const size_t mid{low + (high - low) / 2};
-        if (m_accounts[mid].account < account) {
-            low = mid + 1;
-        } else {
-            high = mid;
-        }
-    }
-    if (low == m_accounts.size() || m_accounts[low].account != account) return std::nullopt;
-    Result<MerkleProof> proof{m_account_tree.Prove(low)};
-    if (!proof.has_value()) return std::nullopt;
-    return AccountWitness{m_accounts[low], m_roots, std::move(proof).value()};
+    const ledger::LedgerState& ledger{m_state->engine.ledger};
+    if (!ledger.HasAccount(account)) return std::nullopt;
+    Result<ledger::AccountWitnessV0> witness{ledger::ProveAccountV0(ledger, account)};
+    if (!witness.has_value()) return std::nullopt;
+    return AccountWitness{std::move(witness->leaf), m_roots, std::move(witness->proof)};
 }
 
 } // namespace flowmesh2::read

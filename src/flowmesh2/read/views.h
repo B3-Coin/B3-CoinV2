@@ -39,20 +39,27 @@
  *   height).
  * - SlotView: everything a reply about one committed slot needs, built
  *   once by the publisher and never changed: the header and certificate,
- *   the outcomes with their tree, the v0 account leaves with their tree
- *   levels and the five component roots, an action index (ActionId to the
- *   outcome position) and an order-fill index (OrderId to every fill it
- *   took part in, as maker or as taker). Readers share it through
+ *   the outcomes with their tree, the head's state (shared, not copied) and
+ *   the five component roots, an action index (ActionId to the outcome
+ *   position) and an order-fill index (OrderId to every fill it took part
+ *   in, as maker or as taker). Readers share it through
  *   shared_ptr<const SlotView>, so a reply's header, certificate, leaf and
  *   proof all come from one object.
  *
  * Not proof of anything by itself: a client checks every reply with
  * b3verify (verify/b3verify.h) against its trusted seat set (SEC-5).
  *
- * SlotView::Build costs O(state): it hashes every account leaf and keeps
- * every level of the accounts tree (REAL-REPLACE M2-LED-02: the sparse
- * Merkle tree of commitment v1 replaces the v0 levels with typed proofs
- * and O(changed) work per publish). Deterministic; no lock, clock or I/O.
+ * Cost (M2-LED-02). Build copies no account: it keeps a reference to the
+ * head's state, whose ledger stores the v0 levels of its accounts and
+ * nullifiers (LedgerState::Seal, M2-LED-10), and checks the head's
+ * commitment, so a publish costs O(outcomes + fills) plus that commitment:
+ * O(changed) for accounts and nullifiers, still O(orders + markets +
+ * assets + withdrawals) for the rest (the books, M2-LED-10). Account() is
+ * O(log n) on a sealed head (every engine result is sealed). The typed
+ * proofs of commitment v1 (AccountProofV1, with absence) are built
+ * (ledger/state_commitment_v1.h) but not served: the header commits v0
+ * until the switch is ruled (REAL-REPLACE M2-LED-02). Deterministic; no
+ * lock, clock or I/O.
  */
 namespace flowmesh2::read {
 
@@ -158,22 +165,22 @@ public:
     std::span<const FillRef> FillsOf(const OrderId& order) const;
 
     //! The number of accounts (v0 leaves).
-    size_t AccountCount() const { return m_accounts.size(); }
+    size_t AccountCount() const { return m_state->engine.ledger.Accounts().size(); }
     //! The leaf of `account`, its proof and the roots; nullopt if the state has no such account (v0 has no absence proof).
+    // TODO(rebirth:M2-LED-02) serve AccountProofV1 (absence included) once the header commits v1.
     std::optional<AccountWitness> Account(const AccountId& account) const;
 
 private:
     SlotView(CertifiedEnvelope envelope, const uint256& header_hash, StateRootsV0 roots, std::vector<OutcomeV2> outcomes,
-             MerkleTree outcome_tree, std::vector<AccountLeafV0> accounts, MerkleTree account_tree,
-             std::map<ActionId, uint32_t> actions, std::map<OrderId, std::vector<FillRef>> fills);
+             MerkleTree outcome_tree, std::shared_ptr<const state::CoreState> state, std::map<ActionId, uint32_t> actions,
+             std::map<OrderId, std::vector<FillRef>> fills);
 
     CertifiedEnvelope m_envelope;
     uint256 m_header_hash;
     StateRootsV0 m_roots;
     std::vector<OutcomeV2> m_outcomes;
     MerkleTree m_outcome_tree;
-    std::vector<AccountLeafV0> m_accounts; //!< ascending AccountId, the accounts tree's leaf order
-    MerkleTree m_account_tree;              //!< REAL-REPLACE M2-LED-02 (v0 tree levels)
+    std::shared_ptr<const state::CoreState> m_state; //!< the head's state, never null
     std::map<ActionId, uint32_t> m_actions;
     std::map<OrderId, std::vector<FillRef>> m_fills;
 };

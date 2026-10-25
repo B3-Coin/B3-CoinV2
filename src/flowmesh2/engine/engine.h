@@ -16,6 +16,7 @@
 #include <flowmesh2/core/result.h>
 #include <flowmesh2/core/slot.h>
 #include <flowmesh2/core/state_root.h>
+#include <flowmesh2/core/state_root_v1.h>
 #include <flowmesh2/engine/book.h>
 #include <flowmesh2/ledger/ledger.h>
 #include <uint256.h>
@@ -180,6 +181,12 @@ struct EngineState {
     std::vector<RestingOrderLeafV0> OrderLeaves() const;
     //! State commitment v0: ledger::CommitTradingStateV0(ledger, Markets(), OrderLeaves()).
     Result<StateRootsV0> Commit() const;
+    /** State commitment v1, the roots a v1 header would commit
+     * (ledger/state_commitment_v1.h). Not live: which profiles switch, the
+     * version byte and the certificate format are BLOCKED-ON-RULING.
+     */
+    // TODO(rebirth:M2-LED-02) commit v1 roots in the header once the switch is ruled.
+    Result<StateRootsV1> CommitV1() const;
 
     /** The invariants that hold at every slot boundary; INVARIANT if one
      * fails (engine phase 9 checks them before any candidate exists):

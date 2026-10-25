@@ -50,6 +50,9 @@ namespace flowmesh2 {
 
 inline constexpr uint8_t SLOT_HEADER_VERSION{1};
 inline constexpr uint8_t COMMITMENT_VERSION_V0{0};
+//! Sparse Merkle commitment v1 (core/state_root_v1.h, M2-LED-02). Reserved:
+//! the header codec refuses it until the switch is ruled (BLOCKED-ON-RULING).
+inline constexpr uint8_t COMMITMENT_VERSION_SMT{1};
 //! Sorted six-root commitment; v1 remains reserved for the separate SMT design.
 inline constexpr uint8_t COMMITMENT_VERSION_WITHDRAWALS{2};
 inline constexpr uint8_t COMMITMENT_VERSION_VIEW_BOUND{3};

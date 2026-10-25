@@ -28,7 +28,9 @@
 #include <flowmesh2/core/outcome.h>
 #include <flowmesh2/core/params.h>
 #include <flowmesh2/core/slot.h>
+#include <flowmesh2/core/smt.h>
 #include <flowmesh2/core/state_root.h>
+#include <flowmesh2/core/state_root_v1.h>
 #include <flowmesh2/net/tcp_mesh_wire.h>
 #include <flowmesh2/read/views.h>
 #include <flowmesh2/state/snapshot.h>
@@ -116,6 +118,29 @@ FUZZ_TARGET(fm2_account_leaf, .init = InitProfiles)
     if (const auto leaf{AccountLeafV0::Decode(bytes, profile)}) {
         assert(leaf->balances.size() <= MAX_LEAF_ASSETS);
         assert(leaf->used_nonces.size() <= profile.nonce_window);
+    }
+}
+FUZZ_TARGET(fm2_smt_proof)
+{
+    const Bytes bytes{buffer.data(), buffer.size()};
+    RoundTripPlain<SmtProof>(bytes);
+    // core/smt.h: a decoded proof is canonical, so it folds to a root along any path its terminal allows.
+    if (const auto proof{SmtProof::Decode(bytes)}) {
+        assert(proof->depth <= SMT_DEPTH && proof->bitmap.size() == (proof->depth + 7) / 8u);
+        assert(proof->siblings.size() <= proof->depth);
+        const uint256 path{proof->terminal == SmtTerminal::LEAF ? proof->leaf.path : uint256{}};
+        if (proof->terminal == SmtTerminal::LEAF) assert(SmtFoldRoot(path, *proof).has_value());
+    }
+}
+FUZZ_TARGET(fm2_account_proof_v1, .init = InitProfiles)
+{
+    RoundTripProfiled<AccountProofV1>(buffer);
+    // core/state_root_v1.h: PRESENT iff the proof ends at the account's own leaf.
+    const auto [profile, bytes]{WithProfile(buffer)};
+    if (const auto proof{AccountProofV1::Decode(bytes, profile)}) {
+        const bool own{proof->proof.terminal == SmtTerminal::LEAF && proof->proof.leaf.path == AccountPathV1(proof->account)};
+        assert(proof->leaf.has_value() == own);
+        if (proof->leaf.has_value()) assert(proof->leaf->account == proof->account);
     }
 }
 FUZZ_TARGET(fm2_slot_header) { RoundTripPlain<SlotHeaderV2>(Bytes{buffer.data(), buffer.size()}); }

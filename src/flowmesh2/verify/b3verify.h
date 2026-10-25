@@ -19,6 +19,7 @@
 #include <flowmesh2/core/seat_set.h>
 #include <flowmesh2/core/slot.h>
 #include <flowmesh2/core/state_root.h>
+#include <flowmesh2/core/state_root_v1.h>
 #include <uint256.h>
 
 #include <cstdint>
@@ -127,10 +128,28 @@ Result<void> VerifyOutcome(const SlotHeaderV2& header, const OutcomeV2& outcome,
  * (LEAF_NOT_CANONICAL); MerkleVerify(leaf.LeafValue(), proof,
  * roots.accounts) (LEAF_PROOF). Commitment v0 only (the header codec
  * refuses another commitment_version); v0 has no absence proof, so an
- * absent account cannot be proved (M2-LED-02).
+ * absent account cannot be proved (VerifyAccountProofV1 can).
  */
 Result<void> VerifyAccountLeaf(const SlotHeaderV2& header, const AccountLeafV0& leaf, const StateRootsV0& roots,
                                const MerkleProof& proof, const ProfileParams& profile);
+
+//! The header does not commit to state commitment v1.
+inline constexpr std::string_view V1_NOT_COMMITTED{"header does not commit to state commitment v1"};
+
+/** A v1 account proof (core/state_root_v1.h; M2-LED-02, PROVISIONAL
+ * REGTEST): Validate(profile) and ProfileHash(profile) ==
+ * header.profile_hash (PROFILE_MISMATCH); header.commitment_version ==
+ * COMMITMENT_VERSION_SMT (V1_NOT_COMMITTED); roots.Root() ==
+ * header.state_root (LEAF_STATE_ROOTS); a PRESENT proof's leaf is canonical
+ * under the profile (LEAF_NOT_CANONICAL); proof.VerifiesUnder(roots.accounts)
+ * (LEAF_PROOF). An ABSENT proof that passes shows the account has no leaf.
+ *
+ * Dormant: the header codec refuses commitment_version 1 and no profile
+ * expects it, so no decoded header passes the version check until the
+ * switch is ruled (BLOCKED-ON-RULING, M2-LED-02).
+ */
+Result<void> VerifyAccountProofV1(const SlotHeaderV2& header, const AccountProofV1& proof, const StateRootsV1& roots,
+                                  const ProfileParams& profile);
 
 //! Checks a v2 committed claim. Pair with VerifyCertificate and compare the
 //! verified record's id/payment fields to the client's requested withdrawal.

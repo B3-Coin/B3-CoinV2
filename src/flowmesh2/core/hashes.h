@@ -61,6 +61,9 @@ enum class HashTag : uint8_t {
     PROTOCOL_ACCOUNT = 27, //!< seat pool and treasury accounts (R5)
     JOURNAL = 28,          //!< first chain value of a journal (R8)
     TEST_ASSET = 29,       //!< synthetic test and simulator assets only
+    SMT_KEY = 30,          //!< commitment v1 path of a component key (M2-LED-02)
+    SMT_LEAF = 31,         //!< commitment v1 sparse Merkle leaf (M2-LED-02)
+    SMT_NODE = 32,         //!< commitment v1 sparse Merkle inner node (M2-LED-02)
 };
 
 //! The prefix of every tag text.

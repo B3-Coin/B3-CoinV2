@@ -462,7 +462,9 @@ FM2_STUB_CASE(M2_LED_06, "M2-LED-06")
 
 FM2_STUB_CASE(M2_LED_02, "M2-LED-02")
 {
-    return Observe(ledger::CommitV1(EmptyRegtestLedger()));
+    // Since M2-LED-02 built commitment v1 in the ledger, the stub is the engine's header switch.
+    const engine::EngineState state{engine::EngineState::Genesis(EmptyRegtestLedger().Profile(), {}).value()};
+    return Observe(state.CommitV1());
 }
 
 FM2_STUB_CASE(M2_LED_03, "M2-LED-03")

@@ -66,7 +66,9 @@ if(BUILD_FLOWMESH2)
     core/result.cpp
     core/seat_set.cpp
     core/slot.cpp
+    core/smt.cpp
     core/state_root.cpp
+    core/state_root_v1.cpp
   )
   target_link_libraries(fm2_types
     PRIVATE
@@ -132,7 +134,9 @@ if(BUILD_FLOWMESH2)
     ledger/ledger.cpp
     ledger/merkle_levels.cpp
     ledger/nonce_window.cpp
+    ledger/smt_tree.cpp
     ledger/state_commitment.cpp
+    ledger/state_commitment_v1.cpp
     net/client_api.cpp
     net/https_sse_api.cpp
     net/in_process_api.cpp
@@ -302,6 +306,7 @@ if(BUILD_FLOWMESH2)
     test/ledger_property_tests.cpp
     test/ledger_cow_tests.cpp
     test/ledger_tests.cpp
+    test/ledger_v1_tests.cpp
     test/market_tests.cpp
     test/matcher_reference_tests.cpp
     test/matcher_tests.cpp
@@ -330,6 +335,8 @@ if(BUILD_FLOWMESH2)
     test/sim_walking_skeleton_tests.cpp
     test/slot_cost_tests.cpp
     test/slot_tests.cpp
+    test/smt_tests.cpp
+    test/smt_tree_tests.cpp
     test/snapshot_store_tests.cpp
     test/snapshot_tests.cpp
     test/state_owner_tests.cpp
