@@ -651,7 +651,11 @@ barrier but never lets a token exist before its barrier. Folded signing
   indexes from its history; a
   crash during a barrier write leaves a torn record that `ScanRecords`
   refuses (`RECORD_CRC` or `RECORD_LENGTH`), so that journal cannot be
-  reopened at all (M4-STO-01). `StateOwner::RestoreVerifiedGenesis` replays
+  reopened at all (M4-STO-01). Whether such a tail may be dropped, or is a
+  CRC break that retires the key (plan section 3.7, DUR-2), waits for a
+  ruling, as do what retirement records and how instance ids stay unique
+  per role. A reopen after any barrier rebuilds both logs' indexes exactly
+  (tested over rolled-over file journals). `StateOwner::RestoreVerifiedGenesis` replays
   a verified commit journal from genesis on regtest; snapshots are still
   missing (M4-STO-03).
 - As landed in R9 (`state/replay.h`): the base must be a genesis head and

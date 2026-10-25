@@ -131,6 +131,34 @@ void RequireCodeAndDetail(const Result<T>& result, ErrorCode code, std::string_v
                             std::string{result.error().detail} + "'");
 }
 
+/** Rewrite `records` into a new file journal under `dir`, one barrier per
+ * record, in segments that hold at least two of the largest records (so it
+ * rolls over). After every barrier the directory is copied: copy k stands for
+ * a crash right after the barrier of record k.
+ */
+std::vector<fs::path> WriteWithCrashCopies(const TestDir& root, const std::string& name, const std::vector<storage::JournalRecord>& records,
+                                           storage::JournalRole role, uint64_t instance)
+{
+    size_t largest{0};
+    for (const storage::JournalRecord& record : records) largest = std::max(largest, storage::RECORD_OVERHEAD_BYTES + record.payload.size());
+    uint64_t segment{storage::SEGMENT_PAGE_BYTES};
+    while (segment < 2 * largest + 512) segment += storage::SEGMENT_PAGE_BYTES;
+    const fs::path dir{root.Sub(name)};
+    Result<std::unique_ptr<storage::FileJournal>> created{storage::FileJournal::CreateNew(dir, role, instance, segment)};
+    RequireOk(created, name + ": FileJournal::CreateNew");
+    std::vector<fs::path> copies;
+    for (size_t i{0}; i < records.size(); ++i) {
+        RequireOk((*created)->Append(records[i].type, records[i].payload), name + ": Append");
+        RequireOk((*created)->Barrier(), name + ": Barrier");
+        const fs::path copy{root.Sub(name + "-after-" + std::to_string(i + 1))};
+        for (const auto& entry : fs::directory_iterator{dir}) {
+            fs::copy_file(entry.path(), copy / fs::u8path(entry.path().filename().string()), fs::copy_options::none);
+        }
+        copies.push_back(copy);
+    }
+    return copies;
+}
+
 } // namespace
 
 BOOST_AUTO_TEST_SUITE(sim_node_tests)
@@ -467,6 +495,122 @@ BOOST_AUTO_TEST_CASE(a_commit_journal_across_segments_reopens_and_replays_after_
         BOOST_CHECK(std::equal(prefix->begin(), prefix->end(), live->begin(), live->begin() + static_cast<std::ptrdiff_t>(k)) &&
                     prefix->size() == k);
         RequireOk(state::ReplayDecisions(rig.node->Genesis(), *prefix), what + ": ReplayDecisions");
+    }
+}
+
+BOOST_AUTO_TEST_CASE(logs_reopened_after_every_barrier_rebuild_their_equivocation_and_decision_indexes)
+{
+    // M4-STO-01 acceptance: a crash after any barrier of a simulated node's
+    // signer or commit journal reopens to logs whose indexes equal the ones
+    // the node held at that barrier. The expected index of a prefix is read
+    // from its durable records: the first SIGNED_VOTE and ACCEPTED_PROPOSAL
+    // of each key (the equivocation index) and the first DECISION of each
+    // slot (the decision index).
+    NodeRig rig;
+    RequireOk(rig.node->SealSlot(), "SealSlot 1");
+    SimClient alice{ClientOf(rig, "alice")};
+    Deposits block{SIM_BASE_HEIGHT + 2, {}};
+    block.Add(alice.Account(), SimAsset("rUSD"), 1'000'000);
+    RequireOk(rig.node->Chain().AppendBlock(SimBlockHash(block.height), std::move(block.facts)), "AppendBlock");
+    for (uint64_t slot{2}; slot <= 6; ++slot) {
+        if (slot >= 3 && slot <= 5) {
+            AdmitOk(rig, alice.Place("idx-" + std::to_string(slot), slot - 2, SimMarketM1(), Side::BUY, TimeInForce::GTC, 250, 1, slot - 1),
+                    "Alice's PLACE");
+        }
+        RequireOk(rig.node->SealSlot(), "SealSlot " + std::to_string(slot));
+    }
+    const ProfileParams& profile{rig.node->Profile()};
+    const TestDir root{"sim_index_rebuild"};
+
+    // Signer journal: SignedAt, AcceptedAt and DurableAcceptedViewsAt.
+    {
+        const Result<std::vector<storage::JournalRecord>> live{rig.node->SignerJournal().ReadAll()};
+        RequireOk(live, "signer ReadAll");
+        const uint64_t instance{rig.node->SignerJournal().InstanceId()};
+        std::vector<std::pair<uint64_t, storage::SignedVoteRecord>> votes;            // (seq, record), first per key
+        std::vector<std::pair<uint64_t, storage::AcceptedProposalRecord>> proposals;  // (seq, record), first per key
+        for (const storage::JournalRecord& record : *live) {
+            if (record.type == storage::RecordType::SIGNED_VOTE) {
+                const Result<storage::SignedVoteRecord> vote{storage::SignedVoteRecord::Decode(record.payload)};
+                RequireOk(vote, "SignedVoteRecord::Decode");
+                if (std::ranges::none_of(votes, [&](const auto& v) { return v.second.key == vote->key; })) votes.emplace_back(record.seq, *vote);
+            } else if (record.type == storage::RecordType::ACCEPTED_PROPOSAL) {
+                const Result<storage::AcceptedProposalRecord> accepted{storage::AcceptedProposalRecord::Decode(record.payload, profile)};
+                RequireOk(accepted, "AcceptedProposalRecord::Decode");
+                if (std::ranges::none_of(proposals, [&](const auto& p) { return p.second.key == accepted->key; })) {
+                    proposals.emplace_back(record.seq, *accepted);
+                }
+            }
+        }
+        BOOST_REQUIRE_GE(votes.size(), 6U);
+        BOOST_REQUIRE_GE(proposals.size(), 3U);
+        const std::vector<fs::path> copies{WriteWithCrashCopies(root, "signer", *live, storage::JournalRole::SIGNER, instance)};
+        for (size_t k{1}; k <= copies.size(); ++k) {
+            const std::string what{"signer crash after barrier " + std::to_string(k)};
+            Result<std::unique_ptr<storage::FileJournal>> journal{
+                storage::FileJournal::OpenExisting(copies[k - 1], storage::JournalRole::SIGNER, instance)};
+            RequireOk(journal, what + ": OpenExisting");
+            const Result<storage::SignerLog> log{storage::SignerLog::Create(**journal, profile)};
+            RequireOk(log, what + ": SignerLog::Create");
+            for (const auto& [seq, vote] : votes) {
+                const std::optional<storage::PendingSignedVote> signed_at{log->SignedAt(vote.key)};
+                if (seq > k) {
+                    BOOST_CHECK_MESSAGE(!signed_at, what + ": a vote after the crash point is known");
+                    continue;
+                }
+                BOOST_REQUIRE_MESSAGE(signed_at, what + ": a durable signed vote is missing");
+                BOOST_CHECK_EQUAL(signed_at->Seq(), seq);
+                BOOST_CHECK_EQUAL(signed_at->JournalInstance(), instance);
+                BOOST_CHECK(signed_at->Key() == (storage::SignedVoteRef{vote.key, vote.digest, vote.signature}));
+            }
+            for (const auto& [seq, accepted] : proposals) {
+                const Result<std::optional<storage::AcceptedProposalRecord>> at{log->AcceptedAt(accepted.key, profile)};
+                RequireOk(at, what + ": AcceptedAt");
+                BOOST_CHECK_MESSAGE(at->has_value() == (seq <= k), what + ": accepted proposal presence");
+                if (*at) BOOST_CHECK(**at == accepted);
+                std::vector<uint64_t> expected;
+                for (const auto& [other_seq, other] : proposals) {
+                    if (other_seq <= k && other.key.epoch == accepted.key.epoch && other.key.slot == accepted.key.slot) expected.push_back(other.key.view);
+                }
+                std::vector<uint64_t> views{log->DurableAcceptedViewsAt(accepted.key.epoch, accepted.key.slot)};
+                std::ranges::sort(views);
+                std::ranges::sort(expected);
+                BOOST_CHECK_MESSAGE(views == expected, what + ": DurableAcceptedViewsAt");
+            }
+        }
+    }
+
+    // Commit journal: DecisionAt.
+    {
+        const Result<std::vector<storage::JournalRecord>> live{rig.node->CommitJournal().ReadAll()};
+        RequireOk(live, "commit ReadAll");
+        const uint64_t instance{rig.node->CommitJournal().InstanceId()};
+        std::vector<std::pair<uint64_t, storage::DecisionRef>> decisions; // (seq, reference), first per slot
+        for (const storage::JournalRecord& record : *live) {
+            if (record.type != storage::RecordType::DECISION) continue;
+            const Result<storage::DecisionRecord> decision{storage::DecisionRecord::Decode(record.payload, profile)};
+            RequireOk(decision, "DecisionRecord::Decode");
+            if (std::ranges::none_of(decisions, [&](const auto& d) { return d.second.slot == decision->header.height; })) {
+                decisions.emplace_back(record.seq, storage::DecisionRef{decision->header.height, decision->header.Hash(), decision->certificate.Hash()});
+            }
+        }
+        BOOST_REQUIRE_EQUAL(decisions.size(), 6U);
+        const std::vector<fs::path> copies{WriteWithCrashCopies(root, "commit", *live, storage::JournalRole::COMMIT, instance)};
+        for (size_t k{1}; k <= copies.size(); ++k) {
+            const std::string what{"commit crash after barrier " + std::to_string(k)};
+            Result<std::unique_ptr<storage::FileJournal>> journal{
+                storage::FileJournal::OpenExisting(copies[k - 1], storage::JournalRole::COMMIT, instance)};
+            RequireOk(journal, what + ": OpenExisting");
+            const Result<storage::CommitLog> log{storage::CommitLog::Create(**journal, profile)};
+            RequireOk(log, what + ": CommitLog::Create");
+            BOOST_CHECK_EQUAL(log->DurableSeq(), k);
+            for (const auto& [seq, reference] : decisions) {
+                const std::optional<storage::DecisionRef> at{log->DecisionAt(reference.slot)};
+                BOOST_CHECK_MESSAGE(at.has_value() == (seq <= k), what + ": decision presence at slot " + std::to_string(reference.slot));
+                if (at) BOOST_CHECK(*at == reference);
+            }
+            BOOST_CHECK(!log->DecisionAt(7));
+        }
     }
 }
 
