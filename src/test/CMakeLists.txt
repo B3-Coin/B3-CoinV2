@@ -49,9 +49,12 @@ add_executable(test_bitcoin
   bridge_deposit_tests.cpp
   bridge_eth_light_client_tests.cpp
   bridge_peer_light_client_tests.cpp
+  bridge_gloas_peer_light_client_tests.cpp
   bridge_arbitrum_source_tests.cpp
   bridge_arbitrum_proof_codec_tests.cpp
   bridge_arbitrum_history_tests.cpp
+  bridge_arbitrum_sepolia_tests.cpp
+  bridge_owned_arbitrum_settlement_tests.cpp
   bridge_ethereum_calldata_tests.cpp
   bridge_exec_chain_tests.cpp
   bridge_forwarder_v2_tests.cpp
@@ -401,3 +404,17 @@ endfunction()
 add_all_test_targets()
 
 install_binary_component(test_bitcoin INTERNAL)
+
+# Pure offline adapters. These tests mock process/node boundaries and never
+# start Docker, contact public networks, or use operator keys.
+if(UNIX AND TARGET Python3::Interpreter)
+  foreach(bridge_adapter IN ITEMS peer nitro_settlement)
+    add_test(NAME bridge_${bridge_adapter}_adapters
+      COMMAND Python3::Interpreter -B -m unittest discover
+        -s ${PROJECT_SOURCE_DIR}/contrib/b3bridge/${bridge_adapter}
+        -p test_*.py -v)
+    set_tests_properties(bridge_${bridge_adapter}_adapters PROPERTIES
+      LABELS "bridge;offline"
+      TIMEOUT 60)
+  endforeach()
+endif()

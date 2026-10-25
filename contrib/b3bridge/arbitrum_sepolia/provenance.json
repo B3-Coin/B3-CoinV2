@@ -1,0 +1,620 @@
+{
+  "format": "b3-arbitrum-sepolia-reviewed-deployment/1",
+  "mainnet_enabled": false,
+  "l1_chain_id": 11155111,
+  "l2_chain_id": 421614,
+  "nitro_commit": "70fa99a6e711f09eedd96a907290c3df0f3bcf7d",
+  "nitro_contracts_reference": "4341b132cfbdcc980ead03765ca5224ff6cb5d97",
+  "latest_confirmed_slot": 116,
+  "assertion_mapping_slot": 117,
+  "discovery_block": "0xc07ca95e98137deb060a6a8afd95f0f69b25159808e9756f52a48be4684a5339",
+  "discovery_is_authority": false,
+  "discovery_transport": "public-read-only-RPC-for-review-only",
+  "authority_required": "native Sepolia Gloas finalized EL header state root and exact MPT witnesses",
+  "whitelist_disabled": false,
+  "fast_confirmer": "0x0000000000000000000000000000000000000000",
+  "validators": [
+    "0x8a8f0a24d7e58a76fc8f77bb68c7c902b91e182e",
+    "0x87630025e63a30ecf9ca9d580d9d95922fea6af0",
+    "0xc32b93e581db6ebc50c08ce381143a259b92f1ed",
+    "0x88888aa374dbde60d26433e275ad700b65872063",
+    "0xd8512870de56e1970ccd5d6b8a5423995a7d2cf7"
+  ],
+  "assumptions": [
+    "Authorized Sepolia upgrade and force-confirmation governance is trusted; the pinned governance upgrade executor address is the trust boundary, not a proof of all controller role memberships.",
+    "At least one authorized validator honestly challenges invalid execution.",
+    "The full fraud-prover graph is not independently proved or executed by this module.",
+    "Canonical contract settlement is not a fast sequencer guarantee or independent Nitro STF proof.",
+    "Correctness of the configured fraud-prover contracts beyond the pinned challenge manager is assumed; their full code and proxy dependency graph is outside this closure."
+  ],
+  "accounts": {
+    "rollup": {
+      "address": "0x042b2e6c5e99d4c521bd49beed5e99651d9b0cf4",
+      "storage": {
+        "0x0000000000000000000000000000000000000000000000000000000000000000": "0x0000000000000000000000000000000000000000000000000000000000000001",
+        "0x0000000000000000000000000000000000000000000000000000000000000033": "0x0000000000000000000000000000000000000000000000000000000000000000",
+        "0x0000000000000000000000000000000000000000000000000000000000000065": "0x0000000000000000000000000000000000000000000000000000000000066eee",
+        "0x0000000000000000000000000000000000000000000000000000000000000066": "0x0000000000000000000000000000000000000000000313800000000000000014",
+        "0x0000000000000000000000000000000000000000000000000000000000000067": "0x000000000000000000000000000000000000000000000001f399b1438a100000",
+        "0x0000000000000000000000000000000000000000000000000000000000000068": "0xc10cd7ec6acaf1c441a3f6bd0900ad20f15855ba775a96f1939118cbc629dc97",
+        "0x0000000000000000000000000000000000000000000000000000000000000069": "0x000000000000000000003840c60b56ff6aab3fe8b9bd70040fe9e95a26258b4c",
+        "0x000000000000000000000000000000000000000000000000000000000000006a": "0x000000000000000000000000aae29b0366299461418f5324a79afc425be5ae21",
+        "0x000000000000000000000000000000000000000000000000000000000000006b": "0x00000000000000000000000038f918d0e9f1b721edaa41302e399fa1b79333a9",
+        "0x000000000000000000000000000000000000000000000000000000000000006c": "0x00000000000000000000000065f07c7d521164a4d5dac6eb8fac8da067a3b78f",
+        "0x000000000000000000000000000000000000000000000000000000000000006d": "0x000000000000000000000000d5b196dd7ec4d823ff5f695536c61f7c8e642b94",
+        "0x000000000000000000000000000000000000000000000000000000000000006e": "0x000000000000000000000000894fc71fa0a666352824ec954b401573c861d664",
+        "0x000000000000000000000000000000000000000000000000000000000000006f": "0x000000000000000000000000391611e7bba966000ac6c78afc673c4ae46f8bca",
+        "0x0000000000000000000000000000000000000000000000000000000000000070": "0x000000000000000000000000efb383126640fe4a760010c6e59c397d2b6c7141",
+        "0x0000000000000000000000000000000000000000000000000000000000000071": "0x000000000000000000000000000000000000000000000000000000000000004b",
+        "0x000000000000000000000000000000000000000000000000000000000000007b": "0x0000000000000000000000000000000000000000000000000000000000000000",
+        "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc": "0x0000000000000000000000003b7aea898c7f51551daaff4dae8ab0f553f2aef8",
+        "0x2b1dbce74324248c222f0ec2d5ed7bd323cfc425b336f0253c5ccfda7265546d": "0x000000000000000000000000dc2f809bba33cbb96a5ea8e9ee2dd4cb104e0ba5",
+        "0xb53127684a568b3173ae13b9f8a6016e243e63b6e8ee1178d6a717850b5d6103": "0x0000000000000000000000005fee78fe9ad96c1d8557c6d6bb22eb5a61eed315",
+        "0x0000000000000000000000000000000000000000000000000000000000000072": "0x0000000000000000000000000000000000000000000000000000000000000005",
+        "0x000000000000000000000000000000000000000000000000000000000000007a": "0x00000000000000000000000000000000000000000000000000000000006ec253",
+        "0xdffbd64cc7c1a7eb27984335d9416d51137a03d3fabec7141025c62663253fe1": "0x0000000000000000000000008a8f0a24d7e58a76fc8f77bb68c7c902b91e182e",
+        "0xdffbd64cc7c1a7eb27984335d9416d51137a03d3fabec7141025c62663253fe2": "0x00000000000000000000000087630025e63a30ecf9ca9d580d9d95922fea6af0",
+        "0xdffbd64cc7c1a7eb27984335d9416d51137a03d3fabec7141025c62663253fe3": "0x000000000000000000000000c32b93e581db6ebc50c08ce381143a259b92f1ed",
+        "0xdffbd64cc7c1a7eb27984335d9416d51137a03d3fabec7141025c62663253fe4": "0x00000000000000000000000088888aa374dbde60d26433e275ad700b65872063",
+        "0xdffbd64cc7c1a7eb27984335d9416d51137a03d3fabec7141025c62663253fe5": "0x000000000000000000000000d8512870de56e1970ccd5d6b8a5423995a7d2cf7",
+        "0x845896e8e96f741eb4af5e059da482dd824e725e833e3270ba946ded519d2ca9": "0x0000000000000000000000000000000000000000000000000000000000000001",
+        "0x331e58f0e26a59d3f86466feda0cae956dea1ed8d6efe79af00bac7bca1f1d0e": "0x0000000000000000000000000000000000000000000000000000000000000002",
+        "0x7d4a4d55d679164a9cd72db9949f76b59a8c2424c0168bcc81ecbc55ca5745f0": "0x0000000000000000000000000000000000000000000000000000000000000003",
+        "0x3b85c10faf974697fabc26ff2ed52137d22580710979d03726a481b517ada761": "0x0000000000000000000000000000000000000000000000000000000000000004",
+        "0xbf569f0edf1059dbbd4c3e4ddc52dad40bcdf40b77551724b8297e252ea1069e": "0x0000000000000000000000000000000000000000000000000000000000000005"
+      },
+      "code_hash": "0x5961c8c303762fe3bdc69d0df28db034e475e46ef4e3582c632eaaa51314ce29"
+    },
+    "rollup-admin": {
+      "address": "0x3b7aea898c7f51551daaff4dae8ab0f553f2aef8",
+      "code_hash": "0xdd93a7606e6067aaae8ad5afa28b943a8272809eb72face4e2bb3bf4d0609445",
+      "storage": {}
+    },
+    "rollup-user": {
+      "address": "0xdc2f809bba33cbb96a5ea8e9ee2dd4cb104e0ba5",
+      "code_hash": "0xeadf786edd4819d0262d9679d43b878d7005408a822aa0c43cf79bd0043c09a3",
+      "storage": {}
+    },
+    "governance-proxy": {
+      "address": "0x5fee78fe9ad96c1d8557c6d6bb22eb5a61eed315",
+      "code_hash": "0xaf1930cb4e04099123212d7165da766dc4b7ea55768ffdf98d38b4b055e03fe3",
+      "storage": {
+        "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc": "0x0000000000000000000000003d745b8815f9be5bf053858165f8ab1f58c77932",
+        "0xb53127684a568b3173ae13b9f8a6016e243e63b6e8ee1178d6a717850b5d6103": "0x0000000000000000000000003729b0b3999fb46aa71386d1016e155d55ccd282",
+        "0x0000000000000000000000000000000000000000000000000000000000000000": "0x0000000000000000000000000000000000000000000000000000000000000001",
+        "0x0000000000000000000000000000000000000000000000000000000000000097": "0x0000000000000000000000000000000000000000000000000000000000000001",
+        "0x2c01dc0041dfb6d4238a91e5a638996136aed16f837d5beb45610732cf9bf4b1": "0xa49807205ce4d355092ef5a8a18f56e8913cf4a201fbe287825b095693c21775",
+        "0x7dc9f88e569f94faad6fa0d44dd44858caf3f34f1bd1c985800aedf5793aad8c": "0xa49807205ce4d355092ef5a8a18f56e8913cf4a201fbe287825b095693c21775"
+      }
+    },
+    "governance-logic": {
+      "address": "0x3d745b8815f9be5bf053858165f8ab1f58c77932",
+      "code_hash": "0xaa9c6e37772ff5bf092a3ff66273fff15c89ea99676b49bf535a8bc6a66cc002",
+      "storage": {}
+    },
+    "challenge-proxy": {
+      "address": "0xc60b56ff6aab3fe8b9bd70040fe9e95a26258b4c",
+      "code_hash": "0x874b6c2d4c8ff6f808adc4edf258b20cb3de1c18281ebf48ba9c19f11076f24f",
+      "storage": {
+        "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc": "0x000000000000000000000000c14422cca7d6462ccbea5feec08ffbae66713ffe",
+        "0xb53127684a568b3173ae13b9f8a6016e243e63b6e8ee1178d6a717850b5d6103": "0x000000000000000000000000dd63bcaa89d7c3199ef220c1dd59c49f821078b8",
+        "0x0000000000000000000000000000000000000000000000000000000000000000": "0x0000000000000000000000000000000000000000000000000000000000000001",
+        "0x0000000000000000000000000000000000000000000000000000000000000005": "0x000000000000000000000000391611e7bba966000ac6c78afc673c4ae46f8bca",
+        "0x0000000000000000000000000000000000000000000000000000000000000006": "0x000000000000000000000000efb383126640fe4a760010c6e59c397d2b6c7141",
+        "0x0000000000000000000000000000000000000000000000000000000000000007": "0x0000000000000000000000000000000000000000000000000000000000000003",
+        "0x0000000000000000000000000000000000000000000000000000000000000008": "0x00000000042b2e6c5e99d4c521bd49beed5e99651d9b0cf4000000000000b2fa",
+        "0x0000000000000000000000000000000000000000000000000000000000000009": "0x000000000000000000000000b9cf664a1bed8f74f4b893a18c86ece876cdae80",
+        "0x000000000000000000000000000000000000000000000000000000000000000a": "0x0000000000000000000000000000000000000000000000000000000004000000",
+        "0x000000000000000000000000000000000000000000000000000000000000000b": "0x0000000000000000000000000000000000000000000000000000000000080000",
+        "0x000000000000000000000000000000000000000000000000000000000000000c": "0x0000000000000000000000000000000000000000000000000000000000800000",
+        "0x000000000000000000000000000000000000000000000000000000000000000d": "0x0000000000000000000000000000000000000000000000000000000000000001",
+        "0xa66cc928b5edb82af9bd49922954155ab7b0942694bea4ce44661d9a8736c688": "0x0000000000000000000000000000000000000000000000000000000000000000",
+        "0xa66cc928b5edb82af9bd49922954155ab7b0942694bea4ce44661d9a8736c689": "0x0000000000000000000000000000000000000000000000004c53ecdc18a60000",
+        "0xa66cc928b5edb82af9bd49922954155ab7b0942694bea4ce44661d9a8736c68a": "0x0000000000000000000000000000000000000000000000000af6a4d07c8f0000"
+      }
+    },
+    "challenge-logic": {
+      "address": "0xc14422cca7d6462ccbea5feec08ffbae66713ffe",
+      "code_hash": "0x57d37018b94f7661642acbb7e5a5ad30db560a27372ebf9435e69c45756962a6",
+      "storage": {}
+    },
+    "bridge-proxy": {
+      "address": "0x38f918d0e9f1b721edaa41302e399fa1b79333a9",
+      "code_hash": "0x8736329b580cfc0c0c39ee6700515e0bc51652afb614640db9e34a5d784933e8",
+      "storage": {
+        "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc": "0x000000000000000000000000ed26e46f38957763f83f2c45f6fb6702cfebc7d8",
+        "0xb53127684a568b3173ae13b9f8a6016e243e63b6e8ee1178d6a717850b5d6103": "0x000000000000000000000000dd63bcaa89d7c3199ef220c1dd59c49f821078b8",
+        "0x0000000000000000000000000000000000000000000000000000000000000000": "0x0000000000000000000000000000000000000000000000000000000000000001",
+        "0x0000000000000000000000000000000000000000000000000000000000000008": "0x000000000000000000000000042b2e6c5e99d4c521bd49beed5e99651d9b0cf4",
+        "0x0000000000000000000000000000000000000000000000000000000000000009": "0x0000000000000000000000006c97864ce4bef387de0b3310a44230f7e3f1be0d"
+      }
+    },
+    "bridge-logic": {
+      "address": "0xed26e46f38957763f83f2c45f6fb6702cfebc7d8",
+      "code_hash": "0x3bd9637547d75e5b4539449e14c759b86b9d37a7c1f2b47a1524f857e4ff1a0c",
+      "storage": {}
+    },
+    "inbox-proxy": {
+      "address": "0xaae29b0366299461418f5324a79afc425be5ae21",
+      "code_hash": "0x8736329b580cfc0c0c39ee6700515e0bc51652afb614640db9e34a5d784933e8",
+      "storage": {
+        "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc": "0x0000000000000000000000004b31d35ce007c9744e71db8fc649629f3b7c619e",
+        "0xb53127684a568b3173ae13b9f8a6016e243e63b6e8ee1178d6a717850b5d6103": "0x000000000000000000000000dd63bcaa89d7c3199ef220c1dd59c49f821078b8",
+        "0x0000000000000000000000000000000000000000000000000000000000000000": "0x0000000000000000000000000000000000000000000000000000000000000001",
+        "0x0000000000000000000000000000000000000000000000000000000000000033": "0x0000000000000000000000000000000000000000000000000000000000000000",
+        "0x0000000000000000000000000000000000000000000000000000000000000065": "0x00000000000000000000000038f918d0e9f1b721edaa41302e399fa1b79333a9",
+        "0x0000000000000000000000000000000000000000000000000000000000000066": "0x0000000000000000000000006c97864ce4bef387de0b3310a44230f7e3f1be0d"
+      }
+    },
+    "inbox-logic": {
+      "address": "0x4b31d35ce007c9744e71db8fc649629f3b7c619e",
+      "code_hash": "0xfe3ffd28beb1679b4d092b68281ecb83a60fef66602448d8c9d9ab76bca1d3c6",
+      "storage": {}
+    },
+    "outbox-proxy": {
+      "address": "0x65f07c7d521164a4d5dac6eb8fac8da067a3b78f",
+      "code_hash": "0x8736329b580cfc0c0c39ee6700515e0bc51652afb614640db9e34a5d784933e8",
+      "storage": {
+        "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc": "0x000000000000000000000000fed2027e956fa0a1f367c03a20555839441e224f",
+        "0xb53127684a568b3173ae13b9f8a6016e243e63b6e8ee1178d6a717850b5d6103": "0x000000000000000000000000dd63bcaa89d7c3199ef220c1dd59c49f821078b8",
+        "0x0000000000000000000000000000000000000000000000000000000000000000": "0x000000000000000000000000042b2e6c5e99d4c521bd49beed5e99651d9b0cf4",
+        "0x0000000000000000000000000000000000000000000000000000000000000001": "0x00000000000000000000000038f918d0e9f1b721edaa41302e399fa1b79333a9"
+      }
+    },
+    "outbox-logic": {
+      "address": "0xfed2027e956fa0a1f367c03a20555839441e224f",
+      "code_hash": "0xe1a7bc91ccb75acc2f907d92efad5b89686a4926dbbcf521b85f972eeb7c8ef9",
+      "storage": {}
+    },
+    "sequencer-proxy": {
+      "address": "0x6c97864ce4bef387de0b3310a44230f7e3f1be0d",
+      "code_hash": "0x8736329b580cfc0c0c39ee6700515e0bc51652afb614640db9e34a5d784933e8",
+      "storage": {
+        "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc": "0x000000000000000000000000bbb2ef6dd70759f6c335c116895c6749ec7427da",
+        "0xb53127684a568b3173ae13b9f8a6016e243e63b6e8ee1178d6a717850b5d6103": "0x000000000000000000000000dd63bcaa89d7c3199ef220c1dd59c49f821078b8",
+        "0x0000000000000000000000000000000000000000000000000000000000000001": "0x00000000000000000000000038f918d0e9f1b721edaa41302e399fa1b79333a9",
+        "0x0000000000000000000000000000000000000000000000000000000000000002": "0x000000000000000000000000042b2e6c5e99d4c521bd49beed5e99651d9b0cf4",
+        "0x000000000000000000000000000000000000000000000000000000000000000a": "0x0000000000000300000000000001518000000000000000400000000000001c20",
+        "0x000000000000000000000000000000000000000000000000000000000000000b": "0x0000000000000000000000000000000000000000000000000000000000000000"
+      }
+    },
+    "sequencer-logic": {
+      "address": "0xbbb2ef6dd70759f6c335c116895c6749ec7427da",
+      "code_hash": "0xeb0d6833b09c7c3b2b0c6fd1aae755cb6c4299a416d7f06928710bc348b4950a",
+      "storage": {}
+    },
+    "core-proxy-admin": {
+      "address": "0xdd63bcaa89d7c3199ef220c1dd59c49f821078b8",
+      "code_hash": "0xdf42de18ce8ffeb9592b92fceea883f369ee2bdca7087d6a462e6e33b3eaf13c",
+      "storage": {
+        "0x0000000000000000000000000000000000000000000000000000000000000000": "0x0000000000000000000000005fee78fe9ad96c1d8557c6d6bb22eb5a61eed315"
+      }
+    },
+    "governance-proxy-admin": {
+      "address": "0x3729b0b3999fb46aa71386d1016e155d55ccd282",
+      "code_hash": "0x80168536d45ad308c350f3247327c464cdf3a2a8290ef1571a8729f3d2a3c944",
+      "storage": {
+        "0x0000000000000000000000000000000000000000000000000000000000000000": "0x0000000000000000000000005fee78fe9ad96c1d8557c6d6bb22eb5a61eed315"
+      }
+    }
+  },
+  "independent_missing_source_verification": {
+    "governance-logic": {
+      "version": "0.8.16",
+      "compiler_sha256": "0x1632786c6c1f856a4a899232ec975a12f305118f43cce90e724ed0b2eebfeee1",
+      "runtime_exact_match": true,
+      "executable_exact_match": true,
+      "only_cbor_auxdata_diff": false,
+      "immutable_references": {},
+      "storage_layout": {
+        "storage": [
+          {
+            "astId": 419,
+            "contract": "src/UpgradeExecutor.sol:UpgradeExecutor",
+            "label": "_initialized",
+            "offset": 0,
+            "slot": "0",
+            "type": "t_uint8"
+          },
+          {
+            "astId": 422,
+            "contract": "src/UpgradeExecutor.sol:UpgradeExecutor",
+            "label": "_initializing",
+            "offset": 1,
+            "slot": "0",
+            "type": "t_bool"
+          },
+          {
+            "astId": 847,
+            "contract": "src/UpgradeExecutor.sol:UpgradeExecutor",
+            "label": "__gap",
+            "offset": 0,
+            "slot": "1",
+            "type": "t_array(t_uint256)50_storage"
+          },
+          {
+            "astId": 1117,
+            "contract": "src/UpgradeExecutor.sol:UpgradeExecutor",
+            "label": "__gap",
+            "offset": 0,
+            "slot": "51",
+            "type": "t_array(t_uint256)50_storage"
+          },
+          {
+            "astId": 39,
+            "contract": "src/UpgradeExecutor.sol:UpgradeExecutor",
+            "label": "_roles",
+            "offset": 0,
+            "slot": "101",
+            "type": "t_mapping(t_bytes32,t_struct(RoleData)34_storage)"
+          },
+          {
+            "astId": 338,
+            "contract": "src/UpgradeExecutor.sol:UpgradeExecutor",
+            "label": "__gap",
+            "offset": 0,
+            "slot": "102",
+            "type": "t_array(t_uint256)49_storage"
+          },
+          {
+            "astId": 1141,
+            "contract": "src/UpgradeExecutor.sol:UpgradeExecutor",
+            "label": "_status",
+            "offset": 0,
+            "slot": "151",
+            "type": "t_uint256"
+          }
+        ],
+        "types": {
+          "t_address": {
+            "encoding": "inplace",
+            "label": "address",
+            "numberOfBytes": "20"
+          },
+          "t_array(t_uint256)49_storage": {
+            "base": "t_uint256",
+            "encoding": "inplace",
+            "label": "uint256[49]",
+            "numberOfBytes": "1568"
+          },
+          "t_array(t_uint256)50_storage": {
+            "base": "t_uint256",
+            "encoding": "inplace",
+            "label": "uint256[50]",
+            "numberOfBytes": "1600"
+          },
+          "t_bool": {
+            "encoding": "inplace",
+            "label": "bool",
+            "numberOfBytes": "1"
+          },
+          "t_bytes32": {
+            "encoding": "inplace",
+            "label": "bytes32",
+            "numberOfBytes": "32"
+          },
+          "t_mapping(t_address,t_bool)": {
+            "encoding": "mapping",
+            "key": "t_address",
+            "label": "mapping(address => bool)",
+            "numberOfBytes": "32",
+            "value": "t_bool"
+          },
+          "t_mapping(t_bytes32,t_struct(RoleData)34_storage)": {
+            "encoding": "mapping",
+            "key": "t_bytes32",
+            "label": "mapping(bytes32 => struct AccessControlUpgradeable.RoleData)",
+            "numberOfBytes": "32",
+            "value": "t_struct(RoleData)34_storage"
+          },
+          "t_struct(RoleData)34_storage": {
+            "encoding": "inplace",
+            "label": "struct AccessControlUpgradeable.RoleData",
+            "members": [
+              {
+                "astId": 31,
+                "contract": "src/UpgradeExecutor.sol:UpgradeExecutor",
+                "label": "members",
+                "offset": 0,
+                "slot": "0",
+                "type": "t_mapping(t_address,t_bool)"
+              },
+              {
+                "astId": 33,
+                "contract": "src/UpgradeExecutor.sol:UpgradeExecutor",
+                "label": "adminRole",
+                "offset": 0,
+                "slot": "1",
+                "type": "t_bytes32"
+              }
+            ],
+            "numberOfBytes": "64"
+          },
+          "t_uint256": {
+            "encoding": "inplace",
+            "label": "uint256",
+            "numberOfBytes": "32"
+          },
+          "t_uint8": {
+            "encoding": "inplace",
+            "label": "uint8",
+            "numberOfBytes": "1"
+          }
+        }
+      }
+    },
+    "outbox-logic": {
+      "version": "0.8.17",
+      "compiler_sha256": "0x99f2070b776e9714f1f76c43c229cf99b8978a92938ee8d2364c6de11c1a03d4",
+      "runtime_exact_match": true,
+      "executable_exact_match": true,
+      "only_cbor_auxdata_diff": false,
+      "immutable_references": {
+        "1308": [
+          {
+            "length": 32,
+            "start": 1938
+          },
+          {
+            "length": 32,
+            "start": 2711
+          }
+        ]
+      },
+      "storage_layout": {
+        "storage": [
+          {
+            "astId": 25,
+            "contract": "src/bridge/Outbox.sol:Outbox",
+            "label": "rollup",
+            "offset": 0,
+            "slot": "0",
+            "type": "t_address"
+          },
+          {
+            "astId": 28,
+            "contract": "src/bridge/Outbox.sol:Outbox",
+            "label": "bridge",
+            "offset": 0,
+            "slot": "1",
+            "type": "t_contract(IBridge)1067"
+          },
+          {
+            "astId": 32,
+            "contract": "src/bridge/Outbox.sol:Outbox",
+            "label": "spent",
+            "offset": 0,
+            "slot": "2",
+            "type": "t_mapping(t_uint256,t_bytes32)"
+          },
+          {
+            "astId": 36,
+            "contract": "src/bridge/Outbox.sol:Outbox",
+            "label": "roots",
+            "offset": 0,
+            "slot": "3",
+            "type": "t_mapping(t_bytes32,t_bytes32)"
+          },
+          {
+            "astId": 52,
+            "contract": "src/bridge/Outbox.sol:Outbox",
+            "label": "context",
+            "offset": 0,
+            "slot": "4",
+            "type": "t_struct(L2ToL1Context)49_storage"
+          },
+          {
+            "astId": 858,
+            "contract": "src/bridge/Outbox.sol:Outbox",
+            "label": "__gap",
+            "offset": 0,
+            "slot": "8",
+            "type": "t_array(t_uint256)42_storage"
+          }
+        ],
+        "types": {
+          "t_address": {
+            "encoding": "inplace",
+            "label": "address",
+            "numberOfBytes": "20"
+          },
+          "t_array(t_uint256)42_storage": {
+            "base": "t_uint256",
+            "encoding": "inplace",
+            "label": "uint256[42]",
+            "numberOfBytes": "1344"
+          },
+          "t_bytes32": {
+            "encoding": "inplace",
+            "label": "bytes32",
+            "numberOfBytes": "32"
+          },
+          "t_contract(IBridge)1067": {
+            "encoding": "inplace",
+            "label": "contract IBridge",
+            "numberOfBytes": "20"
+          },
+          "t_mapping(t_bytes32,t_bytes32)": {
+            "encoding": "mapping",
+            "key": "t_bytes32",
+            "label": "mapping(bytes32 => bytes32)",
+            "numberOfBytes": "32",
+            "value": "t_bytes32"
+          },
+          "t_mapping(t_uint256,t_bytes32)": {
+            "encoding": "mapping",
+            "key": "t_uint256",
+            "label": "mapping(uint256 => bytes32)",
+            "numberOfBytes": "32",
+            "value": "t_bytes32"
+          },
+          "t_struct(L2ToL1Context)49_storage": {
+            "encoding": "inplace",
+            "label": "struct AbsOutbox.L2ToL1Context",
+            "members": [
+              {
+                "astId": 38,
+                "contract": "src/bridge/Outbox.sol:Outbox",
+                "label": "l2Block",
+                "offset": 0,
+                "slot": "0",
+                "type": "t_uint128"
+              },
+              {
+                "astId": 40,
+                "contract": "src/bridge/Outbox.sol:Outbox",
+                "label": "timestamp",
+                "offset": 16,
+                "slot": "0",
+                "type": "t_uint128"
+              },
+              {
+                "astId": 42,
+                "contract": "src/bridge/Outbox.sol:Outbox",
+                "label": "outputId",
+                "offset": 0,
+                "slot": "1",
+                "type": "t_bytes32"
+              },
+              {
+                "astId": 44,
+                "contract": "src/bridge/Outbox.sol:Outbox",
+                "label": "sender",
+                "offset": 0,
+                "slot": "2",
+                "type": "t_address"
+              },
+              {
+                "astId": 46,
+                "contract": "src/bridge/Outbox.sol:Outbox",
+                "label": "l1Block",
+                "offset": 20,
+                "slot": "2",
+                "type": "t_uint96"
+              },
+              {
+                "astId": 48,
+                "contract": "src/bridge/Outbox.sol:Outbox",
+                "label": "withdrawalAmount",
+                "offset": 0,
+                "slot": "3",
+                "type": "t_uint256"
+              }
+            ],
+            "numberOfBytes": "128"
+          },
+          "t_uint128": {
+            "encoding": "inplace",
+            "label": "uint128",
+            "numberOfBytes": "16"
+          },
+          "t_uint256": {
+            "encoding": "inplace",
+            "label": "uint256",
+            "numberOfBytes": "32"
+          },
+          "t_uint96": {
+            "encoding": "inplace",
+            "label": "uint96",
+            "numberOfBytes": "12"
+          }
+        }
+      }
+    },
+    "core-proxy-admin": {
+      "version": "0.8.9",
+      "compiler_sha256": "0xf851f11fad37496baabaf8d6cb5c057ca0d9754fddb7a351ab580d7fd728cb94",
+      "runtime_exact_match": false,
+      "executable_exact_match": true,
+      "only_cbor_auxdata_diff": true,
+      "immutable_references": {},
+      "storage_layout": {
+        "storage": [
+          {
+            "astId": 965,
+            "contract": "src/ProxyAdmin.sol:ProxyAdmin",
+            "label": "_owner",
+            "offset": 0,
+            "slot": "0",
+            "type": "t_address"
+          }
+        ],
+        "types": {
+          "t_address": {
+            "encoding": "inplace",
+            "label": "address",
+            "numberOfBytes": "20"
+          }
+        }
+      }
+    },
+    "governance-proxy-admin": {
+      "version": "0.8.16",
+      "compiler_sha256": "0x1632786c6c1f856a4a899232ec975a12f305118f43cce90e724ed0b2eebfeee1",
+      "runtime_exact_match": false,
+      "executable_exact_match": true,
+      "only_cbor_auxdata_diff": true,
+      "immutable_references": {},
+      "storage_layout": {
+        "storage": [
+          {
+            "astId": 7,
+            "contract": "node_modules/@openzeppelin/contracts/proxy/transparent/ProxyAdmin.sol:ProxyAdmin",
+            "label": "_owner",
+            "offset": 0,
+            "slot": "0",
+            "type": "t_address"
+          }
+        ],
+        "types": {
+          "t_address": {
+            "encoding": "inplace",
+            "label": "address",
+            "numberOfBytes": "20"
+          }
+        }
+      }
+    }
+  },
+  "public_source_sha256": {
+    "bridge-logic-sourcify.json": "cc95d659bcae522cb7eb4daa4799ee7415e030e87a60b154374ab4320cd2daf0",
+    "bridge-proxy-sourcify.json": "e920c3101190dd826d393ecd152d8e1349e23745a71aea04ce35cb77bc02aac0",
+    "challenge-logic-sourcify.json": "8e32669825c00cc4ba73acae6e20792af50d681311b86a1ac3a5d9b45da748d6",
+    "challenge-proxy-sourcify.json": "f04682525e4dd3b140c975d464d9aee7f1a0bcf89fe80833256a03fa878fee81",
+    "core-proxy-admin-independently-recompiled.json": "3195d12a4c8013c9b810f8e039c7cfd391bf2d2e414bbcd605973c8ae79f7192",
+    "core-proxy-admin-std-input.json": "54f40d436f852fd25d98858ea3a59f511f1e0ea9fa228588165ed1374100652d",
+    "governance-logic-independently-recompiled.json": "dd2a5e3b334c9e4fbcb5906cfc94c14ba12db3c2fa57f9be1c9b0e812ecd5303",
+    "governance-logic-std-input.json": "a28bf1e680ea904b02bea0b8b36e9bf80e2474e8724f7a6981c940c0eb611588",
+    "governance-proxy-admin-independently-recompiled.json": "e9e814d4dd855ecb7db107861bc56c02ab71197d672904cfb6676fbef882c14d",
+    "governance-proxy-admin-std-input.json": "29ed97b298df71387f452fc124d485c6d2f565c14c2514554f69b844aa850da5",
+    "governance-proxy-sourcify.json": "4bd0bf0276d7281ea24dbd65d17b92fd98b82e1a90d80443dd1a2ff2f75f790c",
+    "inbox-logic-sourcify.json": "d2d4e7c41b5c32dd0f88cebf67fcf638b79aa0f6dc2532c5947c131a951a8c8d",
+    "inbox-proxy-sourcify.json": "fa793871120a7157c8df130f7dd08e1159eef14fdfbeae2c9ebeb372d35afdb8",
+    "independent-bytecode-verification.json": "162accdcf779f4ffd443acb032722ee4a200ef1302144fb691c6e4c401f2e68f",
+    "manifest.json": "b03d99da3d97ac8357d28de109403e85535a0719199fe6eea18ec2a1994c3fbe",
+    "monitoring-config.json": "ee503b430ad7af2027c5686803856c46ff41f46d650e7b3618cc005c8c3fbbdf",
+    "nitro-chaininfo.json": "d7e8b87f078b10178a0ef03e809d3dad93a2583f6e181cc50f12368b57e58cdc",
+    "nitro-tree.json": "39f8742916bad2f5af92faf9f0d3b46897810d99a64b0ee807e4cb1cd7e54760",
+    "outbox-logic-independently-recompiled.json": "822fe9023cf62422339bcfeff99c85df9169014f556e9127146f7492761f1203",
+    "outbox-logic-std-input.json": "f455c086452c57351639a75c696b8bb967cf74949e39b531f2c0f50ba77559f2",
+    "rollup-admin-sourcify.json": "7612cf219c1da94a91f634db866536d2a3e11a879602e4aef29cc6def54af578",
+    "rollup-user-sourcify.json": "69c12f99b45ae770401af745fbfcd1a37741966c43aeda325482bcdfa43dc605",
+    "sepolia-bold-admin-sourcify.json": "7612cf219c1da94a91f634db866536d2a3e11a879602e4aef29cc6def54af578",
+    "sepolia-bold-rollup-sourcify.json": "8575096b0a161bdf56a651df67769479437ff37043fd976a9ce949d169176e7b",
+    "sepolia-bold-user-sourcify.json": "69c12f99b45ae770401af745fbfcd1a37741966c43aeda325482bcdfa43dc605",
+    "sepolia-closure-config.json": "c2d60a72f377ff1937dcb47aa3a8141b46d47095dd5563cba94b9be16c858550",
+    "sepolia-closure-discovery.json": "efeafe1ffc679bf9a17f40f39391ac7c2cdcfab8ae1a74432fdf5ad2860cf3b1",
+    "sepolia-rollup-sourcify.json": "57d6dd0c5a307a0d2c0e1c4207f490a9ae90284421bb7b67c88f6ffc0c5fb1c8",
+    "sepolia-untrusted-discovery.json": "f1ad30bf05b4d7ba5e49a0ed69ef7bed8f0cb4ed3160cee9c86513fd231492ff",
+    "sepolia-upgrade-executor-sourcify.json": "4bd0bf0276d7281ea24dbd65d17b92fd98b82e1a90d80443dd1a2ff2f75f790c",
+    "sequencer-logic-sourcify.json": "1d2b9fd4218a6b9413478015e7544925267d503baea1bce2f26fa77f7a2ab33e",
+    "sequencer-proxy-sourcify.json": "44211895988e836df4d9916e8cb7c05e87813d952f2d0a12f2d51bf2f49a5e74",
+    "src__libraries__AdminFallbackProxy.sol": "5c89164a148b9896eed71611e8297265ba65099c3f5d96faf67f1f3d1d115e80",
+    "src__libraries__DoubleLogicUUPSUpgradeable.sol": "9ad473fd6ce45d89b24f324064d8b2d76a0642b4ad073954bf88a41fa977df42",
+    "src__rollup__Assertion.sol": "5055b86d16e3a72b420a9093b1145d04517a86283931f9360a9b959b5fbca998",
+    "src__rollup__AssertionState.sol": "d88f95777ad5e4a24e93cc460de27099c6dcd74863630729bb7739a4bac663ac",
+    "src__rollup__RollupCore.sol": "399c0c0d78e2d801bca88e874e696f489639d9c1557852cdd0b43301c7a44d83",
+    "src__rollup__RollupLib.sol": "95b4754b7483bcb82c190f8ff0d83b0fb2e11f6875225b85527c8aced42aaf13",
+    "src__rollup__RollupProxy.sol": "ef44aa0f5a71a1adf35ed215faa827728766fdd483bac38095ec0c8fcd8755b3"
+  }
+}
