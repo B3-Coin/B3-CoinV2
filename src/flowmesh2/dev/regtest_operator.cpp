@@ -2,6 +2,8 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
+// TODO(rebirth:M4-DEV-01) regtest operator worker; chain facts arrive only through
+// the wrapper-fed observe command until the b3d adapter (MB1-ADP-06) delivers them.
 #include <flowmesh2/dev/regtest_operator.h>
 
 #include <crypto/bls.h>

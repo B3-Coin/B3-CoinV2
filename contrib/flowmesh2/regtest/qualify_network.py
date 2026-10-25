@@ -3,6 +3,8 @@
 
 This program has no mainnet mode. Synthetic assets and owned local chains only.
 """
+# TODO(rebirth:M0-QUAL-01) default tool and build paths are machine-bound
+# (/home/josh/...); the gates must run on a second machine from documented tools.
 import argparse
 import json
 import os

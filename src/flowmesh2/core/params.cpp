@@ -70,6 +70,8 @@ AssetId RegtestQuoteAsset()
                           std::span{reinterpret_cast<const unsigned char*>(label.data()), label.size()})};
 }
 
+// TODO(rebirth:M6-PRF-01) regtest stable-quote profiles assume D3 (fees in Q);
+// they are replaced by the ratified profile and never selectable off REGTEST.
 Result<ProfileParams> StableQRegtestProfile(ChainType chain)
 {
     Result<ProfileParams> legacy{DevRegtestProfile(chain)};

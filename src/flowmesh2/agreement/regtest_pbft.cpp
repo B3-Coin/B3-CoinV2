@@ -15,6 +15,8 @@
 
 namespace flowmesh2::agreement {
 namespace {
+// TODO(rebirth:M4-AGR-13) regtest-only four-seat PBFT; the literal seat count,
+// quorum and leader rule give way to the general agreement of M4-AGR-02.
 constexpr size_t MAX_BODIES{16};
 constexpr size_t MAX_BODY_CACHE_BYTES{16 * 1024 * 1024};
 constexpr size_t MAX_PEER_OUTBOX{16};

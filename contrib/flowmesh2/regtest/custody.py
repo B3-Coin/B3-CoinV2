@@ -5,6 +5,8 @@ Only Python's standard library and the pinned local Foundry tools are used.
 RPC is restricted to literal loopback addresses, unforked Anvil and chain31337.
 The fixture mnemonic is public test data. Never supply an actual wallet/key.
 """
+# TODO(rebirth:M8-CUS-01) 3-of-4 EVM custody fixture; it contradicts the planned
+# keyless VaultV2 (D2, SEC-1) and waits for the owner's custody ruling.
 
 import argparse
 import ipaddress

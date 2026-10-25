@@ -14,6 +14,8 @@
 #include <utility>
 
 namespace flowmesh2::storage {
+// TODO(rebirth:M4-STO-08) private control journal of the regtest view change;
+// the general VIEW_STATE and NEW_VIEW_ACCEPTED records of M4-STO-07 replace it.
 namespace {
 constexpr uint8_t CONTROL_RECORD_VERSION{1};
 constexpr size_t CONTROL_INTENT_MAX{1 + CONTROL_KEY_BYTES + 5 + MAX_CONTROL_MESSAGE_BYTES};
