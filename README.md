@@ -17,6 +17,23 @@ V2 work in `src/flowmesh2/`, see
 - the fixes found while integrating `rebirth`: a test race in the FlowMesh
   API health suite, a staking test that skipped its proposer round in Debug,
   and duplicate queued copies of retained local actions;
+- gap-filling work on FlowMesh V2 in `src/flowmesh2/`, each item with a
+  failing-first test and its row in
+  [`src/flowmesh2/TODO.md`](src/flowmesh2/TODO.md): the M0-AUD-01 audit,
+  portable regtest tool paths, journal segments and recovery, state
+  snapshots, decoder fuzzing, seat-mesh drop reasons, the fixed-capacity
+  band book, copy-on-write slot state, sparse Merkle commitment v1, short
+  IDs with body fetch, seat counts of 4 to 7 in the regtest PBFT, and a
+  constant-time signer-log lookup.
+  Where a step needs an owner ruling, the row says BLOCKED-ON-RULING and the
+  code stops at the groundwork;
+- the interim repair status in
+  [doc/design/b3-interim-repair-status.md](doc/design/b3-interim-repair-status.md),
+  with tests showing that a lowered finality quorum cannot unfreeze the
+  broken lineage;
+- on Windows, a refusal at startup of a `-datadir` too long for MAX_PATH
+  (with a message naming both remedies) and the `longPathAware` manifest
+  setting;
 - **B3 Hive, the new desktop app** in [`hive/`](hive/README.md), a Tauri 2
   shell around an unchanged `b3coind`.
 
@@ -65,7 +82,8 @@ loopback RPC with a per-launch login and an RPC whitelist, and separate
 approval and passphrase windows for everything that moves value or unlocks a
 wallet. It runs B3 mainnet in the legacy data folder, so a Qt user finds their
 chain and wallets. Pages: Home, Send, Receive, Activity, Stake, Trade
-(FlowMesh markets, with a demo market while the network has none), Address
+(FlowMesh markets, with a demo market while the network has none, and a
+read-only card for a FlowMesh V2 regtest operator's HTTPS API), Address
 book, Wallets, Console, Network, Settings and Updates. It is a prototype
 offered for comparison with the Qt wallet, not a release; the
 [hive README](hive/README.md) has the build, run and test instructions and
