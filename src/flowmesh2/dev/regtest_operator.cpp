@@ -1139,6 +1139,23 @@ struct RegtestOperator::Impl {
             descriptions.pushKV(i == 0 ? "TOKENA_Q" : "TOKENB_Q", std::move(item));
         }
         out.pushKV("markets", std::move(descriptions)); out.pushKV("facts_to", CursorJson(head->Header().facts_to));
+        // Report the source checkpoint from the reexecuted certified body,
+        // never from the wrapper's mutable source-current JSON. A reopened
+        // observer must bind its retained proof cursor to this exact marker.
+        if (profile.source_range_commitment && head->Header().height) {
+            const auto& body{decisions.at(head->Header().height).body};
+            Need(!body.facts.empty(), "certified body lacks source checkpoint");
+            const auto fact{Must(DecodeFact(body.facts.back()))};
+            const auto* range{std::get_if<SourceRangeFact>(&fact)};
+            Need(range && range->domain == domain && range->chain_id == profile.source_chain_id &&
+                 range->confirmations == profile.source_confirmations,
+                 "certified source checkpoint differs from deployment");
+            UniValue point{UniValue::VOBJ};
+            point.pushKV("height", range->to_height);
+            point.pushKV("hash", "0x" + HexStr(range->to_hash));
+            point.pushKV("minimum_confirmations", range->confirmations);
+            out.pushKV("source_checkpoint", std::move(point));
+        }
         out.pushKV("signer_seq", signer_journal->DurableSeq()); out.pushKV("commit_seq", commit_journal->DurableSeq());
         if (pbft_view_change) out.pushKV("control_seq", control_journal->DurableSeq());
         out.pushKV("profile_name", profile.profile_id);
