@@ -80,8 +80,9 @@ Result<Candidate> BuildCandidate(const engine::Engine& engine, const HeadView& p
     const Result<engine::ValidatedSlot> slot{engine::ValidateSlotInputs(engine_parent, engine_inputs, engine.Profile())};
     if (!slot.has_value()) return slot.error();
 
-    // 3. Execution. The engine copies the whole parent state into the result.
-    // TODO(rebirth:M2-LED-10) copy-on-write candidate state: same roots, work O(changed leaves).
+    // 3. Execution. The candidate shares the parent's ledger trees and stored
+    // commitment levels (M2-LED-10): copy, phase 9 and the roots cost
+    // O(changed) in the ledger; the books are still copied whole.
     Result<engine::SlotResult> executed{engine.ApplySlot(engine_parent, *slot)};
     if (!executed.has_value()) return executed.error();
     engine::SlotResult result{std::move(executed).value()};

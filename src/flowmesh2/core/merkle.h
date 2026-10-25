@@ -44,6 +44,17 @@ inline constexpr size_t MAX_MERKLE_PATH{64};
 //! Committed root of `leaves` (see file comment).
 uint256 MerkleRoot(std::span<const uint256> leaves);
 
+/** The three hashes every tree here is made of, for code that keeps a tree's
+ * levels and updates them (ledger/merkle_levels.h, M2-LED-10):
+ *   MerkleLeafNode(d)     = Tagged(MERKLE_LEAF, d)
+ *   MerkleInnerNode(l, r) = Tagged(MERKLE_NODE, l || r)
+ *   MerkleBindRoot(n, h)  = Tagged(MERKLE_ROOT, u64 LE n || h)
+ * so MerkleRoot(D) == MerkleBindRoot(n, MTH(D)) for n >= 1.
+ */
+uint256 MerkleLeafNode(const uint256& value);
+uint256 MerkleInnerNode(const uint256& left, const uint256& right);
+uint256 MerkleBindRoot(uint64_t size, const uint256& tree_hash);
+
 /** Inclusion proof of leaf `index` in a tree of `size` leaves. `path` lists
  * the sibling subtree hashes from the leaf level up (RFC 9162 order).
  * Serialization: u64 LE index, u64 LE size, CompactSize-capped path.

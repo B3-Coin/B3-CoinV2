@@ -232,8 +232,9 @@ private:
  *    commitment v0 root), action_count, outcome_count, commitment_version 0.
  * The next state keeps the parent's seat set.
  *
- * REAL-REPLACE M2-LED-10: the engine copies the whole parent state for every
- * candidate; copy-on-write makes the work O(changed).
+ * REAL-REPLACE M2-LED-10: the candidate shares the parent's ledger trees and
+ * commitment levels, so the ledger's part of the work is O(changed); the
+ * books are still copied, hashed and checked whole, O(orders).
  */
 Result<Candidate> BuildCandidate(const engine::Engine& engine, const HeadView& parent, const SlotInputs& inputs);
 

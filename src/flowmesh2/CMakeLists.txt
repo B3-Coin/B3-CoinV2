@@ -130,6 +130,7 @@ if(BUILD_FLOWMESH2)
     futures/futures.cpp
     governance/governance.cpp
     ledger/ledger.cpp
+    ledger/merkle_levels.cpp
     ledger/nonce_window.cpp
     ledger/state_commitment.cpp
     net/client_api.cpp
@@ -299,10 +300,12 @@ if(BUILD_FLOWMESH2)
     test/journal_tests.cpp
     test/lanes_tests.cpp
     test/ledger_property_tests.cpp
+    test/ledger_cow_tests.cpp
     test/ledger_tests.cpp
     test/market_tests.cpp
     test/matcher_reference_tests.cpp
     test/matcher_tests.cpp
+    test/merkle_levels_tests.cpp
     test/merkle_tests.cpp
     test/messages_tests.cpp
     test/nonce_rule_tests.cpp
@@ -310,6 +313,7 @@ if(BUILD_FLOWMESH2)
     test/outcome_tests.cpp
     test/params_tests.cpp
     test/pbft_view_change_tests.cpp
+    test/persistent_tree_tests.cpp
     test/pool_tests.cpp
     test/read_tests.cpp
     test/record_tests.cpp
@@ -324,6 +328,7 @@ if(BUILD_FLOWMESH2)
     test/sim_scheduler_tests.cpp
     test/sim_trace_tests.cpp
     test/sim_walking_skeleton_tests.cpp
+    test/slot_cost_tests.cpp
     test/slot_tests.cpp
     test/snapshot_store_tests.cpp
     test/snapshot_tests.cpp

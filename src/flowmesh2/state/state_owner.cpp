@@ -167,7 +167,7 @@ Result<Candidate> StateOwner::Preview(const ParentRef& parent, const SlotInputs&
     if (parent.kind != ParentKind::COMMITTED) return Invalid(PARENT_KIND_UNKNOWN);
     const std::shared_ptr<const HeadView> head{Head()}; // the only work under the lock: a pointer copy
     if (parent.height != head->Header().height || parent.header_hash != head->HeaderHash()) return Stale();
-    // Executes without the lock. The engine copies the whole state (REAL-REPLACE M2-LED-10, in BuildCandidate).
+    // Executes without the lock. The candidate shares the ledger and copies the books (REAL-REPLACE M2-LED-10).
     return BuildCandidate(m_engine, *head, inputs);
 }
 

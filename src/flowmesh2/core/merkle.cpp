@@ -55,6 +55,10 @@ void NextLevel(std::vector<uint256>& level)
 
 } // namespace
 
+uint256 MerkleLeafNode(const uint256& value) { return LeafNode(value); }
+uint256 MerkleInnerNode(const uint256& left, const uint256& right) { return InnerNode(left, right); }
+uint256 MerkleBindRoot(uint64_t size, const uint256& tree_hash) { return BindRoot(size, tree_hash); }
+
 uint256 MerkleRoot(std::span<const uint256> leaves)
 {
     if (leaves.empty()) return BindRoot(0, Tagged(HashTag::MERKLE_EMPTY, {}));

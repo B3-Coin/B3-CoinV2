@@ -173,10 +173,11 @@ Result<std::shared_ptr<const CoreState>> DecodeSnapshot(std::span<const unsigned
                                                                   leaf.fills})};
         if (!rested.has_value()) return rested.error();
     }
-    auto state{std::make_shared<CoreState>(CoreState{engine::EngineState{std::move(ledger).value(), std::move(books).value()}, parts.seat_set_root})};
+    auto state{std::make_shared<CoreState>(CoreState{engine::EngineState{std::move(ledger).value(), std::move(books).value(), nullptr}, parts.seat_set_root})};
     // A snapshot rests orders in book order; anything else is not the state that was written.
     if (state->engine.OrderLeaves() != parts.orders) return Error{ErrorCode::INVALID_INPUT, SNAPSHOT_ORDER};
-    if (const Result<void> invariants{state->engine.CheckInvariants()}; !invariants.has_value()) return invariants.error();
+    // The full check (nothing is verified yet), which also records the basis later slots check against.
+    if (const Result<void> invariants{state->engine.Verify()}; !invariants.has_value()) return invariants.error();
     return Ok(std::shared_ptr<const CoreState>{std::move(state)});
 }
 

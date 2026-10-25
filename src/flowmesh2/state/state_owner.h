@@ -41,8 +41,8 @@
  *   PARENT_KIND_UNKNOWN); copies the head pointer under the lock; STALE_PARENT
  *   (PARENT_NOT_HEAD) unless `parent` names that head (height and header
  *   hash); then BuildCandidate (state/candidate.h) WITHOUT the lock. The
- *   head is never changed. REAL-REPLACE M2-LED-10: every Preview copies
- *   the whole state (copy-on-write replaces it).
+ *   head is never changed. REAL-REPLACE M2-LED-10: every Preview shares
+ *   the head's ledger but still copies its books.
  * - Reexecute(header, body) const: a follower's check of a proposal or a
  *   decided slot: ReexecuteOn on the head, i.e. Preview with the inputs the
  *   header names plus exact header and canonical-body equality (VERIFY_FAILED

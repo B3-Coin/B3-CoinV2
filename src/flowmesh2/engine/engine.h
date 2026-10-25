@@ -22,6 +22,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
+#include <set>
 #include <span>
 #include <string_view>
 #include <utility>
@@ -137,9 +139,35 @@ Result<uint64_t> ArrivalRank(uint64_t height, SlotPhase phase, uint64_t rank, ui
  * candidate, Engine::ApplySlot mutates the copy, and the result is published
  * immutably. Markets are fixed at genesis (D6; listings are M7-GOV-01).
  */
+/** A state that passed the slot-boundary invariants (EngineState::Verify,
+ * M2-LED-10): its ledger and the owners of its resting orders, all phase 9
+ * needs to check a later state by its changes. Only Verify makes one, right
+ * after the check, so every basis satisfies the invariants; the ledger copy
+ * shares the checked state's trees.
+ */
+class VerifiedBasis
+{
+public:
+    const ledger::LedgerState& Ledger() const { return m_ledger; }
+    //! Every owner of a resting order of the checked state.
+    const std::set<AccountId>& Owners() const { return m_owners; }
+
+private:
+    friend struct EngineState;
+    VerifiedBasis(ledger::LedgerState ledger, std::set<AccountId> owners) : m_ledger{std::move(ledger)}, m_owners{std::move(owners)} {}
+
+    ledger::LedgerState m_ledger;
+    std::set<AccountId> m_owners;
+};
+
 struct EngineState {
     ledger::LedgerState ledger;
     BookSet books;
+    /** The last state Verify checked: this one, or an ancestor that copies
+     * and changes led from. Shared by copies, never part of the value
+     * (operator== ignores it). Null when nothing was verified.
+     */
+    std::shared_ptr<const VerifiedBasis> verified;
 
     /** The state at genesis: LedgerState::Create(profile) and one empty book
      * per market (BookSet::Create); their errors propagate.
@@ -166,7 +194,26 @@ struct EngineState {
      */
     Result<void> CheckInvariants() const;
 
-    friend bool operator==(const EngineState&, const EngineState&) = default;
+    /** CheckInvariants, given that `basis` satisfies them (M2-LED-10):
+     * conservation by LedgerState::CheckConservationSince(basis ledger), the
+     * books and invariant 3 in full, and invariants 4 and 5 for every account
+     * that changed since the basis or owns a resting order here or in the
+     * basis. Any other account is the basis's own and ordered nothing, so its
+     * basis check still holds. The same verdict as CheckInvariants, in
+     * O(changed + orders + assets + withdrawals) instead of O(accounts +
+     * orders); "changed" counts every change since the basis, however made.
+     */
+    Result<void> CheckInvariantsSince(const VerifiedBasis& basis) const;
+
+    /** Engine phase 9: CheckInvariantsSince(*verified), or CheckInvariants
+     * when nothing was verified; on success `verified` becomes this state.
+     * Genesis and snapshot loads verify too, so a slot on any head the
+     * engine or a restore produced checks only its own changes.
+     */
+    Result<void> Verify();
+
+    //! The ledger and the books; never `verified`.
+    friend bool operator==(const EngineState& a, const EngineState& b) { return a.ledger == b.ledger && a.books == b.books; }
 };
 
 /** A committed head as the engine reads it: the parent header and the state

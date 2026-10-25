@@ -161,7 +161,7 @@ std::string Compare(const LedgerState& ledger, const Shadow& shadow, const std::
         }
         if (state->open_orders != account.open) return "open orders";
     }
-    if (ledger.Nullifiers() != shadow.credited) return "nullifiers";
+    if (!std::ranges::equal(ledger.Nullifiers(), shadow.credited)) return "nullifiers";
     for (const AssetId& asset : assets) {
         const AssetTotals t{ledger.TotalsOf(asset)};
         const int64_t deposits{shadow.deposits.contains(asset) ? shadow.deposits.at(asset) : 0};

@@ -15,19 +15,6 @@ namespace flowmesh2::ledger {
 
 namespace {
 
-//! Leaf values of the accounts tree in ascending AccountId order (the map order).
-Result<std::vector<uint256>> AccountLeafValues(const LedgerState& ledger)
-{
-    std::vector<uint256> values;
-    values.reserve(ledger.Accounts().size());
-    for (const auto& entry : ledger.Accounts()) {
-        const Result<AccountLeafV0> leaf{ledger.Leaf(entry.first)};
-        if (!leaf.has_value()) return leaf.error();
-        values.push_back(leaf->LeafValue());
-    }
-    return Ok(std::move(values));
-}
-
 //! MerkleRoot of `keyed` values sorted by key; INVALID_INPUT if a key repeats.
 template <class Key>
 Result<uint256> SortedRoot(std::vector<std::pair<Key, uint256>> keyed, const char* repeated)
@@ -48,9 +35,11 @@ Result<StateRootsV0> CommitV0(const LedgerState& ledger, std::span<const MarketD
 {
     StateRootsV0 roots;
 
-    const Result<std::vector<uint256>> accounts{AccountLeafValues(ledger)};
+    // The ledger keeps both trees' levels (M2-LED-10): same roots as
+    // MerkleRoot of every leaf value, from the changes since its last Seal.
+    const Result<uint256> accounts{ledger.AccountsRootV0()};
     if (!accounts.has_value()) return accounts.error();
-    roots.accounts = MerkleRoot(*accounts);
+    roots.accounts = *accounts;
 
     std::vector<std::pair<OrderId, uint256>> order_leaves;
     order_leaves.reserve(orders.size());
@@ -70,10 +59,7 @@ Result<StateRootsV0> CommitV0(const LedgerState& ledger, std::span<const MarketD
     if (!markets_root.has_value()) return markets_root.error();
     roots.markets = *markets_root;
 
-    std::vector<uint256> nullifiers;
-    nullifiers.reserve(ledger.Nullifiers().size());
-    for (const Outpoint& outpoint : ledger.Nullifiers()) nullifiers.push_back(NullifierLeafValue(outpoint));
-    roots.nullifiers = MerkleRoot(nullifiers);
+    roots.nullifiers = ledger.NullifiersRootV0();
 
     std::vector<uint256> totals;
     totals.reserve(ledger.Totals().size());
@@ -115,14 +101,10 @@ Result<StateRootsV0> CommitTradingStateV0(const LedgerState& ledger, std::span<c
 
 Result<AccountWitnessV0> ProveAccountV0(const LedgerState& ledger, const AccountId& account)
 {
-    const auto it{ledger.Accounts().find(account)};
-    if (it == ledger.Accounts().end()) return Error{ErrorCode::INVALID_INPUT, "unknown account (v0 has no absence proof)"};
+    if (!ledger.HasAccount(account)) return Error{ErrorCode::INVALID_INPUT, "unknown account (v0 has no absence proof)"};
     Result<AccountLeafV0> leaf{ledger.Leaf(account)};
     if (!leaf.has_value()) return leaf.error();
-    const Result<std::vector<uint256>> values{AccountLeafValues(ledger)};
-    if (!values.has_value()) return values.error();
-    const auto index{static_cast<uint64_t>(std::distance(ledger.Accounts().begin(), it))};
-    Result<MerkleProof> proof{MerkleProve(*values, index)};
+    Result<MerkleProof> proof{ledger.ProveAccountLeafV0(account)};
     if (!proof.has_value()) return proof.error();
     return Ok(AccountWitnessV0{std::move(leaf).value(), std::move(proof).value()});
 }

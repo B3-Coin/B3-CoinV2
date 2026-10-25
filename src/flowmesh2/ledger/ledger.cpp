@@ -5,6 +5,8 @@
 #include <flowmesh2/ledger/ledger.h>
 
 #include <algorithm>
+#include <optional>
+#include <set>
 #include <utility>
 #include <vector>
 
@@ -35,7 +37,47 @@ Result<void> CheckAssetCap(const AccountState* account, const AssetId& asset, co
     return Ok();
 }
 
+//! The per-account conservation rules (open orders, nonce window, canonical
+//! entries); each entry's available + reserved is added to `held`.
+Result<void> CheckAccountRules(const AccountState& account, uint32_t max_open_orders, std::map<AssetId, Atoms>& held)
+{
+    if (account.open_orders > max_open_orders) return Error{ErrorCode::INVARIANT, "open orders above the cap"};
+    if (!NonceWindowValid(account.nonces.Used(), account.nonces.Size())) {
+        return Error{ErrorCode::INVARIANT, "malformed nonce window"};
+    }
+    for (const auto& [asset, balance] : account.balances) {
+        if (balance.IsZero()) return Error{ErrorCode::INVARIANT, "all-zero balance entry stored"};
+        const Result<Atoms> sum{AddAtoms(balance.available, balance.reserved)};
+        if (!sum.has_value()) return Error{ErrorCode::INVARIANT, "account balance outside [0, MAX_ATOMS]"};
+        const Result<Atoms> total{AddAtoms(held[asset], *sum)};
+        if (!total.has_value()) return Error{ErrorCode::INVARIANT, "liabilities outside [0, MAX_ATOMS]"};
+        held[asset] = *total;
+    }
+    return Ok();
+}
+
+//! One asset's equation: owed + pending + fees_held == deposits - effects.
+Result<void> CheckAssetEquation(Atoms owed, const AssetTotals& t)
+{
+    const Result<Atoms> with_pending{AddAtoms(owed, t.pending)};
+    if (!with_pending.has_value()) return Error{ErrorCode::INVARIANT, "liabilities and pending outside [0, MAX_ATOMS]"};
+    const Result<Atoms> lhs{AddAtoms(*with_pending, t.fees_held)};
+    if (!lhs.has_value()) return Error{ErrorCode::INVARIANT, "liabilities and fees outside [0, MAX_ATOMS]"};
+    const Result<Atoms> rhs{SubAtoms(t.deposits, t.effects)};
+    if (!rhs.has_value()) return Error{ErrorCode::INVARIANT, "effects exceed deposits"};
+    if (*lhs != *rhs) return Error{ErrorCode::INVARIANT, "conservation broken"};
+    return Ok();
+}
+
 } // namespace
+
+//! The levels of both commitment components and the trees they are of.
+struct LedgerState::CommitmentLevels {
+    AccountMap accounts;
+    MerkleLevels account_levels;
+    NullifierSet nullifiers;
+    MerkleLevels nullifier_levels;
+};
 
 Balance AccountState::BalanceOf(const AssetId& asset) const
 {
@@ -65,32 +107,16 @@ Result<void> CheckConservation(const AccountMap& accounts, const TotalsMap& tota
 {
     std::map<AssetId, Atoms> liabilities;
     for (const auto& [id, account] : accounts) {
-        if (account.open_orders > max_open_orders) return Error{ErrorCode::INVARIANT, "open orders above the cap"};
-        if (!NonceWindowValid(account.nonces.Used(), account.nonces.Size())) {
-            return Error{ErrorCode::INVARIANT, "malformed nonce window"};
-        }
-        for (const auto& [asset, balance] : account.balances) {
-            if (balance.IsZero()) return Error{ErrorCode::INVARIANT, "all-zero balance entry stored"};
-            const Result<Atoms> held{AddAtoms(balance.available, balance.reserved)};
-            if (!held.has_value()) return Error{ErrorCode::INVARIANT, "account balance outside [0, MAX_ATOMS]"};
-            const Result<Atoms> sum{AddAtoms(liabilities[asset], *held)};
-            if (!sum.has_value()) return Error{ErrorCode::INVARIANT, "liabilities outside [0, MAX_ATOMS]"};
-            liabilities[asset] = *sum;
-        }
+        if (const Result<void> rules{CheckAccountRules(account, max_open_orders, liabilities)}; !rules.has_value()) return rules;
     }
     for (const auto& entry : liabilities) {
         if (!totals.contains(entry.first)) return Error{ErrorCode::INVARIANT, "balance of an asset without totals"};
     }
     for (const auto& [asset, t] : totals) {
         const auto it{liabilities.find(asset)};
-        const Atoms owed{it == liabilities.end() ? Atoms{0} : it->second};
-        const Result<Atoms> with_pending{AddAtoms(owed, t.pending)};
-        if (!with_pending.has_value()) return Error{ErrorCode::INVARIANT, "liabilities and pending outside [0, MAX_ATOMS]"};
-        const Result<Atoms> lhs{AddAtoms(*with_pending, t.fees_held)};
-        if (!lhs.has_value()) return Error{ErrorCode::INVARIANT, "liabilities and fees outside [0, MAX_ATOMS]"};
-        const Result<Atoms> rhs{SubAtoms(t.deposits, t.effects)};
-        if (!rhs.has_value()) return Error{ErrorCode::INVARIANT, "effects exceed deposits"};
-        if (*lhs != *rhs) return Error{ErrorCode::INVARIANT, "conservation broken"};
+        if (const Result<void> equal{CheckAssetEquation(it == liabilities.end() ? Atoms{0} : it->second, t)}; !equal.has_value()) {
+            return equal;
+        }
     }
     return Ok();
 }
@@ -127,11 +153,11 @@ Result<LedgerState> LedgerState::FromLeaves(const ProfileParams& profile, std::s
         AccountState state{std::move(window).value()};
         for (const AssetBalance& balance : leaf.balances) state.balances.emplace_hint(state.balances.end(), balance.asset, Balance{balance.available, balance.reserved});
         state.open_orders = leaf.open_orders;
-        ledger.m_accounts.emplace_hint(ledger.m_accounts.end(), leaf.account, std::move(state));
+        ledger.m_accounts.TryEmplace(leaf.account, std::move(state));
     }
     for (size_t i{0}; i < nullifiers.size(); ++i) {
         if (i > 0 && !(nullifiers[i - 1] < nullifiers[i])) return bad;
-        ledger.m_nullifiers.emplace_hint(ledger.m_nullifiers.end(), nullifiers[i]);
+        ledger.m_nullifiers.Insert(nullifiers[i]);
     }
     for (size_t i{0}; i < totals.size(); ++i) {
         if ((i > 0 && !(totals[i - 1].first < totals[i].first)) || totals[i].second.IsZero()) return bad;
@@ -142,6 +168,7 @@ Result<LedgerState> LedgerState::FromLeaves(const ProfileParams& profile, std::s
         ledger.m_withdrawals.emplace_hint(ledger.m_withdrawals.end(), withdrawals[i].id, withdrawals[i]);
     }
     if (const Result<void> conserved{ledger.CheckConservation()}; !conserved.has_value()) return conserved.error();
+    if (const Result<void> sealed{ledger.Seal()}; !sealed.has_value()) return sealed.error();
     return Ok(std::move(ledger));
 }
 
@@ -150,17 +177,9 @@ bool LedgerState::IsProtocolAccount(const AccountId& account) const
     return account == m_seat_pool || account == m_treasury;
 }
 
-const AccountState* LedgerState::Find(const AccountId& account) const
-{
-    const auto it{m_accounts.find(account)};
-    return it == m_accounts.end() ? nullptr : &it->second;
-}
+const AccountState* LedgerState::Find(const AccountId& account) const { return m_accounts.Find(account); }
 
-AccountState* LedgerState::FindMutable(const AccountId& account)
-{
-    const auto it{m_accounts.find(account)};
-    return it == m_accounts.end() ? nullptr : &it->second;
-}
+AccountState* LedgerState::FindMutable(const AccountId& account) { return m_accounts.FindMutable(account); }
 
 Balance LedgerState::BalanceOf(const AccountId& account, const AssetId& asset) const
 {
@@ -187,14 +206,19 @@ Result<AccountLeafV0> LedgerState::Leaf(const AccountId& account) const
 {
     const AccountState* state{Find(account)};
     if (!state) return UnknownAccount();
+    return LeafOf(account, *state);
+}
+
+Result<AccountLeafV0> LedgerState::LeafOf(const AccountId& account, const AccountState& state) const
+{
     AccountLeafV0 leaf;
     leaf.account = account;
-    leaf.balances.reserve(state->balances.size());
-    for (const auto& [asset, balance] : state->balances) {
+    leaf.balances.reserve(state.balances.size());
+    for (const auto& [asset, balance] : state.balances) {
         leaf.balances.push_back(AssetBalance{asset, balance.available, balance.reserved});
     }
-    leaf.used_nonces.assign(state->nonces.Used().begin(), state->nonces.Used().end());
-    leaf.open_orders = state->open_orders;
+    leaf.used_nonces.assign(state.nonces.Used().begin(), state.nonces.Used().end());
+    leaf.open_orders = state.open_orders;
     if (!leaf.IsCanonical(m_profile)) return Error{ErrorCode::INVARIANT, "account state is not canonical"};
     return Ok(std::move(leaf));
 }
@@ -203,6 +227,144 @@ Result<void> LedgerState::CheckConservation() const
 {
     const Result<void> balanced{ledger::CheckConservation(m_accounts, m_totals, m_profile.max_open_orders_per_account)};
     if (!balanced.has_value()) return balanced.error();
+    return CheckWithdrawalObligations();
+}
+
+Result<void> LedgerState::CheckConservationSince(const LedgerState& parent) const
+{
+    if (!(parent.m_profile == m_profile)) return Error{ErrorCode::INVARIANT, "parent ledger under another profile"};
+    // Per asset, what the changed accounts held in the parent and hold now.
+    std::map<AssetId, Atoms> held_before;
+    std::map<AssetId, Atoms> held_after;
+    std::optional<Error> broken;
+    ForEachChangedAccount(parent, [&](const AccountId&, const AccountState* before, const AccountState* after) {
+        if (broken.has_value()) return;
+        if (after == nullptr) {
+            broken = Error{ErrorCode::INVARIANT, "account removed"};
+            return;
+        }
+        if (const Result<void> rules{CheckAccountRules(*after, m_profile.max_open_orders_per_account, held_after)}; !rules.has_value()) {
+            broken = rules.error();
+            return;
+        }
+        if (before == nullptr) return;
+        for (const auto& [asset, balance] : before->balances) {
+            const Result<Atoms> sum{AddAtoms(balance.available, balance.reserved)};
+            const Result<Atoms> total{sum.has_value() ? AddAtoms(held_before[asset], *sum) : sum};
+            if (!total.has_value()) {
+                broken = Error{ErrorCode::INVARIANT, "parent liabilities outside [0, MAX_ATOMS]"};
+                return;
+            }
+            held_before[asset] = *total;
+        }
+    });
+    if (broken.has_value()) return *broken;
+
+    // Every asset that either ledger has totals for or a changed account holds.
+    std::set<AssetId> assets;
+    for (const auto& entry : parent.m_totals) assets.insert(entry.first);
+    for (const auto& entry : m_totals) assets.insert(entry.first);
+    for (const auto& entry : held_after) assets.insert(entry.first);
+    for (const AssetId& asset : assets) {
+        // The parent's liabilities from its own equation, then this ledger's.
+        const AssetTotals was{parent.TotalsOf(asset)};
+        const Result<Atoms> net{SubAtoms(was.deposits, was.effects)};
+        const Result<Atoms> less_pending{net.has_value() ? SubAtoms(*net, was.pending) : net};
+        const Result<Atoms> owed_before{less_pending.has_value() ? SubAtoms(*less_pending, was.fees_held) : less_pending};
+        const auto before{held_before.find(asset)};
+        const auto after{held_after.find(asset)};
+        const Atoms left{before == held_before.end() ? Atoms{0} : before->second};
+        const Atoms joined{after == held_after.end() ? Atoms{0} : after->second};
+        if (!owed_before.has_value() || *owed_before < left) return Error{ErrorCode::INVARIANT, "parent totals not conserved"};
+        const Result<Atoms> owed{AddAtoms(*owed_before - left, joined)};
+        if (!owed.has_value()) return Error{ErrorCode::INVARIANT, "liabilities outside [0, MAX_ATOMS]"};
+        if (!m_totals.contains(asset)) {
+            if (*owed != 0) return Error{ErrorCode::INVARIANT, "balance of an asset without totals"};
+            continue;
+        }
+        if (const Result<void> equal{CheckAssetEquation(*owed, TotalsOf(asset))}; !equal.has_value()) return equal;
+    }
+    return CheckWithdrawalObligations();
+}
+
+Result<MerkleLevels> LedgerState::AccountLevels() const
+{
+    if (!m_levels) {
+        std::vector<uint256> values;
+        values.reserve(m_accounts.size());
+        for (const auto& [account, state] : m_accounts) {
+            const Result<AccountLeafV0> leaf{LeafOf(account, state)};
+            if (!leaf.has_value()) return leaf.error();
+            values.push_back(leaf->LeafValue());
+        }
+        return Ok(MerkleLevels::Build(values));
+    }
+    std::vector<MerkleLevels::Edit> edits;
+    std::optional<Error> broken;
+    AccountMap::Diff(m_levels->accounts, m_accounts, [&](const AccountMap::value_type* before, const AccountMap::value_type* after) {
+        if (after == nullptr) {
+            broken = Error{ErrorCode::INVARIANT, "account removed"};
+            return false;
+        }
+        const Result<AccountLeafV0> leaf{LeafOf(after->first, after->second)};
+        if (!leaf.has_value()) {
+            broken = leaf.error();
+            return false;
+        }
+        edits.push_back(MerkleLevels::Edit{m_accounts.Rank(after->first), leaf->LeafValue(), before == nullptr});
+        return true;
+    });
+    if (broken.has_value()) return *broken;
+    return m_levels->account_levels.Apply(edits);
+}
+
+MerkleLevels LedgerState::NullifierLevels() const
+{
+    if (!m_levels) {
+        std::vector<uint256> values;
+        values.reserve(m_nullifiers.size());
+        for (const Outpoint& outpoint : m_nullifiers) values.push_back(NullifierLeafValue(outpoint));
+        return MerkleLevels::Build(values);
+    }
+    std::vector<MerkleLevels::Edit> edits;
+    NullifierSet::Diff(m_levels->nullifiers, m_nullifiers, [&](const Outpoint* before, const Outpoint* after) {
+        // The ledger removes no nullifier: a key only `before` has cannot occur (Apply would refuse the size).
+        if (after != nullptr) edits.push_back(MerkleLevels::Edit{m_nullifiers.Rank(*after), NullifierLeafValue(*after), before == nullptr});
+        return true;
+    });
+    Result<MerkleLevels> applied{m_levels->nullifier_levels.Apply(edits)};
+    // Ascending distinct positions below the new size: Apply cannot refuse them.
+    return std::move(applied).value();
+}
+
+Result<uint256> LedgerState::AccountsRootV0() const
+{
+    const Result<MerkleLevels> levels{AccountLevels()};
+    if (!levels.has_value()) return levels.error();
+    return Ok(levels->Root());
+}
+
+uint256 LedgerState::NullifiersRootV0() const { return NullifierLevels().Root(); }
+
+Result<MerkleProof> LedgerState::ProveAccountLeafV0(const AccountId& account) const
+{
+    if (!HasAccount(account)) return Error{ErrorCode::INVALID_INPUT, "unknown account (v0 has no absence proof)"};
+    const Result<MerkleLevels> levels{AccountLevels()};
+    if (!levels.has_value()) return levels.error();
+    return levels->Prove(m_accounts.Rank(account));
+}
+
+Result<void> LedgerState::Seal()
+{
+    Result<MerkleLevels> accounts{AccountLevels()};
+    if (!accounts.has_value()) return accounts.error();
+    MerkleLevels nullifiers{NullifierLevels()};
+    m_levels = std::make_shared<const CommitmentLevels>(CommitmentLevels{m_accounts, std::move(accounts).value(), m_nullifiers, std::move(nullifiers)});
+    return Ok();
+}
+
+Result<void> LedgerState::CheckWithdrawalObligations() const
+{
     std::map<AssetId, std::pair<Atoms, Atoms>> obligations;
     std::set<Outpoint> paid_events;
     size_t pending_count{0};
@@ -252,9 +414,9 @@ Result<void> LedgerState::CreditDeposit(const DepositFact& fact)
     if (!cap.has_value()) return cap.error();
 
     // Commit: nothing below can fail.
-    AccountState& account{m_accounts.try_emplace(fact.account, m_empty_window).first->second};
+    AccountState& account{*m_accounts.TryEmplace(fact.account, m_empty_window).first};
     PutBalance(account, fact.asset, next);
-    m_nullifiers.insert(fact.outpoint);
+    m_nullifiers.Insert(fact.outpoint);
     totals.deposits = *deposits;
     PutTotals(fact.asset, totals);
     return Ok();
@@ -337,7 +499,7 @@ Result<void> LedgerState::Credit(const AccountId& account, const AssetId& asset,
     if (!cap.has_value()) return cap.error();
 
     // Commit: nothing below can fail.
-    AccountState& state{m_accounts.try_emplace(account, m_empty_window).first->second};
+    AccountState& state{*m_accounts.TryEmplace(account, m_empty_window).first};
     PutBalance(state, asset, next);
     totals.fees_held -= amount;
     PutTotals(asset, totals);

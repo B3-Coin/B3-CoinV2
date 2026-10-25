@@ -36,9 +36,14 @@
  * never on the order of the operations that produced it or of the inputs.
  * The state root is StateRootsV0::Root().
  *
- * Cost: O(state) hashing per call, with no caching. The planned sparse Merkle
- * trees (M2-LED-02, with non-membership proofs and O(changed) updates)
- * replace v0; v0 has no absence proof.
+ * Cost (M2-LED-10): the accounts and nullifiers roots come from the levels
+ * the ledger stored at its last Seal (LedgerState::AccountsRootV0), so a
+ * changed account costs O(log n) hashes and a key inserted at position p
+ * about n - p (v0's sorted leaves shift); orders, markets, totals and
+ * withdrawals are still hashed whole, O(orders + markets + assets +
+ * withdrawals). The planned sparse Merkle trees (M2-LED-02, with
+ * non-membership proofs and O(changed) updates) replace v0; v0 has no
+ * absence proof.
  *
  * Deterministic, no locks, no I/O. Errors: INVALID_INPUT for an invalid or
  * repeated market, a repeated OrderId, or (ProveAccountV0) an absent account;

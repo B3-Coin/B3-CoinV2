@@ -33,6 +33,63 @@ constexpr Error Invalid(const char* detail) { return Error{ErrorCode::INVALID_IN
 constexpr Error Invalid(std::string_view detail) { return Error{ErrorCode::INVALID_INPUT, detail}; }
 constexpr Error Broken(const char* detail) { return Error{ErrorCode::INVARIANT, detail}; }
 
+//! Per (owner, asset), the reservations of the resting orders; per owner, their number.
+using ReservedMap = std::map<std::pair<AccountId, AssetId>, Atoms>;
+using RestingMap = std::map<AccountId, uint64_t>;
+
+//! Invariants 2 to 4 that need only the books and lookups: book invariants,
+//! no fees held, every owner a trading account, and the sums of `reserved` and `resting`.
+Result<void> CheckBooks(const EngineState& state, ReservedMap& reserved, RestingMap& resting)
+{
+    const Result<void> booked{state.books.CheckInvariants()};
+    if (!booked.has_value()) return booked.error();
+    for (const auto& [asset, totals] : state.ledger.Totals()) {
+        if (totals.fees_held != 0) return Broken("fees held at a slot boundary");
+    }
+    for (const auto& [id, book] : state.books.Books()) {
+        for (const RestingOrder& o : book.Orders()) {
+            if (!state.ledger.HasAccount(o.owner) || state.ledger.IsProtocolAccount(o.owner)) {
+                return Broken("resting order without a trading account");
+            }
+            const AssetId& asset{o.side == Side::BUY ? book.Market().quote : book.Market().base};
+            Atoms& sum{reserved[{o.owner, asset}]};
+            const Result<Atoms> next{AddAtoms(sum, o.reserved_left)};
+            if (!next.has_value()) return Broken("resting reservations above MAX_ATOMS");
+            sum = *next;
+            ++resting[o.owner];
+        }
+    }
+    return Ok();
+}
+
+//! Invariants 4 and 5 for one account: its reserved balances and open-order count are its resting orders'.
+Result<void> CheckAccountOrders(const AccountId& account, const ledger::AccountState& state, const ReservedMap& reserved,
+                                const RestingMap& resting)
+{
+    for (const auto& [asset, balance] : state.balances) {
+        const auto it{reserved.find({account, asset})};
+        if (balance.reserved != (it == reserved.end() ? Atoms{0} : it->second)) {
+            return Broken("reserved balance differs from the resting orders' reservations");
+        }
+    }
+    const auto count{resting.find(account)};
+    if (state.open_orders != (count == resting.end() ? uint64_t{0} : count->second)) {
+        return Broken("open-order count differs from the resting orders");
+    }
+    return Ok();
+}
+
+//! The other direction of invariant 4: every resting reservation is held by the ledger.
+Result<void> CheckReservationsHeld(const EngineState& state, const ReservedMap& reserved)
+{
+    for (const auto& [key, amount] : reserved) {
+        if (amount != 0 && state.ledger.BalanceOf(key.first, key.second).reserved != amount) {
+            return Broken("resting reservation the ledger does not hold");
+        }
+    }
+    return Ok();
+}
+
 } // namespace
 
 // ---- Canonical order -----------------------------------------------------------
@@ -187,7 +244,9 @@ Result<EngineState> EngineState::Genesis(const ProfileParams& profile, std::span
     }
     Result<BookSet> books{BookSet::Create(markets)};
     if (!books.has_value()) return books.error();
-    return Ok(EngineState{std::move(ledger).value(), std::move(books).value()});
+    EngineState state{std::move(ledger).value(), std::move(books).value(), nullptr};
+    if (const Result<void> verified{state.Verify()}; !verified.has_value()) return verified.error();
+    return Ok(std::move(state));
 }
 
 std::vector<MarketDescriptor> EngineState::Markets() const
@@ -222,45 +281,47 @@ Result<void> EngineState::CheckInvariants() const
 {
     const Result<void> conserved{ledger.CheckConservation()};
     if (!conserved.has_value()) return conserved.error();
-    const Result<void> booked{books.CheckInvariants()};
-    if (!booked.has_value()) return booked.error();
-    for (const auto& [asset, totals] : ledger.Totals()) {
-        if (totals.fees_held != 0) return Broken("fees held at a slot boundary");
-    }
-
     // Reservations and open orders are exactly those of the resting orders.
-    std::map<std::pair<AccountId, AssetId>, Atoms> reserved;
-    std::map<AccountId, uint64_t> resting;
-    for (const auto& [id, book] : books.Books()) {
-        for (const RestingOrder& o : book.Orders()) {
-            if (!ledger.HasAccount(o.owner) || ledger.IsProtocolAccount(o.owner)) {
-                return Broken("resting order without a trading account");
-            }
-            const AssetId& asset{o.side == Side::BUY ? book.Market().quote : book.Market().base};
-            Atoms& sum{reserved[{o.owner, asset}]};
-            const Result<Atoms> next{AddAtoms(sum, o.reserved_left)};
-            if (!next.has_value()) return Broken("resting reservations above MAX_ATOMS");
-            sum = *next;
-            ++resting[o.owner];
-        }
-    }
+    ReservedMap reserved;
+    RestingMap resting;
+    if (const Result<void> booked{CheckBooks(*this, reserved, resting)}; !booked.has_value()) return booked;
     for (const auto& [account, state] : ledger.Accounts()) {
-        for (const auto& [asset, balance] : state.balances) {
-            const auto it{reserved.find({account, asset})};
-            if (balance.reserved != (it == reserved.end() ? Atoms{0} : it->second)) {
-                return Broken("reserved balance differs from the resting orders' reservations");
-            }
-        }
-        const auto count{resting.find(account)};
-        if (state.open_orders != (count == resting.end() ? uint64_t{0} : count->second)) {
-            return Broken("open-order count differs from the resting orders");
-        }
+        if (const Result<void> orders{CheckAccountOrders(account, state, reserved, resting)}; !orders.has_value()) return orders;
     }
-    for (const auto& [key, amount] : reserved) {
-        if (amount != 0 && ledger.BalanceOf(key.first, key.second).reserved != amount) {
-            return Broken("resting reservation the ledger does not hold");
-        }
+    return CheckReservationsHeld(*this, reserved);
+}
+
+Result<void> EngineState::CheckInvariantsSince(const VerifiedBasis& basis) const
+{
+    const Result<void> conserved{ledger.CheckConservationSince(basis.Ledger())};
+    if (!conserved.has_value()) return conserved.error();
+    ReservedMap reserved;
+    RestingMap resting;
+    if (const Result<void> booked{CheckBooks(*this, reserved, resting)}; !booked.has_value()) return booked;
+    // An account outside these three sets is the basis's own and owns no
+    // order now or in the basis, so the basis's invariants 4 and 5 hold for it.
+    std::set<AccountId> accounts{basis.Owners()};
+    ledger.ForEachChangedAccount(basis.Ledger(), [&accounts](const AccountId& account, const ledger::AccountState*,
+                                                             const ledger::AccountState*) { accounts.insert(account); });
+    for (const auto& entry : resting) accounts.insert(entry.first);
+    for (const AccountId& account : accounts) {
+        const ledger::AccountState* state{ledger.Find(account)};
+        // CheckBooks found every current owner; an absent account is a removed one.
+        if (state == nullptr) return Broken("account removed");
+        if (const Result<void> orders{CheckAccountOrders(account, *state, reserved, resting)}; !orders.has_value()) return orders;
     }
+    return CheckReservationsHeld(*this, reserved);
+}
+
+Result<void> EngineState::Verify()
+{
+    const Result<void> checked{verified ? CheckInvariantsSince(*verified) : CheckInvariants()};
+    if (!checked.has_value()) return checked.error();
+    std::set<AccountId> owners;
+    for (const auto& [id, book] : books.Books()) {
+        for (const RestingOrder& o : book.Orders()) owners.insert(o.owner);
+    }
+    verified = std::shared_ptr<const VerifiedBasis>{new VerifiedBasis{ledger, std::move(owners)}};
     return Ok();
 }
 
@@ -552,6 +613,8 @@ const AssetId& ReservedAsset(const MarketDescriptor& market, Side side) { return
 class SlotRun
 {
 public:
+    // The copy shares the parent's ledger trees and commitment levels (M2-LED-10).
+    // TODO(rebirth:M2-LED-10) the books are still copied, hashed and checked whole every slot: O(orders).
     SlotRun(const ProfileParams& profile, const EngineState& parent, const ValidatedSlot& slot)
         : m_profile{profile}, m_parent{parent}, m_slot{slot}, m_state{parent}, m_records(slot.Actions().size()) {}
 
@@ -952,10 +1015,13 @@ private:
         return Ok();
     }
 
-    // Phase 9.
+    // Phase 9. The invariants are checked on what changed since the last
+    // verified state the candidate descends from (M2-LED-10; the parent
+    // itself when the engine, genesis or a snapshot load produced it), and the
+    // candidate becomes the verified state of the slots built on it.
     Result<SlotResult> Finish()
     {
-        const Result<void> invariants{m_state.CheckInvariants()};
+        const Result<void> invariants{m_state.Verify()};
         if (!invariants.has_value()) return invariants.error();
 
         std::vector<OutcomeV2> outcomes{std::move(m_fact_outcomes)};
@@ -992,23 +1058,32 @@ private:
                 if (!added.has_value()) return Broken("outcome deltas overflow");
             }
         }
+        // The balance transition: an account whose state equals the parent's
+        // adds nothing, so only the changed accounts are summed.
         DeltaMap actual;
-        for (const auto& [account, state] : m_state.ledger.Accounts()) {
-            for (const auto& [asset, balance] : state.balances) {
-                const Result<void> added{AddTo(actual, account, asset, balance.available, balance.reserved)};
-                if (!added.has_value()) return Broken("balance outside [0, MAX_ATOMS]");
+        bool overflow{false};
+        m_state.ledger.ForEachChangedAccount(m_parent.ledger, [&](const AccountId& account, const ledger::AccountState* before,
+                                                                  const ledger::AccountState* after) {
+            if (after != nullptr) {
+                for (const auto& [asset, balance] : after->balances) {
+                    overflow = overflow || !AddTo(actual, account, asset, balance.available, balance.reserved).has_value();
+                }
             }
-        }
-        for (const auto& [account, state] : m_parent.ledger.Accounts()) {
-            for (const auto& [asset, balance] : state.balances) {
-                const Result<void> added{AddTo(actual, account, asset, -balance.available, -balance.reserved)};
-                if (!added.has_value()) return Broken("balance outside [0, MAX_ATOMS]");
+            if (before != nullptr) {
+                for (const auto& [asset, balance] : before->balances) {
+                    overflow = overflow || !AddTo(actual, account, asset, -balance.available, -balance.reserved).has_value();
+                }
             }
-        }
+        });
+        if (overflow) return Broken("balance outside [0, MAX_ATOMS]");
         std::erase_if(reported, [](const auto& entry) { return entry.second == std::pair<int64_t, int64_t>{0, 0}; });
         std::erase_if(actual, [](const auto& entry) { return entry.second == std::pair<int64_t, int64_t>{0, 0}; });
         if (reported != actual) return Broken("outcome deltas differ from the balance transition");
 
+        // Store the commitment levels of the new state, so its roots, and
+        // those of every slot built on it, start from them.
+        const Result<void> sealed{m_state.ledger.Seal()};
+        if (!sealed.has_value()) return sealed.error();
         const Result<StateRootsV0> roots{m_state.Commit()};
         if (!roots.has_value()) return roots.error();
         std::vector<uint256> leaves;
@@ -1021,7 +1096,7 @@ private:
     const ProfileParams& m_profile;
     const EngineState& m_parent;
     const ValidatedSlot& m_slot;
-    EngineState m_state;                        //!< the candidate, a copy of the parent
+    EngineState m_state;                        //!< the candidate: a copy of the parent sharing its ledger trees
     std::vector<ActionRecord> m_records;        //!< by canonical rank
     std::vector<OutcomeV2> m_fact_outcomes;     //!< by body order
     std::vector<OutcomeV2> m_fee_outcomes;      //!< by quote AssetId
