@@ -238,6 +238,18 @@ fs::path GetSpecialFolderPath(int nFolder, bool fCreate)
     LogError("SHGetSpecialFolderPathW() failed, could not obtain requested path.");
     return fs::path("");
 }
+
+bool LongPathsEnabled()
+{
+    // ntdll exports this from Windows 10 1607 on; older systems have no long
+    // path support at all.
+    using AreLongPathsEnabled = BOOLEAN(WINAPI*)();
+    const HMODULE ntdll{GetModuleHandleW(L"ntdll.dll")};
+    if (ntdll == nullptr) return false;
+    const auto fn{reinterpret_cast<AreLongPathsEnabled>(
+        reinterpret_cast<void*>(GetProcAddress(ntdll, "RtlAreLongPathsEnabled")))};
+    return fn != nullptr && fn() != FALSE;
+}
 #endif
 
 bool RenameOver(fs::path src, fs::path dest)

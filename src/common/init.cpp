@@ -8,6 +8,7 @@
 #include <logging.h>
 #include <tinyformat.h>
 #include <util/fs.h>
+#include <util/fs_helpers.h>
 #include <util/translation.h>
 
 #include <algorithm>
@@ -15,6 +16,25 @@
 #include <optional>
 
 namespace common {
+std::optional<ConfigError> CheckDataDirPathLength(const ArgsManager& args)
+{
+#ifdef WIN32
+    if (LongPathsEnabled()) return std::nullopt;
+    const fs::path net_path{args.GetDataDirNet()};
+    const size_t length{net_path.native().size()};
+    if (length <= MAX_WINDOWS_DATADIR_LENGTH) return std::nullopt;
+    return ConfigError{ConfigStatus::FAILED, Untranslated(strprintf(
+        "The data directory %s is %u characters long. Windows limits a path to %u characters unless long paths are "
+        "enabled, and the node creates files up to %u characters below its data directory, so the data directory may be "
+        "at most %u characters. Choose a shorter -datadir, or enable Windows long paths (LongPathsEnabled).",
+        fs::quoted(fs::PathToString(net_path)), length, WINDOWS_MAX_PATH_LENGTH, DATADIR_LONGEST_RELATIVE_PATH,
+        MAX_WINDOWS_DATADIR_LENGTH))};
+#else
+    (void)args;
+    return std::nullopt;
+#endif
+}
+
 std::optional<ConfigError> InitConfig(ArgsManager& args, SettingsAbortFn settings_abort_fn)
 {
     try {
@@ -41,6 +61,8 @@ std::optional<ConfigError> InitConfig(ArgsManager& args, SettingsAbortFn setting
 
         // Check for chain settings (Params() calls are only valid after this clause)
         SelectParams(args.GetChainType());
+
+        if (const auto error{CheckDataDirPathLength(args)}) return error;
 
         // Create datadir if it does not exist.
         const auto base_path{args.GetDataDirBase()};

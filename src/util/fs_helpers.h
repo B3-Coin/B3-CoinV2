@@ -95,6 +95,10 @@ std::optional<fs::perms> InterpretPermString(const std::string& s);
 
 #ifdef WIN32
 fs::path GetSpecialFolderPath(int nFolder, bool fCreate = true);
+/** Whether this process may use paths longer than MAX_PATH: Windows long
+ *  paths are enabled on the system (LongPathsEnabled) and the executable's
+ *  manifest opts in (longPathAware). */
+bool LongPathsEnabled();
 #endif
 
 #endif // BITCOIN_UTIL_FS_HELPERS_H
