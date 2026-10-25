@@ -286,15 +286,15 @@ BOOST_AUTO_TEST_CASE(allocate_pro_rata_exhaustive_small_domain)
             do {
                 for (uint64_t supply{0}; supply <= 15; ++supply) {
                     const Result<std::vector<uint64_t>> got{AllocateProRata(supply, d, rank)};
-                    BOOST_REQUIRE(got.has_value());
-                    BOOST_REQUIRE(*got == NaiveProRata(supply, d, rank));
+                    FM2_REQUIRE(got.has_value());
+                    FM2_REQUIRE(*got == NaiveProRata(supply, d, rank));
                     uint64_t sum{0}, demand{0};
                     for (size_t i{0}; i < n; ++i) {
-                        BOOST_REQUIRE((*got)[i] <= d[i]);
+                        FM2_REQUIRE((*got)[i] <= d[i]);
                         sum += (*got)[i];
                         demand += d[i];
                     }
-                    BOOST_REQUIRE_EQUAL(sum, std::min(supply, demand));
+                    FM2_REQUIRE_EQUAL(sum, std::min(supply, demand));
                     ++cases;
                 }
             } while (std::next_permutation(rank.begin(), rank.end()));
@@ -305,6 +305,7 @@ BOOST_AUTO_TEST_CASE(allocate_pro_rata_exhaustive_small_domain)
         }
     }
     BOOST_TEST_MESSAGE("pro-rata cases: " << cases);
+    BOOST_CHECK_GT(cases, 0U);
 
     // A rank tie-break that is not the span order.
     const auto alloc = [](uint64_t s, std::vector<uint64_t> d, std::vector<uint64_t> r) { return *AllocateProRata(s, d, r); };

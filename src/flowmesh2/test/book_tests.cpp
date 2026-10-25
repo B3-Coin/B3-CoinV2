@@ -453,7 +453,7 @@ BOOST_AUTO_TEST_CASE(random_operations_equal_a_naive_book)
                 const uint64_t last{model.LastRankAt(side, price, level_has_orders)};
                 const bool expect_ok{!model.Crosses(side, price) && !(level_has_orders && last >= rank)};
                 const Result<void> rested{book.Rest(order)};
-                BOOST_REQUIRE_EQUAL(rested.has_value(), expect_ok);
+                FM2_REQUIRE_EQUAL(rested.has_value(), expect_ok);
                 if (expect_ok) {
                     model.orders.push_back(order);
                     ++rests;
@@ -468,7 +468,7 @@ BOOST_AUTO_TEST_CASE(random_operations_equal_a_naive_book)
                 const size_t at{static_cast<size_t>(rng.Below(model.orders.size()))};
                 const Result<RestingOrder> removed{book.Remove(model.orders[at].id)};
                 RequireOk(removed, "remove");
-                BOOST_REQUIRE(*removed == model.orders[at]);
+                FM2_REQUIRE(*removed == model.orders[at]);
                 model.orders.erase(model.orders.begin() + static_cast<std::ptrdiff_t>(at));
                 ++removes;
             } else {
@@ -495,8 +495,8 @@ BOOST_AUTO_TEST_CASE(random_operations_equal_a_naive_book)
                     maker.cum_quote += quote;
                     maker.fee_charged += fee;
                     maker.fills += 1;
-                    BOOST_REQUIRE(filled->order == maker);
-                    BOOST_REQUIRE_EQUAL(filled->closed, maker.remaining_lots == 0);
+                    FM2_REQUIRE(filled->order == maker);
+                    FM2_REQUIRE_EQUAL(filled->closed, maker.remaining_lots == 0);
                     ++fills;
                     if (maker.remaining_lots == 0) {
                         model.orders.erase(model.orders.begin() + front);
@@ -505,14 +505,14 @@ BOOST_AUTO_TEST_CASE(random_operations_equal_a_naive_book)
                 }
             }
             // Full comparison.
-            BOOST_REQUIRE(book.Orders() == model.Listing());
-            BOOST_REQUIRE(book.BestBid() == model.Best(Side::BUY));
-            BOOST_REQUIRE(book.BestAsk() == model.Best(Side::SELL));
+            FM2_REQUIRE(book.Orders() == model.Listing());
+            FM2_REQUIRE(book.BestBid() == model.Best(Side::BUY));
+            FM2_REQUIRE(book.BestAsk() == model.Best(Side::SELL));
             for (const Side side : {Side::BUY, Side::SELL}) {
                 const int front{model.Front(side)};
                 const RestingOrder* got{book.BestFront(side)};
-                BOOST_REQUIRE_EQUAL(got == nullptr, front < 0);
-                if (got) BOOST_REQUIRE(*got == model.orders[static_cast<size_t>(front)]);
+                FM2_REQUIRE_EQUAL(got == nullptr, front < 0);
+                if (got) FM2_REQUIRE(*got == model.orders[static_cast<size_t>(front)]);
             }
             for (uint64_t price{1}; price <= 20; ++price) {
                 for (const Side side : {Side::BUY, Side::SELL}) {
@@ -520,15 +520,15 @@ BOOST_AUTO_TEST_CASE(random_operations_equal_a_naive_book)
                     for (const auto& o : model.orders) {
                         if (o.side == side && o.price_ticks == price) sum += o.remaining_lots;
                     }
-                    BOOST_REQUIRE_EQUAL(*book.LevelLots(side, price), sum);
+                    FM2_REQUIRE_EQUAL(*book.LevelLots(side, price), sum);
                 }
             }
             for (const auto& o : model.orders) {
                 const RestingOrder* got{book.Find(o.id)};
-                BOOST_REQUIRE(got != nullptr && *got == o);
+                FM2_REQUIRE(got != nullptr && *got == o);
             }
-            BOOST_REQUIRE_EQUAL(book.Size(), model.orders.size());
-            BOOST_REQUIRE(book.CheckInvariants().has_value());
+            FM2_REQUIRE_EQUAL(book.Size(), model.orders.size());
+            FM2_REQUIRE(book.CheckInvariants().has_value());
         }
     }
     BOOST_TEST_MESSAGE("book ops: rests " << rests << " refused " << refused_rests << " removes " << removes << " fills "

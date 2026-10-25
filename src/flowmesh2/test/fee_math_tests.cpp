@@ -8,6 +8,7 @@
 
 #include <flowmesh2/core/amount.h>
 #include <flowmesh2/core/fee_math.h>
+#include <flowmesh2/test/util/require.h>
 
 #include <algorithm>
 #include <cstdint>
@@ -103,16 +104,19 @@ BOOST_AUTO_TEST_CASE(increments_sum_to_the_fee_of_the_total)
 
 BOOST_AUTO_TEST_CASE(split_exhaustive_0_to_10000)
 {
+    uint64_t checked{0};
     for (Atoms fees{0}; fees <= 10'000; ++fees) {
         for (uint32_t percent{0}; percent <= 100; ++percent) {
             const FeeSplit split{SplitSlotFees(fees, percent).value()};
-            BOOST_REQUIRE(split.seat_pool >= 0 && split.treasury >= 0);
-            BOOST_REQUIRE_EQUAL(split.seat_pool + split.treasury, fees);
+            FM2_REQUIRE(split.seat_pool >= 0 && split.treasury >= 0);
+            FM2_REQUIRE_EQUAL(split.seat_pool + split.treasury, fees);
             // seat_pool = floor(fees * percent / 100).
-            BOOST_REQUIRE(split.seat_pool * 100 <= fees * percent);
-            BOOST_REQUIRE((split.seat_pool + 1) * 100 > fees * percent);
+            FM2_REQUIRE(split.seat_pool * 100 <= fees * percent);
+            FM2_REQUIRE((split.seat_pool + 1) * 100 > fees * percent);
+            ++checked;
         }
     }
+    BOOST_CHECK_EQUAL(checked, 10'001U * 101U);
 }
 
 BOOST_AUTO_TEST_CASE(edges_and_refusals)

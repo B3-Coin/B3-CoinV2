@@ -7,6 +7,7 @@
 #include <boost/test/unit_test.hpp>
 
 #include <flowmesh2/core/nonce_rule.h>
+#include <flowmesh2/test/util/require.h>
 
 #include <cstdint>
 #include <limits>
@@ -67,18 +68,18 @@ struct Counts {
 void Explore(const std::vector<uint64_t>& window, const std::set<uint64_t>& consumed, size_t depth, Counts& counts)
 {
     ++counts.states;
-    BOOST_REQUIRE(NonceWindowValid(window, W));
-    BOOST_REQUIRE(AsVector(TopW(consumed, W)) == window);
+    FM2_REQUIRE(NonceWindowValid(window, W));
+    FM2_REQUIRE(AsVector(TopW(consumed, W)) == window);
     for (uint64_t n{0}; n <= MAX_NONCE; ++n) {
         ++counts.classifications;
         const NonceVerdict verdict{ClassifyNonce(window, n, W).value()};
-        BOOST_REQUIRE(verdict == HistoryClassify(consumed, n, W));
+        FM2_REQUIRE(verdict == HistoryClassify(consumed, n, W));
         if (verdict != NonceVerdict::ACCEPTABLE) {
             CheckError(NonceInsert(window, n, W), ErrorCode::INVALID_INPUT);
             continue;
         }
         // The lemma VerifyExpired relies on: acceptable means never consumed.
-        BOOST_REQUIRE(!consumed.count(n));
+        FM2_REQUIRE(!consumed.count(n));
         if (depth == 0) continue;
         std::set<uint64_t> next_consumed{consumed};
         next_consumed.insert(n);
