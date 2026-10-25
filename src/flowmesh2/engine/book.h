@@ -29,6 +29,9 @@
  * bitmap, Fenwick tree, FIFO pool, open-addressing OrderId table that is
  * never iterated, BOOK_FULL). The interface below is the contract that
  * replacement keeps; the skeleton has no capacity limit and no price band.
+ * engine/band_book.h holds that replacement, tested against this book; the
+ * engine keeps this one until the band, the capacity and the refusal codes
+ * are ruled (BLOCKED-ON-RULING).
  *
  * Invariants. Every mutation keeps all of them or changes nothing:
  * 1. Every resting order has a known side, price_ticks >= 1,

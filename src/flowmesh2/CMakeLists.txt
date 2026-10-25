@@ -122,6 +122,7 @@ if(BUILD_FLOWMESH2)
     bridge/forced_exit.cpp
     chain/b3d_adapter.cpp
     chain/chain_adapter.cpp
+    engine/band_book.cpp
     engine/book.cpp
     engine/engine.cpp
     engine/matcher.cpp
@@ -270,6 +271,7 @@ if(BUILD_FLOWMESH2)
     test/agreement_tests.cpp
     test/amount_tests.cpp
     test/authority_tests.cpp
+    test/band_book_tests.cpp
     test/body_tests.cpp
     test/book_tests.cpp
     test/budget_tests.cpp
