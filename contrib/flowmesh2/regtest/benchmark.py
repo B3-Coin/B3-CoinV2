@@ -9,6 +9,7 @@ import sys
 import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import stage_trace
 import tool_paths
 from custody import Q_ASSET, SYNTHETIC_ASSETS, atomic_json, expect, q_units
 from local_process import raw_hex
@@ -62,6 +63,7 @@ def run(fixture, samples, warmup):
     measured, client_loop = [], []
     for index in range(count):
         start = time.perf_counter_ns()
+        stage_trace.event('sample', index=index, phase='start')
         # The same actual B3 anchor can support many trading slots. Trading
         # must not require a freshly mined B3 block for every order.
         if not public:
@@ -75,6 +77,7 @@ def run(fixture, samples, warmup):
                                              'price_ticks': 100, 'lots': 1}, ref_slot=head['height'])
         result = commit([action['frame']], label='benchmark warmup' if index < warmup else 'benchmark measured fill')
         elapsed = (time.perf_counter_ns() - start) / 1_000_000
+        stage_trace.event('sample', index=index, phase='end', latency_ms=result['latency_ms'], client_loop_ms=elapsed)
         if index >= warmup:
             measured.append(result['latency_ms'])
             client_loop.append(elapsed)
@@ -107,6 +110,9 @@ def run(fixture, samples, warmup):
               'source_finality_wait_and_withdrawal_dispute_excluded_from_trading_latency': True,
               'production_or_internet_latency_qualified': False,
               'final_heads': fixture.infos()}
+    if stage_trace.ENABLED:
+        import stage_report
+        report['stage_breakdown'] = stage_report.analyse(stage_report.load(fixture.evidence / 'stage-trace'), warmup)['stages']
     atomic_json(fixture.evidence / 'benchmark-report.json', report)
     return report
 
@@ -122,6 +128,8 @@ def main():
     parser.add_argument('--custody', choices=('fixture', 'production'), default='fixture')
     parser.add_argument('--samples', type=int, default=100)
     parser.add_argument('--warmup', type=int, default=20)
+    parser.add_argument('--stage-trace', action='store_true',
+                        help='write per-stage timestamps to EVIDENCE/stage-trace and add stage_breakdown to the report')
     args = parser.parse_args()
     tool_paths.resolve(parser, args, 'b3coind', 'b3coin_cli', 'tools', 'solc')
     if not 100 <= args.samples <= 1000 or not 5 <= args.warmup <= 100:
@@ -133,6 +141,9 @@ def main():
             fixture = NetworkRoundtrip(args)
         else:
             fixture = Roundtrip(args)
+        if args.stage_trace:
+            stage_trace.enable(fixture.evidence / 'stage-trace')
+        stage_trace.install('client')
         report = run(fixture, args.samples, args.warmup)
         print(json.dumps({'passed': True, 'target_met': report['target_met'],
                           'p95_ms': report['latency']['p95_ms'], 'report': str(fixture.evidence / 'benchmark-report.json')}))

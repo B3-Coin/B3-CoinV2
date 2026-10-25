@@ -650,6 +650,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config', required=True)
     args = parser.parse_args()
+    import stage_trace
+    stage_trace.install('operator')  # no-op unless FM2_STAGE_TRACE_DIR is set
     operator = None
     try:
         def stop_owned(signum, frame):
