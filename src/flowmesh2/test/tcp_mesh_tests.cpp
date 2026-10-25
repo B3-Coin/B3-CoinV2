@@ -29,6 +29,16 @@ using namespace flowmesh2::test;
 using namespace std::chrono_literals;
 
 namespace {
+//! True for the "try again" errors of a non-blocking socket. EAGAIN and
+//! EWOULDBLOCK are one value on Linux, so compare both only where they differ.
+bool WouldBlock(int error)
+{
+#if EAGAIN == EWOULDBLOCK
+    return error == EAGAIN;
+#else
+    return error == EAGAIN || error == EWOULDBLOCK;
+#endif
+}
 using WireBytes = std::vector<unsigned char>;
 using Mesh = std::unique_ptr<net::SeatMesh>;
 
@@ -152,7 +162,7 @@ public:
         while (position < payload.size() && std::chrono::steady_clock::now() < end) {
             const ssize_t n{send(fd, payload.data() + position, payload.size() - position, MSG_NOSIGNAL)};
             if (n > 0) position += n;
-            else if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) {
+            else if (n < 0 && (WouldBlock(errno) || errno == EINTR)) {
                 auto result{pair.mesh[1]->Poll()}; RequireOk(result, "raw send pump");
                 std::this_thread::sleep_for(1ms);
             } else break;
@@ -169,7 +179,7 @@ public:
             BOOST_REQUIRE(!*result);
             const ssize_t n{recv(fd, out.data() + position, size - position, 0)};
             if (n > 0) position += n;
-            else if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) std::this_thread::sleep_for(1ms);
+            else if (n < 0 && (WouldBlock(errno) || errno == EINTR)) std::this_thread::sleep_for(1ms);
             else break;
         }
         BOOST_REQUIRE_EQUAL(position, size);

@@ -34,6 +34,18 @@
 
 namespace flowmesh2::net {
 namespace {
+#ifndef _WIN32
+//! True for the "try again" errors of a non-blocking socket. EAGAIN and
+//! EWOULDBLOCK are one value on Linux, so compare both only where they differ.
+bool WouldBlock(int error)
+{
+#if EAGAIN == EWOULDBLOCK
+    return error == EAGAIN;
+#else
+    return error == EAGAIN || error == EWOULDBLOCK;
+#endif
+}
+#endif
 constexpr std::string_view CONFIG_BAD{"invalid authenticated TCP mesh configuration"};
 constexpr std::string_view ENDPOINT_BAD{"invalid signed seat endpoint or counter rollback"};
 constexpr std::string_view SOCKET_BAD{"cannot bind authenticated seat listener"};
@@ -297,7 +309,7 @@ private:
             const int fd{accept(m_listener, nullptr, nullptr)};
             if (fd < 0) {
                 if (errno == EINTR) continue;
-                if (errno != EAGAIN && errno != EWOULDBLOCK) m_closed = true;
+                if (!WouldBlock(errno)) m_closed = true;
                 break;
             }
             if (m_pending.size() >= m_config.max_pending_connections || !Nonblocking(fd)) {
@@ -393,7 +405,7 @@ private:
             const ssize_t n{send(link.fd, link.wire.data() + link.wire_pos, amount, MSG_NOSIGNAL)};
             if (n <= 0) {
                 if (n < 0 && errno == EINTR) continue;
-                if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return;
+                if (n < 0 && WouldBlock(errno)) return;
                 link.dead = true;
                 return;
             }
@@ -408,7 +420,7 @@ private:
             const ssize_t n{recv(link.fd, target + position, std::min(budget, total - position), 0)};
             if (n <= 0) {
                 if (n < 0 && errno == EINTR) continue;
-                if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return false;
+                if (n < 0 && WouldBlock(errno)) return false;
                 link.dead = true;
                 return false;
             }
