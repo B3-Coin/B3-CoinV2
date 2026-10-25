@@ -12,6 +12,7 @@
 #include <flowmesh2/core/slot.h>
 #include <flowmesh2/storage/durable.h>
 #include <flowmesh2/storage/journal.h>
+#include <flowmesh2/storage/snapshot_mark.h>
 #include <flowmesh2/storage/tokens.h>
 #include <uint256.h>
 
@@ -59,6 +60,13 @@
  *   otherwise the slot must be the successor of the last applied slot
  *   (slot 1 first), else ORDER_VIOLATION (APPLIED_OUT_OF_ORDER), the same
  *   contiguity replay requires (O-89).
+ * - AppendSnapshotMark(mark) (M4-STO-03, O-95): the SNAPSHOT_MARK record
+ *   of a snapshot already stored (storage/snapshot_mark.h). VERIFY_FAILED
+ *   (SNAPSHOT_MARK_UNAPPLIED) unless the slot is applied in this log with
+ *   that header hash and state root: only committed state is snapshotted.
+ *   The same mark again is idempotent (its first sequence number). The
+ *   caller makes it durable with Barrier; a mark is a restart point once
+ *   durable, and SnapshotMarks lists every mark this log holds.
  * - DecisionAt(slot): the reference of the decision this log holds for the
  *   slot, if any (used by the certifier before it signs, O-89).
  * - Every Append and Confirm of a fatal journal is FENCED.
@@ -72,6 +80,7 @@
  * - DECISION: header (366) | CompactSize(len) | certificate (len bytes) |
  *   body (SlotBody encoding, the rest).
  * - APPLIED: u64 slot | header_hash | state_root (72 bytes).
+ * - SNAPSHOT_MARK: SnapshotMark (u64 slot | header_hash | state_root, 72 bytes).
  *
  * Threading: a CommitLog is owned by one thread (the sealing thread,
  * section 4); it has no lock of its own and never holds the journal's.
@@ -85,6 +94,7 @@ inline constexpr std::string_view DECISION_CONFLICT{"DECISION_CONFLICT"};       
 inline constexpr std::string_view APPLIED_DECISION_UNKNOWN{"APPLIED_DECISION_UNKNOWN"};   //!< (VERIFY_FAILED)
 inline constexpr std::string_view APPLIED_ROOT_MISMATCH{"APPLIED_ROOT_MISMATCH"};         //!< (VERIFY_FAILED)
 inline constexpr std::string_view APPLIED_OUT_OF_ORDER{"APPLIED_OUT_OF_ORDER"};           //!< (ORDER_VIOLATION)
+inline constexpr std::string_view SNAPSHOT_MARK_UNAPPLIED{"SNAPSHOT_MARK_UNAPPLIED"};   //!< (VERIFY_FAILED)
 inline constexpr std::string_view LOG_PENDING_RECORDS{"LOG_PENDING_RECORDS"};           //!< (ORDER_VIOLATION)
 inline constexpr std::string_view LOG_REPLAY_PROFILE_REQUIRED{"LOG_REPLAY_PROFILE_REQUIRED"}; //!< (INVALID_INPUT)
 inline constexpr std::string_view LOG_REPLAY_SEQUENCE{"LOG_REPLAY_SEQUENCE"};           //!< (ORDER_VIOLATION)
@@ -169,6 +179,11 @@ public:
      */
     std::optional<DecisionRef> DecisionAt(uint64_t slot) const;
 
+    //! Append the SNAPSHOT_MARK record of `mark`; returns its sequence number. See the file comment.
+    Result<uint64_t> AppendSnapshotMark(const SnapshotMark& mark);
+    //! Every mark this log holds (appended or replayed), ascending slot.
+    std::vector<SnapshotMark> SnapshotMarks() const;
+
     //! Durable PBFT view state. Stub: M4-STO-07.
     Result<uint64_t> AppendPreparedQc(const PreparedQcRecord& record);
 
@@ -183,6 +198,10 @@ public:
 private:
     static Result<CommitLog> CreateImpl(Journal& journal, const ProfileParams* profile);
     explicit CommitLog(Journal& journal) : m_journal{&journal} {}
+    //! Index `mark` (record `seq`): VERIFY_FAILED (SNAPSHOT_MARK_UNAPPLIED) unless its slot is applied with its header and root.
+    Result<void> Mark(const SnapshotMark& mark, uint64_t seq);
+    //! True when `mark.slot` is applied in this log with `mark`'s header hash and state root.
+    bool IsApplied(const SnapshotMark& mark) const;
 
     struct DecisionEntry {
         uint256 header_hash;
@@ -195,6 +214,7 @@ private:
     Journal* m_journal;
     std::map<std::tuple<uint64_t, uint64_t, uint64_t>, std::pair<PreparedQcRecord, uint64_t>> m_prepared;
     std::map<uint64_t, DecisionEntry> m_decisions; //!< by slot
+    std::map<uint64_t, std::pair<SnapshotMark, uint64_t>> m_marks; //!< by slot: the mark and its record's sequence number
     uint64_t m_last_applied_slot{0};               //!< 0 before the first application (the genesis height)
 };
 

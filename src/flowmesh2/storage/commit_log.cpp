@@ -195,8 +195,12 @@ Result<CommitLog> CommitLog::CreateImpl(Journal& journal, const ProfileParams* p
             }
             break;
         }
-        case RecordType::SNAPSHOT_MARK:
-            return NotImplemented("M4-STO-03"); // TODO(rebirth:M4-STO-03)
+        case RecordType::SNAPSHOT_MARK: {
+            const Result<SnapshotMark> mark{SnapshotMark::Decode(record.payload)};
+            if (!mark.has_value()) return mark.error();
+            if (const Result<void> marked{log.Mark(*mark, record.seq)}; !marked.has_value()) return marked.error();
+            break;
+        }
         case RecordType::PREPARED_QC: {
             auto prepared{PreparedQcRecord::Decode(record.payload, *profile)};
             if (!prepared.has_value()) return prepared.error();
@@ -237,6 +241,43 @@ Result<PendingDecision> CommitLog::AppendDecision(const SlotHeaderV2& header, co
     if (!seq.has_value()) return seq.error();
     m_decisions.emplace(header.height, DecisionEntry{header_hash, cert_hash, header.state_root, *seq, std::nullopt});
     return Ok(PendingDecision{m_journal->InstanceId(), *seq, DecisionRef{header.height, header_hash, cert_hash}});
+}
+
+bool CommitLog::IsApplied(const SnapshotMark& mark) const
+{
+    const auto it{m_decisions.find(mark.slot)};
+    return it != m_decisions.end() && it->second.applied_seq && it->second.header_hash == mark.header_hash &&
+           it->second.state_root == mark.state_root;
+}
+
+Result<void> CommitLog::Mark(const SnapshotMark& mark, uint64_t seq)
+{
+    if (!IsApplied(mark)) return Error{ErrorCode::VERIFY_FAILED, SNAPSHOT_MARK_UNAPPLIED};
+    m_marks.try_emplace(mark.slot, mark, seq); // a repeat keeps the first record
+    return Ok();
+}
+
+Result<uint64_t> CommitLog::AppendSnapshotMark(const SnapshotMark& mark)
+{
+    if (m_journal->IsFatal()) return Error{ErrorCode::FENCED, JOURNAL_FENCED};
+    if (const auto it{m_marks.find(mark.slot)}; it != m_marks.end()) {
+        if (it->second.first == mark) return Ok(it->second.second);
+        return Error{ErrorCode::VERIFY_FAILED, SNAPSHOT_MARK_UNAPPLIED};
+    }
+    // Checked before the append, so a refused mark writes nothing.
+    if (!IsApplied(mark)) return Error{ErrorCode::VERIFY_FAILED, SNAPSHOT_MARK_UNAPPLIED};
+    Result<uint64_t> seq{m_journal->Append(RecordType::SNAPSHOT_MARK, mark.Encode())};
+    if (!seq.has_value()) return seq.error();
+    if (const Result<void> marked{Mark(mark, *seq)}; !marked.has_value()) return marked.error();
+    return seq;
+}
+
+std::vector<SnapshotMark> CommitLog::SnapshotMarks() const
+{
+    std::vector<SnapshotMark> marks;
+    marks.reserve(m_marks.size());
+    for (const auto& [slot, entry] : m_marks) marks.push_back(entry.first);
+    return marks;
 }
 
 Result<PendingApplied> CommitLog::AppendApplied(const ApplyReceipt& receipt)

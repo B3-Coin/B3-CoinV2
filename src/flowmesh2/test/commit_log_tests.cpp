@@ -174,9 +174,48 @@ BOOST_AUTO_TEST_CASE(recovery_keeps_first_certificate_and_refuses_unsupported_re
         auto journal{NewMemoryJournal(JournalRole::COMMIT, 61 + static_cast<uint8_t>(type))};
         RequireStorageOk(journal->Append(type, {}), "unsupported record");
         RequireStorageOk(journal->Barrier(), "unsupported record durable");
-        if (type == RecordType::SNAPSHOT_MARK) RequireStub(CommitLog::Create(*journal, Profile()), "M4-STO-03");
-        else RequireCode(CommitLog::Create(*journal, Profile()), ErrorCode::DECODE, "malformed prepared record");
+        RequireCode(CommitLog::Create(*journal, Profile()), ErrorCode::DECODE, "malformed record");
     }
+}
+
+BOOST_AUTO_TEST_CASE(snapshot_marks_name_applied_slots_and_survive_recovery)
+{
+    OwnerFixture f{71};
+    const SkeletonRun run{RunWalkingSkeleton(f)};
+    const auto mark_of{[&](uint64_t slot) {
+        const SlotHeaderV2& header{run.heads[slot - 1]->Header()};
+        return SnapshotMark{slot, header.Hash(), header.state_root};
+    }};
+    const uint64_t before{f.journal->Status().appended_seq};
+    const Result<uint64_t> seq{f.log.AppendSnapshotMark(mark_of(3))};
+    RequireOk(seq, "AppendSnapshotMark");
+    BOOST_CHECK_EQUAL(*seq, before + 1);
+    // The same mark again is idempotent and writes nothing.
+    BOOST_CHECK(f.log.AppendSnapshotMark(mark_of(3)).value() == *seq);
+    BOOST_CHECK_EQUAL(f.journal->Status().appended_seq, before + 1);
+    // Only an applied slot with its own header and root; a refusal writes nothing.
+    SnapshotMark other_root{mark_of(4)};
+    other_root.state_root = LabelHash("fm2/test/other-root");
+    RequireRefusal(f.log.AppendSnapshotMark(other_root), ErrorCode::VERIFY_FAILED, SNAPSHOT_MARK_UNAPPLIED, "another root");
+    SnapshotMark undecided{mark_of(5)};
+    undecided.slot = 6;
+    RequireRefusal(f.log.AppendSnapshotMark(undecided), ErrorCode::VERIFY_FAILED, SNAPSHOT_MARK_UNAPPLIED, "an undecided slot");
+    SnapshotMark moved{mark_of(3)};
+    moved.header_hash = mark_of(2).header_hash;
+    RequireRefusal(f.log.AppendSnapshotMark(moved), ErrorCode::VERIFY_FAILED, SNAPSHOT_MARK_UNAPPLIED, "another mark for a marked slot");
+    BOOST_CHECK_EQUAL(f.journal->Status().appended_seq, before + 1);
+    RequireOk(f.log.AppendSnapshotMark(mark_of(5)), "mark slot 5");
+    RequireStorageOk(f.log.Barrier(), "durable marks");
+    BOOST_CHECK((f.log.SnapshotMarks() == std::vector<SnapshotMark>{mark_of(3), mark_of(5)}));
+    // Recovery rebuilds the marks, and keeps refusing what the live log refused.
+    CommitLog restored{CommitLog::Create(*f.journal, Profile()).value()};
+    BOOST_CHECK((restored.SnapshotMarks() == std::vector<SnapshotMark>{mark_of(3), mark_of(5)}));
+    BOOST_CHECK(restored.AppendSnapshotMark(mark_of(3)).value() == *seq);
+    // A journal holding a mark of a slot it never applied does not recover.
+    auto journal{NewMemoryJournal(JournalRole::COMMIT, 72)};
+    RequireStorageOk(journal->Append(RecordType::SNAPSHOT_MARK, mark_of(1).Encode()), "a mark without its slot");
+    RequireStorageOk(journal->Barrier(), "durable mark");
+    RequireRefusal(CommitLog::Create(*journal, Profile()), ErrorCode::VERIFY_FAILED, SNAPSHOT_MARK_UNAPPLIED, "mark of an unknown slot");
 }
 
 BOOST_AUTO_TEST_CASE(decision_then_applied)

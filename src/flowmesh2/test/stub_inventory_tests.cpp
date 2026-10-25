@@ -515,13 +515,11 @@ FM2_STUB_CASE(M4_STO_02, "M4-STO-02")
 
 FM2_STUB_CASE(M4_STO_03, "M4-STO-03")
 {
-    // StateOwner::Restore (R9) and the replay of a SNAPSHOT_MARK record. The
-    // snapshot bytes (state/snapshot.h) and SnapshotStore are real since the 2026-10-25 run.
+    // StateOwner::Restore (R9). The snapshot bytes (state/snapshot.h),
+    // SnapshotStore and the SNAPSHOT_MARK record and its replay are real since the 2026-10-25 run.
     HeartbeatOwner heartbeat{MakeHeartbeatOwner()};
     const std::shared_ptr<const state::HeadView> head{heartbeat.owner->Head()};
-    const std::vector<storage::JournalRecord> marked{{1, storage::RecordType::SNAPSHOT_MARK, {}, uint256{}}};
-    return FirstDeviation("M4-STO-03", {Observe(heartbeat.owner->Restore(*head, {})),
-                                        Observe(state::ReplayDecisions(*head, marked))});
+    return Observe(heartbeat.owner->Restore(*head, {}));
 }
 
 FM2_STUB_CASE(M4_STO_07, "M4-STO-07")

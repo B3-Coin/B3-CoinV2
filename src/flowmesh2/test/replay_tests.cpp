@@ -243,9 +243,7 @@ BOOST_AUTO_TEST_CASE(replay_refuses_an_inconsistent_journal)
     Records unknown_type{good};
     unknown_type.push_back(storage::JournalRecord{good.size() + 1, static_cast<storage::RecordType>(0x7f), {}, uint256{}});
     RequireFailure(replay(unknown_type), ErrorCode::DECODE, storage::RECORD_TYPE, "an unregistered type");
-    // The base must be a genesis head, and the records must continue it.
-    RequireFailure(state::ReplayDecisions(*fx.run.heads[0], good), ErrorCode::INVALID_INPUT, state::REPLAY_BASE_NOT_GENESIS,
-                   "base at height 1");
+    // The records must continue the base (a snapshot base: replay_from_a_snapshot_base_equals_replay_from_genesis).
     AuthorityVersion other_seats{TestAuthority(RegtestProfile())};
     other_seats.seat_set_root = LabelHash("fm2/test/other-seats");
     const std::vector<MarketDescriptor> markets{MarketM1(), MarketM2()};
@@ -255,12 +253,96 @@ BOOST_AUTO_TEST_CASE(replay_refuses_an_inconsistent_journal)
     RequireFailure(state::ReplayDecisions(other_genesis, good), ErrorCode::STALE_PARENT, state::PARENT_NOT_HEAD, "another genesis");
 }
 
+BOOST_AUTO_TEST_CASE(replay_from_a_snapshot_base_equals_replay_from_genesis)
+{
+    // Every committed head is a base: the records below it are checked as a
+    // chain, the ones above it re-executed, and the result is the genesis
+    // replay's (M4-STO-03, O-95).
+    const ReplayFixture fx;
+    const Result<state::ReplayResult> from_genesis{state::ReplayDecisions(fx.genesis, fx.records)};
+    RequireOk(from_genesis, "replay from genesis");
+    for (size_t k{0}; k < fx.run.heads.size(); ++k) {
+        const state::HeadView& base{*fx.run.heads[k]};
+        const Result<state::ReplayResult> result{state::ReplayDecisions(base, fx.records)};
+        RequireOk(result, "replay from the head of slot " + std::to_string(k + 1));
+        RequireReproduced(*result, fx);
+        BOOST_CHECK(result->slots == from_genesis->slots);
+        BOOST_CHECK(result->decided_head.Header() == from_genesis->decided_head.Header());
+        // The records below the base must be there, and must apply it.
+        const Records undecided{fx.records.begin(), fx.records.begin() + static_cast<std::ptrdiff_t>(2 * k + 1)};
+        RequireFailure(state::ReplayDecisions(base, undecided), ErrorCode::INVALID_INPUT, state::REPLAY_BASE_UNKNOWN,
+                       "base decided but not applied");
+        const Records short_of_base{fx.records.begin(), fx.records.begin() + static_cast<std::ptrdiff_t>(2 * k)};
+        RequireFailure(state::ReplayDecisions(base, short_of_base), ErrorCode::INVALID_INPUT, state::REPLAY_BASE_UNKNOWN,
+                       "base never decided");
+    }
+    // A base the records do not decide: the head of another run at slot 4.
+    const ReplayFixture other{[](OwnerFixture& f) { f.Run(f.Inputs({}, {})); }}; // a heartbeat first
+    BOOST_REQUIRE(!(other.run.heads[2]->Header() == fx.run.heads[2]->Header()));
+    RequireFailure(state::ReplayDecisions(*other.run.heads[2], fx.records), ErrorCode::VERIFY_FAILED, state::REPLAY_BASE_CHAIN,
+                   "another chain's head");
+    // A decision below the base that does not chain: slot 1 with another header (and a certificate naming it).
+    storage::DecisionRecord forged{DecodeDecision(fx.records[0])};
+    forged.header.state_root = LabelHash("fm2/test/forged-root");
+    forged.certificate = TestCertificate(forged.header);
+    Records broken{fx.records};
+    broken[0] = DecisionRecordOf(forged, 1);
+    broken.erase(broken.begin() + 1); // its APPLIED would name the original header
+    RequireFailure(state::ReplayDecisions(*fx.run.heads[2], Renumbered(broken)), ErrorCode::VERIFY_FAILED, state::REPLAY_BASE_CHAIN,
+                   "slot 2 does not name the forged slot 1 as parent");
+    // The base header at its height with another certificate.
+    storage::DecisionRecord recertified{DecodeDecision(fx.records[4])};
+    recertified.certificate = TestCertificate(recertified.header, /*variant=*/7);
+    Records other_cert{fx.records};
+    other_cert[4] = DecisionRecordOf(recertified, 5);
+    RequireFailure(state::ReplayDecisions(*fx.run.heads[2], other_cert), ErrorCode::VERIFY_FAILED, state::REPLAY_BASE_CHAIN,
+                   "the base decided with another certificate");
+}
+
+BOOST_AUTO_TEST_CASE(snapshot_marks_name_applied_slots_and_move_no_head)
+{
+    const ReplayFixture fx;
+    const auto mark_of{[&](size_t slot) {
+        const SlotHeaderV2& header{fx.run.heads[slot - 1]->Header()};
+        return storage::SnapshotMark{slot, header.Hash(), header.state_root};
+    }};
+    const auto with{[&](Records records, size_t at, const std::vector<unsigned char>& payload) {
+        records.insert(records.begin() + static_cast<std::ptrdiff_t>(at),
+                       storage::JournalRecord{0, storage::RecordType::SNAPSHOT_MARK, payload, uint256{}});
+        return Renumbered(records);
+    }};
+    // Marks of slots 2 and 4 (slot 2 twice), each after its APPLIED.
+    const Records marked{with(with(with(fx.records, 8, mark_of(4).Encode()), 4, mark_of(2).Encode()), 5, mark_of(2).Encode())};
+    const Result<state::ReplayResult> result{state::ReplayDecisions(fx.genesis, marked)};
+    RequireOk(result, "replay with marks");
+    RequireReproduced(*result, fx);
+    BOOST_CHECK((result->marks == std::vector<storage::SnapshotMark>{mark_of(2), mark_of(4)}));
+    // A mark before its slot's APPLIED, of slot 0, or of a slot never applied.
+    RequireFailure(state::ReplayDecisions(fx.genesis, with(fx.records, 3, mark_of(2).Encode())), ErrorCode::ORDER_VIOLATION,
+                   state::REPLAY_MARK_UNAPPLIED, "mark before APPLIED");
+    RequireFailure(state::ReplayDecisions(fx.genesis, with(fx.records, 2, storage::SnapshotMark{0, fx.genesis.HeaderHash(), fx.genesis.Header().state_root}.Encode())),
+                   ErrorCode::ORDER_VIOLATION, state::REPLAY_MARK_UNAPPLIED, "mark of slot 0");
+    storage::SnapshotMark beyond{mark_of(5)};
+    beyond.slot = 6;
+    RequireFailure(state::ReplayDecisions(fx.genesis, with(fx.records, 10, beyond.Encode())), ErrorCode::ORDER_VIOLATION,
+                   state::REPLAY_MARK_UNAPPLIED, "mark of an undecided slot");
+    storage::SnapshotMark other_root{mark_of(3)};
+    other_root.state_root = LabelHash("fm2/test/other-root");
+    RequireFailure(state::ReplayDecisions(fx.genesis, with(fx.records, 6, other_root.Encode())), ErrorCode::VERIFY_FAILED,
+                   state::REPLAY_MARK_MISMATCH, "mark with another root");
+    storage::SnapshotMark other_header{mark_of(3)};
+    other_header.header_hash = mark_of(2).header_hash;
+    RequireFailure(state::ReplayDecisions(fx.genesis, with(fx.records, 6, other_header.Encode())), ErrorCode::VERIFY_FAILED,
+                   state::REPLAY_MARK_MISMATCH, "mark with another header");
+    RequireError(state::ReplayDecisions(fx.genesis, with(fx.records, 6, {})), ErrorCode::DECODE, "empty mark");
+}
+
+// The name is historical: neither record is a stub any more (SNAPSHOT_MARK:
+// snapshot_marks_name_applied_slots_and_move_no_head). Renaming the case
+// removes an INVENTORY.txt line, which needs an audit and owner sign-off.
 BOOST_AUTO_TEST_CASE(replay_of_snapshot_and_view_records_is_a_stub)
 {
     const ReplayFixture fx;
-    Records snapshot{fx.records};
-    snapshot.push_back(storage::JournalRecord{snapshot.size() + 1, storage::RecordType::SNAPSHOT_MARK, {}, uint256{}});
-    RequireStub(state::ReplayDecisions(fx.genesis, snapshot), "M4-STO-03");
     Records prepared{fx.records};
     prepared.push_back(storage::JournalRecord{prepared.size() + 1, storage::RecordType::PREPARED_QC, {}, uint256{}});
     RequireError(state::ReplayDecisions(fx.genesis, prepared), ErrorCode::DECODE, "truncated prepared value");
