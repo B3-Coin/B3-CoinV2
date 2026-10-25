@@ -480,6 +480,16 @@ if(BUILD_FLOWMESH2)
       add_executable(fm2_canary_${fm2_canary} ${PROJECT_SOURCE_DIR}/contrib/flowmesh2/canaries/${fm2_canary}_canary.cpp)
       target_link_libraries(fm2_canary_${fm2_canary} PRIVATE core_interface)
     endforeach()
+    # GCC's UBSan object-size check sees the canary's read past the end
+    # first and halts before AddressSanitizer can report it, so the ASan
+    # canary would fire with the wrong diagnostic. Turn that one UBSan check
+    # off for this one program under GCC; Clang and every other target and
+    # check are unchanged. A source-file option is placed after the
+    # -fsanitize flags that core_interface brings in, so it takes effect.
+    if(TARGET fm2_canary_asan AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+      set_source_files_properties(${PROJECT_SOURCE_DIR}/contrib/flowmesh2/canaries/asan_canary.cpp
+        PROPERTIES COMPILE_OPTIONS -fno-sanitize=object-size)
+    endif()
     message(STATUS "flowmesh2 sanitizer canaries: ${fm2_canaries}")
   endif()
 
