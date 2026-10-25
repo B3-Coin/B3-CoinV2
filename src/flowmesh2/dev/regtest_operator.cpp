@@ -1685,7 +1685,8 @@ struct RegtestOperator::Impl {
             out.pushKV("pending", reply.pending.has_value()); out.pushKV("included", reply.included.has_value());
             if (reply.outcome) out.pushKV("outcome", HexStr(reply.outcome->outcome.outcome.Encode()));
             if (reply.pending || reply.included) out.pushKV("account", HexStr(Must(ActionV2::Decode(frame, profile)).Account().id));
-            if (reply.id) out.pushKV("id", HexStr(reply.id->id)); return out;
+            if (reply.id) out.pushKV("id", HexStr(reply.id->id));
+            return out;
         }
         Fail(ErrorCode::INVALID_INPUT, "unknown operator command");
     }

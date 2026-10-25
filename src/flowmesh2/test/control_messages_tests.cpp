@@ -132,7 +132,7 @@ BOOST_AUTO_TEST_CASE(control_codecs_are_exact_and_report_counts_are_capped_befor
     ControlMessagesFixture f;
     auto report{f.Report(0, 1)};
     auto view{f.NewView(1, f.Header().Hash(), {report, f.Report(1, 1), f.Report(2, 1)})};
-    for (const Message message : {Message{report}, Message{view}}) {
+    for (const Message& message : {Message{report}, Message{view}}) {
         auto bytes{EncodeMessage(message, f.profile).value()};
         BOOST_CHECK(DecodeMessage(bytes, f.profile).value() == message);
         bytes.push_back(0);
