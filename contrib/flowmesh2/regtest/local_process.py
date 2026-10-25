@@ -14,7 +14,8 @@ import time
 import urllib.error
 import urllib.request
 
-from custody import CustodyError, NoRedirect, hex_value, local_rpc_url, uint
+from custody import CustodyError, hex_value, local_rpc_url, uint
+from keepalive import KeepAliveOpener
 
 MODERN_GENESIS = '10d0f5bb6fde880011fd56ea35dddbf9b32da2a7825f5579ac587a7904d6929a'
 
@@ -127,7 +128,8 @@ class B3Rpc:
         self.cookie_file = Path(cookie_file).resolve()
         self.counter = 0
         self.id_lock = threading.Lock()
-        self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
+        # One loopback URL, no proxy, no redirects, one kept-alive connection per thread.
+        self.opener = KeepAliveOpener(self.url)
 
     def _identities(self, count):
         with self.id_lock:

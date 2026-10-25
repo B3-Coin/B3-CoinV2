@@ -24,6 +24,7 @@ import urllib.parse
 import urllib.request
 import uuid
 
+from keepalive import KeepAliveOpener
 import tool_paths
 
 CHAIN_ID = 31337
@@ -42,11 +43,6 @@ class CustodyError(RuntimeError):
 
 class RpcError(CustodyError):
     pass
-
-
-class NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, request, file_pointer, code, message, headers, new_url):
-        raise RpcError("RPC HTTP redirects are forbidden")
 
 
 def expect(condition, message):
@@ -157,7 +153,8 @@ class LocalRpc:
         self.counter = 0
         self.counter_lock = threading.Lock()
         # Environment proxies must never forward local custody data elsewhere.
-        self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
+        # One loopback URL, no proxy, no redirects, one kept-alive connection per thread.
+        self.opener = KeepAliveOpener(self.url)
 
     @staticmethod
     def _unique_fields(pairs):

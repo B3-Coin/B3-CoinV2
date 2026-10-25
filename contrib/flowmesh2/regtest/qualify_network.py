@@ -78,6 +78,7 @@ def main():
                             ('runtime-guard-order', 'test_runtime_guards.py'),
                             ('custody-grouped-snapshot', 'test_custody_group.py'),
                             ('b3-rpc-batch-boundary', 'test_b3_rpc_batch.py'),
+                            ('rpc-keepalive-boundary', 'test_keepalive.py'),
                             ('finality-and-relayer-codec', 'test_source_finality.py')):
             run(label, [sys.executable, '-B', driver / name])
         run('custody-proxy-upgrade', [sys.executable, '-B', driver / 'test_custody_proxy.py',
