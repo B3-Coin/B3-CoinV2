@@ -633,7 +633,7 @@ BOOST_AUTO_TEST_CASE(authenticated_far_view_with_known_decision_fences_before_so
     SignObservationControl(first, node);
     ControlNewView view{{TestDomain(), ProfileHash(node.profile), node.seats.Root(), 0, 1, node.genesis.Header().Hash(),
         2, 17, storage::ControlPhase::NEW_VIEW}, candidate.Header().Hash(),
-        {first, ObservationReport(node, 2, 17), ObservationReport(node, 3, 17)}, {}};
+        {first, ObservationReport(node, 2, 17), ObservationReport(node, 3, 17)}, {}, {}};
     view.selected_proposal = Proposal{0, 17, candidate.Header(), std::nullopt, candidate.Body()};
     SignObservationControl(view, node);
     RequireOk(node.agreement->OnMessage(2, EncodeMessage(Message{view}, node.profile).value()), "full quorum proof may bridge more than the report discovery window");
@@ -717,7 +717,7 @@ BOOST_AUTO_TEST_CASE(remote_new_view_after_long_idle_gets_its_full_active_timeou
     RequireOk(node.agreement->OnTimeout(0), "observe an idle clock without active work");
     ControlNewView view{{TestDomain(), ProfileHash(node.profile), node.seats.Root(), 0, 1,
         node.genesis.Header().Hash(), 2, 1, storage::ControlPhase::NEW_VIEW}, candidate.Header().Hash(),
-        {ObservationReport(node, 1, 1), ObservationReport(node, 2, 1), ObservationReport(node, 3, 1)}, {}};
+        {ObservationReport(node, 1, 1), ObservationReport(node, 2, 1), ObservationReport(node, 3, 1)}, {}, {}};
     view.selected_proposal = Proposal{0, 1, candidate.Header(), std::nullopt, candidate.Body()};
     SignObservationControl(view, node);
     RequireOk(node.agreement->OnMessage(2, EncodeMessage(Message{view}, node.profile).value()), "first full authenticated NEW_VIEW after idle");
@@ -789,7 +789,7 @@ BOOST_AUTO_TEST_CASE(pure_crypto_memo_fifo_eviction_falls_back_to_verification_w
     auto candidate{node.Candidate()};
     ControlNewView view{{TestDomain(), ProfileHash(node.profile), node.seats.Root(), 0, 1,
         node.genesis.Header().Hash(), 3, 66, storage::ControlPhase::NEW_VIEW}, candidate.Header().Hash(),
-        {ObservationReport(node, 1, 66), ObservationReport(node, 2, 66), ObservationReport(node, 3, 66)}, {}};
+        {ObservationReport(node, 1, 66), ObservationReport(node, 2, 66), ObservationReport(node, 3, 66)}, {}, {}};
     view.selected_proposal = Proposal{0, 66, candidate.Header(), std::nullopt, candidate.Body()};
     SignObservationControl(view, node);
     RequireOk(node.agreement->OnMessage(3, EncodeMessage(Message{view}, node.profile).value()), "authenticated current view without fresh ordinary proposal");

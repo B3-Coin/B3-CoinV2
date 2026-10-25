@@ -58,7 +58,7 @@ struct ControlMessagesFixture {
     }
     ControlNewView NewView(uint64_t target, const uint256& selected, std::vector<ControlReport> reports) const
     {
-        ControlNewView view{Key(static_cast<uint32_t>((1 + target) % 4), target, storage::ControlPhase::NEW_VIEW), selected, std::move(reports), {}};
+        ControlNewView view{Key(static_cast<uint32_t>((1 + target) % 4), target, storage::ControlPhase::NEW_VIEW), selected, std::move(reports), {}, {}};
         const auto header{Header(131).Hash() == selected ? Header(131) : Header(130)};
         view.selected_proposal = Proposal{0, target, header, std::nullopt, {}};
         Sign(view);

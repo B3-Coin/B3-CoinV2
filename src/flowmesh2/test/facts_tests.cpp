@@ -62,9 +62,9 @@ BOOST_AUTO_TEST_CASE(kind_registry_pinned)
         {SeatChangeFact{at}, FactKind::SEAT_CHANGE},
         {ListingFact{at}, FactKind::LISTING},
         {CheckpointAcceptedFact{at}, FactKind::CHECKPOINT_ACCEPTED},
-        {PayoutConfirmedFact{at}, FactKind::PAYOUT_CONFIRMED},
+        {PayoutConfirmedFact{at, {}, {}, {}, 0, {}, {}, {}}, FactKind::PAYOUT_CONFIRMED},
         {ExitNullifierFact{at}, FactKind::EXIT_NULLIFIER},
-        {SourceRangeFact{at}, FactKind::SOURCE_RANGE},
+        {SourceRangeFact{at, {}, 0, 0, {}, 0, {}, 0}, FactKind::SOURCE_RANGE},
     };
     BOOST_CHECK_EQUAL(kinds.size(), std::variant_size_v<Fact>);
     for (const auto& [fact, kind] : kinds) {

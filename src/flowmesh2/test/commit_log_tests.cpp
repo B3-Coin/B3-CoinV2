@@ -322,7 +322,7 @@ BOOST_AUTO_TEST_CASE(decision_rules)
     BOOST_CHECK(f.log.DecisionAt(3) == std::optional<DecisionRef>{first.Key()});
     BOOST_CHECK(!f.log.DecisionAt(2).has_value());
     BOOST_CHECK(!f.log.DecisionAt(4).has_value());
-    RequireStub(f.log.AppendPreparedQc(PreparedQcRecord{0, 3, 0, slot.header.Hash(), Bytes("qc")}), "M4-STO-07");
+    RequireStub(f.log.AppendPreparedQc(PreparedQcRecord{0, 3, 0, slot.header.Hash(), Bytes("qc"), {}, {}}), "M4-STO-07");
     BOOST_CHECK_EQUAL(f.journal->Status().appended_seq, 1U);
 }
 

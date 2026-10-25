@@ -550,7 +550,7 @@ FM2_STUB_CASE(M4_STO_07, "M4-STO-07")
     HeartbeatOwner heartbeat{MakeHeartbeatOwner()};
     return FirstDeviation("M4-STO-07", {Observe(signer.AppendViewState(storage::ViewStateRecord{0, 1})),
                                         Observe(signer.AppendNewViewAccepted(storage::NewViewAcceptedRecord{0, 1, Bytes("nv")})),
-                                        Observe(commit.AppendPreparedQc(storage::PreparedQcRecord{0, 1, 1, uint256::ONE, Bytes("qc")}))});
+                                        Observe(commit.AppendPreparedQc(storage::PreparedQcRecord{0, 1, 1, uint256::ONE, Bytes("qc"), {}, {}}))});
 }
 
 // ---- Slice R9: the state owner ----

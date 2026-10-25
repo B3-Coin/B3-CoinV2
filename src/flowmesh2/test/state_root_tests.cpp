@@ -44,7 +44,7 @@ StateRootsV0 LabelledRoots()
 {
     return StateRootsV0{LabelHash("fm2/test/root/accounts"), LabelHash("fm2/test/root/orders"),
                         LabelHash("fm2/test/root/markets"), LabelHash("fm2/test/root/nullifiers"),
-                        LabelHash("fm2/test/root/totals")};
+                        LabelHash("fm2/test/root/totals"), uint256{}};
 }
 
 void Flip(uint256& value) { value.data()[0] ^= 0x01; }

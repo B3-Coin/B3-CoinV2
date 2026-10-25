@@ -79,7 +79,7 @@ public:
             if (m_view && (m_changing || !m_new_view || m_new_view->selected != (*accepted)->header.Hash())) return Refuse(ErrorCode::FENCED, "PBFT_RESTORED_ACCEPTANCE_NOT_SELECTED");
             Proposal proposal{0, m_view, (*accepted)->header, m_parent_certificate, (*accepted)->body};
             if (auto body{Cache(proposal)}; !body.has_value()) return body.error();
-            auto [it, inserted]{m_states.emplace(m_view, ViewState{proposal.header.Hash()})};
+            auto [it, inserted]{m_states.emplace(m_view, ViewState{proposal.header.Hash(), {}, {}})};
             it->second.accepted = true;
             m_offer = proposal.header.Hash();
             m_have_work = true;
@@ -273,7 +273,7 @@ public:
         if (available && available->header.Hash() == *selected) body = Ok(std::optional<Proposal>{*available});
         if (!*body) return Ok(std::optional<ControlNewView>{});
         auto proposal{**body}; proposal.view = m_view;
-        ControlNewView view{key, *selected, reports, {}}; view.selected_proposal = proposal;
+        ControlNewView view{key, *selected, reports, {}, {}}; view.selected_proposal = proposal;
         if (auto proof{VerifyControlNewViewEvidence(view, m_context.owner.Head()->Header(), m_seats, m_profile)}; !proof.has_value()) return proof.error();
         if (auto execution{ValueExecutable(proposal)}; !execution.has_value()) return execution.error();
         return Ok(std::optional<ControlNewView>{std::move(view)});
@@ -508,7 +508,7 @@ private:
         if (const auto existing{m_states.find(m_view)}; existing != m_states.end() && existing->second.hash != proposal.header.Hash()) return Refuse(ErrorCode::EQUIVOCATION_REFUSED, "PBFT_PROPOSAL_CONFLICT");
         if (auto valid{Executable(proposal)}; !valid.has_value()) return valid.error();
         if (auto cached{Cache(proposal)}; !cached.has_value()) return cached.error();
-        const auto [it, inserted]{m_states.try_emplace(m_view, ViewState{proposal.header.Hash()})};
+        const auto [it, inserted]{m_states.try_emplace(m_view, ViewState{proposal.header.Hash(), {}, {}})};
         if (!inserted && it->second.hash != proposal.header.Hash()) return Refuse(ErrorCode::EQUIVOCATION_REFUSED, "PBFT_PROPOSAL_CONFLICT");
         it->second.accepted = true;
         if (!m_offer) m_offer = proposal.header.Hash();
@@ -627,7 +627,7 @@ private:
         else {
             const auto key{std::pair{vote.view, vote.header_hash}};
             if (!m_observed_votes.contains(key) && m_observed_votes.size() >= 128) return Refuse(ErrorCode::BUSY, "PBFT_RECEIVED_VOTE_BOUND");
-            bucket = &m_observed_votes.try_emplace(key, ViewState{vote.header_hash}).first->second;
+            bucket = &m_observed_votes.try_emplace(key, ViewState{vote.header_hash, {}, {}}).first->second;
         }
         auto& votes{vote.phase == storage::VotePhase::PREPARE ? bucket->prepares : bucket->commits};
         if (const auto old{votes.find(vote.seat)}; old != votes.end() && old->second != vote) return Refuse(ErrorCode::EQUIVOCATION_REFUSED, "PBFT_DOUBLE_VOTE");
@@ -795,7 +795,7 @@ private:
         if (!found.has_value()) return found.error();
         if (!*found) return Ok();
         auto proposal{**found}; proposal.view = m_view;
-        ControlNewView view{Key(m_view, storage::ControlPhase::NEW_VIEW), *selected, reports, {}};
+        ControlNewView view{Key(m_view, storage::ControlPhase::NEW_VIEW), *selected, reports, {}, {}};
         view.selected_proposal = proposal; // exact body becomes part of the durable NV intent
         if (auto proof{VerifyControlNewViewEvidence(view, m_context.owner.Head()->Header(), m_seats, m_profile)}; !proof.has_value()) return proof.error();
         if (auto value{ValueExecutable(proposal)}; !value.has_value()) return value.error();
