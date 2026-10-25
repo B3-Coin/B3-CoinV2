@@ -171,7 +171,7 @@ if(BUILD_FLOWMESH2)
 
   # Authenticated socket/crypto boundary. The deterministic core and pure
   # verifier retain their existing link isolation from bitcoin_common.
-  add_library(fm2_transport STATIC net/tcp_mesh.cpp ${PROJECT_SOURCE_DIR}/src/bip324.cpp)
+  add_library(fm2_transport STATIC net/tcp_mesh.cpp net/tcp_mesh_wire.cpp ${PROJECT_SOURCE_DIR}/src/bip324.cpp)
   target_link_libraries(fm2_transport PRIVATE core_interface fm2_warnings
     PUBLIC fm2_core bitcoin_common)
 
@@ -328,6 +328,7 @@ if(BUILD_FLOWMESH2)
     test/state_owner_tests.cpp
     test/state_root_tests.cpp
     test/tcp_mesh_tests.cpp
+    test/tcp_mesh_wire_tests.cpp
     test/stub_inventory_tests.cpp
     test/validate_slot_tests.cpp
     test/verify_tests.cpp

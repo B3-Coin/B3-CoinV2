@@ -4,6 +4,7 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <flowmesh2/net/tcp_mesh.h>
+#include <flowmesh2/net/tcp_mesh_wire.h>
 
 #include <bip324.h>
 #include <hash.h>
@@ -49,9 +50,7 @@ bool WouldBlock(int error)
 constexpr std::string_view CONFIG_BAD{"invalid authenticated TCP mesh configuration"};
 constexpr std::string_view ENDPOINT_BAD{"invalid signed seat endpoint or counter rollback"};
 constexpr std::string_view SOCKET_BAD{"cannot bind authenticated seat listener"};
-constexpr size_t HELLO_BYTES{74};
 constexpr size_t IO_BUDGET{256 * 1024};
-constexpr unsigned char WIRE_VERSION{1};
 
 void Put32(std::vector<unsigned char>& b, uint32_t n)
 {
@@ -60,12 +59,6 @@ void Put32(std::vector<unsigned char>& b, uint32_t n)
 void Put64(std::vector<unsigned char>& b, uint64_t n)
 {
     for (int i{0}; i != 8; ++i) b.push_back((n >> (8 * i)) & 255);
-}
-uint32_t Get32(const unsigned char* p)
-{
-    uint32_t n{0};
-    for (int i{0}; i != 4; ++i) n |= uint32_t{p[i]} << (8 * i);
-    return n;
 }
 void Common(std::vector<unsigned char>& b, const TcpMeshConfig& c)
 {
@@ -341,10 +334,11 @@ private:
 
     void MakeHello(Link& link)
     {
-        link.wire = {WIRE_VERSION, static_cast<unsigned char>(link.lane)};
-        Put32(link.wire, Config().self_seat);
-        Put32(link.wire, link.peer);
-        for (const auto b : link.cipher->GetOurPubKey()) link.wire.push_back(static_cast<unsigned char>(b));
+        MeshHello hello{link.lane, Config().self_seat, link.peer, {}};
+        const auto key{link.cipher->GetOurPubKey()};
+        std::transform(key.begin(), key.end(), hello.ellswift.begin(), [](std::byte b) { return static_cast<unsigned char>(b); });
+        const auto bytes{EncodeHello(hello)};
+        link.wire.assign(bytes.begin(), bytes.end());
         link.sending = Link::Sending::HELLO;
     }
     void Encrypt(Link& link, std::span<const unsigned char> bytes)
@@ -434,18 +428,14 @@ private:
         link.hello.resize(HELLO_BYTES);
         if (!ReadInto(link, link.hello.data(), HELLO_BYTES, link.packet_pos, budget)) return;
         const auto& h{link.hello};
-        const uint32_t claimed{Get32(h.data() + 2)};
-        const uint32_t target{Get32(h.data() + 6)};
-        const Lane lane{static_cast<Lane>(h[1])};
-        if (h[0] != WIRE_VERSION || !IsKnown(lane) || target != Config().self_seat ||
-            claimed >= Config().seat_count || claimed == Config().self_seat ||
-            (link.initiator && (claimed != link.peer || lane != link.lane)) ||
-            (!link.initiator && claimed >= Config().self_seat)) {
+        const auto hello{CheckHello(std::span<const unsigned char, HELLO_BYTES>{h.data(), HELLO_BYTES},
+            HelloExpectation{Config().self_seat, Config().seat_count, link.initiator, link.peer, link.lane})};
+        if (!hello) {
             link.dead = true;
             return;
         }
-        link.peer = claimed;
-        link.lane = lane;
+        link.peer = hello->from_seat;
+        link.lane = hello->lane;
         // An existing socket remains active until the replacement proves its
         // identity. Merely claiming this seat or lane cannot evict it.
         link.cipher->InitializeForNetwork(EllSwiftPubKey{std::as_bytes(std::span{h}.subspan(10))},
