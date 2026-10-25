@@ -118,7 +118,8 @@ Result<SignerLog> SignerLog::CreateImpl(Journal& journal, const ProfileParams* p
             }
             if (!BodyMatchesHeader(header, accepted->body)) return Error{ErrorCode::VERIFY_FAILED, BODY_HEADER_MISMATCH};
             const auto [it, inserted]{log.m_proposals.emplace(
-                accepted->key, ProposalEntry{header.Hash(), header.domain, VersionedCommitDigest(header, accepted->key.view), record.seq})};
+                accepted->key,
+                ProposalEntry{header.Hash(), header.domain, VersionedCommitDigest(header, accepted->key.view), record.seq, record.payload})};
             if (!inserted && it->second.header_hash != header.Hash()) return Error{ErrorCode::EQUIVOCATION_REFUSED, PROPOSAL_CONFLICT};
             break;
         }
@@ -181,10 +182,10 @@ Result<PendingProposal> SignerLog::AppendAcceptedProposal(const ProposalKey& key
         if (it->second.header_hash != header_hash) return Error{ErrorCode::EQUIVOCATION_REFUSED, PROPOSAL_CONFLICT};
         return Ok(PendingProposal{m_journal->InstanceId(), it->second.seq, ref});
     }
-    const std::vector<unsigned char> payload{AcceptedProposalRecord{key, header, body}.Encode()};
+    std::vector<unsigned char> payload{AcceptedProposalRecord{key, header, body}.Encode()};
     Result<uint64_t> seq{m_journal->Append(RecordType::ACCEPTED_PROPOSAL, payload)};
     if (!seq.has_value()) return seq.error();
-    m_proposals.emplace(key, ProposalEntry{header_hash, header.domain, VersionedCommitDigest(header, key.view), *seq});
+    m_proposals.emplace(key, ProposalEntry{header_hash, header.domain, VersionedCommitDigest(header, key.view), *seq, std::move(payload)});
     return Ok(PendingProposal{m_journal->InstanceId(), *seq, ref});
 }
 
@@ -260,15 +261,14 @@ std::optional<PendingSignedVote> SignerLog::SignedAt(const VoteKey& key) const
 Result<std::optional<AcceptedProposalRecord>> SignerLog::AcceptedAt(const ProposalKey& key, const ProfileParams& profile) const
 {
     if (IsFatal()) return Error{ErrorCode::FENCED, JOURNAL_FENCED};
-    auto records{m_journal->ReadAll()};
-    if (!records.has_value()) return records.error();
-    for (const auto& record : *records) {
-        if (record.type != RecordType::ACCEPTED_PROPOSAL) continue;
-        auto proposal{AcceptedProposalRecord::Decode(record.payload, profile)};
-        if (!proposal.has_value()) return proposal.error();
-        if (proposal->key == key) return Ok(std::optional{std::move(*proposal)});
-    }
-    return Ok(std::optional<AcceptedProposalRecord>{});
+    // The index keeps the first record of each key (a repeat appends nothing,
+    // recovery keeps the first), which is the record a scan of the durable
+    // journal finds first; the durable prefix is every seq <= DurableSeq.
+    const auto it{m_proposals.find(key)};
+    if (it == m_proposals.end() || it->second.seq > m_journal->DurableSeq()) return Ok(std::optional<AcceptedProposalRecord>{});
+    auto proposal{AcceptedProposalRecord::Decode(it->second.payload, profile)};
+    if (!proposal.has_value()) return proposal.error();
+    return Ok(std::optional{std::move(*proposal)});
 }
 
 std::vector<uint64_t> SignerLog::DurableAcceptedViewsAt(uint64_t epoch, uint64_t slot) const

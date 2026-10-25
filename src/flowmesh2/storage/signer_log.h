@@ -169,6 +169,11 @@ public:
     bool Knows(const DurableIntent& intent) const;
     //! Exact durable retained data for restart/retransmission; never signs.
     std::optional<PendingSignedVote> SignedAt(const VoteKey& key) const;
+    /** The durable accepted proposal of `key`, decoded under `profile`, or
+     * nullopt while it is absent or not yet durable. One map lookup and one
+     * decode: the payload is kept with the index entry, so the cost does not
+     * grow with the slots signed (it used to re-read the whole journal).
+     */
     Result<std::optional<AcceptedProposalRecord>> AcceptedAt(const ProposalKey& key, const ProfileParams& profile) const;
     //! Every ordinary intent/signed vote is bound to one accepted proposal.
     //! Only views whose accepted record passed its barrier are returned.
@@ -191,6 +196,8 @@ private:
         uint256 domain;
         uint256 commit_digest;
         uint64_t seq{0};
+        //! The exact ACCEPTED_PROPOSAL payload at `seq` (AcceptedAt decodes it).
+        std::vector<unsigned char> payload;
     };
     struct VoteEntry {
         uint256 digest;

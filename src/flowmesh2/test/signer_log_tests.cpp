@@ -11,8 +11,12 @@
 #include <flowmesh2/test/util/storage_fixtures.h>
 #include <util/strencodings.h>
 
+#include <algorithm>
+#include <chrono>
 #include <cstdint>
+#include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -423,6 +427,150 @@ BOOST_AUTO_TEST_CASE(stubs_return_their_task_ids)
     RequireStub(f.log.AppendNewViewAccepted(NewViewAcceptedRecord{0, 1, Bytes("nv")}), "M4-STO-07");
     // The stubs wrote nothing.
     BOOST_CHECK_EQUAL(f.journal->Status().appended_seq, 1U);
+}
+
+BOOST_AUTO_TEST_SUITE_END()
+
+namespace {
+
+/** The answers AcceptedAt gave before it was indexed, from one scan of the
+ * durable journal: the first ACCEPTED_PROPOSAL record of each key.
+ */
+std::map<ProposalKey, AcceptedProposalRecord> ScanAccepted(const Journal& journal, const ProfileParams& profile)
+{
+    std::map<ProposalKey, AcceptedProposalRecord> first;
+    const auto records{journal.ReadAll()};
+    RequireStorageOk(records, "scan the durable journal");
+    for (const auto& record : *records) {
+        if (record.type != RecordType::ACCEPTED_PROPOSAL) continue;
+        auto proposal{AcceptedProposalRecord::Decode(record.payload, profile)};
+        RequireStorageOk(proposal, "decode a durable proposal");
+        first.emplace(proposal->key, std::move(*proposal));
+    }
+    return first;
+}
+
+//! "" when the log answers `key` as the scan does, byte for byte.
+std::string SameAnswer(const SignerLog& log, const std::map<ProposalKey, AcceptedProposalRecord>& scan, const ProposalKey& key,
+                       const ProfileParams& profile)
+{
+    const auto got{log.AcceptedAt(key, profile)};
+    if (!got.has_value()) return "lookup failed: " + std::string{got.error().detail};
+    const auto want{scan.find(key)};
+    if (got->has_value() != (want != scan.end())) return got->has_value() ? "an answer the scan does not have" : "a missing answer";
+    if (got->has_value() && (*got)->Encode() != want->second.Encode()) return "other bytes";
+    return "";
+}
+
+using AcceptedClock = std::chrono::steady_clock;
+
+//! Fastest of `reps` mean AcceptedAt times, in microseconds, of the newest of `slots` durable proposals.
+double TimeAcceptedAt(uint64_t slots, int reps)
+{
+    SignerFixture f{70};
+    for (uint64_t height{1}; height <= slots; ++height) f.Accept(MakeStorageSlot(height, 0, "cost/" + std::to_string(height)), 0);
+    RequireStorageOk(f.log.Barrier(), "make the proposals durable");
+    const ProposalKey newest{0, slots, 0};
+    const ProfileParams profile{Profile()};
+    BOOST_REQUIRE(f.log.AcceptedAt(newest, profile).value().has_value());
+    double best{1e300};
+    for (int rep{0}; rep < reps; ++rep) {
+        constexpr int CALLS{50};
+        const auto start{AcceptedClock::now()};
+        for (int call{0}; call < CALLS; ++call) {
+            const auto found{f.log.AcceptedAt(newest, profile)};
+            if (!found.has_value() || !found->has_value()) BOOST_FAIL("AcceptedAt lost the newest proposal");
+        }
+        const std::chrono::duration<double, std::micro> took{AcceptedClock::now() - start};
+        best = std::min(best, took.count() / CALLS);
+    }
+    return best;
+}
+
+} // namespace
+
+BOOST_AUTO_TEST_SUITE(signer_log_accepted_tests)
+
+BOOST_AUTO_TEST_CASE(accepted_at_costs_the_same_with_two_thousand_slots_as_with_a_hundred)
+{
+    // Every agreement step of the regtest PBFT looks up the proposal it
+    // accepted (agreement/regtest_pbft, dev/regtest_operator); a scan of the
+    // journal made each step slower with every slot signed (latency report).
+    const double small{TimeAcceptedAt(100, 5)};
+    const double large{TimeAcceptedAt(2'000, 5)};
+    BOOST_TEST_MESSAGE("AcceptedAt of the newest proposal: " << small << " us at 100 slots, " << large << " us at 2000 slots, ratio "
+                                                             << large / small);
+    BOOST_CHECK_LT(large / small, 5.0);
+}
+
+BOOST_AUTO_TEST_CASE(accepted_at_answers_like_a_scan_of_the_durable_journal)
+{
+    // 400 slots, a few in two or three views; barriers now and then, so that
+    // some records are durable and some only appended; a repeated accept;
+    // and keys that were never accepted. Every answer must be the scan's,
+    // byte for byte, before and after a rebuild from the journal.
+    // Thinned to a checkpoint every 50 slots to keep the sanitizer time low.
+    SignerFixture f{71};
+    const ProfileParams profile{Profile()};
+    std::vector<ProposalKey> keys;
+    uint64_t state{0x4acc};
+    const auto next{[&state] {
+        state = state * 6'364'136'223'846'793'005ULL + 1'442'695'040'888'963'407ULL;
+        return state >> 33;
+    }};
+    size_t durable_answers{0}, pending_answers{0};
+    for (uint64_t height{1}; height <= 400; ++height) {
+        const uint64_t views{next() % 8 == 0 ? 1 + next() % 3 : 1};
+        for (uint64_t view{0}; view < views; ++view) {
+            const StorageSlot slot{MakeStorageSlot(height, 0, "scan/" + std::to_string(height) + "/" + std::to_string(view))};
+            const PendingProposal first{f.Accept(slot, view)};
+            if (next() % 16 == 0) BOOST_REQUIRE(f.Accept(slot, view) == first); // the repeat keeps the first record
+            keys.push_back(ProposalKey{0, height, view});
+        }
+        if (next() % 5 == 0) RequireStorageOk(f.log.Barrier(), "barrier");
+        if (height % 50 == 0) {
+            const auto scan{ScanAccepted(*f.journal, profile)};
+            for (const ProposalKey& key : keys) {
+                const std::string difference{SameAnswer(f.log, scan, key, profile)};
+                if (!difference.empty()) BOOST_FAIL("height " << height << " key " << key.slot << "/" << key.view << ": " << difference);
+                if (scan.contains(key)) {
+                    ++durable_answers;
+                } else {
+                    ++pending_answers;
+                }
+            }
+        }
+    }
+    const std::vector<ProposalKey> absent{{0, 401, 0}, {0, 1, 7}, {1, 1, 0}, {0, 0, 0}};
+    for (const ProposalKey& key : absent) BOOST_CHECK(!f.log.AcceptedAt(key, profile).value().has_value());
+    BOOST_TEST_MESSAGE("answers compared: " << durable_answers << " durable, " << pending_answers << " not yet durable");
+    BOOST_CHECK_GT(durable_answers, 1'000U);
+    BOOST_CHECK_GT(pending_answers, 10U);
+
+    // A log rebuilt from the journal answers the same.
+    RequireStorageOk(f.log.Barrier(), "last barrier");
+    Result<SignerLog> created{SignerLog::Create(*f.journal, profile)};
+    RequireStorageOk(created, "rebuild");
+    const SignerLog restored{std::move(created).value()};
+    const auto scan{ScanAccepted(*f.journal, profile)};
+    BOOST_CHECK_EQUAL(scan.size(), keys.size());
+    for (const ProposalKey& key : keys) {
+        BOOST_REQUIRE_EQUAL(SameAnswer(f.log, scan, key, profile), "");
+        BOOST_REQUIRE_EQUAL(SameAnswer(restored, scan, key, profile), "");
+    }
+}
+
+BOOST_AUTO_TEST_CASE(accepted_at_after_a_fatal_barrier_is_fenced)
+{
+    SignerFixture f{72, MemoryJournalFaults{.fail_barrier = 2}};
+    const StorageSlot slot{MakeStorageSlot(1, 0, "fenced")};
+    f.Accept(slot, 0);
+    RequireStorageOk(f.log.Barrier(), "first barrier");
+    const ProfileParams profile{Profile()};
+    BOOST_REQUIRE(f.log.AcceptedAt(ProposalKey{0, 1, 0}, profile).value().has_value());
+    f.Accept(MakeStorageSlot(2, 0, "fenced/2"), 0);
+    RequireRefusal(f.log.Barrier(), ErrorCode::STORAGE_FATAL, MEMORY_JOURNAL_BARRIER_FAULT, "second barrier");
+    RequireRefusal(f.log.AcceptedAt(ProposalKey{0, 1, 0}, profile), ErrorCode::FENCED, JOURNAL_FENCED, "lookup after fatal");
 }
 
 BOOST_AUTO_TEST_SUITE_END()
