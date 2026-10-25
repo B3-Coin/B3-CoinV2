@@ -515,14 +515,12 @@ FM2_STUB_CASE(M4_STO_02, "M4-STO-02")
 
 FM2_STUB_CASE(M4_STO_03, "M4-STO-03")
 {
-    // Write and Load; the store touches no file in the outline. StateOwner::Restore (R9).
-    storage::SnapshotStore store{fs::PathFromString(FM2_TEST_TMP_DIR) / fs::u8path("stub_m4_sto_03_never_created")};
-    const storage::SnapshotMark mark{1, uint256::ONE, uint256::ONE};
+    // StateOwner::Restore (R9) and the replay of a SNAPSHOT_MARK record. The
+    // snapshot bytes (state/snapshot.h) and SnapshotStore are real since the 2026-10-25 run.
     HeartbeatOwner heartbeat{MakeHeartbeatOwner()};
     const std::shared_ptr<const state::HeadView> head{heartbeat.owner->Head()};
     const std::vector<storage::JournalRecord> marked{{1, storage::RecordType::SNAPSHOT_MARK, {}, uint256{}}};
-    return FirstDeviation("M4-STO-03", {Observe(store.Write(mark, Bytes("state"))), Observe(store.Load(mark)),
-                                        Observe(heartbeat.owner->Restore(*head, {})),
+    return FirstDeviation("M4-STO-03", {Observe(heartbeat.owner->Restore(*head, {})),
                                         Observe(state::ReplayDecisions(*head, marked))});
 }
 

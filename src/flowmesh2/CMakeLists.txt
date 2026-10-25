@@ -155,12 +155,14 @@ if(BUILD_FLOWMESH2)
     storage/record.cpp
     storage/seat_signer.cpp
     storage/signer_log.cpp
+    storage/snapshot_mark.cpp
     storage/snapshot_store.cpp
   )
   target_link_libraries(fm2_core
     PRIVATE
       core_interface
       crc32c
+      leveldb
       fm2_warnings
     PUBLIC
       flowmesh2_foundations
@@ -320,6 +322,7 @@ if(BUILD_FLOWMESH2)
     test/sim_trace_tests.cpp
     test/sim_walking_skeleton_tests.cpp
     test/slot_tests.cpp
+    test/snapshot_store_tests.cpp
     test/snapshot_tests.cpp
     test/state_owner_tests.cpp
     test/state_root_tests.cpp
