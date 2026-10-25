@@ -433,6 +433,9 @@ def create_local_tls(directory):
             subprocess.run(['openssl', 'req', '-x509', '-newkey', 'ec', '-pkeyopt', 'ec_paramgen_curve:P-256',
                             '-noenc', '-days', '2', '-subj', '/CN=fm2-local-operator',
                             '-addext', 'subjectAltName=IP:127.0.0.1,IP:::1',
+                            # A server certificate, not a CA: rustls/webpki (B3 Hive)
+                            # refuses a CA certificate presented by a server.
+                            '-addext', 'basicConstraints=critical,CA:FALSE',
                             '-keyout', str(key), '-out', str(certificate)], check=True, capture_output=True)
         finally:
             os.umask(previous)

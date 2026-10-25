@@ -86,6 +86,16 @@ class HttpsBoundary(unittest.TestCase):
         self.assertEqual(caught.exception.status, 495)
         self.assertEqual(self.calls, [])
 
+    def test_certificate_is_a_server_certificate_not_a_ca(self):
+        # rustls/webpki clients (B3 Hive) refuse a CA certificate that a
+        # server presents as its own (CaUsedAsEndEntity).
+        import subprocess
+        text = subprocess.run(['openssl', 'x509', '-in', self.config['certificate'], '-noout', '-ext',
+                               'basicConstraints'], check=True, capture_output=True, text=True).stdout
+        self.assertIn('critical', text)
+        self.assertIn('CA:FALSE', text)
+        self.assertNotIn('CA:TRUE', text)
+
     def test_tls12_and_plaintext_never_dispatch(self):
         context = ssl.create_default_context(cafile=self.config['certificate'])
         context.maximum_version = ssl.TLSVersion.TLSv1_2
