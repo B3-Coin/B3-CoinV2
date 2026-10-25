@@ -143,6 +143,7 @@ if(BUILD_FLOWMESH2)
     read/views.cpp
     state/candidate.cpp
     state/replay.cpp
+    state/snapshot.cpp
     state/state_owner.cpp
     storage/commit_log.cpp
     storage/control_log.cpp
@@ -319,6 +320,7 @@ if(BUILD_FLOWMESH2)
     test/sim_trace_tests.cpp
     test/sim_walking_skeleton_tests.cpp
     test/slot_tests.cpp
+    test/snapshot_tests.cpp
     test/state_owner_tests.cpp
     test/state_root_tests.cpp
     test/tcp_mesh_tests.cpp

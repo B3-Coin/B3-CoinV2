@@ -19,6 +19,7 @@
 #include <cstdint>
 #include <map>
 #include <set>
+#include <span>
 #include <string_view>
 #include <utility>
 
@@ -70,6 +71,9 @@
  * (M2-LED-07 replaces it with the frozen model's rules).
  */
 namespace flowmesh2::ledger {
+
+//! (INVALID_INPUT) FromLeaves: leaves out of order, repeated or not canonical.
+inline constexpr std::string_view LEDGER_LEAVES_ORDER{"ledger leaves out of order or not canonical"};
 
 //! One account's spot balance of one asset.
 struct Balance {
@@ -130,6 +134,21 @@ public:
      * profile that turns on an outline stub returns that stub's error.
      */
     static Result<LedgerState> Create(const ProfileParams& profile);
+
+    /** The ledger whose commitment leaves these are (M4-STO-03 snapshots,
+     * state/snapshot.h): every account's canonical leaf, ascending
+     * AccountId; the nullifier set, ascending; every asset's totals,
+     * ascending AssetId, none all-zero; every withdrawal record, ascending
+     * ActionId. Create(profile)'s errors first. INVALID_INPUT
+     * (LEDGER_LEAVES_ORDER) for leaves out of order or repeated, a leaf that
+     * is not canonical, or a nonce list the profile's window does not hold.
+     * Then CheckConservation (INVARIANT), so a ledger no operation sequence
+     * could reach is refused, as far as the conservation rules can tell.
+     */
+    static Result<LedgerState> FromLeaves(const ProfileParams& profile, std::span<const AccountLeafV0> accounts,
+                                          std::span<const Outpoint> nullifiers,
+                                          std::span<const std::pair<AssetId, AssetTotals>> totals,
+                                          std::span<const WithdrawalRecord> withdrawals);
 
     // ---- Reads --------------------------------------------------------------
 

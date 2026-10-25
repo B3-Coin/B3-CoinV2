@@ -110,6 +110,41 @@ Result<LedgerState> LedgerState::Create(const ProfileParams& profile)
     return Ok(LedgerState{profile, SeatPoolAccount(profile_hash), TreasuryAccount(profile_hash), std::move(window).value()});
 }
 
+Result<LedgerState> LedgerState::FromLeaves(const ProfileParams& profile, std::span<const AccountLeafV0> accounts,
+                                            std::span<const Outpoint> nullifiers,
+                                            std::span<const std::pair<AssetId, AssetTotals>> totals,
+                                            std::span<const WithdrawalRecord> withdrawals)
+{
+    Result<LedgerState> created{Create(profile)};
+    if (!created.has_value()) return created.error();
+    LedgerState ledger{std::move(created).value()};
+    const Error bad{ErrorCode::INVALID_INPUT, LEDGER_LEAVES_ORDER};
+    for (size_t i{0}; i < accounts.size(); ++i) {
+        const AccountLeafV0& leaf{accounts[i]};
+        if ((i > 0 && !(accounts[i - 1].account < leaf.account)) || !leaf.IsCanonical(profile)) return bad;
+        Result<NonceWindow> window{NonceWindow::FromUsed(profile.nonce_window, leaf.used_nonces)};
+        if (!window.has_value()) return bad;
+        AccountState state{std::move(window).value()};
+        for (const AssetBalance& balance : leaf.balances) state.balances.emplace_hint(state.balances.end(), balance.asset, Balance{balance.available, balance.reserved});
+        state.open_orders = leaf.open_orders;
+        ledger.m_accounts.emplace_hint(ledger.m_accounts.end(), leaf.account, std::move(state));
+    }
+    for (size_t i{0}; i < nullifiers.size(); ++i) {
+        if (i > 0 && !(nullifiers[i - 1] < nullifiers[i])) return bad;
+        ledger.m_nullifiers.emplace_hint(ledger.m_nullifiers.end(), nullifiers[i]);
+    }
+    for (size_t i{0}; i < totals.size(); ++i) {
+        if ((i > 0 && !(totals[i - 1].first < totals[i].first)) || totals[i].second.IsZero()) return bad;
+        ledger.m_totals.emplace_hint(ledger.m_totals.end(), totals[i].first, totals[i].second);
+    }
+    for (size_t i{0}; i < withdrawals.size(); ++i) {
+        if ((i > 0 && !(withdrawals[i - 1].id < withdrawals[i].id)) || !withdrawals[i].IsCanonical()) return bad;
+        ledger.m_withdrawals.emplace_hint(ledger.m_withdrawals.end(), withdrawals[i].id, withdrawals[i]);
+    }
+    if (const Result<void> conserved{ledger.CheckConservation()}; !conserved.has_value()) return conserved.error();
+    return Ok(std::move(ledger));
+}
+
 bool LedgerState::IsProtocolAccount(const AccountId& account) const
 {
     return account == m_seat_pool || account == m_treasury;
