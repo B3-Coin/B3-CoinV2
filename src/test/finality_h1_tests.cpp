@@ -1916,4 +1916,80 @@ BOOST_FIXTURE_TEST_CASE(h2_pin_above_rh_refuses_competitor, H1ChainFixture)
     BOOST_CHECK(V1FieldsAsWithoutH1());
 }
 
+// (q) The quorum-reduction counter-argument (interim repair, task 3.1).
+// Lowering the V1 certificate threshold cannot unfreeze a broken lineage:
+// once the extension is exhausted, placement refuses every certificate as
+// lineage-broken before it looks at a signature or a quorum. The test signs
+// a certificate with every member of the frozen set (so it meets any
+// threshold, 1-of-2 and 2-of-3 included), shows that exactly this block is
+// valid one height before the break, and that it is refused after it. The
+// V1 set stays frozen; from R_h the H1 schedule lets the new stake produce.
+BOOST_FIXTURE_TEST_CASE(unanimous_certificate_after_break_refused_h1_unfreezes, H1ChainFixture)
+{
+    // V1 Set_0 = {A 15, B 1}, W 16; C (10) is staked but not bound.
+    PrepareFinalityChain(/*min_finality_set=*/1, /*reorg_horizon=*/200, /*with_unbound_c=*/true);
+    const int M{m_M};
+    const int E{SCALED_E};
+    const int break_height{M + E + SCALED_MAX_EXTENSION};
+    const int R_h{break_height + 10};
+    ConfigureH1(R_h);
+
+    Produce(m_vk_a); // M: V1 bootstrap
+    const auto set0{FinalityState().current};
+    BOOST_REQUIRE(set0);
+    BOOST_CHECK_EQUAL(set0->Size(), 2U);
+    BOOST_CHECK_EQUAL(set0->TotalWeight(), 16U);
+
+    // C binds at M + 5; V1 never hands over, so C never enters its set.
+    ProduceTo(M + 4, m_vk_a);
+    const auto bind_c{MakeBinding(m_validator_c, m_vk_c, &m_bls_c, 0)};
+    Produce(m_vk_a, {}, {MakeTx(8, {bind_c.cell}, {bind_c.record})});
+
+    // The handover certificate of epoch 0, signed by A and B: every member.
+    ProduceTo(break_height - 2, m_vk_a);
+    const auto before{FinalityState()};
+    BOOST_REQUIRE(before.next);
+    BOOST_CHECK(!before.lineage_broken);
+    int cp{M};
+    while (!modern::IsCheckpointHeight(cp, M, SCALED_INTERVAL)) ++cp;
+    const auto cert{MakeCertificate({cp, 0, before.next->SetHash()}, *set0)};
+    {
+        // One height before the break the same certificate is valid.
+        const CBlock block{BuildPosBlock(m_vk_a, {cert})};
+        BOOST_CHECK_EQUAL(Probe(block), "");
+    }
+    Produce(m_vk_a); // break_height - 1, without the certificate
+    BOOST_CHECK(!FinalityState().lineage_broken);
+    Produce(m_vk_a); // break_height: the extension is exhausted
+    BOOST_CHECK(FinalityState().lineage_broken);
+    {
+        const CBlock block{BuildPosBlock(m_vk_a, {cert})};
+        const std::string probe{Probe(block)};
+        BOOST_CHECK_MESSAGE(probe.find("lineage-broken") != std::string::npos, "got '" << probe << "'");
+    }
+    ProduceExpectConnectFailure(m_vk_a, {cert});
+    {
+        const auto s{FinalityState()};
+        BOOST_CHECK(s.lineage_broken);
+        BOOST_CHECK_EQUAL(s.epoch, 0U);
+        BOOST_CHECK(HashOf(s.current) == set0->SetHash());
+        BOOST_CHECK(!s.finalized);
+    }
+
+    // Frozen through R_h - 1: C, ACTIVE and bound, has no weight.
+    ProduceTo(R_h - 2, m_vk_a);
+    BOOST_CHECK(Weights(m_vk_c) == std::make_pair(CAmount{0}, CAmount{16}));
+    ProduceExpectConnectFailure(m_vk_c, {}, 1);
+    Produce(m_vk_a); // R_h - 1
+
+    // From R_h the producer set is Snapshot(R_h - 1) = {A, B, C}, W 26.
+    BOOST_CHECK(Weights(m_vk_c) == std::make_pair(CAmount{10}, CAmount{26}));
+    Produce(m_vk_c); // R_h: the new stake produces
+    const auto s{FinalityState()};
+    BOOST_REQUIRE(s.producers);
+    BOOST_CHECK_EQUAL(s.producers->epoch_start, R_h);
+    BOOST_CHECK(s.lineage_broken); // V1 itself stays frozen and broken
+    BOOST_CHECK(HashOf(s.current) == set0->SetHash());
+}
+
 BOOST_AUTO_TEST_SUITE_END()

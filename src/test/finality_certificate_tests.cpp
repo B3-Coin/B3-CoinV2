@@ -24,6 +24,7 @@
 #include <boost/test/unit_test.hpp>
 
 #include <map>
+#include <numeric>
 #include <vector>
 
 using modern::CertificateCheck;
@@ -357,6 +358,60 @@ BOOST_AUTO_TEST_CASE(production_fail_closed_test_context_active)
     BOOST_CHECK(!modern::CheckTransactionMpa(CTransaction{m}, test_ctx, err));
     BOOST_CHECK_EQUAL(err, "mpa-bad-record-size");
     BOOST_CHECK(!modern::IsActivatedPolicy(6, 1));
+}
+
+// The quorum-reduction counter-argument (interim repair, task 3.1), the
+// arithmetic half: the mainnet epoch-10 set has 47 members and about 20 of
+// them still sign. Neither the V1 rule (more than 2/3 of the weight and more
+// than 2/3 of the members) nor a rule lowered to 2-of-3 or 1-of-2 of the
+// members is met by 20 signers, whatever their weights. The other half,
+// that no threshold matters once the lineage is broken, is
+// finality_h1_tests/unanimous_certificate_after_break_refused_h1_unfreezes.
+BOOST_AUTO_TEST_CASE(forty_seven_members_twenty_signing_meet_no_lowered_quorum)
+{
+    constexpr uint32_t MEMBERS{47};
+    constexpr uint32_t SIGNING{20};
+    const FinalizedBlock fb{Fb(1000, 10)};
+    //! The smallest signer count above num/den of n (the V1 form: n * 2 / 3 + 1).
+    const auto needed{[](uint32_t n, uint32_t num, uint32_t den) { return n * num / den + 1; }};
+    BOOST_CHECK_EQUAL(modern::FinalityHeadcountQuorum(MEMBERS), needed(MEMBERS, 2, 3));
+    BOOST_CHECK_EQUAL(needed(MEMBERS, 2, 3), 32U);
+    BOOST_CHECK_EQUAL(needed(MEMBERS, 1, 2), 24U);
+    BOOST_CHECK_LT(SIGNING, needed(MEMBERS, 1, 2));
+
+    // Equal weights: 20 of 47 is below half the weight and below both counts.
+    {
+        SetUnderTest set{std::vector<uint64_t>(MEMBERS, 1), 10};
+        BOOST_REQUIRE_EQUAL(set.view.validator_count, MEMBERS);
+        std::vector<uint32_t> signers(SIGNING);
+        std::iota(signers.begin(), signers.end(), 0U);
+        BOOST_CHECK(modern::VerifyFinalityCertificate(CHAIN_DOMAIN, fb, Sign(set, fb, signers), set.view, SUCCESSOR) ==
+                    CertificateCheck::INSUFFICIENT_WEIGHT);
+        BOOST_CHECK_LT(SIGNING * 2, MEMBERS); // not even half the weight
+    }
+    // The 20 signers hold most of the weight (10 each, 27 others 1 each):
+    // the weight test passes, the member count still refuses.
+    {
+        std::vector<uint64_t> weights(MEMBERS, 1);
+        for (uint32_t i{0}; i < SIGNING; ++i) weights[i] = 10;
+        SetUnderTest set{weights, 10};
+        std::vector<uint32_t> signers;
+        for (uint32_t i{0}; i < MEMBERS; ++i) {
+            if (set.view.weights[i] == 10) signers.push_back(i);
+        }
+        BOOST_REQUIRE_EQUAL(signers.size(), SIGNING);
+        BOOST_CHECK_GE(10U * SIGNING, set.view.quorum_weight);
+        BOOST_CHECK(modern::VerifyFinalityCertificate(CHAIN_DOMAIN, fb, Sign(set, fb, signers), set.view, SUCCESSOR) ==
+                    CertificateCheck::INSUFFICIENT_HEADCOUNT);
+    }
+    // For comparison, the V1 rule is met once enough members sign.
+    {
+        SetUnderTest set{std::vector<uint64_t>(MEMBERS, 1), 10};
+        std::vector<uint32_t> signers(needed(MEMBERS, 2, 3));
+        std::iota(signers.begin(), signers.end(), 0U);
+        BOOST_CHECK(modern::VerifyFinalityCertificate(CHAIN_DOMAIN, fb, Sign(set, fb, signers), set.view, SUCCESSOR) ==
+                    CertificateCheck::OK);
+    }
 }
 
 BOOST_AUTO_TEST_SUITE_END()
