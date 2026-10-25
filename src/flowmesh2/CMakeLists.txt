@@ -500,6 +500,18 @@ if(BUILD_FLOWMESH2)
     message(STATUS "flowmesh2 sanitizer canaries: ${fm2_canaries}")
   endif()
 
+  # Fuzz targets of every fm2 decoder (M0-FUZ-01): FUZZ=<target> bin/fm2_fuzz.
+  # libFuzzer when SANITIZERS includes fuzzer (Clang); otherwise a corpus
+  # replay driver (GCC). Its own driver, fuzz/fuzz_main.cpp, keeps the node's
+  # test_fuzz library and the V1 code out of this executable.
+  if(BUILD_FUZZ_BINARY)
+    add_executable(fm2_fuzz fuzz/fuzz_main.cpp fuzz/decoders.cpp)
+    target_link_libraries(fm2_fuzz PRIVATE core_interface fm2_warnings fuzzer_interface fm2_core fm2_transport)
+    if(NOT FUZZ_BINARY_LINKS_WITHOUT_MAIN_FUNCTION)
+      target_compile_definitions(fm2_fuzz PRIVATE FM2_FUZZ_PROVIDE_MAIN)
+    endif()
+  endif()
+
   # -------------------------------------------------------------------------
   # KEEP THIS SECTION LAST: it enumerates every target of this directory.
   #

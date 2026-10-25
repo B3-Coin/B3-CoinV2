@@ -186,6 +186,8 @@ Expected after R14 and the review fixes (O-89 to O-92): 10 CTests pass
 `flowmesh2_negative_compile` with six negative controls and a positive one).
 R14 itself had 505 cases and four negative controls. The file journal tests write only under
 `build-rebirth/fm2-test-tmp/`.
-Sanitizer builds and their canaries are described in ARCHITECTURE.md §13.2. Open gates (workspace lock reconciliation, decision
+Sanitizer builds and their canaries are described in ARCHITECTURE.md §13.2,
+and so is the fuzz binary `fm2_fuzz` (M0-FUZ-01), which has one target per
+fm2 decoder and is built only with `BUILD_FUZZ_BINARY=ON`. Open gates (workspace lock reconciliation, decision
 D3) are listed in ARCHITECTURE.md §0. All outline values are provisional and
 REGTEST-only.

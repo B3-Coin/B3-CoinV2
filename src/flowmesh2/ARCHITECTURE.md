@@ -209,6 +209,7 @@ so the existing `add_subdirectory(flowmesh2)` hook is reused.
 | `fm2_sim_cli` | binary `fm2-sim` (since R14; `sim/fm2_sim_main.cpp`) | `fm2_simlib`; guard rule 3 inspects it for V1 symbols (`ALWAYS_INSPECTED`) |
 | `fm2_regtest_node` | binary `fm2-regtest-node` (since `12b501fe`, UNIX only): the four-seat regtest operator worker, `dev/regtest_operator.cpp`, `dev/regtest_node_main.cpp`; never linked into b3coind | `fm2_dev`, `fm2_core`, `fm2_verify`, `fm2_transport`, `bitcoin_common`, `bitcoin_clientversion`, `univalue`, `secp256k1` |
 | `fm2_canary_*` | sanitizer canaries | only with `FLOWMESH2_SANITIZER_CANARIES=ON` |
+| `fm2_fuzz` | binary `fm2_fuzz` (M0-FUZ-01), only with `BUILD_FUZZ_BINARY=ON`: `fuzz/fuzz_main.cpp`, its own registry behind the repository's `FUZZ_TARGET` macro, and `fuzz/decoders.cpp`, 15 targets; `FUZZ=<target>` selects one. With `SANITIZERS=fuzzer,...` (Clang) it is a libFuzzer binary; otherwise it replays the files, directories or stdin it is given. It never links the node's `test_fuzz` library, which pulls in `bitcoin_node` and V1 code | `fm2_core`, `fm2_transport`, `fuzzer_interface` |
 | `fm2_all` | custom target: every fm2 library and executable that is built by default | — |
 
 `file(GENERATE)` writes `fm2_libs.manifest` (from R2) into the build directory
@@ -347,6 +348,7 @@ header marked *landed* is normative; the others are the target contract.
 | `sim/sim_client.h` | R14 | landed | `SimClient::Create`, `AccountOf`; outbox `SignOnce` (`CLIENT_LABEL_TAKEN`), `Place`, `Cancel`, `Transfer`, `Withdraw`, `Bytes`, `Action`, `TamperedSignature`; engine-off `VerifyHead` (`CLIENT_HEAD_*`), `VerifyAccount` (`CLIENT_NOT_FOUND`, `CLIENT_WRONG_ACCOUNT`), `VerifyIncluded` (`CLIENT_OUTCOME_SUBJECT`, `CLIENT_REF_MISMATCH`), `VerifyExpiredReply` (`CLIENT_NOT_EXPIRED`), `VerifyFills` (`CLIENT_UNKNOWN_MARKET`) |
 | `sim/cluster.h` | R14 | landed | `SimCluster::Create(n)` (0: `CLUSTER_EMPTY`; 1: real; more: stub M4-SIM-01), `CreateTwins` (stub M4-SIM-03), `Size`, `Node` |
 | `sim/scenario.h` | R14 | landed | `Variant` (WALKING_SKELETON=1, STORAGE_FAULT=2, AUTHORITY_FAULT=3; append-only), `ToString`, `VariantFromName`, `AllVariants`; `AllChecks`, `ManifestOf`, `SuiteChecks`; `CheckResult`, `CheckMap`, `RunReport` (`Passed`), `RunWalkingSkeleton`; `EvaluateP6`; `SuiteReport`, `RunSuite`, `SuiteJson` |
+| `fuzz/decoders.cpp` | M0-FUZ-01 | landed | one target per decoder: `fm2_action`, `fm2_slot_body`, `fm2_outcome`, `fm2_account_leaf`, `fm2_slot_header`, `fm2_slot_certificate`, `fm2_certified_envelope`, `fm2_state_leaves`, `fm2_fact`, `fm2_agreement_message` (also the lane-frame plaintext, control reports and NEW_VIEW), `fm2_journal_payload` (every record type), `fm2_journal_image` (`ScanRecords`), `fm2_snapshot`, `fm2_fact_batch` (`CheckBatch`) and `fm2_mesh_hello`. The oracle: an input that decodes encodes back to exactly the input and decodes again; the certificate, envelope and account-leaf targets also check the documented bounds of what `Decode` returns. A profiled decoder gets one of three regtest profiles, chosen by the first byte |
 
 ---
 
@@ -1328,6 +1330,21 @@ python3 -I -B contrib/flowmesh2/evidence.py run --dir "$EV" --label ctest_ubsan 
   ctest --test-dir build-rebirth/ubsan -L flowmesh2 --no-tests=error --output-on-failure
 python3 -I -B contrib/flowmesh2/evidence.py verify --dir "$EV" --require-expectations
 ```
+
+Fuzzing (M0-FUZ-01; Clang, libFuzzer):
+
+```sh
+cmake -S . -B build-rebirth/fuzz "${COMMON[@]}" -DBUILD_FLOWMESH2=ON -DBUILD_FUZZ_BINARY=ON   -DSANITIZERS=fuzzer,address,undefined -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
+cmake --build build-rebirth/fuzz --target fm2_fuzz --parallel 8
+FUZZ=none build-rebirth/fuzz/bin/fm2_fuzz                     # lists the targets
+FUZZ=fm2_slot_certificate build-rebirth/fuzz/bin/fm2_fuzz -max_total_time=60 corpus/fm2_slot_certificate
+```
+
+With GCC the same configure without `fuzzer` in `SANITIZERS` builds a replay
+driver: `FUZZ=<target> bin/fm2_fuzz <files or directories>` runs each input
+once, and with no argument it reads one input from stdin. The CI workflow has
+no fuzz job (it is owner-protected); the evidence of M0-FUZ-01 was made by
+hand.
 
 `FLOWMESH2_SANITIZER_CANARIES=ON` builds one canary per sanitizer named in
 `SANITIZERS` (`fm2_canary_asan`, `fm2_canary_ubsan`, `fm2_canary_tsan`; sources
