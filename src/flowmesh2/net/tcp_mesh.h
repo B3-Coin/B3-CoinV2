@@ -34,6 +34,36 @@ struct SeatEndpoint {
     std::array<unsigned char, 64> identity_signature{};
 };
 
+/** Why the mesh closed a socket or refused a connection. Diagnostic only:
+ * no wire format or record carries it, and a drop never changes what an
+ * authenticated peer may do. Before a HELLO, `seat` and `lane` are those of
+ * the dial (initiator) or 0 and BULK (an accepted socket); after it they are
+ * what the HELLO claimed, authenticated only when `authenticated` is set. */
+enum class MeshDropReason : uint8_t {
+    PENDING_FULL = 1,      //!< accepted while max_pending_connections sockets were already pending
+    HANDSHAKE_TIMEOUT = 2, //!< not mutually authenticated within handshake_timeout_ms of its creation
+    CONNECT_FAILED = 3,    //!< a dial did not connect
+    PEER_CLOSED = 4,       //!< the peer closed or reset the socket, or a send or receive failed
+    HELLO_REFUSED = 5,     //!< CheckHello refused the HELLO (net/tcp_mesh_wire.h)
+    SIGN_FAILED = 6,       //!< our own session signature could not be made or did not verify
+    AUTH_LENGTH = 7,       //!< the first packet's declared length is not that of a signature
+    FRAME_OVERSIZE = 8,    //!< an authenticated packet declared a length above max_frame_bytes
+    DECRYPT_FAILED = 9,    //!< a packet failed authenticated decryption or set the ignore bit
+    AUTH_REFUSED = 10,     //!< the session signature does not verify under the claimed seat's pinned key
+    DATA_BEFORE_AUTH = 11, //!< application data before both session signatures were exchanged
+    REPLACED = 12,         //!< a freshly authenticated session of the same seat and lane took this one's place
+    SOCKET_SETUP = 13,     //!< a local socket could not be made or made non-blocking
+};
+
+struct MeshDrop {
+    MeshDropReason reason{MeshDropReason::PEER_CLOSED};
+    bool initiator{false};
+    bool hello_received{false};
+    bool authenticated{false};
+    uint32_t seat{0};
+    Lane lane{Lane::BULK};
+};
+
 struct TcpMeshConfig {
     MeshConfig mesh;
     uint16_t listen_port{DEFAULT_SEAT_MESH_PORT};
@@ -51,6 +81,10 @@ struct TcpMeshConfig {
     size_t max_queued_bytes_per_lane{64 * 1024 * 1024};
     uint32_t handshake_timeout_ms{5000};
     uint32_t reconnect_ms{100};
+    /** Called once for every socket the mesh closes or refuses, on the
+     * event-loop thread inside Poll, before the socket is closed. It must
+     * not call the mesh. Optional; the drop happens either way. */
+    std::function<void(const MeshDrop&)> on_drop;
 };
 
 /** Four independent persistent nonblocking TCP sessions per peer. Uses the

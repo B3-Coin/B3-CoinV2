@@ -214,7 +214,10 @@ public:
                 // A returning peer may replace a stale half-open session,
                 // but ONLY after proving its pinned identity in the fresh
                 // encrypted session. A claimed hello never evicts a peer.
-                if (channel.link) ReleaseInFlight(*channel.link);
+                if (channel.link) {
+                    ReleaseInFlight(*channel.link);
+                    Notify(*channel.link, MeshDropReason::REPLACED);
+                }
                 channel.link = std::move(m_pending[i]);
                 m_pending.erase(m_pending.begin() + i);
             } else {
@@ -282,6 +285,17 @@ private:
         --m_in_messages[index];
         link.input_reserved = false;
     }
+    void Notify(const Link& link, MeshDropReason reason) const
+    {
+        if (m_config.on_drop) m_config.on_drop(MeshDrop{reason, link.initiator, link.hello_received, link.Authenticated(), link.peer, link.lane});
+    }
+    //! Marks the link dead with the first reason that applies; Poll closes it.
+    void Drop(Link& link, MeshDropReason reason) const
+    {
+        if (link.dead) return;
+        link.dead = true;
+        Notify(link, reason);
+    }
 
     uint256 SessionDigest(const Link& link, bool initiator_signature) const
     {
@@ -305,7 +319,9 @@ private:
                 if (!WouldBlock(errno)) m_closed = true;
                 break;
             }
-            if (m_pending.size() >= m_config.max_pending_connections || !Nonblocking(fd)) {
+            const bool full{m_pending.size() >= m_config.max_pending_connections};
+            if (full || !Nonblocking(fd)) {
+                if (m_config.on_drop) m_config.on_drop(MeshDrop{full ? MeshDropReason::PENDING_FULL : MeshDropReason::SOCKET_SETUP});
                 (void)close(fd);
                 continue;
             }
@@ -322,12 +338,15 @@ private:
         const std::string& text{endpoint.addresses[c.next_address++ % endpoint.addresses.size()]};
         const auto address{ParseAddress(text, endpoint.port)};
         if (!address) return; // Create already validates every pinned address.
+        const auto failed{[&](MeshDropReason reason) {
+            if (m_config.on_drop) m_config.on_drop(MeshDrop{reason, true, false, false, seat, lane});
+        }};
         const int fd{socket(address->storage.ss_family, SOCK_STREAM, 0)};
-        if (fd < 0) return;
-        if (!Nonblocking(fd)) { (void)close(fd); return; }
+        if (fd < 0) { failed(MeshDropReason::SOCKET_SETUP); return; }
+        if (!Nonblocking(fd)) { failed(MeshDropReason::SOCKET_SETUP); (void)close(fd); return; }
         ConfigureSocket(fd);
         const int connected{connect(fd, reinterpret_cast<const sockaddr*>(&address->storage), address->size)};
-        if (connected != 0 && errno != EINPROGRESS) { (void)close(fd); return; }
+        if (connected != 0 && errno != EINPROGRESS) { failed(MeshDropReason::CONNECT_FAILED); (void)close(fd); return; }
         c.link = std::make_unique<Link>(fd, true, seat, lane);
         c.link->connecting = connected != 0;
     }
@@ -359,7 +378,7 @@ private:
             const auto signature{m_config.sign_session(SessionDigest(link, link.initiator))};
             if (!signature || !XOnlyPubKey{m_config.identity_keys[Config().self_seat]}.VerifySchnorr(
                     SessionDigest(link, link.initiator), *signature)) {
-                link.dead = true;
+                Drop(link, MeshDropReason::SIGN_FAILED);
                 return;
             }
             Encrypt(link, *signature);
@@ -400,7 +419,7 @@ private:
             if (n <= 0) {
                 if (n < 0 && errno == EINTR) continue;
                 if (n < 0 && WouldBlock(errno)) return;
-                link.dead = true;
+                Drop(link, MeshDropReason::PEER_CLOSED);
                 return;
             }
             budget -= n;
@@ -415,7 +434,7 @@ private:
             if (n <= 0) {
                 if (n < 0 && errno == EINTR) continue;
                 if (n < 0 && WouldBlock(errno)) return false;
-                link.dead = true;
+                Drop(link, MeshDropReason::PEER_CLOSED);
                 return false;
             }
             position += n;
@@ -431,7 +450,7 @@ private:
         const auto hello{CheckHello(std::span<const unsigned char, HELLO_BYTES>{h.data(), HELLO_BYTES},
             HelloExpectation{Config().self_seat, Config().seat_count, link.initiator, link.peer, link.lane})};
         if (!hello) {
-            link.dead = true;
+            Drop(link, MeshDropReason::HELLO_REFUSED);
             return;
         }
         link.peer = hello->from_seat;
@@ -457,8 +476,15 @@ private:
             if (!link.packet_length) {
                 if (!ReadInto(link, link.length.data(), link.length.size(), link.length_pos, budget)) return;
                 const size_t length{link.cipher->DecryptLength(std::as_bytes(std::span{link.length}))};
-                if (length > Config().max_frame_bytes || (!link.auth_received && length != 64)) {
-                    link.dead = true;
+                // Refused at the 3-byte length, before any body is allocated.
+                // Create keeps max_frame_bytes >= 64, so before the peer's
+                // signature only a signature-sized packet is acceptable.
+                if (!link.auth_received && length != 64) {
+                    Drop(link, MeshDropReason::AUTH_LENGTH);
+                    return;
+                }
+                if (length > Config().max_frame_bytes) {
+                    Drop(link, MeshDropReason::FRAME_OVERSIZE);
                     return;
                 }
                 link.packet_length = length;
@@ -483,14 +509,14 @@ private:
             bool ignore{false};
             if (!link.cipher->Decrypt(std::as_bytes(std::span{link.packet}), {}, ignore,
                     std::as_writable_bytes(std::span{plain})) || ignore) {
-                link.dead = true;
+                Drop(link, MeshDropReason::DECRYPT_FAILED);
                 return;
             }
             bool activate_after_packet{false};
             if (!link.auth_received) {
                 if (!XOnlyPubKey{m_config.identity_keys[link.peer]}.VerifySchnorr(
                         SessionDigest(link, !link.initiator), plain)) {
-                    link.dead = true;
+                    Drop(link, MeshDropReason::AUTH_REFUSED);
                     return;
                 }
                 link.auth_received = true;
@@ -500,7 +526,7 @@ private:
             } else {
                 // An initiator may send data only after seeing our auth; a
                 // receiver likewise waits for its own auth to leave the socket.
-                if (!link.Authenticated()) { link.dead = true; return; }
+                if (!link.Authenticated()) { Drop(link, MeshDropReason::DATA_BEFORE_AUTH); return; }
                 At(link.peer, link.lane).incoming.push_back(std::move(plain));
                 link.input_reserved = false; // reservation now belongs to the queue
             }
@@ -514,7 +540,7 @@ private:
     void Step(Link& link)
     {
         if (!link.Authenticated() && Clock::now() - link.born > std::chrono::milliseconds{m_config.handshake_timeout_ms}) {
-            link.dead = true;
+            Drop(link, MeshDropReason::HANDSHAKE_TIMEOUT);
             return;
         }
         if (link.connecting) {
@@ -523,7 +549,7 @@ private:
             int error{0};
             socklen_t size{sizeof(error)};
             if (getsockopt(link.fd, SOL_SOCKET, SO_ERROR, &error, &size) != 0 || error != 0) {
-                link.dead = true;
+                Drop(link, MeshDropReason::CONNECT_FAILED);
                 return;
             }
             link.connecting = false;

@@ -5,6 +5,7 @@
 #include <boost/test/unit_test.hpp>
 #include <bip324.h>
 #include <flowmesh2/net/tcp_mesh.h>
+#include <flowmesh2/net/tcp_mesh_wire.h>
 #include <flowmesh2/test/util/keys.h>
 #include <flowmesh2/test/util/mesh_fixtures.h>
 #include <hash.h>
@@ -13,6 +14,8 @@
 #include <cerrno>
 #include <chrono>
 #include <fcntl.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -60,6 +63,8 @@ struct Pair {
     std::array<CKey, 2> keys{KeyFromLabel("fm2/tcp/TEST/0"), KeyFromLabel("fm2/tcp/TEST/1")};
     std::array<net::TcpMeshConfig, 2> config;
     std::array<Mesh, 2> mesh;
+    //! Every MeshDrop each mesh reported, in order (TcpMeshConfig::on_drop).
+    std::array<std::vector<net::MeshDrop>, 2> drops;
 
     explicit Pair(bool open = true)
     {
@@ -94,6 +99,7 @@ struct Pair {
             c.sign_session = [key](const uint256& digest) -> Result<std::array<unsigned char, 64>> {
                 return Ok(SignDigest(key, digest, uint256{}));
             };
+            c.on_drop = [this, self](const net::MeshDrop& drop) { drops[self].push_back(drop); };
         }
         if (open) { Open(0); Open(1); }
     }
@@ -119,6 +125,34 @@ struct Pair {
         } while (std::chrono::steady_clock::now() < end);
         return received;
     }
+    size_t Drops(uint32_t self, net::MeshDropReason reason) const
+    {
+        return std::count_if(drops[self].begin(), drops[self].end(), [reason](const auto& d) { return d.reason == reason; });
+    }
+    //! Polls seat `self` until it reports a drop for `reason`; false on timeout.
+    bool AwaitDrop(uint32_t self, net::MeshDropReason reason, std::chrono::milliseconds timeout = 2000ms)
+    {
+        const auto end{std::chrono::steady_clock::now() + timeout};
+        while (Drops(self, reason) == 0 && std::chrono::steady_clock::now() < end) {
+            auto frame{mesh[self]->Poll()};
+            RequireOk(frame, "socket Poll while awaiting a drop");
+            BOOST_REQUIRE(!*frame);
+            std::this_thread::sleep_for(1ms);
+        }
+        return Drops(self, reason) > 0;
+    }
+    //! Polls seat `self` until it reported `count` drops in all; false on timeout.
+    bool AwaitDropCount(uint32_t self, size_t count, std::chrono::milliseconds timeout = 2000ms)
+    {
+        const auto end{std::chrono::steady_clock::now() + timeout};
+        while (drops[self].size() < count && std::chrono::steady_clock::now() < end) {
+            auto frame{mesh[self]->Poll()};
+            RequireOk(frame, "socket Poll while awaiting drops");
+            BOOST_REQUIRE(!*frame);
+            std::this_thread::sleep_for(1ms);
+        }
+        return drops[self].size() >= count;
+    }
     void Resign(uint32_t self)
     {
         for (auto& e : config[self].endpoints) {
@@ -140,6 +174,7 @@ public:
     net::Lane lane;
     uint32_t claimed_seat{0};
     std::unique_ptr<BIP324Cipher> cipher;
+    WireBytes hello_sent; //!< the exact HELLO bytes of Hello()
 
     explicit RawPeer(Pair& p, net::Lane service = net::Lane::ACTION, uint32_t claimed = 0)
         : pair{p}, lane{service}, claimed_seat{claimed}
@@ -152,6 +187,10 @@ public:
         address.sin_port = htons(pair.config[1].listen_port);
         BOOST_REQUIRE(connect(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0);
         BOOST_REQUIRE(fcntl(fd, F_SETFL, O_NONBLOCK) == 0);
+        // As the mesh's own sockets: without it Nagle holds a small packet
+        // until the delayed ACK of the previous one, about 40 ms on Linux.
+        const int one{1};
+        BOOST_REQUIRE(setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one)) == 0);
     }
     ~RawPeer() { if (fd >= 0) (void)close(fd); }
 
@@ -194,6 +233,7 @@ public:
         WireBytes hello{1, static_cast<unsigned char>(lane)};
         Put32(hello, claimed_seat); Put32(hello, pair.config[1].mesh.self_seat);
         for (const auto b : cipher->GetOurPubKey()) hello.push_back(static_cast<unsigned char>(b));
+        hello_sent = hello;
         Send(hello);
         const WireBytes response{Read(74)};
         BOOST_CHECK_EQUAL(response[0], 1);
@@ -241,7 +281,34 @@ public:
         BOOST_CHECK(XOnlyPubKey{pair.config[1].identity_keys[pair.config[1].mesh.self_seat]}.VerifySchnorr(SessionDigest(false), plain));
     }
     void Authenticate() { Authenticate(SignDigest(pair.keys[claimed_seat], SessionDigest(true), uint256{})); }
+    //! One send, ignoring a peer that already closed (slowloris, refused peers).
+    void TrySend(std::span<const unsigned char> bytes) { (void)send(fd, bytes.data(), bytes.size(), MSG_NOSIGNAL); }
+    //! True once the mesh closed this socket (EOF or reset), after polling it.
+    bool ClosedByMesh(std::chrono::milliseconds timeout = 2000ms)
+    {
+        const auto end{std::chrono::steady_clock::now() + timeout};
+        do {
+            auto result{pair.mesh[1]->Poll()}; RequireOk(result, "closed pump");
+            unsigned char byte{0};
+            const ssize_t n{recv(fd, &byte, 1, 0)};
+            if (n == 0 || (n < 0 && errno == ECONNRESET)) return true;
+            std::this_thread::sleep_for(1ms);
+        } while (std::chrono::steady_clock::now() < end);
+        return false;
+    }
 };
+
+//! A HELLO claiming `from` and addressed to `to`, with a valid EllSwift key.
+WireBytes RawHello(uint32_t from, uint32_t to, net::Lane lane = net::Lane::ACTION)
+{
+    CKey fresh;
+    fresh.MakeNewKey(true);
+    const BIP324Cipher cipher{fresh, std::array<std::byte, 32>{}};
+    WireBytes hello{1, static_cast<unsigned char>(lane)};
+    Put32(hello, from); Put32(hello, to);
+    for (const auto b : cipher.GetOurPubKey()) hello.push_back(static_cast<unsigned char>(b));
+    return hello;
+}
 
 } // namespace
 
@@ -565,6 +632,218 @@ BOOST_AUTO_TEST_CASE(partial_packets_reserve_global_lane_capacity_and_release_on
             BOOST_CHECK(received[0].bytes == WireBytes(64, 0x41));
         }
     }
+}
+
+// Adversarial inputs (TODO.md M4-NET-01, rebirth task 2.7). Each attack is
+// refused with its MeshDropReason; none delivers a frame or blocks a valid peer.
+
+BOOST_AUTO_TEST_CASE(half_open_sockets_are_dropped_at_the_handshake_deadline)
+{
+    Pair p{false};
+    p.config[1].handshake_timeout_ms = 50;
+    p.Open(1);
+    RawPeer silent{p};            // TCP only: no HELLO
+    RawPeer hello_only{p}; hello_only.Hello(); // HELLO answered, then nothing
+    BOOST_REQUIRE(p.AwaitDrop(1, net::MeshDropReason::HANDSHAKE_TIMEOUT));
+    BOOST_REQUIRE(silent.ClosedByMesh());
+    BOOST_REQUIRE(hello_only.ClosedByMesh());
+    BOOST_CHECK_EQUAL(p.Drops(1, net::MeshDropReason::HANDSHAKE_TIMEOUT), 2U);
+    BOOST_CHECK_EQUAL(p.drops[1].size(), 2U);
+    for (const auto& drop : p.drops[1]) BOOST_CHECK(!drop.authenticated && !drop.initiator);
+    BOOST_CHECK(std::ranges::count_if(p.drops[1], [](const auto& d) { return d.hello_received; }) == 1);
+    BOOST_CHECK(p.Pump(1, 10ms).empty());
+}
+
+BOOST_AUTO_TEST_CASE(a_slowloris_hello_is_dropped_at_the_deadline_however_slowly_it_progresses)
+{
+    Pair p{false};
+    p.config[1].handshake_timeout_ms = 40;
+    p.Open(1);
+    RawPeer slow{p};
+    const WireBytes hello{RawHello(0, 1)};
+    const auto start{std::chrono::steady_clock::now()};
+    size_t sent{0};
+    while (sent < hello.size() && p.Drops(1, net::MeshDropReason::HANDSHAKE_TIMEOUT) == 0) {
+        slow.TrySend(std::span{hello}.subspan(sent++, 1)); // one byte, then wait: every byte is progress
+        for (int i{0}; i < 4; ++i) { RequireOk(p.mesh[1]->Poll(), "slowloris pump"); std::this_thread::sleep_for(1ms); }
+    }
+    BOOST_REQUIRE(p.AwaitDrop(1, net::MeshDropReason::HANDSHAKE_TIMEOUT));
+    const auto elapsed{std::chrono::steady_clock::now() - start};
+    BOOST_CHECK_LT(sent, hello.size()); // dropped while the HELLO was still incomplete
+    BOOST_CHECK(elapsed < 40ms + 1500ms); // the deadline counts from the connect, not from the last byte
+    BOOST_REQUIRE(slow.ClosedByMesh());
+    p.Open(0);
+    RequireOk(p.mesh[0]->Send(1, net::Lane::ACTION, WireBytes{0x52}), "valid peer after slowloris");
+    const auto received{p.Pump(1)};
+    BOOST_REQUIRE_EQUAL(received.size(), 1U);
+    BOOST_CHECK(received[0].bytes == WireBytes{0x52});
+}
+
+BOOST_AUTO_TEST_CASE(extra_connections_beyond_the_pending_bound_are_refused)
+{
+    Pair p{false};
+    p.config[1].max_pending_connections = 2;
+    p.config[1].handshake_timeout_ms = 20;
+    p.Open(1);
+    RawPeer a{p}, b{p}, c{p};
+    BOOST_REQUIRE(p.AwaitDrop(1, net::MeshDropReason::PENDING_FULL));
+    BOOST_CHECK_EQUAL(p.Drops(1, net::MeshDropReason::PENDING_FULL), 1U);
+    // The two pending sockets hold their slots only until the deadline;
+    // after it a valid peer authenticates and delivers.
+    BOOST_REQUIRE(p.AwaitDrop(1, net::MeshDropReason::HANDSHAKE_TIMEOUT));
+    p.Open(0);
+    RequireOk(p.mesh[0]->Send(1, net::Lane::ACTION, WireBytes{0x53}), "valid peer after pending flood");
+    BOOST_REQUIRE_EQUAL(p.Pump(1).size(), 1U);
+}
+
+BOOST_AUTO_TEST_CASE(oversize_and_unsigned_lengths_are_refused_before_the_body)
+{
+    for (const bool authenticated : {false, true}) {
+        Pair p{false};
+        p.config[1].mesh.max_frame_bytes = 64;
+        p.Open(1);
+        RawPeer raw{p}; raw.Hello();
+        if (authenticated) raw.Authenticate();
+        // Only the 3 encrypted length bytes of a 65-byte packet; no body follows.
+        const WireBytes packet{raw.Encrypted(WireBytes(65, 1))};
+        raw.Send(WireBytes(packet.begin(), packet.begin() + BIP324Cipher::LENGTH_LEN));
+        const auto reason{authenticated ? net::MeshDropReason::FRAME_OVERSIZE : net::MeshDropReason::AUTH_LENGTH};
+        BOOST_REQUIRE(p.AwaitDrop(1, reason));
+        BOOST_CHECK_EQUAL(p.drops[1].size(), 1U);
+        BOOST_CHECK_EQUAL(p.drops[1].front().authenticated, authenticated);
+        BOOST_CHECK_EQUAL(p.drops[1].front().seat, 0U);
+        BOOST_REQUIRE(raw.ClosedByMesh());
+    }
+}
+
+BOOST_AUTO_TEST_CASE(a_replayed_auth_is_refused_in_a_fresh_session_and_as_ciphertext)
+{
+    using net::MeshDropReason;
+    Pair p{false};
+    p.Open(1);
+    RawPeer first{p}; first.Hello();
+    const auto signature{SignDigest(p.keys[0], first.SessionDigest(true), uint256{})};
+    const WireBytes encrypted_auth{first.Encrypted(signature)};
+    first.Send(encrypted_auth);
+    const WireBytes length{first.Read(BIP324Cipher::LENGTH_LEN)};
+    (void)first.Read(first.cipher->DecryptLength(std::as_bytes(std::span{length})) + BIP324Cipher::EXPANSION - BIP324Cipher::LENGTH_LEN);
+    const WireBytes packet{first.Encrypted(WireBytes{7})};
+    first.Send(packet);
+    BOOST_REQUIRE_EQUAL(p.Pump(1).size(), 1U);
+    BOOST_CHECK(p.drops[1].empty());
+    // A replayed packet's length decrypts to noise under the advanced cipher:
+    // refused at the length when the noise is above max_frame_bytes, else by
+    // the AEAD once the padding below completes the claimed body.
+    first.Send(packet);
+    first.TrySend(WireBytes(p.config[1].mesh.max_frame_bytes + BIP324Cipher::EXPANSION, 0));
+    BOOST_REQUIRE(p.AwaitDropCount(1, 1));
+    BOOST_CHECK(p.drops[1][0].reason == MeshDropReason::FRAME_OVERSIZE || p.drops[1][0].reason == MeshDropReason::DECRYPT_FAILED);
+    BOOST_CHECK(p.drops[1][0].authenticated);
+    // The captured HELLO and encrypted AUTH replayed on a new connection: the
+    // listener's fresh key gives other session keys, so the AUTH's length is
+    // noise (almost never 64) and, if it were 64, its tag would fail.
+    RawPeer wire_replay{p};
+    wire_replay.Send(first.hello_sent);
+    (void)wire_replay.Read(net::HELLO_BYTES);
+    wire_replay.Send(encrypted_auth);
+    wire_replay.TrySend(WireBytes(64 + BIP324Cipher::EXPANSION, 0));
+    BOOST_REQUIRE(p.AwaitDropCount(1, 2));
+    BOOST_CHECK(p.drops[1][1].reason == MeshDropReason::AUTH_LENGTH || p.drops[1][1].reason == MeshDropReason::DECRYPT_FAILED);
+    BOOST_CHECK(!p.drops[1][1].authenticated);
+    // The signature itself, freshly encrypted in a new session: it signs
+    // another session ID, so it decrypts and then fails BIP340.
+    RawPeer signature_replay{p}; signature_replay.Hello();
+    signature_replay.Send(signature_replay.Encrypted(signature));
+    BOOST_REQUIRE(p.AwaitDropCount(1, 3));
+    BOOST_CHECK(p.drops[1][2].reason == MeshDropReason::AUTH_REFUSED);
+    BOOST_CHECK(p.Pump(1, 20ms).empty());
+}
+
+BOOST_AUTO_TEST_CASE(a_seat_outside_the_roster_or_with_an_unpinned_key_is_refused)
+{
+    Pair p{false};
+    p.Open(1);
+    // Claims of seats that do not exist in this two-seat roster, of the
+    // listener itself, and a HELLO addressed to another seat.
+    const std::array<std::pair<uint32_t, uint32_t>, 5> claims{{{2, 1}, {4, 1}, {0xffffffff, 1}, {1, 1}, {0, 2}}};
+    for (const auto& [from, to] : claims) {
+        RawPeer raw{p};
+        raw.Send(RawHello(from, to));
+        BOOST_CHECK(raw.ClosedByMesh());
+    }
+    BOOST_CHECK_EQUAL(p.Drops(1, net::MeshDropReason::HELLO_REFUSED), claims.size());
+    // A fifth key, not pinned in the roster, claiming the real seat 0.
+    const CKey outsider{KeyFromLabel("fm2/tcp/TEST/4")};
+    RawPeer raw{p}; raw.Hello();
+    raw.Send(raw.Encrypted(SignDigest(outsider, raw.SessionDigest(true), uint256{})));
+    BOOST_REQUIRE(p.AwaitDrop(1, net::MeshDropReason::AUTH_REFUSED));
+    BOOST_CHECK(raw.ClosedByMesh());
+    BOOST_CHECK(p.Pump(1, 20ms).empty());
+}
+
+BOOST_AUTO_TEST_CASE(a_seat_connecting_twice_keeps_one_session_and_reports_the_replaced_one)
+{
+    Pair p{false};
+    p.Open(1);
+    RawPeer first{p}; first.Hello(); first.Authenticate();
+    first.Send(first.Encrypted(WireBytes{1}));
+    BOOST_REQUIRE_EQUAL(p.Pump(1).size(), 1U);
+    // A second pending connection of the same seat and lane, and a third one
+    // that only sends its HELLO. Neither replaces the first before it signs.
+    RawPeer second{p}; second.Hello();
+    RawPeer third{p}; third.Hello();
+    first.Send(first.Encrypted(WireBytes{2}));
+    auto received{p.Pump(1)};
+    BOOST_REQUIRE_EQUAL(received.size(), 1U);
+    BOOST_CHECK(received[0].bytes == WireBytes{2});
+    BOOST_CHECK_EQUAL(p.Drops(1, net::MeshDropReason::REPLACED), 0U);
+    second.Authenticate();
+    second.Send(second.Encrypted(WireBytes{3}));
+    received = p.Pump(1);
+    BOOST_REQUIRE_EQUAL(received.size(), 1U);
+    BOOST_CHECK(received[0].bytes == WireBytes{3});
+    BOOST_REQUIRE_EQUAL(p.Drops(1, net::MeshDropReason::REPLACED), 1U);
+    const auto replaced{*std::ranges::find_if(p.drops[1], [](const auto& d) { return d.reason == net::MeshDropReason::REPLACED; })};
+    BOOST_CHECK(replaced.authenticated && replaced.hello_received && !replaced.initiator);
+    BOOST_CHECK_EQUAL(replaced.seat, 0U);
+    BOOST_CHECK(replaced.lane == net::Lane::ACTION);
+    BOOST_CHECK(first.ClosedByMesh());
+    // The third connection authenticates too and replaces the second.
+    third.Authenticate();
+    third.Send(third.Encrypted(WireBytes{4}));
+    received = p.Pump(1);
+    BOOST_REQUIRE_EQUAL(received.size(), 1U);
+    BOOST_CHECK(received[0].bytes == WireBytes{4});
+    BOOST_CHECK_EQUAL(p.Drops(1, net::MeshDropReason::REPLACED), 2U);
+    BOOST_CHECK(second.ClosedByMesh());
+}
+
+BOOST_AUTO_TEST_CASE(a_flooded_inbound_lane_does_not_starve_the_critical_lane)
+{
+    Pair p{false};
+    p.config[1].max_messages_per_lane = 64;
+    p.Open(1);
+    RawPeer bulk{p, net::Lane::BULK}; bulk.Hello(); bulk.Authenticate();
+    RawPeer critical{p, net::Lane::CRITICAL}; critical.Hello(); critical.Authenticate();
+    WireBytes flood;
+    for (int i{0}; i < 64; ++i) {
+        const WireBytes packet{bulk.Encrypted(WireBytes(32, static_cast<unsigned char>(i)))};
+        flood.insert(flood.end(), packet.begin(), packet.end());
+    }
+    bulk.Send(flood);
+    const auto early{p.Pump(8)}; // the bulk lane is full and draining
+    BOOST_REQUIRE_EQUAL(early.size(), 8U);
+    BOOST_CHECK(std::ranges::all_of(early, [](const auto& f) { return f.lane == net::Lane::BULK; }));
+    critical.Send(critical.Encrypted(WireBytes{0xcc}));
+    const auto rest{p.Pump(57)};
+    BOOST_REQUIRE_EQUAL(rest.size(), 57U);
+    const auto position{std::ranges::find_if(rest, [](const auto& f) { return f.lane == net::Lane::CRITICAL; }) - rest.begin()};
+    BOOST_REQUIRE_LT(static_cast<size_t>(position), rest.size());
+    BOOST_CHECK(rest[position].bytes == WireBytes{0xcc});
+    // With 56 bulk frames still queued, the critical frame leaves within one
+    // service cycle (4 critical, 2 proposal, 1 action, 1 bulk).
+    BOOST_CHECK_LT(position, 8);
+    BOOST_CHECK(p.drops[1].empty());
 }
 
 BOOST_AUTO_TEST_SUITE_END()
