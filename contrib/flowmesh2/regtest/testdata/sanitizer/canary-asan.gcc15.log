@@ -1,0 +1,48 @@
+=================================================================
+==3115740==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x77cd741e0020 at pc 0x60dbdfc9e4ea bp 0x7fff46f1a540 sp 0x7fff46f1a530
+READ of size 4 at 0x77cd741e0020 thread T0
+    #0 0x60dbdfc9e4e9 in main /home/mo/b3-src/contrib/flowmesh2/canaries/asan_canary.cpp:34
+    #1 0x7bad74e2a600 in __libc_start_call_main ../sysdeps/nptl/libc_start_call_main.h:59
+    #2 0x7bad74e2a717 in __libc_start_main_impl ../csu/libc-start.c:360
+    #3 0x60dbdfc9e244 in _start (/tmp/gcc_asan_canary+0x2244) (BuildId: f34c85c4ff77a0b3cfc8b9a20506f0c6466d88dd)
+
+0x77cd741e0020 is located 0 bytes after 16-byte region [0x77cd741e0010,0x77cd741e0020)
+allocated by thread T0 here:
+    #0 0x7bad75f2c8cf in operator new[](unsigned long) ../../../../src/libsanitizer/asan/asan_new_delete.cpp:111
+    #1 0x60dbdfc9e358 in main /home/mo/b3-src/contrib/flowmesh2/canaries/asan_canary.cpp:32
+    #2 0x7bad74e2a717 in __libc_start_main_impl ../csu/libc-start.c:360
+    #3 0x60dbdfc9e244 in _start (/tmp/gcc_asan_canary+0x2244) (BuildId: f34c85c4ff77a0b3cfc8b9a20506f0c6466d88dd)
+
+SUMMARY: AddressSanitizer: heap-buffer-overflow /home/mo/b3-src/contrib/flowmesh2/canaries/asan_canary.cpp:34 in main
+Shadow bytes around the buggy address:
+  0x77cd741dfd80: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+  0x77cd741dfe00: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+  0x77cd741dfe80: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+  0x77cd741dff00: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+  0x77cd741dff80: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+=>0x77cd741e0000: fa fa 00 00[fa]fa fa fa fa fa fa fa fa fa fa fa
+  0x77cd741e0080: fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa
+  0x77cd741e0100: fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa
+  0x77cd741e0180: fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa
+  0x77cd741e0200: fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa
+  0x77cd741e0280: fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa
+Shadow byte legend (one shadow byte represents 8 application bytes):
+  Addressable:           00
+  Partially addressable: 01 02 03 04 05 06 07 
+  Heap left redzone:       fa
+  Freed heap region:       fd
+  Stack left redzone:      f1
+  Stack mid redzone:       f2
+  Stack right redzone:     f3
+  Stack after return:      f5
+  Stack use after scope:   f8
+  Global redzone:          f9
+  Global init order:       f6
+  Poisoned by user:        f7
+  Container overflow:      fc
+  Array cookie:            ac
+  Intra object redzone:    bb
+  ASan internal:           fe
+  Left alloca redzone:     ca
+  Right alloca redzone:    cb
+==3115740==ABORTING

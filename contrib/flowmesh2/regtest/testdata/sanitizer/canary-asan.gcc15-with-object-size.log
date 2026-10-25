@@ -1,0 +1,9 @@
+asan_canary.cpp:34:31: runtime error: load of address 0x746b83be0020 with insufficient space for an object of type 'volatile const int'
+0x746b83be0020: note: pointer points here
+ 00 00 00 00  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  00 00 00 00
+              ^ 
+    #0 0x62e7c5bac578 in main /home/mo/b3-src/contrib/flowmesh2/canaries/asan_canary.cpp:34
+    #1 0x784b8482a600 in __libc_start_call_main ../sysdeps/nptl/libc_start_call_main.h:59
+    #2 0x784b8482a717 in __libc_start_main_impl ../csu/libc-start.c:360
+    #3 0x62e7c5bac244 in _start (/tmp/gcc_asan_canary_raw+0x2244) (BuildId: 2186e74a835acb5328fea7c8747648b32cc93384)
+
