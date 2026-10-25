@@ -12,6 +12,7 @@ import ipaddress
 import json
 import os
 from pathlib import Path
+import select
 import socket
 import socketserver
 import ssl
@@ -76,7 +77,18 @@ class _Handler(socketserver.BaseRequestHandler):
             self.request.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             self.request.settimeout(gateway.header_timeout)
             connection = gateway.context.wrap_socket(self.request, server_side=True)
-            gateway.handle(connection, self.client_address[0])
+            # A client that asks for keep-alive may send its next request on
+            # this connection after a 200 reply. Every request is read, budgeted
+            # and validated exactly as a first one; an idle or closed connection
+            # ends silently after header_timeout; the per-connection cap bounds
+            # how long one client holds a connection slot.
+            for served in range(gateway.keep_alive_requests):
+                if served and not connection.pending():
+                    if not select.select([connection], [], [], gateway.header_timeout)[0]:
+                        break
+                if not gateway.handle(connection, self.client_address[0],
+                                      keep_alive=served + 1 < gateway.keep_alive_requests):
+                    break
         except (OSError, ValueError, ssl.SSLError):
             pass
         finally:
@@ -110,6 +122,7 @@ class HttpsGateway:
         self.max_body = config.get('max_body_bytes', 32768)
         self.header_timeout = config.get('header_timeout_seconds', 3)
         self.stream_seconds = config.get('stream_seconds', 10)
+        self.keep_alive_requests = 100
         if any(type(value) is not int for value in (capacity, rate, self.max_body, self.header_timeout, self.stream_seconds)):
             raise ValueError('HTTPS bounds must be integers')
         if not (4 <= capacity <= 128 and 10 <= rate <= 100000 and 1024 <= self.max_body <= 1048576 and
@@ -225,18 +238,21 @@ class HttpsGateway:
             body += part
         return method, target, headers, body
 
-    def _write(self, connection, status, value, origin=None):
+    def _write(self, connection, status, value, origin=None, keep=False):
         payload = json.dumps(value, sort_keys=True, separators=(',', ':')).encode()
         if len(payload) > 1048576:
-            status, payload = 500, b'{"error":"native response exceeded API bound"}'
+            status, payload, keep = 500, b'{"error":"native response exceeded API bound"}', False
+        keep = keep and status == 200
         headers = [f'HTTP/1.1 {status} Response', 'Content-Type: application/json',
-                   'Content-Length: ' + str(len(payload)), 'Connection: close', 'Cache-Control: no-store',
+                   'Content-Length: ' + str(len(payload)), 'Connection: ' + ('keep-alive' if keep else 'close'),
+                   'Cache-Control: no-store',
                    'X-Content-Type-Options: nosniff']
         if origin:
             headers += ['Access-Control-Allow-Origin: ' + origin, 'Vary: Origin',
                         'Access-Control-Allow-Methods: GET, POST, OPTIONS', 'Access-Control-Allow-Headers: Content-Type']
         connection.settimeout(2)
         connection.sendall(('\r\n'.join(headers) + '\r\n\r\n').encode() + payload)
+        return keep
 
     def _events(self, connection, after, origin):
         if not self.streams.acquire(blocking=False):
@@ -271,12 +287,14 @@ class HttpsGateway:
         finally:
             self.streams.release()
 
-    def handle(self, connection, address):
+    def handle(self, connection, address, keep_alive=False):
+        """Answer one request; True only if a 200 reply kept the connection open."""
         origin = None
         try:
             if not self._budget(address):
                 raise HttpsApiError(429, 'client request budget exhausted')
             method, target, headers, body = self._read_request(connection)
+            keep = keep_alive and headers.get('connection', '').lower() == 'keep-alive'
             supplied = headers.get('origin')
             if supplied is not None:
                 if supplied not in self.origins:
@@ -286,8 +304,7 @@ class HttpsGateway:
             if parsed.netloc or parsed.fragment:
                 raise HttpsApiError(400, 'invalid origin request target')
             if method == 'OPTIONS':
-                self._write(connection, 200, {'allowed': True}, origin)
-                return
+                return self._write(connection, 200, {'allowed': True}, origin, keep)
             if method == 'GET' and parsed.path == '/v1/events':
                 query = parse_qs(parsed.query, strict_parsing=True)
                 if set(query) - {'after-height'} or len(query.get('after-height', ['0'])) != 1:
@@ -296,7 +313,7 @@ class HttpsGateway:
                 if not raw.isdecimal() or len(raw) > 20 or int(raw) >= 1 << 64:
                     raise HttpsApiError(400, 'invalid event cursor')
                 self._events(connection, int(raw), origin)
-                return
+                return False
             if parsed.query:
                 raise HttpsApiError(400, 'unexpected query parameters')
             if method == 'POST' and parsed.path == '/v1/submit':
@@ -310,7 +327,7 @@ class HttpsGateway:
                 result = self.dispatch('submit', value)
                 if not isinstance(result, dict) or result.get('code') not in ('ADMITTED', 'DUPLICATE'):
                     self._write(connection, 422, {'error': 'signed action refused', 'result': result}, origin)
-                    return
+                    return False
             elif method == 'GET' and parsed.path in ('/v1/info', '/v1/totals'):
                 result = self.dispatch(parsed.path.rsplit('/', 1)[1], {})
             elif method == 'GET' and parsed.path.startswith(('/v1/account/', '/v1/withdrawal/')):
@@ -320,7 +337,7 @@ class HttpsGateway:
                 result = self.dispatch(kind, {'account' if kind == 'account' else 'withdrawal_id': identifier})
             else:
                 raise HttpsApiError(404, 'public API route is not available')
-            self._write(connection, 200, {'result': result}, origin)
+            return self._write(connection, 200, {'result': result}, origin, keep)
         except HttpsApiError as error:
             self._write(connection, error.status, {'error': str(error)}, origin)
         except (UnicodeError, ValueError, json.JSONDecodeError):
@@ -328,38 +345,78 @@ class HttpsGateway:
         except Exception:
             # Never echo a private worker request/config or an operator secret.
             self._write(connection, 503, {'error': 'operator refused the request or is unavailable'}, origin)
+        return False
 
 
 class HttpsClient:
-    def __init__(self, url, certificate, certificate_sha256):
+    """Pinned TLS 1.3 client.
+
+    With keep_alive (the default) each thread reuses one pinned connection
+    while the gateway agrees and the connection was idle under IDLE_SECONDS,
+    which is below the gateway's smallest header_timeout. The pin is checked
+    on every new connection before any request is sent. A failed request is
+    never retried, and any reply other than a complete keep-alive 200 closes
+    the connection.
+    """
+    IDLE_SECONDS = 0.5
+
+    def __init__(self, url, certificate, certificate_sha256, keep_alive=True, clock=time.monotonic):
         parsed = _origin(url)
         self.host, self.port = parsed.hostname, parsed.port or 443
         self.context = ssl.create_default_context(cafile=str(certificate))
         self.context.minimum_version = ssl.TLSVersion.TLSv1_3
         self.pin = certificate_sha256
+        self.keep_alive, self.clock = keep_alive, clock
+        self.local = threading.local()
 
-    def request(self, method, path, value=None, headers=None):
-        connection = http.client.HTTPSConnection(self.host, self.port, context=self.context, timeout=10)
-        try:
+    def _connection(self):
+        local = self.local
+        connection = getattr(local, 'connection', None)
+        if connection is not None and self.clock() - local.last_used > self.IDLE_SECONDS:
+            self._drop()
+            connection = None
+        if connection is None:
+            connection = http.client.HTTPSConnection(self.host, self.port, context=self.context, timeout=10)
+            local.connection = connection
             connection.connect()
             actual = hashlib.sha256(connection.sock.getpeercert(binary_form=True)).hexdigest()
             if not hmac.compare_digest(actual, self.pin):
                 raise HttpsApiError(495, 'HTTPS server certificate pin differs')
+        return connection
+
+    def _drop(self):
+        connection = getattr(self.local, 'connection', None)
+        self.local.connection = None
+        if connection is not None:
+            connection.close()
+
+    def request(self, method, path, value=None, headers=None):
+        reusable = False
+        try:
+            connection = self._connection()
             body = None if value is None else json.dumps(value, separators=(',', ':')).encode()
-            fields = {'Connection': 'close', **(headers or {})}
+            fields = {'Connection': 'keep-alive' if self.keep_alive else 'close', **(headers or {})}
             if body is not None:
                 fields['Content-Type'] = 'application/json'
             connection.request(method, path, body=body, headers=fields)
             response = connection.getresponse()
             data = response.read(1048577)
+            reusable = (fields['Connection'] == 'keep-alive' and response.status == 200 and
+                        response.isclosed() and not response.will_close)
             if len(data) > 1048576:
                 raise HttpsApiError(502, 'HTTPS response exceeds client bound')
             result = json.loads(data)
             if response.status != 200:
                 raise HttpsApiError(response.status, result.get('error', 'HTTPS request refused'))
             return result['result'] if 'result' in result else result
+        except BaseException:
+            reusable = False
+            raise
         finally:
-            connection.close()
+            if reusable:
+                self.local.last_used = self.clock()
+            else:
+                self._drop()
 
 
 def create_local_tls(directory):

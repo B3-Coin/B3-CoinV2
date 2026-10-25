@@ -70,6 +70,7 @@ def main():
             '--offline', '--use', args.solc, '--out', evidence / 'contracts-out',
             '--cache-path', evidence / 'contracts-cache', '-vv'])
         for label, name in (('tls-boundary', 'test_https_api.py'), ('rpc-batch-boundary', 'test_custody_batch.py'),
+                            ('tls-keepalive-boundary', 'test_https_keepalive.py'),
                             ('private-identity-update', 'test_private_atomic_json.py'),
                             ('automatic-custody-protocol', 'test_automatic_custody.py'),
                             ('automatic-batching-protocol', 'test_automatic_batches.py'),
