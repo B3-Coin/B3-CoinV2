@@ -121,6 +121,14 @@ stage_breakdown to the report; stage_report.py prints the same breakdown and
 the per-process call totals. Tracing is off unless asked for and changes no
 decision; the timings it reports include its own small overhead.
 
+Three extra reports never change the gate's pass/fail rule, which stays with
+the default invocation. --samples up to 1000 records running p50/p95/p99
+every 100 fills. --failures count keeps going after a refused or timed-out
+fill, counts it as one sample at the 45 s commit deadline (with_failures) and
+still fails the run. --concurrency N (1..8) gives N clients their own accounts
+and HTTPS clients and has them all submit at once every round. The last two
+need --transport authenticated-tcp.
+
 Required evidence
 
 The network release runner requires the complete earlier regression suite,
