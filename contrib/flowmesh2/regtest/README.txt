@@ -115,6 +115,12 @@ waiting. Full client signing/preparation time is reported separately. The local
 withdrawal challenge is 30 seconds. Neither local timings nor the generic
 contract's provisional delay floors establish live network latency or security.
 
+benchmark.py --stage-trace also writes per-stage timestamps from the client and
+all four operators to EVIDENCE/stage-trace (stage_trace.py) and adds a
+stage_breakdown to the report; stage_report.py prints the same breakdown and
+the per-process call totals. Tracing is off unless asked for and changes no
+decision; the timings it reports include its own small overhead.
+
 Required evidence
 
 The network release runner requires the complete earlier regression suite,
