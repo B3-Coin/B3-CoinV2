@@ -398,7 +398,7 @@ Result<std::unique_ptr<Agreement>> PbftAgreement::Create(const ProfileParams& pr
     if (authority.epoch != 0 || authority.profile_hash != ProfileHash(profile)) return Refuse(ErrorCode::INVALID_INPUT, "PBFT_STATIC_AUTHORITY");
     auto seats{context.adapter.SeatSetAt(authority.epoch)};
     if (!seats.has_value()) return seats.error();
-    if (seats->Size() != 4 || seats->Quorum() != 3 || seats->Root() != authority.seat_set_root) return Refuse(ErrorCode::INVALID_INPUT, "PBFT_FOUR_SEATS");
+    if (!RegtestPbftSeatCount(seats->Size()) || seats->Root() != authority.seat_set_root) return Refuse(ErrorCode::INVALID_INPUT, "PBFT_SEAT_COUNT");
     if (config.self_seat >= seats->Size() || seats->Keys()[config.self_seat].Key() != context.signer.PublicKey()) {
         return Refuse(ErrorCode::INVALID_INPUT, "PBFT_SELF_KEY");
     }

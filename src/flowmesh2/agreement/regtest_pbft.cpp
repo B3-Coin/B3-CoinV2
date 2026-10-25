@@ -15,8 +15,9 @@
 
 namespace flowmesh2::agreement {
 namespace {
-// TODO(rebirth:M4-AGR-13) regtest-only four-seat PBFT; the literal seat count,
-// quorum and leader rule give way to the general agreement of M4-AGR-02.
+// TODO(rebirth:M4-AGR-13) regtest-only PBFT for 4..7 seats: quorum, bitmap,
+// leader rule and report counts follow the seat set (O-98); the general
+// agreement of M4-AGR-02 replaces it.
 constexpr size_t MAX_BODIES{16};
 constexpr size_t MAX_BODY_CACHE_BYTES{16 * 1024 * 1024};
 constexpr size_t MAX_PEER_OUTBOX{16};
@@ -46,7 +47,7 @@ class FullViewAgreement final : public Agreement
 public:
     FullViewAgreement(ProfileParams profile, PbftConfig config, PbftContext context, SeatSet seats)
         : m_profile{std::move(profile)}, m_config{std::move(config)}, m_context{context}, m_seats{std::move(seats)},
-          m_control{*context.control_log}, m_parent_certificate{m_config.parent_certificate} {}
+          m_control{*context.control_log}, m_parent_certificate{m_config.parent_certificate}, m_outbox(m_seats.Size()) {}
 
     Result<void> Initialize()
     {
@@ -174,7 +175,7 @@ public:
         Result<void> result{Ok()};
         if (const auto* offer{std::get_if<OfferedProposal>(&*decoded)}) result = OnOffer(offer->proposal);
         else if (const auto* proposal{std::get_if<Proposal>(&*decoded)}) {
-            if (from != static_cast<uint32_t>((proposal->header.height % 4 + proposal->view % 4) % 4)) return Refuse(ErrorCode::VERIFY_FAILED, "PBFT_PROPOSAL_LEADER");
+            if (from != LeaderOf(proposal->header.height, proposal->view)) return Refuse(ErrorCode::VERIFY_FAILED, "PBFT_PROPOSAL_LEADER");
             result = AcceptProposal(*proposal);
             if (result.has_value() && proposal->header.height == m_slot && proposal->view == m_view && !m_changing) result = MakeVote(storage::VotePhase::PREPARE);
         } else if (const auto* vote{std::get_if<Vote>(&*decoded)}) {
@@ -372,7 +373,15 @@ private:
         if (m_halted) return Refuse(ErrorCode::FENCED, "PBFT_SAFETY_HALT");
         return Ok();
     }
-    uint32_t Leader(uint64_t view) const { return static_cast<uint32_t>((m_slot % 4 + view % 4) % 4); }
+    //! (slot + view) mod k, without overflow; the control log checks the same rule.
+    uint32_t LeaderOf(uint64_t slot, uint64_t view) const
+    {
+        const uint64_t k{m_seats.Size()};
+        return static_cast<uint32_t>((slot % k + view % k) % k);
+    }
+    uint32_t Leader(uint64_t view) const { return LeaderOf(m_slot, view); }
+    //! f + 1 = k - quorum + 1: enough reports of a higher view that one is honest.
+    size_t OneHonest() const { return m_seats.Size() - m_seats.Quorum() + 1; }
     uint64_t Timeout() const
     {
         uint64_t timeout{m_config.view_timeout_floor_ms};
@@ -595,7 +604,7 @@ private:
         }
         const auto aggregate{bls::AggregateSignatures(signatures)};
         if (!aggregate) return Refuse(ErrorCode::VERIFY_FAILED, "PBFT_AGGREGATE");
-        SlotCertificate cert{proposal.header.Hash(), SlotCertificate::MakeBitmap(4, indices).value(), aggregate->Compressed(), votes.begin()->second.view};
+        SlotCertificate cert{proposal.header.Hash(), SlotCertificate::MakeBitmap(m_seats.Size(), indices).value(), aggregate->Compressed(), votes.begin()->second.view};
         if (auto valid{VerifyCachedCertificate(cert, proposal.header, digest)}; !valid.has_value()) return valid.error();
         return Ok(std::move(cert));
     }
@@ -614,7 +623,7 @@ private:
         if (auto valid{CheckVote(vote)}; !valid.has_value()) return valid.error();
         if (!vote.inclusion.empty()) return Refuse(ErrorCode::UNSUPPORTED, "PBFT_INCLUSION_NOT_SIGNED");
         if (const auto decided{m_context.commit_log.DecisionAt(vote.slot)}; decided && decided->header_hash == vote.header_hash) return Ok();
-        if (vote.epoch != 0 || vote.slot != m_slot || vote.seat >= 4 || vote.view > storage::MAX_CONTROL_VIEW) return Refuse(ErrorCode::VERIFY_FAILED, "PBFT_VOTE_INSTANCE");
+        if (vote.epoch != 0 || vote.slot != m_slot || vote.seat >= m_seats.Size() || vote.view > storage::MAX_CONTROL_VIEW) return Refuse(ErrorCode::VERIFY_FAILED, "PBFT_VOTE_INSTANCE");
         // Naked future votes never grant entry to their view.
         if (vote.view > m_view) return Refuse(ErrorCode::NEED_DATA, "PBFT_FUTURE_VOTE");
         auto body{Body(vote.header_hash, vote.view)};
@@ -634,7 +643,7 @@ private:
         auto& votes{vote.phase == storage::VotePhase::PREPARE ? bucket->prepares : bucket->commits};
         if (const auto old{votes.find(vote.seat)}; old != votes.end() && old->second != vote) return Refuse(ErrorCode::EQUIVOCATION_REFUSED, "PBFT_DOUBLE_VOTE");
         votes.emplace(vote.seat, vote);
-        if (vote.phase == storage::VotePhase::PREPARE && votes.size() >= 3) {
+        if (vote.phase == storage::VotePhase::PREPARE && votes.size() >= m_seats.Quorum()) {
             auto qc{Aggregate(proposal, votes, PbftPrepareDigest(proposal.header, vote.view))};
             if (!qc.has_value()) return qc.error();
             if (auto saved{SavePrepared({vote.view, proposal.header, *qc}, proposal)}; !saved.has_value()) {
@@ -645,7 +654,7 @@ private:
             // or manufactures permission to vote in an abandoned view.
             if (vote.view == m_view && !m_changing && bucket->accepted && !bucket->commit_sent) return MakeVote(storage::VotePhase::COMMIT);
         }
-        if (vote.phase == storage::VotePhase::COMMIT && votes.size() >= 3 && !m_final) {
+        if (vote.phase == storage::VotePhase::COMMIT && votes.size() >= m_seats.Quorum() && !m_final) {
             auto cert{Aggregate(proposal, votes, VersionedCommitDigest(proposal.header, vote.view))};
             if (!cert.has_value()) return cert.error();
             CertifiedProposal final{proposal, *cert};
@@ -758,7 +767,7 @@ private:
         }
         // A single arbitrary target never advances view state. f+1 reports
         // for ONE same target may synchronize a lagging honest replica.
-        if (report.key.view > m_view && reports.size() >= 2) return EnterView(report.key.view);
+        if (report.key.view > m_view && reports.size() >= OneHonest()) return EnterView(report.key.view);
         if (report.key.view == m_view && m_changing) return MaybeNewView();
         return Ok();
     }
@@ -777,9 +786,9 @@ private:
             if (!previous || previous->key != existing->key || previous->key != key) return Refuse(ErrorCode::FENCED, "PBFT_NEW_VIEW_REPLAY_TYPE");
             return PublishNewView(*previous, *existing);
         }
-        if (Reports(m_view).size() < 3) return Ok();
+        if (Reports(m_view).size() < m_seats.Quorum()) return Ok();
         std::vector<ControlReport> reports;
-        for (const auto& [seat, report] : Reports(m_view)) { reports.push_back(report); if (reports.size() == 3) break; }
+        for (const auto& [seat, report] : Reports(m_view)) { reports.push_back(report); if (reports.size() == m_seats.Quorum()) break; }
         std::optional<ControlPrepared> highest;
         for (const auto& report : reports) {
             if (auto verified{VerifyControlReport(report, m_context.owner.Head()->Header(), m_seats, m_profile)}; !verified.has_value()) return verified.error();
@@ -991,7 +1000,7 @@ private:
         if (bytes->size() > MAX_PEER_OUTBOX_BYTES) return Refuse(ErrorCode::OVERSIZE, "PBFT_OUTBOX_FRAME_BOUND");
         uint256 hash;
         if (const auto* v{std::get_if<Vote>(&message)}) hash = v->header_hash;
-        for (uint32_t seat{0}; seat < 4; ++seat) {
+        for (uint32_t seat{0}; seat < m_seats.Size(); ++seat) {
             if (seat == m_config.self_seat) continue;
             auto& queue{m_outbox[seat]};
             // Retry of an exact immutable object occupies one slot, even
@@ -1013,7 +1022,7 @@ private:
     }
     Result<void> Flush()
     {
-        for (uint32_t seat{0}; seat < 4; ++seat) {
+        for (uint32_t seat{0}; seat < m_seats.Size(); ++seat) {
             auto& queue{m_outbox[seat]};
             while (!queue.empty()) {
                 const auto& frame{queue.front()};
@@ -1055,7 +1064,7 @@ private:
     std::optional<CertifiedHeader> m_known_decision;
     std::optional<CertifiedProposal> m_final;
     std::optional<Decision> m_decision;
-    std::array<std::deque<Frame>, 4> m_outbox;
+    std::vector<std::deque<Frame>> m_outbox; //!< one queue per seat
     std::optional<uint64_t> m_now;
     std::optional<uint64_t> m_timer_start;
     std::optional<uint64_t> m_last_retry;
@@ -1069,7 +1078,7 @@ Result<std::unique_ptr<Agreement>> MakeRegtestFullViewAgreement(const ProfilePar
     const auto& control{context.control_log->Config()};
     const auto parent{context.owner.Head()};
     if (control.domain != parent->Header().domain || control.profile_hash != ProfileHash(profile) || control.seat_set_root != seats.Root() ||
-        control.epoch != 0 || control.self_seat != config.self_seat || control.seat_count != 4 || !profile.view_bound_commits ||
+        control.epoch != 0 || control.self_seat != config.self_seat || control.seat_count != seats.Size() || !profile.view_bound_commits ||
         parent->Header().commitment_version != COMMITMENT_VERSION_VIEW_BOUND) {
         return Refuse(ErrorCode::INVALID_INPUT, "PBFT_CONTROL_CONFIG");
     }

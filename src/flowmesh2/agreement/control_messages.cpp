@@ -27,7 +27,7 @@ Result<void> VerifyCertificate(const SlotCertificate& cert, const SlotHeaderV2& 
 Result<void> VerifyInstance(const storage::ControlKey& key, const SlotHeaderV2& parent, const SeatSet& seats,
                             const ProfileParams& profile, storage::ControlPhase phase)
 {
-    if (seats.Size() != 4 || seats.Quorum() != 3) return Invalid("CONTROL_FOUR_SEATS");
+    if (!RegtestPbftSeatCount(seats.Size())) return Invalid("CONTROL_SEAT_COUNT");
     const auto expected{profile.source_range_commitment ? StableQNetworkRegtestProfile(ChainType::REGTEST) : StableQViewRegtestProfile(ChainType::REGTEST)};
     if (!expected.has_value()) return expected.error();
     if (profile != *expected || ProfileHash(profile) != parent.profile_hash || parent.commitment_version != ExpectedCommitmentVersion(profile)) return Invalid("CONTROL_STABLE_PROFILE");

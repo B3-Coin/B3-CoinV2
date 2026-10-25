@@ -170,7 +170,7 @@ Result<ControlLog> ControlLog::Create(Journal& journal, const ControlConfig& con
     const auto network_profile{StableQNetworkRegtestProfile(ChainType::REGTEST)};
     if (!network_profile.has_value()) return network_profile.error();
     if ((config.profile_hash != ProfileHash(*profile) && config.profile_hash != ProfileHash(*network_profile)) ||
-        config.epoch != 0 || config.seat_count != 4) return Invalid("CONTROL_REGTEST_VIEW_PROFILE");
+        config.epoch != 0 || !RegtestPbftSeatCount(config.seat_count)) return Invalid("CONTROL_REGTEST_VIEW_PROFILE");
     auto records{journal.ReadAll()};
     if (!records.has_value()) return records.error();
     if (records->size() != status.durable_seq) return Error{ErrorCode::ORDER_VIOLATION, LOG_REPLAY_SEQUENCE};

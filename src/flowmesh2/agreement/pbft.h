@@ -32,8 +32,10 @@
  * proposal (O-51); view change with durable view state (M4-STO-07); one slot
  * in flight. The barriers of section 7.3 apply to both phases.
  *
- * The explicit regtest_fixed_view opt-in implements the four-seat, quorum-three
- * view-0 PREPARE / COMMIT path with independent reexecution/fact checks, strict
+ * The explicit regtest_fixed_view opt-in implements the view-0 PREPARE /
+ * COMMIT path for a regtest seat set of 4..7 seats (REGTEST_PBFT_MIN_SEATS
+ * to REGTEST_PBFT_MAX_SEATS, O-98; the regtest operator runs four), quorum
+ * QuorumFor(k), with independent reexecution/fact checks, strict
  * intent/vote/PreparedQC/decision barriers and real BLS. Local timeouts fence
  * fresh signing. Certified decisions can still be learned after that fence.
  * This slice has no leader failover, durable view-change control signing or
@@ -66,7 +68,7 @@ struct PbftConfig {
     uint64_t view_timeout_floor_ms{50}; //!< plan 3.4.1 co-located floor; PROVISIONAL (M4-AGR-05)
     bool regtest_fixed_view{false};   //!< explicit safe view-0 test slice; timeout fences, no view change
     std::optional<SlotCertificate> parent_certificate; //!< verified exact parent proof on restart
-    bool regtest_full_view{false}; //!< durable four-seat view-change controller, exclusive control journal required
+    bool regtest_full_view{false}; //!< durable regtest view-change controller (4..7 seats, O-98), exclusive control journal required
 };
 
 //! What a PBFT instance works with; every reference must outlive it.

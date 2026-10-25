@@ -9,11 +9,17 @@
 #include <flowmesh2/storage/control_log.h>
 #include <flowmesh2/net/seat_mesh.h>
 #include <flowmesh2/test/util/agreement_fixtures.h>
+#include <crypto/common.h>
+#include <crypto/sha256.h>
+#include <util/strencodings.h>
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <deque>
 #include <functional>
+#include <map>
 #include <set>
+#include <string>
 #include <util/chaintype.h>
 using namespace flowmesh2;
 using namespace flowmesh2::agreement;
@@ -51,9 +57,18 @@ std::unique_ptr<storage::MemoryJournal> Reopened(storage::JournalRole role, cons
     return std::move(journal).value();
 }
 
+//! The seat names s0 .. s(k-1) of a k-seat test network.
+std::vector<std::string> SeatNames(uint32_t k)
+{
+    std::vector<std::string> names;
+    for (uint32_t i{0}; i < k; ++i) names.push_back("s" + std::to_string(i));
+    return names;
+}
+
 struct ViewReplica {
+    uint32_t k; //!< seats of the network; set before `seats` (declaration order)
     ProfileParams profile{StableQViewRegtestProfile(ChainType::REGTEST).value()};
-    SeatSet seats{TestSeats({"s0", "s1", "s2", "s3"})};
+    SeatSet seats{TestSeats(SeatNames(k))};
     AuthorityVersion authority{0, seats.Root(), ProfileHash(profile)};
     std::unique_ptr<dev::FakeChainAdapter> adapter{dev::FakeChainAdapter::Create(TestNetwork(), authority, seats, TestAnchor(129)).value()};
     RecordingObserver observer;
@@ -70,13 +85,13 @@ struct ViewReplica {
     ViewQueueSink sink;
     std::unique_ptr<Agreement> agreement;
 
-    ViewReplica(uint32_t self, std::deque<ViewFrame>& frames, storage::MemoryJournalFaults faults = {})
-        : signer_journal{NewMemoryJournal(storage::JournalRole::SIGNER, 10 + self, faults, &observer)},
+    ViewReplica(uint32_t self, std::deque<ViewFrame>& frames, storage::MemoryJournalFaults faults = {}, uint32_t seat_count = 4)
+        : k{seat_count}, signer_journal{NewMemoryJournal(storage::JournalRole::SIGNER, 10 + self, faults, &observer)},
           commit_journal{NewMemoryJournal(storage::JournalRole::COMMIT, 20 + self, {}, &observer)},
           control_journal{NewMemoryJournal(storage::JournalRole::SIGNER, 30 + self, {}, &observer)},
           signer_log{storage::SignerLog::Create(*signer_journal, profile).value()},
           commit_log{storage::CommitLog::Create(*commit_journal, profile).value()},
-          control_log{storage::ControlLog::Create(*control_journal, {TestDomain(), ProfileHash(profile), seats.Root(), 0, self, 4, seats.Keys()[self].Key()}).value()},
+          control_log{storage::ControlLog::Create(*control_journal, {TestDomain(), ProfileHash(profile), seats.Root(), 0, self, k, seats.Keys()[self].Key()}).value()},
           signer{storage::SeatSigner::FromIKM(AgreementRig::SeatIkm("s" + std::to_string(self)), signer_log, control_log).value()},
           owner{state::StateOwner::Create(profile, genesis, commit_journal->InstanceId()).value()}, sink{self, frames}
     {
@@ -97,13 +112,13 @@ struct ViewReplica {
     //! durable, its logs and head rebuilt from them alone, and a new agreement on
     //! the same chain. Nothing else survives.
     ViewReplica(uint32_t self, std::deque<ViewFrame>& frames, ViewReplica& crashed)
-        : adapter{std::move(crashed.adapter)},
+        : k{crashed.k}, adapter{std::move(crashed.adapter)},
           signer_journal{Reopened(storage::JournalRole::SIGNER, *crashed.signer_journal, &observer)},
           commit_journal{Reopened(storage::JournalRole::COMMIT, *crashed.commit_journal, &observer)},
           control_journal{Reopened(storage::JournalRole::SIGNER, *crashed.control_journal, &observer)},
           signer_log{storage::SignerLog::Create(*signer_journal, profile).value()},
           commit_log{storage::CommitLog::Create(*commit_journal, profile).value()},
-          control_log{storage::ControlLog::Create(*control_journal, {TestDomain(), ProfileHash(profile), seats.Root(), 0, self, 4, seats.Keys()[self].Key()}).value()},
+          control_log{storage::ControlLog::Create(*control_journal, {TestDomain(), ProfileHash(profile), seats.Root(), 0, self, k, seats.Keys()[self].Key()}).value()},
           signer{storage::SeatSigner::FromIKM(AgreementRig::SeatIkm("s" + std::to_string(self)), signer_log, control_log).value()},
           owner{state::StateOwner::Create(profile, genesis, commit_journal->InstanceId()).value()}, sink{self, frames}
     {
@@ -182,10 +197,10 @@ PreparedSplit PrepareAOnly(ViewNetwork& network);
 
 struct ViewNetwork {
     std::deque<ViewFrame> frames;
-    std::array<std::unique_ptr<ViewReplica>, 4> nodes;
-    ViewNetwork()
+    std::vector<std::unique_ptr<ViewReplica>> nodes;
+    explicit ViewNetwork(uint32_t k = 4)
     {
-        for (uint32_t i{0}; i < 4; ++i) nodes[i] = std::make_unique<ViewReplica>(i, frames);
+        for (uint32_t i{0}; i < k; ++i) nodes.push_back(std::make_unique<ViewReplica>(i, frames, storage::MemoryJournalFaults{}, k));
     }
     std::vector<ViewFrame> history;
     //! Seat `seat` crashes and restarts from its journals (M4-STO-07).
@@ -937,6 +952,314 @@ BOOST_AUTO_TEST_CASE(pure_crypto_memo_fifo_eviction_falls_back_to_verification_w
     BOOST_CHECK_EQUAL(node.signer_journal->DurableSeq(), 0U);
     BOOST_CHECK_EQUAL(node.agreement->CurrentView(), 66U);
     BOOST_CHECK(!node.agreement->TakeDecision());
+}
+
+BOOST_AUTO_TEST_SUITE_END()
+
+namespace {
+
+//! SHA-256 over every delivered frame (u32 LE from, to and length, then the bytes), in delivery order.
+std::string TranscriptDigest(const std::vector<ViewFrame>& history)
+{
+    CSHA256 hasher;
+    for (const ViewFrame& frame : history) {
+        unsigned char head[12];
+        WriteLE32(head, frame.from);
+        WriteLE32(head + 4, frame.to);
+        WriteLE32(head + 8, static_cast<uint32_t>(frame.bytes.size()));
+        hasher.Write(head, sizeof(head));
+        hasher.Write(frame.bytes.data(), frame.bytes.size());
+    }
+    std::array<unsigned char, CSHA256::OUTPUT_SIZE> out;
+    hasher.Finalize(out.data());
+    return HexStr(out);
+}
+
+struct ScheduleRng {
+    uint64_t state;
+    uint64_t Next()
+    {
+        state = state * 6'364'136'223'846'793'005ULL + 1'442'695'040'888'963'407ULL;
+        return state >> 33;
+    }
+};
+
+/** Deliver the queued frames in a random order. Frames to or from `offline`
+ * seats are lost, and so is a share `drop_per_mille` of the others. A refused
+ * message is counted, not failed: under reordering a seat may see a vote
+ * before what it votes on.
+ */
+size_t RandomDrain(ViewNetwork& network, ScheduleRng& rng, const std::set<uint32_t>& offline, uint32_t drop_per_mille)
+{
+    size_t refused{0}, work{0};
+    auto& frames{network.frames};
+    while (!frames.empty()) {
+        BOOST_REQUIRE(++work < 50'000);
+        const size_t pick{static_cast<size_t>(rng.Next() % frames.size())};
+        ViewFrame frame{std::move(frames[pick])};
+        frames.erase(frames.begin() + static_cast<std::ptrdiff_t>(pick));
+        if (offline.contains(frame.from) || offline.contains(frame.to)) continue;
+        if (rng.Next() % 1'000 < drop_per_mille) continue;
+        network.history.push_back(frame);
+        if (!network.nodes[frame.to]->agreement->OnMessage(frame.from, frame.bytes).has_value()) ++refused;
+        network.nodes[frame.to]->ApplyDecision();
+    }
+    for (auto& node : network.nodes) node->ApplyDecision();
+    return refused;
+}
+
+//! Every DECISION in a seat's commit journal, by height.
+std::map<uint64_t, uint256> DecisionsOf(const ViewReplica& node)
+{
+    std::map<uint64_t, uint256> out;
+    const auto records{node.commit_journal->ReadAll()};
+    RequireOk(records, "commit journal");
+    for (const auto& record : *records) {
+        if (record.type != storage::RecordType::DECISION) continue;
+        const auto decision{storage::DecisionRecord::Decode(record.payload, node.profile)};
+        RequireOk(decision, "decision record");
+        out.emplace(decision->header.height, decision->header.Hash());
+    }
+    return out;
+}
+
+struct ScheduleOutcome {
+    size_t decisions{0};
+    size_t refused{0};
+    size_t violations{0}; //!< a height at which two seats decided different headers
+    bool live{true};      //!< every online seat decided both slots
+};
+
+/** One seeded schedule of a seven-seat network: up to two seats offline for
+ * the whole run, random delivery order, a lossy run on odd seeds, a seat
+ * crash and restart now and then, and two slots each offered by a random
+ * online seat, with timeouts until the online seats decide or eight rounds
+ * pass.
+ */
+ScheduleOutcome RunSevenSeatSchedule(uint64_t seed)
+{
+    ViewNetwork network{7};
+    ScheduleRng rng{seed * 0x9e37'79b9'7f4a'7c15ULL + 1};
+    std::set<uint32_t> offline;
+    const uint64_t offline_count{rng.Next() % 3};
+    while (offline.size() < offline_count) offline.insert(static_cast<uint32_t>(rng.Next() % 7));
+    const uint32_t drop{seed % 2 ? 30U : 0U};
+    std::vector<uint32_t> online;
+    for (uint32_t seat{0}; seat < 7; ++seat) {
+        if (!offline.contains(seat)) online.push_back(seat);
+    }
+    ScheduleOutcome outcome;
+    uint64_t now{0};
+    for (uint64_t slot{1}; slot <= 2; ++slot) {
+        const uint32_t proposer{online[rng.Next() % online.size()]};
+        auto& offerer{*network.nodes[proposer]};
+        if (offerer.owner->Head()->Header().height + 1 == slot) {
+            RequireOk(offerer.agreement->Propose(offerer.Candidate(), offerer.authority), "offer the next slot");
+        }
+        for (uint32_t seat : online) RequireOk(network.nodes[seat]->agreement->OnTimeout(now), "timer baseline");
+        for (int round{0}; round < 8; ++round) {
+            outcome.refused += RandomDrain(network, rng, offline, drop);
+            if (std::all_of(online.begin(), online.end(), [&](uint32_t s) { return network.nodes[s]->owner->Head()->Header().height >= slot; })) break;
+            if (rng.Next() % 4 == 0) {
+                const uint32_t crashed{online[rng.Next() % online.size()]};
+                network.Restart(crashed);
+                RequireOk(network.nodes[crashed]->agreement->OnTimeout(now), "restarted timer baseline");
+            }
+            now += 120'000;
+            for (uint32_t seat : online) RequireOk(network.nodes[seat]->agreement->OnTimeout(now), "view timeout");
+        }
+    }
+    std::map<uint64_t, uint256> decided;
+    for (const auto& node : network.nodes) {
+        for (const auto& [height, hash] : DecisionsOf(*node)) {
+            ++outcome.decisions;
+            const auto [it, fresh]{decided.emplace(height, hash)};
+            if (!fresh && it->second != hash) ++outcome.violations;
+        }
+    }
+    for (uint32_t seat : online) outcome.live = outcome.live && network.nodes[seat]->owner->Head()->Header().height >= 2;
+    return outcome;
+}
+
+} // namespace
+
+BOOST_AUTO_TEST_SUITE(pbft_seven_seat_tests)
+
+BOOST_AUTO_TEST_CASE(four_seat_transcripts_are_unchanged)
+{
+    // Pinned on the four-seat-only code before the seat-count literals were
+    // generalized; a change here changes four-seat bytes on the wire.
+    std::string silent, prepared;
+    {
+        ViewNetwork network;
+        RequireOk(network.nodes[0]->agreement->Propose(network.nodes[0]->Candidate(), network.nodes[0]->authority), "offer");
+        network.Drain({1});
+        for (uint32_t i : {0U, 2U, 3U}) RequireOk(network.nodes[i]->agreement->OnTimeout(0), "timer baseline");
+        for (uint32_t i : {0U, 2U, 3U}) RequireOk(network.nodes[i]->agreement->OnTimeout(500), "next view");
+        network.Drain({1});
+        BOOST_REQUIRE_EQUAL(network.nodes[0]->owner->Head()->Header().height, 1U);
+        silent = TranscriptDigest(network.history);
+    }
+    {
+        ViewNetwork network;
+        const PreparedSplit split{PrepareAOnly(network)};
+        RequireOk(network.nodes[3]->agreement->Propose(split.b, network.nodes[3]->authority), "future leader only knows B");
+        network.Drain({2});
+        for (uint32_t i : {0U, 1U, 3U}) RequireOk(network.nodes[i]->agreement->OnTimeout(0), "timer baseline");
+        for (uint32_t i : {0U, 1U, 3U}) RequireOk(network.nodes[i]->agreement->OnTimeout(500), "prepared leader loss");
+        network.Drain({2});
+        RequireADecided(network, split);
+        prepared = TranscriptDigest(network.history);
+    }
+    BOOST_TEST_MESSAGE("silent leader " << silent << ", prepared body " << prepared);
+    BOOST_CHECK_EQUAL(silent, "fde2c91cd780c631707f4ed834d69d9b3858605c72729de065fb444e07b2a223");
+    BOOST_CHECK_EQUAL(prepared, "eb5a5c1a593ecaf60b255a312c8d78f77c9e630180c020dfbd463ab836446ab4");
+}
+
+BOOST_AUTO_TEST_CASE(seven_seats_decide_with_five_after_a_silent_leader)
+{
+    // Slot 1: the view-0 leader is seat 1, and seat 6 is offline too, so five
+    // seats, exactly the quorum, move to view 1 (leader 2) and decide.
+    ViewNetwork network{7};
+    const std::set<uint32_t> offline{1, 6};
+    const std::vector<uint32_t> online{0, 2, 3, 4, 5};
+    auto candidate{network.nodes[0]->Candidate()};
+    const auto expected{candidate.Header().Hash()};
+    RequireOk(network.nodes[0]->agreement->Propose(candidate, network.nodes[0]->authority), "nonleader offers original work");
+    network.Drain(offline);
+    for (uint32_t i : online) BOOST_REQUIRE_EQUAL(network.nodes[i]->owner->Head()->Header().height, 0U);
+    for (uint32_t i : online) RequireOk(network.nodes[i]->agreement->OnTimeout(0), "start active timer");
+    for (uint32_t i : online) RequireOk(network.nodes[i]->agreement->OnTimeout(500), "enter next view");
+    network.Drain(offline);
+    for (uint32_t i : online) {
+        auto& node{*network.nodes[i]};
+        BOOST_CHECK_EQUAL(node.owner->Head()->Header().height, 1U);
+        BOOST_CHECK(node.owner->Head()->Header().Hash() == expected);
+        const auto records{node.commit_journal->ReadAll().value()};
+        for (const auto& record : records) {
+            if (record.type != storage::RecordType::DECISION) continue;
+            const auto decision{storage::DecisionRecord::Decode(record.payload, node.profile).value()};
+            BOOST_REQUIRE(decision.certificate.view);
+            BOOST_CHECK_EQUAL(*decision.certificate.view, 1U);
+        }
+    }
+    for (uint32_t i : offline) BOOST_CHECK_EQUAL(network.nodes[i]->owner->Head()->Header().height, 0U);
+}
+
+BOOST_AUTO_TEST_CASE(seven_seats_rotate_the_view_zero_leader_through_seats_four_and_five)
+{
+    // The view-0 leader of slot s is s mod 7. Slots 4 and 5 are led by
+    // seats 4 and 5, which a rotation over four seats never picks. The seats
+    // such a rotation would pick (0 at slot 4, then 1 at slot 5) are
+    // offline and no timer runs, so each slot decides, in view 0, only if
+    // its real leader proposes. Seat 6 offers the work every time.
+    ViewNetwork network{7};
+    std::set<uint32_t> offline;
+    for (uint64_t slot{1}; slot <= 5; ++slot) {
+        if (slot == 4) offline.insert(0);
+        if (slot == 5) offline.insert(1);
+        auto candidate{network.nodes[6]->Candidate()};
+        const auto expected{candidate.Header().Hash()};
+        RequireOk(network.nodes[6]->agreement->Propose(candidate, network.nodes[6]->authority), "seat 6 offers the work");
+        network.Drain(offline);
+        for (uint32_t i{0}; i < 7; ++i) {
+            if (offline.contains(i)) continue;
+            auto& node{*network.nodes[i]};
+            BOOST_REQUIRE_MESSAGE(node.owner->Head()->Header().height == slot, "seat " << i << " did not decide slot " << slot);
+            BOOST_CHECK(node.owner->Head()->Header().Hash() == expected);
+            std::optional<uint64_t> view;
+            const auto records{node.commit_journal->ReadAll()};
+            RequireOk(records, "commit journal");
+            for (const auto& record : *records) {
+                if (record.type != storage::RecordType::DECISION) continue;
+                const auto decision{storage::DecisionRecord::Decode(record.payload, node.profile)};
+                RequireOk(decision, "decision record");
+                if (decision->header.height == slot) view = decision->certificate.view;
+            }
+            BOOST_REQUIRE(view.has_value());
+            BOOST_CHECK_EQUAL(*view, 0U);
+        }
+    }
+}
+
+BOOST_AUTO_TEST_CASE(seven_seats_with_four_online_never_decide)
+{
+    ViewNetwork network{7};
+    const std::set<uint32_t> offline{1, 5, 6};
+    const std::vector<uint32_t> online{0, 2, 3, 4};
+    RequireOk(network.nodes[0]->agreement->Propose(network.nodes[0]->Candidate(), network.nodes[0]->authority), "offer");
+    network.Drain(offline);
+    for (uint64_t now : {0ULL, 500ULL, 60'000ULL, 600'000ULL}) {
+        for (uint32_t i : online) RequireOk(network.nodes[i]->agreement->OnTimeout(now), "timeout below quorum");
+        network.Drain(offline);
+    }
+    for (const auto& node : network.nodes) {
+        BOOST_CHECK_EQUAL(node->owner->Head()->Header().height, 0U);
+        BOOST_CHECK(DecisionsOf(*node).empty());
+    }
+    for (uint32_t i : online) BOOST_CHECK(network.nodes[i]->agreement->ChangingView());
+}
+
+BOOST_AUTO_TEST_CASE(seven_seats_carry_a_prepared_body_to_the_next_leader)
+{
+    // Slot 2 (leaders: view 0 seat 2, view 1 seat 3). Seat 2 proposes A;
+    // seats 0, 1, 2, 4, 5 and 6 prepare it and no COMMIT is delivered; seat 3
+    // hears none of it and is offered B. Seat 2 then goes silent, and the
+    // view-1 NEW_VIEW of seat 3 must select A from the reports.
+    ViewNetwork network{7};
+    RequireOk(network.nodes[1]->agreement->Propose(network.nodes[1]->Candidate(), network.nodes[1]->authority), "funding slot");
+    network.Drain();
+    for (const auto& node : network.nodes) BOOST_REQUIRE_EQUAL(node->owner->Head()->Header().height, 1U);
+    SlotFixture actions{network.nodes[0]->profile};
+    auto a{network.nodes[2]->Candidate({actions.Cancel("alice", 1, OrderId{LabelHash("seven prepared cancel A")})})};
+    auto b{network.nodes[3]->Candidate({actions.Cancel("alice", 1, OrderId{LabelHash("seven fresh cancel B")})})};
+    BOOST_REQUIRE(a.Header().Hash() != b.Header().Hash());
+    RequireOk(network.nodes[2]->agreement->Propose(a, network.nodes[2]->authority), "view-0 leader proposes A");
+    network.Drain({}, [&](const ViewFrame& frame) {
+        if (frame.to == 3 || frame.from == 3) return false;
+        const auto decoded{DecodeMessage(frame.bytes, network.nodes[0]->profile).value()};
+        const auto* vote{std::get_if<Vote>(&decoded)};
+        return !vote || vote->phase != storage::VotePhase::COMMIT;
+    });
+    for (uint32_t i : {0U, 1U, 2U, 4U, 5U, 6U}) {
+        BOOST_REQUIRE(network.nodes[i]->commit_log.PreparedAt(0, 2, 0));
+        BOOST_REQUIRE(!network.nodes[i]->commit_log.DecisionAt(2));
+    }
+    RequireOk(network.nodes[3]->agreement->Propose(b, network.nodes[3]->authority), "view-1 leader only knows B");
+    network.Drain({2});
+    const std::vector<uint32_t> survivors{0, 1, 3, 4, 5, 6};
+    for (uint32_t i : survivors) RequireOk(network.nodes[i]->agreement->OnTimeout(0), "timer baseline");
+    for (uint32_t i : survivors) RequireOk(network.nodes[i]->agreement->OnTimeout(500), "prepared leader loss");
+    network.Drain({2});
+    for (uint32_t i : survivors) {
+        BOOST_CHECK_EQUAL(network.nodes[i]->owner->Head()->Header().height, 2U);
+        BOOST_CHECK(network.nodes[i]->owner->Head()->Header().Hash() == a.Header().Hash());
+    }
+}
+
+BOOST_AUTO_TEST_CASE(seven_seat_random_schedules_never_decide_two_headers)
+{
+    // Seeds 1..8 here; FM2_PBFT_SCHEDULE_SEEDS raises the count for evidence runs.
+    uint64_t seeds{8};
+    if (const char* env{std::getenv("FM2_PBFT_SCHEDULE_SEEDS")}) seeds = std::max<uint64_t>(seeds, std::strtoull(env, nullptr, 10));
+    size_t decisions{0}, refused{0}, violations{0}, live{0}, lossless{0}, lossless_live{0};
+    for (uint64_t seed{1}; seed <= seeds; ++seed) {
+        const ScheduleOutcome outcome{RunSevenSeatSchedule(seed)};
+        decisions += outcome.decisions;
+        refused += outcome.refused;
+        violations += outcome.violations;
+        live += outcome.live;
+        if (seed % 2 == 0) {
+            ++lossless;
+            lossless_live += outcome.live;
+            BOOST_CHECK_MESSAGE(outcome.live, "seed " << seed << ": a lossless schedule with five or more seats online did not decide both slots");
+        }
+        BOOST_CHECK_MESSAGE(outcome.violations == 0, "seed " << seed << ": two headers decided at one height");
+    }
+    BOOST_TEST_MESSAGE("seven-seat schedules: seeds " << seeds << ", decisions " << decisions << ", refused messages " << refused
+                       << ", live " << live << " (lossless " << lossless_live << "/" << lossless << "), violations " << violations);
+    BOOST_CHECK_EQUAL(violations, 0U);
+    BOOST_CHECK_GT(decisions, seeds * 5);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

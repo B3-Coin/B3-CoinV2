@@ -42,6 +42,15 @@ inline constexpr size_t MAX_SEATS{1'024};
 //! floor(2k/3) + 1 for k >= 1; 0 for k == 0.
 constexpr size_t QuorumFor(size_t seat_count) { return seat_count == 0 ? 0 : (2 * seat_count) / 3 + 1; }
 
+/** Seat counts the regtest PBFT (agreement/pbft, agreement/regtest_pbft)
+ * and its control journal accept: 4..7. PROVISIONAL REGTEST (O-98): the
+ * literals of the four-seat form generalized as groundwork; the general
+ * seat set is M4-AGR-02 (D10, D11).
+ */
+inline constexpr size_t REGTEST_PBFT_MIN_SEATS{4};
+inline constexpr size_t REGTEST_PBFT_MAX_SEATS{7};
+constexpr bool RegtestPbftSeatCount(size_t seat_count) { return seat_count >= REGTEST_PBFT_MIN_SEATS && seat_count <= REGTEST_PBFT_MAX_SEATS; }
+
 struct SeatRegistration {
     bls::PublicKey key;
     bls::Signature pop;

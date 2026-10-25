@@ -138,9 +138,13 @@ BOOST_AUTO_TEST_CASE(control_codecs_are_exact_and_report_counts_are_capped_befor
         bytes.push_back(0);
         RequireCode(DecodeMessage(bytes, f.profile), ErrorCode::DECODE, "trailing control bytes");
     }
+    // The cap is one report per seat of the largest regtest seat set (O-98):
+    // MAX_CONTROL_REPORTS encode, one more is refused.
     view.reports.push_back(f.Report(3, 1));
+    while (view.reports.size() < MAX_CONTROL_REPORTS) view.reports.push_back(report);
+    BOOST_CHECK(EncodeMessage(Message{view}, f.profile).has_value());
     view.reports.push_back(report);
-    RequireCode(EncodeMessage(Message{view}, f.profile), ErrorCode::OVERSIZE, "five reports");
+    RequireCode(EncodeMessage(Message{view}, f.profile), ErrorCode::OVERSIZE, "one report past MAX_CONTROL_REPORTS");
     report.signature.fill(0);
     RequireCode(VerifyControlReport(report, f.genesis.Header(), f.seats, f.profile), ErrorCode::VERIFY_FAILED, "opaque invalid BLS bytes do not authenticate");
 }

@@ -273,7 +273,7 @@ struct ControlReport {
     storage::VoteSignature signature{};
     friend bool operator==(const ControlReport&, const ControlReport&) = default;
 };
-inline constexpr size_t MAX_CONTROL_REPORTS{4}; //!< only the explicit four-seat regtest profile
+inline constexpr size_t MAX_CONTROL_REPORTS{REGTEST_PBFT_MAX_SEATS}; //!< at most one report per seat of a regtest PBFT (O-98)
 struct ControlNewView {
     storage::ControlKey key;
     uint256 selected;

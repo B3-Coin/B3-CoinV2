@@ -318,6 +318,7 @@ if(BUILD_FLOWMESH2)
     test/outcome_tests.cpp
     test/params_tests.cpp
     test/pbft_view_change_tests.cpp
+    test/pbft_seat_count_tests.cpp
     test/persistent_tree_tests.cpp
     test/pool_tests.cpp
     test/read_tests.cpp
