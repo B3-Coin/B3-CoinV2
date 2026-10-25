@@ -64,6 +64,7 @@ enum class HashTag : uint8_t {
     SMT_KEY = 30,          //!< commitment v1 path of a component key (M2-LED-02)
     SMT_LEAF = 31,         //!< commitment v1 sparse Merkle leaf (M2-LED-02)
     SMT_NODE = 32,         //!< commitment v1 sparse Merkle inner node (M2-LED-02)
+    SHORT_ID_KEY = 33,     //!< SipHash keys of relay short IDs (M4-NET-02)
 };
 
 //! The prefix of every tag text.

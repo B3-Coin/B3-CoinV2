@@ -161,6 +161,11 @@
       "id": 32,
       "name": "SMT_NODE",
       "text": "B3/FM2/SMT_NODE"
+    },
+    {
+      "id": 33,
+      "name": "SHORT_ID_KEY",
+      "text": "B3/FM2/SHORT_ID_KEY"
     }
   ]
 }

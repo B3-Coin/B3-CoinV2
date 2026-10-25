@@ -327,6 +327,7 @@ if(BUILD_FLOWMESH2)
     test/seat_mesh_tests.cpp
     test/seat_set_tests.cpp
     test/seat_signer_tests.cpp
+    test/short_id_tests.cpp
     test/signer_log_tests.cpp
     test/sim_node_tests.cpp
     test/sim_restart_tests.cpp

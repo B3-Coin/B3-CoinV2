@@ -59,8 +59,8 @@
  * (KindAdmissible, whose Unsupported refusals become UNSUPPORTED_KIND).
  * Slice R13 adds the client API's HTTPS + SSE transport (M5-API-01) and
  * streams (M5-API-02, InProcessApi::Subscribe); the in-process (M4-SIM-01)
- * and TCP (M4-NET-01) seat meshes, short IDs (M4-NET-02; Encode and
- * Decode) and sentry fan-out (M4-NET-03); the bridge's mint (M8-BRG-01)
+ * and TCP (M4-NET-01) seat meshes, short IDs (M4-NET-02, since finished)
+ * and sentry fan-out (M4-NET-03); the bridge's mint (M8-BRG-01)
  * and release limits (M8-BRG-03); the futures oracle (M9-FUT-02) and
  * margin (M9-FUT-03); removals (M7-GOV-02) and versioned parameters
  * (M7-GOV-03). It extends M8-BRG-02 to probe BuildWithdrawalPacket,
@@ -101,7 +101,6 @@
 #include <flowmesh2/net/in_process_api.h>
 #include <flowmesh2/net/in_process_mesh.h>
 #include <flowmesh2/net/sentry.h>
-#include <flowmesh2/net/short_id.h>
 #include <flowmesh2/net/tcp_mesh.h>
 #include <flowmesh2/sim/cluster.h>
 #include <flowmesh2/sim/faults.h>
@@ -682,13 +681,6 @@ BOOST_AUTO_TEST_CASE(M4_NET_01)
     const auto mesh{net::TcpSeatMesh::Create(config)};
     BOOST_REQUIRE(!mesh.has_value());
     BOOST_CHECK(mesh.error().code == ErrorCode::INVALID_INPUT);
-}
-
-FM2_STUB_CASE(M4_NET_02, "M4-NET-02")
-{
-    const net::ShortIdCodec codec{uint256::ONE, 7};
-    const std::vector<ActionId> known{ActionId{uint256::ONE}};
-    return FirstDeviation("M4-NET-02", {Observe(codec.Encode(ActionId{uint256::ONE})), Observe(codec.Decode(agreement::ShortId{}, known))});
 }
 
 FM2_STUB_CASE(M4_NET_03, "M4-NET-03")
