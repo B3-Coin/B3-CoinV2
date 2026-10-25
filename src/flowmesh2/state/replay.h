@@ -5,6 +5,9 @@
 #ifndef B3_FLOWMESH2_STATE_REPLAY_H
 #define B3_FLOWMESH2_STATE_REPLAY_H
 
+#include <flowmesh2/core/body.h>
+#include <flowmesh2/core/certificate.h>
+#include <flowmesh2/core/outcome.h>
 #include <flowmesh2/core/result.h>
 #include <flowmesh2/core/slot.h>
 #include <flowmesh2/state/candidate.h>
@@ -13,6 +16,7 @@
 #include <uint256.h>
 
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <span>
 #include <string_view>
@@ -82,6 +86,15 @@
  *   before the mark; VERIFY_FAILED (REPLAY_MARK_MISMATCH) unless header hash
  *   and state root are that slot's. It never moves either head; `marks`
  *   lists each marked slot once (the first record), ascending.
+ * - Observer (M4-STO-03, O-71): ReplayDecisions(base, records, observer)
+ *   calls `observer` once for every slot above the base when its APPLIED
+ *   record makes it committed, in height order, with the slot's head, its
+ *   certificate (of the first DECISION record), canonical body and outcomes
+ *   in emission order: what the read service and the action pool were
+ *   given when the slot was sealed. An observer error ends the replay and is
+ *   returned. The calls happen while the replay runs, before the result is
+ *   known to be valid, so a caller that builds anything from them discards
+ *   it when the replay (or Restore) refuses.
  * - Any other type: a signer-journal type is ORDER_VIOLATION
  *   (storage::RECORD_ROLE), an unregistered one DECODE (storage::RECORD_TYPE).
  *
@@ -125,8 +138,20 @@ struct ReplayResult {
     std::vector<storage::SnapshotMark> marks; //!< SNAPSHOT_MARK records, one per marked slot, ascending
 };
 
+//! A slot the replay just made committed (its APPLIED record): see the file comment.
+struct ReplayCommitted {
+    const HeadView& head;               //!< the committed head after the slot
+    const SlotCertificate& certificate; //!< of its first DECISION record
+    const SlotBody& body;               //!< the certified canonical body
+    std::span<const OutcomeV2> outcomes; //!< emission order
+};
+using ReplayObserver = std::function<Result<void>(const ReplayCommitted&)>;
+
 //! See the file comment.
 Result<ReplayResult> ReplayDecisions(const HeadView& genesis, std::span<const storage::JournalRecord> records);
+//! The same, calling `observer` for every slot above the base as it becomes committed (an empty observer is never called).
+Result<ReplayResult> ReplayDecisions(const HeadView& genesis, std::span<const storage::JournalRecord> records,
+                                     const ReplayObserver& observer);
 
 } // namespace flowmesh2::state
 

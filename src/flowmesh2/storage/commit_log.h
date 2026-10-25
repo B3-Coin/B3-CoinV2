@@ -179,6 +179,17 @@ public:
      */
     std::optional<DecisionRef> DecisionAt(uint64_t slot) const;
 
+    /** The APPLIED record this log holds for `slot` as a PendingApplied
+     * (its sequence number and reference), or nullopt if the slot is not
+     * applied here. Confirm turns it into the slot's DurableApplied once the
+     * record is durable: a restart hands the read service and the pool the
+     * tokens of slots applied before the crash (M4-STO-03, O-71). It writes
+     * nothing, so it can never make APPLIED of a refused slot (O-92).
+     */
+    std::optional<PendingApplied> AppliedAt(uint64_t slot) const;
+    //! The last applied slot (0 before the first application).
+    uint64_t LastAppliedSlot() const { return m_last_applied_slot; }
+
     //! Append the SNAPSHOT_MARK record of `mark`; returns its sequence number. See the file comment.
     Result<uint64_t> AppendSnapshotMark(const SnapshotMark& mark);
     //! Every mark this log holds (appended or replayed), ascending slot.

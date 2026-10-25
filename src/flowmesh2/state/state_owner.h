@@ -66,13 +66,26 @@
  *   only input CommitLog::AppendApplied takes: APPLIED, and so publication,
  *   can only follow an Apply that passed check 3 (O-92).
  * - Head(): the current head; never null.
- * - Restore(base, records): install a head rebuilt from a snapshot and the
- *   DECISION records after it. Stub M4-STO-03; ReplayDecisions
- *   (state/replay.h) is the real, pure part of recovery. Restore installs
- *   ReplayResult::head (the last APPLIED slot); a decided slot without
- *   APPLIED is applied only after check 3 passes again under the current
- *   authority, and a refusal leaves the head there and the node fenced
- *   (O-89).
+ * - Restore(base, records, seats) (M4-STO-03, O-95): install the head a
+ *   snapshot base (state::SnapshotHead) and the whole commit journal give.
+ *   A genesis base is RestoreVerifiedGenesis. Otherwise: STALE_PARENT
+ *   unless the owner still holds its configured genesis; VERIFY_FAILED
+ *   (RESTORE_AUTHORITY) unless `seats` is the base's seat set; the base's
+ *   domain, profile, static epoch 0, seat set, commitment version, state
+ *   root and slot-boundary invariants (O-54; RESTORE_AUTHORITY,
+ *   OWNER_COMMITMENT_VERSION, OWNER_STATE_ROOT_MISMATCH, the invariant's
+ *   error); every record verified as RestoreVerifiedGenesis verifies it
+ *   (chain, exact bodies, quorum certificates); ReplayDecisions from the
+ *   base (state/replay.h: the decisions below it chain into it); VERIFY_FAILED
+ *   (RESTORE_BASE_UNMARKED) unless the records hold the base's SNAPSHOT_MARK;
+ *   both replayed heads checked again; then a compare-and-swap installs
+ *   ReplayResult::head (the last APPLIED slot). On refusal the head is
+ *   unchanged. `observer` sees every slot above the base as the replay
+ *   commits it (state/replay.h), before the install: that is how a restart
+ *   rebuilds the read service and the action pool (O-71) without
+ *   executing a slot twice. The decided tail is returned UNAPPLIED: the caller runs
+ *   check 3 on it under the current authority before it writes APPLIED,
+ *   and a refusal keeps the head there and the node fenced (O-89).
  *
  * Create(profile, genesis, commit_journal_instance) takes a GENESIS head
  * only (height 0, zero parent hash, parent certificate hash and certificate
@@ -104,6 +117,7 @@ inline constexpr std::string_view OWNER_COMMITMENT_VERSION{"head commitment vers
 inline constexpr std::string_view RESTORE_BASE_MISMATCH{"restore base differs from configured genesis"}; //!< (VERIFY_FAILED)
 inline constexpr std::string_view RESTORE_AUTHORITY{"restore requires the configured static epoch-zero authority"}; //!< (VERIFY_FAILED)
 inline constexpr std::string_view RESTORE_CERTIFICATE{"restore decision certificate does not verify"}; //!< (VERIFY_FAILED)
+inline constexpr std::string_view RESTORE_BASE_UNMARKED{"restore base has no durable snapshot mark"}; //!< (VERIFY_FAILED)
 inline constexpr std::string_view RESTORE_RECORD_CHAIN{"restore commit-journal chain does not match this instance"}; //!< (VERIFY_FAILED)
 
 //! What a successful Apply gives: the new head, and the receipt CommitLog::AppendApplied requires (O-92).
@@ -138,8 +152,9 @@ public:
     Result<AppliedSlot> Apply(Candidate&& candidate, const DurableDecision& decision, const AuthorityVersion& current)
         EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
 
-    //! Snapshot `base` plus the commit journal `records` after it. Stub: M4-STO-03.
-    Result<void> Restore(const HeadView& base, std::span<const storage::JournalRecord> records) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+    //! Snapshot (or genesis) `base` plus the whole commit journal `records`. See the file comment.
+    Result<ReplayResult> Restore(const HeadView& base, std::span<const storage::JournalRecord> records, const SeatSet& seats,
+                                 const ReplayObserver& observer = {}) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
 
     /** Certified genesis-only restart for the static REGTEST authority.
      * `base` must equal this owner's configured genesis and the owner must
@@ -156,14 +171,22 @@ public:
      * publication and sealing fenced until the caller completes it through
      * recovered CommitLog, Reexecute, Apply and APPLIED+Barrier. No log writes,
      * signing, receipts or durable tokens are fabricated by restoration.
-     * This does not implement snapshots, changing rosters, view-change or
-     * rollback detection; the two-argument snapshot Restore remains a stub.
+     * This does not implement changing rosters, view-change or rollback
+     * detection; a snapshot base is Restore.
      */
     Result<ReplayResult> RestoreVerifiedGenesis(const HeadView& base, std::span<const storage::JournalRecord> records,
                                                const SeatSet& seats) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
 
 private:
     StateOwner(engine::Engine engine, std::shared_ptr<const HeadView> genesis, uint64_t commit_journal_instance);
+
+    //! RestoreVerifiedGenesis with an observer (Restore of a genesis base).
+    Result<ReplayResult> RestoreGenesis(const HeadView& base, std::span<const storage::JournalRecord> records, const SeatSet& seats,
+                                        const ReplayObserver& observer) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+    //! The verified part both restores share: replay from `base`, the mark of a snapshot base, both heads checked, CAS from `before`.
+    Result<ReplayResult> Install(const std::shared_ptr<const HeadView>& before, const HeadView& base,
+                                 std::span<const storage::JournalRecord> records, const ReplayObserver& observer)
+        EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
 
     const engine::Engine m_engine;
     const uint64_t m_commit_journal_instance;

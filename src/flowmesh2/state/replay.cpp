@@ -21,6 +21,12 @@ constexpr Error Order(std::string_view detail) { return Error{ErrorCode::ORDER_V
 
 Result<ReplayResult> ReplayDecisions(const HeadView& genesis, std::span<const storage::JournalRecord> records)
 {
+    return ReplayDecisions(genesis, records, ReplayObserver{});
+}
+
+Result<ReplayResult> ReplayDecisions(const HeadView& genesis, std::span<const storage::JournalRecord> records,
+                                     const ReplayObserver& observer)
+{
     const ProfileParams& profile{genesis.State().Profile()};
     Result<engine::Engine> created{engine::Engine::Create(profile)};
     if (!created.has_value()) return created.error();
@@ -31,8 +37,14 @@ Result<ReplayResult> ReplayDecisions(const HeadView& genesis, std::span<const st
     HeadView head{genesis};         // after the last decided slot
     HeadView applied_head{genesis}; // after the last applied slot: the committed head
     std::map<uint64_t, storage::SnapshotMark> marks;
-    // Heads of decided slots above the committed head, by height (normally at most one).
-    std::map<uint64_t, HeadView> unapplied;
+    // Decided slots above the committed head, by height (normally at most one).
+    struct Unapplied {
+        HeadView head;
+        SlotCertificate certificate;
+        SlotBody body;
+        std::vector<OutcomeV2> outcomes;
+    };
+    std::map<uint64_t, Unapplied> unapplied;
     std::vector<ReplayedSlot> slots;
     uint64_t duplicate_decisions{0};
     uint64_t duplicate_applied{0};
@@ -78,7 +90,7 @@ Result<ReplayResult> ReplayDecisions(const HeadView& genesis, std::span<const st
             Result<HeadView> next{HeadView::Make(header, cert_hash, candidate->Next())};
             if (!next.has_value()) return next.error();
             head = std::move(next).value();
-            unapplied.emplace(header.height, head);
+            unapplied.emplace(header.height, Unapplied{head, decision->certificate, decision->body, candidate->Outcomes()});
             slots.push_back(ReplayedSlot{header, cert_hash, record.seq, std::nullopt});
             break;
         }
@@ -102,7 +114,12 @@ Result<ReplayResult> ReplayDecisions(const HeadView& genesis, std::span<const st
             const auto pending{unapplied.find(applied->slot)};
             // Every decided slot above the committed head is in `unapplied`.
             if (pending == unapplied.end()) return Error{ErrorCode::INVARIANT, "replayed slot without its head"};
-            applied_head = std::move(pending->second);
+            if (observer) {
+                const Unapplied& slot_state{pending->second};
+                const ReplayCommitted committed{slot_state.head, slot_state.certificate, slot_state.body, slot_state.outcomes};
+                if (const Result<void> observed{observer(committed)}; !observed.has_value()) return observed.error();
+            }
+            applied_head = std::move(pending->second.head);
             unapplied.erase(pending);
             break;
         }

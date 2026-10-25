@@ -8,9 +8,21 @@
 
 namespace flowmesh2::storage {
 
-MemoryJournal::MemoryJournal(JournalRole role, uint64_t instance_id, MemoryJournalFaults faults, BarrierObserver* observer)
-    : Journal(ImplKey{}, role, instance_id, observer), m_faults{faults}
+MemoryJournal::MemoryJournal(JournalRole role, uint64_t instance_id, MemoryJournalFaults faults, BarrierObserver* observer,
+                             const ScanResult* recovered, std::vector<unsigned char> image)
+    : Journal(ImplKey{}, role, instance_id, observer, recovered), m_faults{faults}, m_image{std::move(image)}
 {
+}
+
+Result<std::unique_ptr<MemoryJournal>> MemoryJournal::Reopen(JournalRole role, uint64_t instance_id, std::vector<unsigned char> image,
+                                                             MemoryJournalFaults faults, BarrierObserver* observer)
+{
+    if (!IsKnown(role)) return Error{ErrorCode::INVALID_INPUT, "unknown journal role"};
+    Result<ScanResult> scanned{ScanRecords(image, role, instance_id)};
+    if (!scanned.has_value()) return scanned.error();
+    // The next barrier writes at the end of the last record (a zero tail is not kept).
+    image.resize(scanned->end_offset);
+    return Ok(std::unique_ptr<MemoryJournal>{new MemoryJournal{role, instance_id, faults, observer, &*scanned, std::move(image)}});
 }
 
 Result<std::unique_ptr<MemoryJournal>> MemoryJournal::Create(JournalRole role, uint64_t instance_id,

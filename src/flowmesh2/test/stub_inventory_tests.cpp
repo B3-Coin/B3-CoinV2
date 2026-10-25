@@ -39,11 +39,11 @@
  * branches of WITHDRAW and the spot/futures transfers (engine PhaseOf) as
  * well. Slice R8 adds the file journal's reopen and read-back and the logs'
  * recovery over a journal with history (M4-STO-01), segment rollover
- * (M4-STO-06, since finished), the group-commit writer (M4-STO-02), snapshots (M4-STO-03) and the view
+ * (M4-STO-06, since finished), the group-commit writer (M4-STO-02), snapshots (M4-STO-03, since finished) and the view
  * state records (M4-STO-07), and extends M4-STO-05 to probe the signer
  * log's folded signing as well. Slice R9 adds the state owner's pipelined
  * Preview over an uncommitted candidate (M4-AGR-10), and extends M4-STO-03
- * to probe StateOwner::Restore and the replay of a SNAPSHOT_MARK record and
+ * (since finished) to probe StateOwner::Restore and the replay of a SNAPSHOT_MARK record and
  * M4-STO-07 to probe the replay of a PREPARED_QC record as well. Slice
  * R10 adds the b3d chain adapters: trusted facts on REGTEST (MB1-ADP-06)
  * and the finalized adapter (M7-ADP-01); PBFT safety (M4-AGR-01; the probe
@@ -511,15 +511,6 @@ FM2_STUB_CASE(M4_STO_02, "M4-STO-02")
 {
     auto journal{NewMemoryJournal(storage::JournalRole::COMMIT, 1)};
     return Observe(storage::LogWriter::Start(*journal, storage::LogWriterOptions{}));
-}
-
-FM2_STUB_CASE(M4_STO_03, "M4-STO-03")
-{
-    // StateOwner::Restore (R9). The snapshot bytes (state/snapshot.h),
-    // SnapshotStore and the SNAPSHOT_MARK record and its replay are real since the 2026-10-25 run.
-    HeartbeatOwner heartbeat{MakeHeartbeatOwner()};
-    const std::shared_ptr<const state::HeadView> head{heartbeat.owner->Head()};
-    return Observe(heartbeat.owner->Restore(*head, {}));
 }
 
 FM2_STUB_CASE(M4_STO_07, "M4-STO-07")

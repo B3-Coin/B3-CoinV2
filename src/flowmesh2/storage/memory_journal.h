@@ -56,6 +56,14 @@ public:
                                                          MemoryJournalFaults faults = {},
                                                          BarrierObserver* observer = nullptr);
 
+    /** A journal over `image`, what a crash left of an earlier MemoryJournal
+     * of this role and instance (its DurableImage()): a restart (M4-STO-03).
+     * ScanRecords' refusals; INVALID_INPUT for an unknown role. Every record
+     * of the image is durable, and appends continue after the last one.
+     */
+    static Result<std::unique_ptr<MemoryJournal>> Reopen(JournalRole role, uint64_t instance_id, std::vector<unsigned char> image,
+                                                         MemoryJournalFaults faults = {}, BarrierObserver* observer = nullptr);
+
     //! The bytes that survived the last successful barrier (what a crash leaves).
     std::vector<unsigned char> DurableImage() const EXCLUSIVE_LOCKS_REQUIRED(!m_image_mutex);
 
@@ -63,7 +71,8 @@ public:
     Result<std::vector<JournalRecord>> ReadAll() const override EXCLUSIVE_LOCKS_REQUIRED(!m_image_mutex);
 
 private:
-    MemoryJournal(JournalRole role, uint64_t instance_id, MemoryJournalFaults faults, BarrierObserver* observer);
+    MemoryJournal(JournalRole role, uint64_t instance_id, MemoryJournalFaults faults, BarrierObserver* observer,
+                  const ScanResult* recovered = nullptr, std::vector<unsigned char> image = {});
 
     Result<uint64_t> AdmitAppend(uint64_t append_number, uint64_t offset, size_t size) const override;
     Result<void> Persist(uint64_t barrier_number, uint64_t offset, std::span<const unsigned char> bytes) override

@@ -65,6 +65,63 @@ Result<void> CheckRestoreHead(const HeadView& head, const HeadView& genesis, con
     return head.State().engine.CheckInvariants();
 }
 
+//! The instance-bound chain, exact bodies and quorum certificates of every DECISION and PREPARED_QC in `records`.
+Result<void> VerifyRestoreRecords(const SlotHeaderV2& base, std::span<const storage::JournalRecord> records, const SeatSet& seats,
+                                  uint64_t commit_journal_instance, const ProfileParams& profile)
+{
+    uint256 chain{storage::JournalGenesisChain(storage::JournalRole::COMMIT, commit_journal_instance)};
+    uint64_t expected_seq{0};
+    for (const auto& record : records) {
+        if (record.seq != ++expected_seq) return Error{ErrorCode::ORDER_VIOLATION, REPLAY_SEQ};
+        if (record.payload.size() > storage::MAX_RECORD_PAYLOAD_BYTES) return Error{ErrorCode::OVERSIZE, storage::RECORD_LENGTH};
+        if (!storage::IsKnown(record.type)) return Error{ErrorCode::DECODE, storage::RECORD_TYPE};
+        if (!storage::RoleAccepts(storage::JournalRole::COMMIT, record.type)) return Error{ErrorCode::ORDER_VIOLATION, storage::RECORD_ROLE};
+        chain = storage::NextChain(chain, record.type, record.payload);
+        if (chain != record.chain) return Error{ErrorCode::VERIFY_FAILED, RESTORE_RECORD_CHAIN};
+        if (record.type != storage::RecordType::DECISION && record.type != storage::RecordType::PREPARED_QC) continue;
+        SlotHeaderV2 header;
+        SlotBody body;
+        SlotCertificate certificate;
+        uint256 digest;
+        if (record.type == storage::RecordType::DECISION) {
+            const auto decision{storage::DecisionRecord::Decode(record.payload, profile)};
+            if (!decision.has_value()) return decision.error();
+            header = decision->header;
+            body = decision->body;
+            certificate = decision->certificate;
+            const auto signed_digest{CertificateDigest(header, certificate)};
+            if (!signed_digest.has_value()) return signed_digest.error();
+            digest = *signed_digest;
+        } else {
+            const auto prepared{storage::PreparedQcRecord::Decode(record.payload, profile)};
+            if (!prepared.has_value()) return prepared.error();
+            header = prepared->header;
+            body = prepared->body;
+            if (prepared->epoch != header.authority_epoch || prepared->slot != header.height ||
+                prepared->header_hash != header.Hash() ||
+                (profile.view_bound_commits ? prepared->view > storage::MAX_CONTROL_VIEW : prepared->view != 0)) {
+                return Error{ErrorCode::VERIFY_FAILED, RESTORE_AUTHORITY};
+            }
+            const auto proof{SlotCertificate::Decode(prepared->qc)};
+            if (!proof.has_value()) return proof.error();
+            certificate = *proof;
+            if (header.commitment_version == COMMITMENT_VERSION_VIEW_BOUND && certificate.view != prepared->view) {
+                return Error{ErrorCode::VERIFY_FAILED, RESTORE_CERTIFICATE};
+            }
+            if (const auto format{CertificateDigest(header, certificate)}; !format.has_value()) return format.error();
+            digest = agreement::PbftPrepareDigest(header, prepared->view);
+        }
+        if (header.version != SLOT_HEADER_VERSION || header.domain != base.domain ||
+            header.profile_hash != base.profile_hash || header.authority_epoch != 0 ||
+            header.seat_set_root != seats.Root()) return Error{ErrorCode::VERIFY_FAILED, RESTORE_AUTHORITY};
+        if (header.commitment_version != CommitmentVersion(profile)) return Error{ErrorCode::VERIFY_FAILED, OWNER_COMMITMENT_VERSION};
+        if (!storage::BodyMatchesHeader(header, body)) return Error{ErrorCode::VERIFY_FAILED, storage::BODY_HEADER_MISMATCH};
+        if (const auto verified{CheckRestoreCertificate(header, certificate, seats, digest)}; !verified.has_value()) return verified.error();
+    }
+
+    return Ok();
+}
+
 } // namespace
 
 StateOwner::StateOwner(engine::Engine engine, std::shared_ptr<const HeadView> genesis, uint64_t commit_journal_instance)
@@ -148,6 +205,12 @@ Result<AppliedSlot> StateOwner::Apply(Candidate&& candidate, const DurableDecisi
 Result<ReplayResult> StateOwner::RestoreVerifiedGenesis(const HeadView& base,
                                                        std::span<const storage::JournalRecord> records, const SeatSet& seats)
 {
+    return RestoreGenesis(base, records, seats, ReplayObserver{});
+}
+
+Result<ReplayResult> StateOwner::RestoreGenesis(const HeadView& base, std::span<const storage::JournalRecord> records,
+                                                const SeatSet& seats, const ReplayObserver& observer)
+{
     const auto before{Head()};
     const HeadView& configured{*m_configured_genesis};
     if (before->Header() != configured.Header() || before->CertHash() != configured.CertHash() ||
@@ -165,58 +228,25 @@ Result<ReplayResult> StateOwner::RestoreVerifiedGenesis(const HeadView& base,
     if (!canonical.has_value() || *canonical != base.Header()) return Error{ErrorCode::VERIFY_FAILED, RESTORE_BASE_MISMATCH};
     if (const auto checked{CheckRestoreHead(base, configured, Profile())}; !checked.has_value()) return checked.error();
 
-    uint256 chain{storage::JournalGenesisChain(storage::JournalRole::COMMIT, m_commit_journal_instance)};
-    uint64_t expected_seq{0};
-    for (const auto& record : records) {
-        if (record.seq != ++expected_seq) return Error{ErrorCode::ORDER_VIOLATION, REPLAY_SEQ};
-        if (record.payload.size() > storage::MAX_RECORD_PAYLOAD_BYTES) return Error{ErrorCode::OVERSIZE, storage::RECORD_LENGTH};
-        if (!storage::IsKnown(record.type)) return Error{ErrorCode::DECODE, storage::RECORD_TYPE};
-        if (!storage::RoleAccepts(storage::JournalRole::COMMIT, record.type)) return Error{ErrorCode::ORDER_VIOLATION, storage::RECORD_ROLE};
-        chain = storage::NextChain(chain, record.type, record.payload);
-        if (chain != record.chain) return Error{ErrorCode::VERIFY_FAILED, RESTORE_RECORD_CHAIN};
-        if (record.type != storage::RecordType::DECISION && record.type != storage::RecordType::PREPARED_QC) continue;
-        SlotHeaderV2 header;
-        SlotBody body;
-        SlotCertificate certificate;
-        uint256 digest;
-        if (record.type == storage::RecordType::DECISION) {
-            const auto decision{storage::DecisionRecord::Decode(record.payload, Profile())};
-            if (!decision.has_value()) return decision.error();
-            header = decision->header;
-            body = decision->body;
-            certificate = decision->certificate;
-            const auto signed_digest{CertificateDigest(header, certificate)};
-            if (!signed_digest.has_value()) return signed_digest.error();
-            digest = *signed_digest;
-        } else {
-            const auto prepared{storage::PreparedQcRecord::Decode(record.payload, Profile())};
-            if (!prepared.has_value()) return prepared.error();
-            header = prepared->header;
-            body = prepared->body;
-            if (prepared->epoch != header.authority_epoch || prepared->slot != header.height ||
-                prepared->header_hash != header.Hash() ||
-                (Profile().view_bound_commits ? prepared->view > storage::MAX_CONTROL_VIEW : prepared->view != 0)) {
-                return Error{ErrorCode::VERIFY_FAILED, RESTORE_AUTHORITY};
-            }
-            const auto proof{SlotCertificate::Decode(prepared->qc)};
-            if (!proof.has_value()) return proof.error();
-            certificate = *proof;
-            if (header.commitment_version == COMMITMENT_VERSION_VIEW_BOUND && certificate.view != prepared->view) {
-                return Error{ErrorCode::VERIFY_FAILED, RESTORE_CERTIFICATE};
-            }
-            if (const auto format{CertificateDigest(header, certificate)}; !format.has_value()) return format.error();
-            digest = agreement::PbftPrepareDigest(header, prepared->view);
-        }
-        if (header.version != SLOT_HEADER_VERSION || header.domain != base.Header().domain ||
-            header.profile_hash != base.Header().profile_hash || header.authority_epoch != 0 ||
-            header.seat_set_root != seats.Root()) return Error{ErrorCode::VERIFY_FAILED, RESTORE_AUTHORITY};
-        if (header.commitment_version != CommitmentVersion(Profile())) return Error{ErrorCode::VERIFY_FAILED, OWNER_COMMITMENT_VERSION};
-        if (!storage::BodyMatchesHeader(header, body)) return Error{ErrorCode::VERIFY_FAILED, storage::BODY_HEADER_MISMATCH};
-        if (const auto verified{CheckRestoreCertificate(header, certificate, seats, digest)}; !verified.has_value()) return verified.error();
+    if (const auto verified{VerifyRestoreRecords(base.Header(), records, seats, m_commit_journal_instance, Profile())}; !verified.has_value()) {
+        return verified.error();
     }
+    return Install(before, base, records, observer);
+}
 
-    Result<ReplayResult> replayed{ReplayDecisions(base, records)};
+Result<ReplayResult> StateOwner::Install(const std::shared_ptr<const HeadView>& before, const HeadView& base,
+                                         std::span<const storage::JournalRecord> records, const ReplayObserver& observer)
+{
+    const HeadView& configured{*m_configured_genesis};
+    Result<ReplayResult> replayed{ReplayDecisions(base, records, observer)};
     if (!replayed.has_value()) return replayed.error();
+    if (base.Header().height != 0) {
+        // A snapshot base is a restart point only once its mark is durable (O-95).
+        const storage::SnapshotMark mark{base.Header().height, base.HeaderHash(), base.Header().state_root};
+        if (std::find(replayed->marks.begin(), replayed->marks.end(), mark) == replayed->marks.end()) {
+            return Error{ErrorCode::VERIFY_FAILED, RESTORE_BASE_UNMARKED};
+        }
+    }
     for (const HeadView* head : {&replayed->head, &replayed->decided_head}) {
         if (const auto checked{CheckRestoreHead(*head, configured, Profile())}; !checked.has_value()) return checked.error();
     }
@@ -229,10 +259,23 @@ Result<ReplayResult> StateOwner::RestoreVerifiedGenesis(const HeadView& base,
     return Ok(std::move(replayed).value());
 }
 
-Result<void> StateOwner::Restore(const HeadView& /*base*/, std::span<const storage::JournalRecord> /*records*/)
+Result<ReplayResult> StateOwner::Restore(const HeadView& base, std::span<const storage::JournalRecord> records, const SeatSet& seats,
+                                         const ReplayObserver& observer)
 {
-    // Snapshot plus exactly-once replay of the DECISION records after it (plan section 3.7).
-    return NotImplemented("M4-STO-03"); // TODO(rebirth:M4-STO-03)
+    if (base.Header().height == 0) return RestoreGenesis(base, records, seats, observer);
+    const auto before{Head()};
+    const HeadView& configured{*m_configured_genesis};
+    if (before->Header() != configured.Header() || before->CertHash() != configured.CertHash() ||
+        !(before->State() == configured.State())) return Stale();
+    if (seats.Size() == 0 || seats.Size() > MAX_SEATS || seats.Root() != base.Header().seat_set_root) {
+        return Error{ErrorCode::VERIFY_FAILED, RESTORE_AUTHORITY};
+    }
+    // The snapshot's own state: this instance's domain, profile, epoch and seats, its commitment and invariants (O-54).
+    if (const auto checked{CheckRestoreHead(base, configured, Profile())}; !checked.has_value()) return checked.error();
+    if (const auto verified{VerifyRestoreRecords(base.Header(), records, seats, m_commit_journal_instance, Profile())}; !verified.has_value()) {
+        return verified.error();
+    }
+    return Install(before, base, records, observer);
 }
 
 bool IsInputRefusal(ErrorCode code)

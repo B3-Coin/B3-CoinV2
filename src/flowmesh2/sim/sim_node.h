@@ -32,11 +32,13 @@
 #include <flowmesh2/sim/faults.h>
 #include <flowmesh2/sim/trace.h>
 #include <flowmesh2/state/candidate.h>
+#include <flowmesh2/state/replay.h>
 #include <flowmesh2/state/state_owner.h>
 #include <flowmesh2/storage/commit_log.h>
 #include <flowmesh2/storage/memory_journal.h>
 #include <flowmesh2/storage/seat_signer.h>
 #include <flowmesh2/storage/signer_log.h>
+#include <flowmesh2/storage/snapshot_mark.h>
 #include <uint256.h>
 
 #include <cstddef>
@@ -103,9 +105,46 @@
  * the node halts at the last applied slot, which is also the head a replay
  * of its commit journal gives (O-89).
  *
+ * Snapshots and restart (M4-STO-03, O-71, O-89, O-95). Snapshot(store)
+ * writes the committed head's state (state::EncodeSnapshot) to a
+ * storage::SnapshotStore, synchronously, then appends its SNAPSHOT_MARK and
+ * makes it durable (B-MARK): only then is that slot a restart point. Crash
+ * gives what a crash leaves: the durable images of both journals and the
+ * base chain, which outlives the node. Restart(crash, config, trace,
+ * store) builds a node over those journals (MemoryJournal::Reopen; the logs
+ * rebuild their indexes) and recovers, in this order:
+ *  1. the base: the newest durable mark whose slot is at least R slots
+ *     below the last applied slot L, where R is the larger of the pool's
+ *     retention and the read service's outcome index (both kept by
+ *     re-execution); its bytes must load and reproduce the certified
+ *     header of that slot (state::SnapshotHead); any mark that does not is
+ *     skipped (traced restart.snapshot_refused) and the next older one
+ *     tried; with none, the configured genesis;
+ *  2. StateOwner::Restore(base, the whole commit journal, seats): every
+ *     record verified, the slots above the base re-executed once, the head
+ *     of L installed. Its observer hands every re-executed slot to the read
+ *     service (Publish) and to the action pool, created at the base height
+ *     (OnCommitted), with the tokens of the slots' durable APPLIED records
+ *     (CommitLog::AppliedAt): so the pool again holds the INCLUDED records
+ *     of the last R slots and an exact resend of an included action is
+ *     DUPLICATE (O-71). Any error here fails Restart: no node;
+ *  3. the decided tail (DECISION durable, APPLIED not): each slot is
+ *     re-executed on the head and applied under the authority read now
+ *     (check 3), then steps 7 to 9 of SealSlot run for it. A refusal fences
+ *     the node and leaves the head at L: Restart returns the fenced node,
+ *     which seals nothing, so that height is never decided again (O-89).
+ *     An error after Apply moved the head fences it too (O-90).
+ * The trace records restart.base, restart.replayed and, per tail slot,
+ * restart.check3. A restart's fault plan may not use fail_commit_barrier_at
+ * (barriers are counted per journal object; INVALID_INPUT, SIM_RESTART_FAULT).
+ *
  * The node is driven by one simulation thread (the scheduler's); the
  * components keep their own locking rules.
  */
+namespace flowmesh2::storage {
+class SnapshotStore;
+} // namespace flowmesh2::storage
+
 namespace flowmesh2::sim {
 
 // Static details (ErrorCode in parentheses).
@@ -118,6 +157,8 @@ inline constexpr std::string_view SIM_FAULT_SLOT{"fault plan slot must be at lea
 inline constexpr std::string_view SIM_NOT_SEALED{"no sealed slot at that height"};                          //!< (INVALID_INPUT)
 inline constexpr std::string_view SIM_BAD_KEY{"a simulator key label gives no key"};                        //!< (INVALID_INPUT)
 inline constexpr std::string_view SIM_FENCED{"the node is fenced and seals nothing"};                       //!< (FENCED)
+inline constexpr std::string_view SIM_RESTART_FAULT{"a restart cannot map a commit barrier fault"};         //!< (INVALID_INPUT)
+inline constexpr std::string_view SIM_RESTART_CHAIN{"a restart needs the base chain of the crash"};         //!< (INVALID_INPUT)
 
 //! The synthetic TEST network of the simulator: chain REGTEST, magic f2 51 4d 01, ModernChainDomain SHA256("fm2/sim/domain").
 NetworkId SimNetwork();
@@ -141,6 +182,28 @@ struct SimNodeConfig {
     size_t max_replies{64};
     uint64_t signer_journal_instance{1};
     uint64_t commit_journal_instance{2};
+    /** TEST only: max_delay_slots and outcome_index_slots of the node's
+     * profile (so its profile hash) set to this, so a test of the retained
+     * window (restart, O-71) needs tens of slots, not thousands. The sim
+     * clients' actions use max_delay 16. Nullopt keeps DevRegtestProfile's.
+     */
+    std::optional<uint16_t> action_window_slots;
+};
+
+//! What a crash of a node leaves (SimNode::Crash): its journals' durable bytes and the base chain.
+struct SimCrash {
+    std::vector<unsigned char> signer_image;
+    std::vector<unsigned char> commit_image;
+    std::unique_ptr<dev::FakeChainAdapter> chain;
+};
+
+//! What Restart recovered (also in the trace).
+struct RestartReport {
+    uint64_t base_height{0};    //!< the snapshot slot restored, or 0 for genesis
+    uint64_t applied_height{0}; //!< the head Restore installed (L)
+    uint64_t replayed{0};       //!< slots re-executed by Restore (above the base)
+    uint64_t tail{0};           //!< decided slots without APPLIED when recovery started
+    uint64_t skipped_marks{0};  //!< marks tried and refused before the base
 };
 
 //! One slot this node sealed: everything a later check or N13 needs.
@@ -172,8 +235,25 @@ public:
     SimNode& operator=(const SimNode&) = delete;
     ~SimNode();
 
+    /** What a crash of `node` leaves: both journals' DurableImage() and its
+     * base chain. Everything else (unflushed records, the pool, the read
+     * service, the sealed list) is lost.
+     */
+    static SimCrash Crash(std::unique_ptr<SimNode> node);
+    //! A node over `crash`, recovered as the file comment says; `snapshots` may be null (restart from genesis).
+    static Result<std::unique_ptr<SimNode>> Restart(SimCrash crash, const SimNodeConfig& config, TraceRecorder& trace,
+                                                    const storage::SnapshotStore* snapshots);
+
     //! Seal the next slot; see the file comment.
     Result<SealReport> SealSlot();
+    /** Store the committed head's snapshot in `store` and make its
+     * SNAPSHOT_MARK durable (file comment). A store error is returned
+     * without a mark; a commit-log error fences as before Apply (O-90).
+     * FENCED (SIM_FENCED) on a fenced node.
+     */
+    Result<storage::SnapshotMark> Snapshot(storage::SnapshotStore& store);
+    //! What the last Restart recovered; nullopt for a node from Create.
+    const std::optional<RestartReport>& Restarted() const { return m_restarted; }
     //! Answer at most `max` queued API requests (InProcessApi::Pump).
     Result<net::PumpReport> Pump(size_t max);
     /** Apply sealed slot `height`'s candidate copy and durable decision again,
@@ -209,6 +289,14 @@ public:
 private:
     struct Parts;
     explicit SimNode(Parts&& parts);
+    //! Create and Restart: `crash` null for a fresh node.
+    static Result<std::unique_ptr<SimNode>> Build(const SimNodeConfig& config, TraceRecorder& trace, SimCrash* crash,
+                                                  const storage::SnapshotStore* snapshots, std::optional<state::ReplayResult>* replayed);
+    //! Restart steps 1 and 2 over the parts (fills parts.pool); see the file comment.
+    static Result<RestartReport> Recover(Parts& parts, const read::ReadLimits& limits, const storage::SnapshotStore* snapshots,
+                                         std::optional<state::ReplayResult>& replayed);
+    //! Restart step 3 for one decided slot without APPLIED; see the file comment.
+    Result<void> CompleteDecided(const storage::DecisionRecord& decision);
 
     //! The steps of SealSlot after slot.begin.
     Result<SealReport> SealNext(const std::shared_ptr<const state::HeadView>& head, uint64_t height);
@@ -247,6 +335,7 @@ private:
     std::unique_ptr<net::InProcessApi> m_api;
     std::unique_ptr<dev::DevSingleSeatCertifier> m_certifier;
     std::vector<SealedSlot> m_sealed;
+    std::optional<RestartReport> m_restarted;
 };
 
 } // namespace flowmesh2::sim

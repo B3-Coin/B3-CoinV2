@@ -303,6 +303,13 @@ Result<PendingApplied> CommitLog::AppendApplied(const ApplyReceipt& receipt)
     return Ok(PendingApplied{m_journal->InstanceId(), *seq, ref});
 }
 
+std::optional<PendingApplied> CommitLog::AppliedAt(uint64_t slot) const
+{
+    const auto it{m_decisions.find(slot)};
+    if (it == m_decisions.end() || !it->second.applied_seq.has_value()) return std::nullopt;
+    return PendingApplied{m_journal->InstanceId(), *it->second.applied_seq, AppliedRef{slot, it->second.header_hash, it->second.state_root}};
+}
+
 std::optional<DecisionRef> CommitLog::DecisionAt(uint64_t slot) const
 {
     const auto it{m_decisions.find(slot)};

@@ -9,9 +9,13 @@
 #include <flowmesh2/core/facts.h>
 #include <flowmesh2/core/hashes.h>
 #include <flowmesh2/core/state_root.h>
+#include <flowmesh2/state/snapshot.h>
+#include <flowmesh2/storage/snapshot_store.h>
 
+#include <algorithm>
 #include <cstddef>
 #include <limits>
+#include <map>
 #include <optional>
 #include <string>
 #include <utility>
@@ -84,6 +88,7 @@ struct SimNode::Parts {
     std::unique_ptr<net::LaneSet> lanes;
     std::unique_ptr<net::InProcessApi> api;
     std::unique_ptr<dev::DevSingleSeatCertifier> certifier;
+    std::optional<RestartReport> restarted;
 };
 
 SimNode::SimNode(Parts&& parts)
@@ -110,13 +115,51 @@ SimNode::SimNode(Parts&& parts)
       m_admission{std::move(parts.admission)},
       m_lanes{std::move(parts.lanes)},
       m_api{std::move(parts.api)},
-      m_certifier{std::move(parts.certifier)}
+      m_certifier{std::move(parts.certifier)},
+      m_restarted{parts.restarted}
 {
 }
 
 SimNode::~SimNode() = default;
 
 Result<std::unique_ptr<SimNode>> SimNode::Create(const SimNodeConfig& config, TraceRecorder& trace)
+{
+    return Build(config, trace, nullptr, nullptr, nullptr);
+}
+
+SimCrash SimNode::Crash(std::unique_ptr<SimNode> node)
+{
+    SimCrash crash{node->m_signer_journal->DurableImage(), node->m_commit_journal->DurableImage(), std::move(node->m_fake)};
+    // The node's other parts die with it; the chain adapter it traced is gone too.
+    return crash;
+}
+
+Result<std::unique_ptr<SimNode>> SimNode::Restart(SimCrash crash, const SimNodeConfig& config, TraceRecorder& trace,
+                                                  const storage::SnapshotStore* snapshots)
+{
+    if (crash.chain == nullptr) return Error{ErrorCode::INVALID_INPUT, SIM_RESTART_CHAIN};
+    if (config.faults.fail_commit_barrier_at.has_value()) return Error{ErrorCode::INVALID_INPUT, SIM_RESTART_FAULT};
+    std::optional<state::ReplayResult> replayed;
+    Result<std::unique_ptr<SimNode>> built{Build(config, trace, &crash, snapshots, &replayed)};
+    if (!built.has_value()) return built.error();
+    std::unique_ptr<SimNode> node{std::move(built).value()};
+    // 3. The decided tail, in height order: check 3 under the authority read now (O-89).
+    for (const state::ReplayedSlot& slot : replayed->slots) {
+        if (slot.applied_seq.has_value() || node->Fenced()) continue;
+        const Result<std::vector<storage::JournalRecord>> records{node->m_commit_journal->ReadAll()};
+        if (!records.has_value()) return records.error();
+        if (slot.decision_seq == 0 || slot.decision_seq > records->size()) return Error{ErrorCode::INVARIANT, "tail decision outside the journal"};
+        Result<storage::DecisionRecord> decision{storage::DecisionRecord::Decode((*records)[slot.decision_seq - 1].payload, node->m_profile)};
+        if (!decision.has_value()) return decision.error();
+        const Result<void> completed{node->CompleteDecided(*decision)};
+        node->m_trace.Record("restart.check3", "slot=" + std::to_string(slot.header.height) + "," +
+                                                   (completed.has_value() ? std::string{"OK"} : std::string{ToString(completed.error().code)}));
+    }
+    return Ok(std::move(node));
+}
+
+Result<std::unique_ptr<SimNode>> SimNode::Build(const SimNodeConfig& config, TraceRecorder& trace, SimCrash* crash,
+                                                const storage::SnapshotStore* snapshots, std::optional<state::ReplayResult>* replayed)
 {
     if (const Result<void> plan{CheckFaultPlan(config.faults)}; !plan.has_value()) return plan.error();
     if ((config.faults.fail_commit_barrier_at.has_value() && *config.faults.fail_commit_barrier_at == 0) ||
@@ -130,6 +173,11 @@ Result<std::unique_ptr<SimNode>> SimNode::Create(const SimNodeConfig& config, Tr
     Result<ProfileParams> profile{DevRegtestProfile(ChainType::REGTEST)};
     if (!profile.has_value()) return profile.error();
     parts.profile = *profile;
+    if (config.action_window_slots.has_value()) {
+        parts.profile.max_delay_slots = *config.action_window_slots;
+        parts.profile.outcome_index_slots = *config.action_window_slots;
+        if (const Result<void> valid{Validate(parts.profile)}; !valid.has_value()) return valid.error();
+    }
     parts.network = SimNetwork();
     parts.domain = DomainHash(parts.network, FM_VERSION);
     parts.markets = {SimMarketM1(), SimMarketM2()};
@@ -142,18 +190,25 @@ Result<std::unique_ptr<SimNode>> SimNode::Create(const SimNodeConfig& config, Tr
         if (slot > std::numeric_limits<uint64_t>::max() / 2) return Error{ErrorCode::INVALID_INPUT, SIM_FAULT_SLOT};
         commit_faults.fail_barrier = 2 * slot - 1;
     }
+    // A restart reopens what the crash left; the logs rebuild their indexes from it.
     Result<std::unique_ptr<storage::MemoryJournal>> signer_journal{
-        storage::MemoryJournal::Create(storage::JournalRole::SIGNER, config.signer_journal_instance, {}, &trace)};
+        crash == nullptr
+            ? storage::MemoryJournal::Create(storage::JournalRole::SIGNER, config.signer_journal_instance, {}, &trace)
+            : storage::MemoryJournal::Reopen(storage::JournalRole::SIGNER, config.signer_journal_instance, crash->signer_image, {}, &trace)};
     if (!signer_journal.has_value()) return signer_journal.error();
     parts.signer_journal = std::move(signer_journal).value();
     Result<std::unique_ptr<storage::MemoryJournal>> commit_journal{
-        storage::MemoryJournal::Create(storage::JournalRole::COMMIT, config.commit_journal_instance, commit_faults, &trace)};
+        crash == nullptr
+            ? storage::MemoryJournal::Create(storage::JournalRole::COMMIT, config.commit_journal_instance, commit_faults, &trace)
+            : storage::MemoryJournal::Reopen(storage::JournalRole::COMMIT, config.commit_journal_instance, crash->commit_image, commit_faults, &trace)};
     if (!commit_journal.has_value()) return commit_journal.error();
     parts.commit_journal = std::move(commit_journal).value();
-    Result<storage::SignerLog> signer_log{storage::SignerLog::Create(*parts.signer_journal)};
+    Result<storage::SignerLog> signer_log{crash == nullptr ? storage::SignerLog::Create(*parts.signer_journal)
+                                                           : storage::SignerLog::Create(*parts.signer_journal, parts.profile)};
     if (!signer_log.has_value()) return signer_log.error();
     parts.signer_log = std::make_unique<storage::SignerLog>(std::move(signer_log).value());
-    Result<storage::CommitLog> commit_log{storage::CommitLog::Create(*parts.commit_journal)};
+    Result<storage::CommitLog> commit_log{crash == nullptr ? storage::CommitLog::Create(*parts.commit_journal)
+                                                           : storage::CommitLog::Create(*parts.commit_journal, parts.profile)};
     if (!commit_log.has_value()) return commit_log.error();
     parts.commit_log = std::make_unique<storage::CommitLog>(std::move(commit_log).value());
 
@@ -171,11 +226,15 @@ Result<std::unique_ptr<SimNode>> SimNode::Create(const SimNodeConfig& config, Tr
     parts.seats = std::move(seats).value();
     parts.authority = AuthorityVersion{0, parts.seats->Root(), ProfileHash(parts.profile)};
 
-    // The chain, seen through the trace.
-    Result<std::unique_ptr<dev::FakeChainAdapter>> fake{
-        dev::FakeChainAdapter::Create(parts.network, parts.authority, *parts.seats, SimAnchor(SIM_BASE_HEIGHT))};
-    if (!fake.has_value()) return fake.error();
-    parts.fake = std::move(fake).value();
+    // The chain, seen through the trace; a restart keeps the chain of the crash.
+    if (crash != nullptr) {
+        parts.fake = std::move(crash->chain);
+    } else {
+        Result<std::unique_ptr<dev::FakeChainAdapter>> fake{
+            dev::FakeChainAdapter::Create(parts.network, parts.authority, *parts.seats, SimAnchor(SIM_BASE_HEIGHT))};
+        if (!fake.has_value()) return fake.error();
+        parts.fake = std::move(fake).value();
+    }
     parts.traced = std::make_unique<TracingChainAdapter>(*parts.fake, trace);
 
     // State, reads, pool, budget, admission, lanes and the API.
@@ -191,10 +250,16 @@ Result<std::unique_ptr<SimNode>> SimNode::Create(const SimNodeConfig& config, Tr
     Result<std::unique_ptr<read::ReadService>> read{read::ReadService::Create(limits, parts.profile)};
     if (!read.has_value()) return read.error();
     parts.read = std::move(read).value();
-    Result<std::unique_ptr<admission::ActionPool>> pool{
-        admission::ActionPool::Create(admission::PoolLimits::FromProfile(parts.profile), parts.profile, 0)};
-    if (!pool.has_value()) return pool.error();
-    parts.pool = std::move(pool).value();
+    if (crash == nullptr) {
+        Result<std::unique_ptr<admission::ActionPool>> pool{
+            admission::ActionPool::Create(admission::PoolLimits::FromProfile(parts.profile), parts.profile, 0)};
+        if (!pool.has_value()) return pool.error();
+        parts.pool = std::move(pool).value();
+    } else {
+        Result<RestartReport> recovered{Recover(parts, limits, snapshots, *replayed)};
+        if (!recovered.has_value()) return recovered.error();
+        parts.restarted = *recovered;
+    }
     Result<std::unique_ptr<dev::UnlimitedDevBudget>> budget{dev::UnlimitedDevBudget::Create(parts.profile)};
     if (!budget.has_value()) return budget.error();
     parts.budget = std::move(budget).value();
@@ -217,6 +282,83 @@ Result<std::unique_ptr<SimNode>> SimNode::Create(const SimNodeConfig& config, Tr
     parts.certifier = std::move(certifier).value();
 
     return Ok(std::unique_ptr<SimNode>{new SimNode{std::move(parts)}});
+}
+
+Result<RestartReport> SimNode::Recover(Parts& parts, const read::ReadLimits& limits, const storage::SnapshotStore* snapshots,
+                                       std::optional<state::ReplayResult>& replayed)
+{
+    TraceRecorder& trace{*parts.trace};
+    const Result<std::vector<storage::JournalRecord>> records{parts.commit_journal->ReadAll()};
+    if (!records.has_value()) return records.error();
+    RestartReport report;
+    const uint64_t last_applied{parts.commit_log->LastAppliedSlot()};
+    // Slots the pool and the read index keep: all of them are re-executed from the base.
+    const uint64_t kept{std::max<uint64_t>(admission::PoolLimits::FromProfile(parts.profile).retention_slots, limits.outcome_index_slots)};
+
+    // 1. The base: the newest durable mark at least `kept` slots below the last applied slot.
+    std::optional<state::HeadView> base;
+    if (snapshots != nullptr) {
+        std::vector<storage::SnapshotMark> marks{parts.commit_log->SnapshotMarks()};
+        std::map<uint64_t, storage::DecisionRecord> decided; // the first DECISION record of every marked slot
+        for (const storage::JournalRecord& record : *records) {
+            if (record.type != storage::RecordType::DECISION) continue;
+            Result<storage::DecisionRecord> decision{storage::DecisionRecord::Decode(record.payload, parts.profile)};
+            if (!decision.has_value()) return decision.error();
+            const uint64_t height{decision->header.height};
+            if (std::any_of(marks.begin(), marks.end(), [&](const storage::SnapshotMark& m) { return m.slot == height; })) {
+                decided.try_emplace(height, std::move(decision).value());
+            }
+        }
+        for (auto mark{marks.rbegin()}; mark != marks.rend() && !base.has_value(); ++mark) {
+            if (mark->slot > last_applied || last_applied - mark->slot < kept) continue;
+            const auto decision{decided.find(mark->slot)};
+            Result<state::HeadView> head{Error{ErrorCode::INVARIANT, "marked slot without its decision"}};
+            if (decision != decided.end()) {
+                Result<std::vector<unsigned char>> bytes{snapshots->Load(*mark)};
+                head = bytes.has_value() ? state::SnapshotHead(*bytes, parts.profile, decision->second.header,
+                                                               decision->second.certificate.Hash())
+                                         : Result<state::HeadView>{bytes.error()};
+            }
+            if (!head.has_value()) {
+                ++report.skipped_marks;
+                trace.Record("restart.snapshot_refused", "slot=" + std::to_string(mark->slot) + "," + std::string{ToString(head.error().code)});
+                continue;
+            }
+            base = std::move(head).value();
+        }
+    }
+    const state::HeadView& from{base.has_value() ? *base : *parts.genesis};
+    report.base_height = from.Header().height;
+    trace.Record("restart.base", "slot=" + std::to_string(report.base_height));
+
+    // 2. Restore; its observer rebuilds the read service and the pool (O-71).
+    Result<std::unique_ptr<admission::ActionPool>> pool{
+        admission::ActionPool::Create(admission::PoolLimits::FromProfile(parts.profile), parts.profile, report.base_height)};
+    if (!pool.has_value()) return pool.error();
+    parts.pool = std::move(pool).value();
+    const state::ReplayObserver observer{[&](const state::ReplayCommitted& committed) -> Result<void> {
+        const uint64_t height{committed.head.Header().height};
+        const std::optional<storage::PendingApplied> applied{parts.commit_log->AppliedAt(height)};
+        if (!applied.has_value()) return Error{ErrorCode::INVARIANT, "replayed slot not applied in the commit log"};
+        Result<DurableApplied> token{parts.commit_log->Confirm(*applied)};
+        if (!token.has_value()) return token.error();
+        const std::vector<OutcomeV2> outcomes{committed.outcomes.begin(), committed.outcomes.end()};
+        Result<std::shared_ptr<const read::SlotView>> view{read::SlotView::Build(committed.head, committed.certificate, outcomes)};
+        if (!view.has_value()) return view.error();
+        if (const Result<void> published{parts.read->Publish(*token, *view)}; !published.has_value()) return published.error();
+        Result<admission::CommitReport> pooled{parts.pool->OnCommitted(*token, committed.head, committed.outcomes, committed.body)};
+        if (!pooled.has_value()) return pooled.error();
+        ++report.replayed;
+        return Ok();
+    }};
+    Result<state::ReplayResult> restored{parts.owner->Restore(from, *records, *parts.seats, observer)};
+    if (!restored.has_value()) return restored.error();
+    report.applied_height = restored->head.Header().height;
+    for (const state::ReplayedSlot& slot : restored->slots) report.tail += slot.applied_seq.has_value() ? 0 : 1;
+    trace.Record("restart.replayed", "applied=" + std::to_string(report.applied_height) + ",replayed=" + std::to_string(report.replayed) +
+                                         ",tail=" + std::to_string(report.tail));
+    replayed.emplace(std::move(restored).value());
+    return Ok(report);
 }
 
 namespace {
@@ -404,6 +546,48 @@ Result<std::shared_ptr<const state::HeadView>> SimNode::ReapplySealed(uint64_t h
         return Ok(std::move(applied->head));
     }
     return Error{ErrorCode::INVALID_INPUT, SIM_NOT_SEALED};
+}
+
+Result<storage::SnapshotMark> SimNode::Snapshot(storage::SnapshotStore& store)
+{
+    if (m_admission->Fenced()) return Error{ErrorCode::FENCED, SIM_FENCED};
+    const std::shared_ptr<const state::HeadView> head{m_owner->Head()};
+    const storage::SnapshotMark mark{head->Header().height, head->HeaderHash(), head->Header().state_root};
+    Result<std::vector<unsigned char>> bytes{state::EncodeSnapshot(head->State())};
+    if (!bytes.has_value()) return bytes.error();
+    // The bytes first, synchronously; the mark only names stored bytes (O-95).
+    if (const Result<void> written{store.Write(mark, *bytes)}; !written.has_value()) return written.error();
+    if (const Result<uint64_t> appended{m_commit_log->AppendSnapshotMark(mark)}; !appended.has_value()) return FenceOn(appended.error());
+    if (const Result<uint64_t> barrier{m_commit_log->Barrier()}; !barrier.has_value()) return FenceOn(barrier.error());
+    m_trace.Record("snapshot.mark", "slot=" + std::to_string(mark.slot));
+    return Ok(mark);
+}
+
+Result<void> SimNode::CompleteDecided(const storage::DecisionRecord& decision)
+{
+    // The slot is durable and final for its height; it only still lacks check 3 and APPLIED.
+    Result<state::Candidate> candidate{m_owner->Reexecute(decision.header, decision.body)};
+    if (!candidate.has_value()) return FenceAfterApply(candidate.error()); // a verified decision that does not re-execute: halt
+    Result<storage::PendingDecision> pending{m_commit_log->AppendDecision(decision.header, decision.certificate, decision.body)};
+    if (!pending.has_value()) return FenceAfterApply(pending.error());
+    Result<DurableDecision> decided{m_commit_log->Confirm(*pending)};
+    if (!decided.has_value()) return FenceAfterApply(decided.error());
+    const std::vector<OutcomeV2> outcomes{candidate->Outcomes()};
+    // Check 3 under the authority read now; a refusal keeps the head and fences the node (O-89).
+    Result<state::AppliedSlot> applied{m_owner->Apply(std::move(*candidate), *decided, m_traced->CurrentAuthority())};
+    if (!applied.has_value()) return FenceAfterApply(applied.error());
+    const std::shared_ptr<const state::HeadView> next{applied->head};
+    Result<storage::PendingApplied> pending_applied{m_commit_log->AppendApplied(applied->receipt)};
+    if (!pending_applied.has_value()) return FenceAfterApply(pending_applied.error());
+    if (const Result<uint64_t> barrier{m_commit_log->Barrier()}; !barrier.has_value()) return FenceAfterApply(barrier.error());
+    Result<DurableApplied> token{m_commit_log->Confirm(*pending_applied)};
+    if (!token.has_value()) return FenceAfterApply(token.error());
+    Result<std::shared_ptr<const read::SlotView>> view{read::SlotView::Build(*next, decision.certificate, outcomes)};
+    if (!view.has_value()) return FenceAfterApply(view.error());
+    if (const Result<void> published{m_read->Publish(*token, *view)}; !published.has_value()) return FenceAfterApply(published.error());
+    Result<admission::CommitReport> report{m_pool->OnCommitted(*token, *next, outcomes, decision.body)};
+    if (!report.has_value()) return FenceAfterApply(report.error());
+    return Ok();
 }
 
 } // namespace flowmesh2::sim

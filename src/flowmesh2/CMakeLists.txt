@@ -318,6 +318,7 @@ if(BUILD_FLOWMESH2)
     test/seat_signer_tests.cpp
     test/signer_log_tests.cpp
     test/sim_node_tests.cpp
+    test/sim_restart_tests.cpp
     test/sim_scheduler_tests.cpp
     test/sim_trace_tests.cpp
     test/sim_walking_skeleton_tests.cpp
