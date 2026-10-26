@@ -161,13 +161,15 @@ This is reported, not resolved.
 6. Confirm which D3/D4 the C rows mean (§6).
 7. Rule whether a valid P3 decision outranks the reorganization horizon for
    the headers that lead to it (§9.3).
+8. Choose P3's validity rule: Stage 0's (any valid branch), or the hybrid
+   of §9.4 (a fresh proposal must be on the voter's own chain).
 
 ## 8. Proposed order
 
 1. B0a, with the tests of §4.5.
 2. A model of P3 sign-versus-reorg, in the style of the escape model. Done
-   for one checkpoint height (§9). Consecutive checkpoints and the epoch
-   handover are the next model step.
+   for one checkpoint height (§9). A handover model is not planned, since it
+   would hold by construction (§9.5).
 3. The chosen escape rule on regtest, with the `escape_race_*` cases
    turned into acceptance tests.
 4. The bounded committee.
@@ -211,8 +213,8 @@ control.
   - no further faults or Byzantine messages;
   - tips settle on a branch the adversary picks;
   - fresh views follow.
-- Bound: three views, or two for the scenarios with four honest members or
-  with tips in the state.
+- Bound: three views, or two for the scenarios with four honest members,
+  with tips in the state, or with the private branch.
 
 ### 9.2 Results
 
@@ -227,6 +229,11 @@ control.
 | NC2: weight-only quorum, heavy member Byzantine | Violated | — |
 | NC2: dual quorum, heavy member Byzantine | Holds | Stalls, beyond the fault bound |
 | Planted bugs (the new view ignores prepared reports; reports forget the prepared value; both thresholds one short) | Violated, each | — |
+| Private branch C, Stage 0 validity, Byzantine view-0 leader | Holds; **C can be decided** | Holds |
+| Private branch C, tip variant | Holds; C never decided | Stalls |
+| Private branch C, hybrid (§9.4), Byzantine view-0 or view-1 leader | Holds; C never decided | Holds |
+| Hybrid, four honest members | Holds | Holds |
+| Planted bug: the hybrid accepts a "forced" claim without its proof | Holds; C can be decided | Holds |
 
 The controls and planted bugs show that the checks can fail.
 
@@ -256,10 +263,69 @@ The controls and planted bugs show that the checks can fail.
    late upgraders (`b3-bridge-v2-finality-dependency.md:230`). Stage 0 does
    not order the two rules. That is a question for the owner (§7, item 7).
 
-### 9.4 Not covered
+### 9.4 A private branch, and a hybrid rule
 
-- Consecutive checkpoints and their parent links.
-- The epoch handover and H1 producers.
+Stage 0's validity (finding 2) lets members vote for any valid branch,
+including one that no honest node's fork choice ever selected. The model
+adds a third candidate C: a branch the adversary built and withheld. Every
+block of C is valid, but no honest tip is ever on it. Under Stage 0's rule,
+a Byzantine leader proposes C in its view and the honest members prepare
+and commit it (six steps, `~/B3-evidence/p3-reorg-private/`).
+
+B3 must then reorganize every honest block above the last decided
+checkpoint onto C. V1 could not be used this way, because members signed
+only their own tip, and fork choice moves only to a branch with more
+blocks. Under P3 the attacker needs a turn as leader, not the heavier
+chain. The protocol itself limits the attack in only two ways:
+- C must extend the last decided checkpoint;
+- C must carry 12 blocks above its checkpoint (`v2-stage0-r1-consensus.md:100-104`).
+
+So in practice the attacker needs a deep enough private branch before the
+next decision moves past its fork point. That is plausible with a large
+stake, or while P3 is stalled, for example during a partition. Anyone
+who accepts B3 payments on confirmations, not on P3 decisions, is exposed
+for that window.
+
+The **hybrid** rule, in the style of Tendermint's lock rule, closes this
+in the model without bringing back finding 2's stall:
+- a member PREPAREs a fresh (free) proposal only if it is on its own tip;
+- it PREPAREs a value that a verified NEW_VIEW forces, or COMMITs one it
+  holds a prepared quorum for, on any tip.
+
+C then cannot gather a first prepared quorum, so it can never be forced.
+Progress holds, because a forced value is still accepted everywhere.
+
+The cost: a fresh decision needs a quorum of members whose fork choice
+agrees long enough. That holds whenever B3 converges, but it ties finality
+liveness to fork-choice convergence, which Stage 0's rule avoids.
+
+Within the bound, tips move freely, so the tip and hybrid rules reach the
+same states. They differ only after stabilization, where tips stay put.
+
+The hybrid contradicts Stage 0's text: "Proposal validation includes
+required branch data, not a requirement that every replica already
+selected the same provisional tip" (`b3-flowmesh-v2-stage0.md:552-553`).
+So it is an owner choice (§7, item 8). The planted bug shows that the
+protection depends on members verifying the NEW_VIEW proof before treating
+a value as forced: taken on trust, C is decided again.
+
+### 9.5 Not covered
+
+- Consecutive checkpoints and the epoch handover. Under C7 the next
+  instance's authority is a function of decided values only:
+  - the incoming set is the one precommitted at the previous terminal
+    decision;
+  - the following set is the snapshot at the decided terminal
+    checkpoint h;
+  - the next floor is h+1 (`v2-stage0-r1-consensus.md:332-343`).
+  Every honest node therefore derives the same authority, whatever
+  branch it is on. A model of that would hold by construction. Its only
+  content would be a V1 control for the inclusion-height ambiguity, which
+  C7 already states (`:324-330`). Liveness at the handover still needs a
+  live quorum of the precommitted incoming set and an included carrier.
+  The first is the inherited lineage-break risk (RC5, FD-7). The second
+  needs a producer to include it, which H1 provides.
+- H1 producers.
 - The Ethereum verifier and digest V2.
 - The bounded committee (NC3).
 - Amnesia, except as the planted bug.

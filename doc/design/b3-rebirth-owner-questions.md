@@ -527,3 +527,26 @@ checkpoint height. Evidence: `~/B3-evidence/p3-reorg/`. Details are in
 Question: for P3, should a valid CommitQC outrank the reorganization horizon
 for the headers that lead to it, or should the horizon stay first and a
 node that far behind need manual recovery? Stage 0 does not say.
+
+## P3 validity: a Byzantine leader can finalize a withheld branch (2026-10-26)
+
+The same model adds a third candidate C: a valid branch the adversary built
+and withheld, which no honest tip is ever on. Under Stage 0's validity
+(any valid branch, whatever the voter's tip), a Byzantine leader proposes C
+and the honest members decide it. B3 must then reorganize every honest
+block above the last decided checkpoint onto C. V1 could not be used this
+way. The attacker needs a deep enough private branch before the next
+decision, which is plausible with a large stake or while P3 is stalled.
+Evidence: `~/B3-evidence/p3-reorg-private/`. Details are in
+`doc/design/b3-height-c-fast-track.md` §9.4.
+
+A hybrid rule, in the style of Tendermint's lock rule, closes this in the
+model and keeps progress:
+- vote for a fresh proposal only if it is on your own tip;
+- always accept a value that a verified view change forces.
+
+The cost is that fresh decisions need members' fork choice to agree, which
+Stage 0 deliberately avoids (`b3-flowmesh-v2-stage0.md:552-553`).
+
+Question: keep Stage 0's rule and treat only P3 decisions, never
+confirmations, as payment finality, or adopt the hybrid?
