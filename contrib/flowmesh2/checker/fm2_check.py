@@ -7,7 +7,7 @@ the independent model in fm2check, and require byte-for-byte agreement on every
 slot: the verdict, the header and its hash, the canonical order, every outcome,
 the five state roots and every resting order.
 
-    fm2_check.py --trace build/bin/fm2-trace [--seeds N] [--slots N] [--kinds random,adversarial,dust,caps]
+    fm2_check.py --trace build/bin/fm2-trace [--seeds N] [--slots N] [--kinds random,adversarial,dust,caps,slotcap]
                  [--keep DIR] [--skeleton]
 
 --skeleton also recomputes the walking skeleton's goldens that are pinned from
@@ -213,6 +213,8 @@ def main():
     print('batches %d, slots %d (accepted %d, refused %d), outcomes %d' % (
         totals['batches'], totals['slots'], totals['accepted'], totals['refused'], totals['outcomes']))
     print('outcome codes: ' + ', '.join('%s %d' % (CODE_NAMES.get(c, c), n) for c, n in sorted(codes.items())))
+    if engine.CAP_STOPS:
+        print('model fill-cap stops: ' + ', '.join('%s %d' % kv for kv in sorted(engine.CAP_STOPS.items())))
     for (real_detail, model_detail), n in sorted(refusals.items()):
         print('  refused %4d  engine: %s  |  model: %s' % (n, real_detail, model_detail))
     if args.skeleton:

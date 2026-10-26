@@ -10,6 +10,7 @@ open, the choice made here is marked GAP; contrib/flowmesh2/checker/README.md
 lists what the comparison with the engine showed for each.
 """
 
+import collections
 import copy
 
 from . import bip340
@@ -25,6 +26,10 @@ from .codec import (
 )
 
 # Profile fm2-dex1-regtest-provisional/1 (PROFILE_DEX1_REGTEST.json).
+# Why each fill-capped taker stopped, over every slot the model applied
+# (diagnostic only; fm2_check prints it so a caps run shows which cap fired).
+CAP_STOPS = collections.Counter()
+
 PROFILE = {
     'fee_ppm': 100, 'seat_share_percent': 80, 'max_actions_per_slot': 1024, 'max_action_payload_bytes': 4096,
     'max_fills_per_order': 1024, 'max_fills_per_slot': 16384, 'max_open_orders_per_account': 1000,
@@ -546,6 +551,7 @@ class Slot:
                 code = FILLED
             elif t['stop'] in ('ORDER_FILL_CAP', 'SLOT_FILL_CAP'):
                 code = REJ_FILL_CAP
+                CAP_STOPS[t['stop']] += 1
             elif t['tif'] == IOC:
                 code = IOC_DONE
             elif t['id'] in crossing:

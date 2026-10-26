@@ -400,7 +400,7 @@ if(BUILD_FLOWMESH2)
 
   # M3-ENG-05: the independent checker (contrib/flowmesh2/checker) must agree
   # with the engine, through fm2-trace, on every slot of seeded random,
-  # adversarial, dust and caps batches, and must recompute the walking
+  # adversarial, dust, caps and slotcap batches, and must recompute the walking
   # skeleton's goldens that are pinned from the C++ output (O-87).
   add_test(NAME flowmesh2_checker_selftest
     COMMAND ${Python3_EXECUTABLE} -I -B ${FM2_CONTRIB}/checker/test_fm2check.py
@@ -416,6 +416,11 @@ if(BUILD_FLOWMESH2)
       --seeds 1 --kinds caps
   )
   set_tests_properties(flowmesh2_checker_caps PROPERTIES TIMEOUT 600 LABELS "flowmesh2;isolated;checker")
+  add_test(NAME flowmesh2_checker_slotcap
+    COMMAND ${Python3_EXECUTABLE} -I -B ${FM2_CONTRIB}/checker/fm2_check.py --trace $<TARGET_FILE:fm2_trace_cli>
+      --seeds 1 --kinds slotcap
+  )
+  set_tests_properties(flowmesh2_checker_slotcap PROPERTIES TIMEOUT 900 LABELS "flowmesh2;isolated;checker")
 
   add_test(NAME flowmesh2_unit COMMAND test_flowmesh2 --log_level=test_suite)
   set_tests_properties(flowmesh2_unit PROPERTIES TIMEOUT 120 LABELS "flowmesh2;isolated;outline")

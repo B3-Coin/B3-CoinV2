@@ -20,13 +20,20 @@ and view-bound profiles, and futures are outside it.
 - `fm2check/engine.py`: the slot validity predicate, the canonical order and
   phases 1-9 (deposits, transfers, cancels, post-only, the A2 sweep, rest or
   release, fees, conservation), outcomes and the next header.
-- `fm2check/batch.py`: seeded batches in four kinds: `random`, `adversarial`
+- `fm2check/batch.py`: seeded batches in five kinds: `random`, `adversarial`
   (25 mutations: bad signature, used nonce, duplicate ActionId, forked
   anchor, broken or out-of-range fact cursors, duplicate outpoint, stub and
   unknown fact kinds, oversize facts, wrong domain or window, unsupported or
   truncated originals, and typed action refusals), `dust` (one-lot,
-  low-price orders and tiny transfers, so fee rounding decides) and `caps`
-  (more than 1,000 open orders on an account, more than 1,024 fills by one taker).
+  low-price orders and tiny transfers, so fee rounding decides), `caps`
+  (more than 1,000 open orders on an account, more than 1,024 fills by one taker)
+  and `slotcap` (17 makers rest 17,000 one-lot asks; then 17 takers of 1,024
+  lots in one slot ask for more than the 16,384 fills of the slot budget. Pro-
+  rata keeps each taker near 1,000 fills, under the per-order cap, so every
+  REJ_FILL_CAP of that slot is the slot budget's; `fm2_check.py` prints the
+  model's stops, `SLOT_FILL_CAP 17`. The slot changes about 17,000 order
+  leaves, more than the 8,192 changed-leaf cap of D6, which nothing enforces
+  yet: when M3-ENG-04 does, this slot must be refused and the batch changed).
 - `fm2_check.py`: runs each batch through `fm2-trace` (the real engine, via
   `state::BuildCandidate`) and through the model. It requires byte equality
   on every slot: the verdict (error code and detail on refusal), the
@@ -35,8 +42,9 @@ and view-bound profiles, and futures are outside it.
   walking skeleton's goldens (below).
 - `test_fm2check.py`: self-tests of the codecs and BIP340.
 
-CTests: `flowmesh2_checker_selftest`, `flowmesh2_checker_agreement` and
-`flowmesh2_checker_caps` (label `checker`).
+CTests: `flowmesh2_checker_selftest`, `flowmesh2_checker_agreement`,
+`flowmesh2_checker_caps` and `flowmesh2_checker_slotcap` (label `checker`;
+the last takes about 3 minutes, mostly signing 17,000 orders in Python).
 
 ## The walking skeleton's goldens (O-87)
 
@@ -86,8 +94,6 @@ TRANSFER.
 
 ## Not covered
 
-- REJ_FILL_CAP via the slot budget (SLOT_FILL_CAP). It needs 16,384 fills in
-  one slot; the per-order cap is covered.
 - Balances or totals above MAX_ATOMS. These are errors, not outcomes (O-34); the
   model raises NotImplementedError rather than guess their code, and no batch
   reaches them.

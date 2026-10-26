@@ -1,8 +1,8 @@
 # Copyright (c) 2026 The B3 developers
 # Distributed under the MIT software license, see the accompanying
 # file COPYING or http://www.opensource.org/licenses/mit-license.php.
-"""Seeded batches of slots (fm2-trace-batch/1) for M3-ENG-05: random, adversarial
-and dust. The batch is the only input shared by fm2-trace and the model."""
+"""Seeded batches of slots (fm2-trace-batch/1) for M3-ENG-05: random, adversarial,
+dust, caps and slotcap. The batch is the only input shared by fm2-trace and the model."""
 
 import hashlib
 import random
@@ -17,7 +17,8 @@ FORMAT = 'fm2-trace-batch/1'
 BASE_HEIGHT = 100
 RUSD, TOK = test_asset('rUSD'), test_asset('TOK')
 MARKETS = (Market(NATIVE, RUSD, 1_000_000, 1), Market(TOK, RUSD, 1, 10))
-KINDS = ('random', 'adversarial', 'dust', 'caps')
+SLOTCAP_MAKERS = 17  # 17,000 resting lots: more than max_fills_per_slot (16,384)
+KINDS = ('random', 'adversarial', 'dust', 'caps', 'slotcap')
 
 
 def h(text):
@@ -47,7 +48,7 @@ class Generator:
         assert kind in KINDS
         self.kind, self.rng = kind, random.Random('%s/%d' % (kind, seed))
         self.domain = h('fm2/check/domain')
-        self.keys = [Key(i) for i in range(users)]
+        self.keys = [Key(i) for i in range(users if kind != 'slotcap' else SLOTCAP_MAKERS + 2)]
         self.slots_wanted = slots
         self.height = 0          # the height the next slot proposes, minus one (accepted slots only)
         self.anchor = BASE_HEIGHT
@@ -241,6 +242,25 @@ class Generator:
         slots.append(self.plain_slot([], takers))
         return slots
 
+    def slotcap_slots(self):
+        """The slotcap kind: SLOTCAP_MAKERS makers rest 1,000 one-lot asks each
+        at two prices, then one slot of 17 takers of 1,024 lots each asks for more
+        fills than max_fills_per_slot. Pro-rata keeps every taker near 1,000
+        fills, below max_fills_per_order, so the slot budget stops the last ones."""
+        r = self.rng
+        makers, takers = self.keys[:SLOTCAP_MAKERS], self.keys[SLOTCAP_MAKERS:]
+        slots = [self.plain_slot(deposits=[(k, NATIVE, 10**13) for k in makers] + [(k, RUSD, 10**13) for k in takers],
+                                 actions=[])]
+        price = r.randrange(95, 100)
+        for k in makers:
+            actions = [self.sign(k, KIND_PLACE, place_payload(MARKETS[0].id(), SELL, POST_ONLY, price + i % 2, 1))
+                       for i in range(1000)]
+            slots.append(self.plain_slot([], actions))
+        sweep = [self.sign(takers[i % 2], KIND_PLACE, place_payload(MARKETS[0].id(), BUY, (GTC, IOC)[i % 2], price + 1, 1024))
+                 for i in range(17)]
+        slots.append(self.plain_slot([], sweep))
+        return slots
+
     def plain_slot(self, deposits, actions):
         """One valid slot at the next anchor: these deposits, these actions."""
         self.anchor += 1
@@ -261,8 +281,9 @@ class Generator:
         return slot
 
     def batch(self):
-        slots = [] if self.kind != 'caps' else self.caps_slots()
-        for _ in range(self.slots_wanted if self.kind != 'caps' else 0):
+        fixed = {'caps': self.caps_slots, 'slotcap': self.slotcap_slots}.get(self.kind)
+        slots = fixed() if fixed else []
+        for _ in range(self.slots_wanted if not fixed else 0):
             snapshot = (self.anchor, [k.next_nonce for k in self.keys], self.funded.copy(), list(self.orders))
             slot, facts_to, invalid = self.slot()
             slots.append(slot)
