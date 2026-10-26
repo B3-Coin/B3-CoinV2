@@ -26,7 +26,8 @@ V2 work in `src/flowmesh2/`, see
   IDs with body fetch, seat counts of 4 to 7 in the regtest PBFT, and a
   constant-time signer-log lookup.
   Where a step needs an owner ruling, the row says BLOCKED-ON-RULING and the
-  code stops at the groundwork;
+  code stops at the groundwork. Every open question is collected in
+  [doc/design/b3-rebirth-owner-questions.md](doc/design/b3-rebirth-owner-questions.md);
 - the interim repair status in
   [doc/design/b3-interim-repair-status.md](doc/design/b3-interim-repair-status.md),
   with tests showing that a lowered finality quorum cannot unfreeze the
