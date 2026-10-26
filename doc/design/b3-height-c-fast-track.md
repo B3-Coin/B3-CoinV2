@@ -173,7 +173,7 @@ This is reported, not resolved.
 3. The chosen escape rule on regtest, with the `escape_race_*` cases
    turned into acceptance tests.
 4. The bounded committee.
-5. P3 on the fresh lineage.
+5. P3 on the fresh lineage, starting from the acceptance cases of §10.
 6. B0b, then extended U == U′ tooling for the owner's shadow-fork run.
 
 ## 9. Finality V2 (P3) against reorganizations: the model
@@ -333,3 +333,27 @@ a value as forced: taken on trust, C is decided again.
 
 A pass is evidence about the specification within the bound, not about any
 implementation.
+
+## 10. Acceptance tests for P3, failing first (proposed)
+
+Each case comes from the two models (§5, §9) or from the Stage 0 text they
+checked. Each fails today, because there is no P3 code. They belong where
+the H1 cases are: unit cases next to `finality_h1_tests`, plus regtest
+functional tests for the fork-choice ones. Two wait on rulings.
+
+| ID | Case | Source | Expected |
+|---|---|---|---|
+| P3-ACC-01 | A member PREPAREs A without a quorum. Its tip then moves to B, and in the next view it PREPAREs B. | V1 controls PC1/PC2 against P3 (§9.2); RC1 | Finality resumes on B. No member is locked by its own vote. |
+| P3-ACC-02 | A reporting quorum holds a prepared quorum on A. | Planted bug "the new view ignores prepared reports"; Stage 0 `:424` | The next leader must propose A. A NEW_VIEW proposing B is refused. |
+| P3-ACC-03 | A member restarts after reaching a prepared quorum. | Planted bug "reports forget the prepared value"; Stage 0 `:422`; R1 C5 | Its VIEW_CHANGE still reports the prepared quorum and its proof. |
+| P3-ACC-04 | A quorum that meets only the weight threshold, or only the headcount threshold, at any phase or in a NEW_VIEW report set. | NC2 (§9.2); R1 `:47-55` | Refused. |
+| P3-ACC-05 | Members whose tip is on B receive a forced A. | Finding 2 (§9.3) | They PREPARE and COMMIT A; A is decided; B3 reorganizes to A. |
+| P3-ACC-06 | After A is decided, a longer branch forks below A. Repeat across a restart and a reindex. | Stage 0 `:576-581` | The longer branch is never adopted. |
+| P3-ACC-07 | A node learns a decision when its branch forked a horizon or more below its tip. | Finding 3; owner ask 7 | **BLOCKED-ON-RULING**: whichever order the owner rules. |
+| P3-ACC-08 | A Byzantine leader makes a free proposal on a withheld branch that no member's tip is on. | §9.4; owner ask 8 | **BLOCKED-ON-RULING**: refused under the hybrid; under Stage 0's rule, a characterization test that it is decided. |
+| P3-ACC-09 | A NEW_VIEW names a "forced" value its reports do not justify. | Planted bug "the hybrid takes a forced claim on trust" | Refused, on every tip. |
+| P3-ACC-10 | A Byzantine leader sends A to some members and B to others in view 0. | S1 with a Byzantine view-0 leader (§9.2) | At most one value is ever decided. |
+| P3-ACC-11 | Finality state after every branch switch. | `escape_race_*` pattern; B0 (§4.5) | Equals the state rebuilt from scratch. |
+
+A mutant for each case should make it fail. The planted bugs of
+`p3_reorg_model.py` are the first three to port.
