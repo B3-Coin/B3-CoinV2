@@ -507,6 +507,32 @@ struct H1ChainFixture : public FinalityChainFixture {
         if (block.GetBlockTime() > GetTime()) SetMockTime(block.GetBlockTime());
         return block;
     }
+    //! A signed block by `key` on `parent` (any branch) at exactly `round`;
+    //! the mock clock moves to its time so the time rules admit it.
+    CBlock BuildOnParent(const CBlockIndex* parent, const modern::PosValidatorKey& key, const int64_t round)
+    {
+        CBlock block{FinishPosBlock(BuildPos(parent, key, round, 0), key, {})};
+        if (block.GetBlockTime() > GetTime()) SetMockTime(block.GetBlockTime());
+        return block;
+    }
+    const CBlockIndex* BlockIndexOf(const uint256& hash)
+    {
+        LOCK(cs_main);
+        const CBlockIndex* index{m_node.chainman->m_blockman.LookupBlockIndex(hash)};
+        BOOST_REQUIRE(index != nullptr);
+        return index;
+    }
+    //! H-H1: the live tracker's state equals that of a tracker rebuilt from
+    //! scratch on the active chain (no schedule left over from another branch).
+    bool AsRebuilt()
+    {
+        LOCK(cs_main);
+        Chainstate& cs{m_node.chainman->ActiveChainstate()};
+        FinalityTracker rebuilt;
+        BOOST_REQUIRE(rebuilt.Sync(cs.m_chain, cs.m_blockman, m_node.chainman->GetConsensus(), *cs.m_chain.Tip()));
+        const auto& live{Finality().Current()};
+        return SameV1(live, rebuilt.Current()) && SameProducers(live.producers, rebuilt.Current().producers);
+    }
     //! Produce and connect one block by `key` at exactly `round`.
     uint256 ProduceInRound(const modern::PosValidatorKey& key, const int64_t round)
     {
@@ -1206,6 +1232,211 @@ BOOST_FIXTURE_TEST_CASE(escape_restarts_schedule, H1ChainFixture)
     ProduceExpectConnectFailure(m_vk_b, {}, 1);
     Produce(m_vk_c); // h_e2 + 1
     BOOST_CHECK(V1FieldsAsWithoutH1());
+}
+
+// (i2) The escape race (dependency document sections 5.2 and 13, H-H1). On one
+// parent P, A (in force) signs a late block L in round R_escape - 1, and C
+// (outside the set in force, in Snapshot(P)) signs an escape block E in round
+// R_escape. Both are valid. Every modern-PoS block carries the same work, so
+// at equal height the fork choice takes the branch whose first block has the
+// earlier timestamp: L. E arrives first and connects; L then reorganizes it
+// away. E's child makes E's branch longer and it wins again; L's child
+// restores equal height and L's branch wins again. After every switch the
+// live tracker equals a tracker rebuilt from scratch (no escape survives on
+// L's branch), and the next block follows the winning branch's schedule.
+// Consequence (reported, not a rule change): a member in force that holds a
+// block for round R_escape - 1 defeats any escape on the same parent.
+BOOST_FIXTURE_TEST_CASE(escape_race_late_in_force_block_wins_at_equal_height, H1ChainFixture)
+{
+    PrepareFinalityChain(/*min_finality_set=*/1, /*reorg_horizon=*/200, /*with_unbound_c=*/true);
+    const int M{m_M};
+    const int R_h{M + 10};
+    constexpr int64_t R_ESC{TEST_ESCAPE_ROUNDS};
+    constexpr int64_t SATURATED{7}; // every key in force is eligible from round 7 (fixture weights)
+    static_assert(SATURATED < R_ESC);
+    ConfigureH1(R_h);
+
+    ProduceTo(R_h + 1, m_vk_a);
+    const auto bind_c{MakeBinding(m_validator_c, m_vk_c, &m_bls_c, 0)};
+    Produce(m_vk_a, {}, {MakeTx(8, {bind_c.cell}, {bind_c.record})}); // R_h + 2
+    const int h_e{R_h + 20};
+    ProduceTo(h_e - 1, m_vk_a);
+    const CBlockIndex* parent{Tip()};
+    BOOST_CHECK(WeightsInRound(m_vk_a, R_ESC - 1) == std::make_pair(CAmount{15}, CAmount{16}));
+    BOOST_CHECK(WeightsInRound(m_vk_c, R_ESC - 1) == std::make_pair(CAmount{0}, CAmount{16}));
+    BOOST_CHECK(WeightsInRound(m_vk_c, R_ESC) == std::make_pair(CAmount{10}, CAmount{26}));
+
+    const CBlock late{BuildOnParent(parent, m_vk_a, R_ESC - 1)};
+    const CBlock escape{BuildOnParent(parent, m_vk_c, R_ESC)};
+    BOOST_CHECK_MESSAGE(Probe(late).empty(), Probe(late));
+    BOOST_CHECK_MESSAGE(Probe(escape).empty(), Probe(escape));
+    BOOST_CHECK_LT(late.GetBlockTime(), escape.GetBlockTime());
+
+    // E first: it connects and restarts the schedule.
+    BOOST_REQUIRE(Submit(escape));
+    BOOST_CHECK(Tip()->GetBlockHash() == escape.GetHash());
+    {
+        const auto s{FinalityState()};
+        BOOST_REQUIRE(s.producers);
+        BOOST_CHECK_EQUAL(s.producers->escapes, 1U);
+        BOOST_CHECK_EQUAL(s.producers->last_escape_height, h_e);
+    }
+    BOOST_CHECK(AsRebuilt());
+
+    // L later, same height: the node reorganizes to L. No escape on L's branch.
+    BOOST_REQUIRE(Submit(late));
+    BOOST_CHECK(Tip()->GetBlockHash() == late.GetHash());
+    BOOST_CHECK_EQUAL(Tip()->nHeight, h_e);
+    {
+        const auto s{FinalityState()};
+        BOOST_REQUIRE(s.producers);
+        BOOST_CHECK_EQUAL(s.producers->epoch, 0U);
+        BOOST_CHECK_EQUAL(s.producers->epoch_start, R_h);
+        BOOST_CHECK_EQUAL(s.producers->escapes, 0U);
+        BOOST_REQUIRE(s.producers->current);
+        BOOST_CHECK(!s.producers->current->IndexOf(m_vk_c));
+    }
+    BOOST_CHECK(AsRebuilt());
+    BOOST_CHECK(V1FieldsAsWithoutH1());
+    BOOST_CHECK(Weights(m_vk_c) == std::make_pair(CAmount{0}, CAmount{16}));
+
+    // E's child: E's branch is longer and wins; the escape is back.
+    const CBlock escape_child{BuildOnParent(BlockIndexOf(escape.GetHash()), m_vk_c, SATURATED)};
+    BOOST_REQUIRE(Submit(escape_child));
+    BOOST_CHECK(Tip()->GetBlockHash() == escape_child.GetHash());
+    {
+        const auto s{FinalityState()};
+        BOOST_REQUIRE(s.producers);
+        BOOST_CHECK_EQUAL(s.producers->escapes, 1U);
+        BOOST_CHECK_EQUAL(s.producers->last_escape_height, h_e);
+        BOOST_REQUIRE(s.producers->current);
+        BOOST_CHECK(s.producers->current->IndexOf(m_vk_c).has_value());
+    }
+    BOOST_CHECK(AsRebuilt());
+
+    // L's child (A, in force on L's branch): equal height again, L's branch wins.
+    const CBlock late_child{BuildOnParent(BlockIndexOf(late.GetHash()), m_vk_a, SATURATED)};
+    BOOST_REQUIRE(Submit(late_child));
+    BOOST_CHECK(Tip()->GetBlockHash() == late_child.GetHash());
+    BOOST_CHECK_EQUAL(Tip()->nHeight, h_e + 1);
+    {
+        const auto s{FinalityState()};
+        BOOST_REQUIRE(s.producers);
+        BOOST_CHECK_EQUAL(s.producers->escapes, 0U);
+    }
+    BOOST_CHECK(AsRebuilt());
+    BOOST_CHECK(V1FieldsAsWithoutH1());
+    BOOST_CHECK(Weights(m_vk_c) == std::make_pair(CAmount{0}, CAmount{16}));
+    {
+        LOCK(cs_main);
+        for (const uint256& h : {escape.GetHash(), escape_child.GetHash()}) {
+            const CBlockIndex* index{m_node.chainman->m_blockman.LookupBlockIndex(h)};
+            BOOST_REQUIRE(index);
+            BOOST_CHECK(!(index->nStatus & BLOCK_FAILED_VALID)); // valid, only outranked
+        }
+    }
+}
+
+// (i3) The same race in the other arrival order: L first, then E. The node
+// never connects E, and ends on the same tip as a node that saw E first.
+BOOST_FIXTURE_TEST_CASE(escape_race_order_independent, H1ChainFixture)
+{
+    PrepareFinalityChain(/*min_finality_set=*/1, /*reorg_horizon=*/200, /*with_unbound_c=*/true);
+    const int M{m_M};
+    const int R_h{M + 10};
+    constexpr int64_t R_ESC{TEST_ESCAPE_ROUNDS};
+    ConfigureH1(R_h);
+
+    ProduceTo(R_h + 1, m_vk_a);
+    const auto bind_c{MakeBinding(m_validator_c, m_vk_c, &m_bls_c, 0)};
+    Produce(m_vk_a, {}, {MakeTx(8, {bind_c.cell}, {bind_c.record})}); // R_h + 2
+    const int h_e{R_h + 20};
+    ProduceTo(h_e - 1, m_vk_a);
+    const CBlockIndex* parent{Tip()};
+    const CBlock late{BuildOnParent(parent, m_vk_a, R_ESC - 1)};
+    const CBlock escape{BuildOnParent(parent, m_vk_c, R_ESC)};
+
+    BOOST_REQUIRE(Submit(late));
+    BOOST_CHECK(Tip()->GetBlockHash() == late.GetHash());
+    BOOST_REQUIRE(Submit(escape));
+    BOOST_CHECK(Tip()->GetBlockHash() == late.GetHash());
+    {
+        const auto s{FinalityState()};
+        BOOST_REQUIRE(s.producers);
+        BOOST_CHECK_EQUAL(s.producers->escapes, 0U);
+        BOOST_CHECK_EQUAL(s.producers->epoch, 0U);
+    }
+    BOOST_CHECK(AsRebuilt());
+    LOCK(cs_main);
+    const CBlockIndex* e{m_node.chainman->m_blockman.LookupBlockIndex(escape.GetHash())};
+    BOOST_REQUIRE(e);
+    BOOST_CHECK(!(e->nStatus & BLOCK_FAILED_VALID));
+}
+
+// (i4) A withheld branch. C escapes on P and C's branch grows to three
+// blocks. A, in force on P, made L in round R_escape - 1 and two children,
+// and publishes them only now, every one of them later in time than the tip
+// it replaces. At equal height the first divergent blocks decide and L is
+// one round earlier than E, so the node disconnects all three of C's blocks.
+// Within the reorganization horizon nothing bounds the depth but the
+// withheld branch's length.
+BOOST_FIXTURE_TEST_CASE(escape_race_withheld_branch_replaces_the_escape_branch, H1ChainFixture)
+{
+    PrepareFinalityChain(/*min_finality_set=*/1, /*reorg_horizon=*/200, /*with_unbound_c=*/true);
+    const int M{m_M};
+    const int R_h{M + 10};
+    constexpr int64_t R_ESC{TEST_ESCAPE_ROUNDS};
+    constexpr int64_t SATURATED{7};
+    ConfigureH1(R_h);
+
+    ProduceTo(R_h + 1, m_vk_a);
+    const auto bind_c{MakeBinding(m_validator_c, m_vk_c, &m_bls_c, 0)};
+    Produce(m_vk_a, {}, {MakeTx(8, {bind_c.cell}, {bind_c.record})}); // R_h + 2
+    const int h_e{R_h + 20};
+    ProduceTo(h_e - 1, m_vk_a);
+    const CBlockIndex* parent{Tip()};
+
+    // A's withheld branch starts with L in round R_escape - 1; its two
+    // children, also in round R_escape - 1, are built below.
+    const CBlock l1{BuildOnParent(parent, m_vk_a, R_ESC - 1)};
+    // C's public branch: the escape, then C in force on its own branch.
+    const CBlock e1{BuildOnParent(parent, m_vk_c, R_ESC)};
+    BOOST_REQUIRE(Submit(e1));
+    const CBlock e2{BuildInRound(m_vk_c, SATURATED)};
+    BOOST_REQUIRE(Submit(e2));
+    const CBlock e3{BuildInRound(m_vk_c, SATURATED)};
+    BOOST_REQUIRE(Submit(e3));
+    BOOST_REQUIRE(Tip()->GetBlockHash() == e3.GetHash());
+    BOOST_CHECK_EQUAL(Tip()->nHeight, h_e + 2);
+    BOOST_CHECK(AsRebuilt());
+
+    // The fixture builds only on indexed blocks, so A's blocks reach the node
+    // one by one; the first two are shorter and stay a side branch.
+    BOOST_REQUIRE(Submit(l1));
+    BOOST_CHECK(Tip()->GetBlockHash() == e3.GetHash());
+    const CBlock l2{BuildOnParent(BlockIndexOf(l1.GetHash()), m_vk_a, R_ESC - 1)};
+    BOOST_CHECK_GT(l2.GetBlockTime(), e2.GetBlockTime());
+    BOOST_REQUIRE(Submit(l2));
+    BOOST_CHECK(Tip()->GetBlockHash() == e3.GetHash());
+    const CBlock l3{BuildOnParent(BlockIndexOf(l2.GetHash()), m_vk_a, R_ESC - 1)};
+    BOOST_CHECK_GT(l3.GetBlockTime(), e3.GetBlockTime());
+    BOOST_REQUIRE(Submit(l3)); // equal height: L's branch wins
+    BOOST_CHECK(Tip()->GetBlockHash() == l3.GetHash());
+    BOOST_CHECK_EQUAL(Tip()->nHeight, h_e + 2);
+    {
+        const auto s{FinalityState()};
+        BOOST_REQUIRE(s.producers);
+        BOOST_CHECK_EQUAL(s.producers->escapes, 0U);
+    }
+    BOOST_CHECK(AsRebuilt());
+    BOOST_CHECK(V1FieldsAsWithoutH1());
+    LOCK(cs_main);
+    for (const uint256& h : {e1.GetHash(), e2.GetHash(), e3.GetHash()}) {
+        const CBlockIndex* index{m_node.chainman->m_blockman.LookupBlockIndex(h)};
+        BOOST_REQUIRE(index);
+        BOOST_CHECK(!m_node.chainman->ActiveChain().Contains(index));
+        BOOST_CHECK(!(index->nStatus & BLOCK_FAILED_VALID));
+    }
 }
 
 // (j) An escape at R_h itself: the bootstrap and the escape apply at the same
