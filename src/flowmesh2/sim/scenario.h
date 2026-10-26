@@ -87,6 +87,13 @@ struct RunReport {
     std::vector<std::string> canonical_order; //!< per committed slot: its originals' labels in body order, "," separated
     uint256 trace_digest;
     size_t trace_events{0};
+    /** The committed slots as fm2-trace-batch/1 JSON for the independent
+     * checker (M3-ENG-05, O-87): the genesis inputs, then per slot its anchor,
+     * fact range, facts, originals sorted by their bytes (so the canonical
+     * order is not given away) and certificate hash, plus "labels" (ActionId
+     * to outbox label). Inputs only: no header, hash, order or root.
+     */
+    std::string replay_batch;
 
     //! No harness error and every manifest check ran and passed.
     bool Passed() const;

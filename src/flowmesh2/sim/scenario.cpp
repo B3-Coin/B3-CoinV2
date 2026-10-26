@@ -28,6 +28,7 @@
 #include <flowmesh2/storage/signer_log.h>
 #include <flowmesh2/verify/b3verify.h>
 #include <util/overflow.h>
+#include <util/strencodings.h>
 
 #include <algorithm>
 #include <array>
@@ -51,8 +52,9 @@ constexpr std::array<Variant, 3> ALL_VARIANTS{Variant::WALKING_SKELETON, Variant
  * from the first run of the outline (every seed gives these; the order is
  * the engine's CanonicalOrder over the parent header hash and the height,
  * O-4b, O-50). A change of any header field before slot 4 may change them.
- * Self-pinned, so a regression check, not an independent one (O-87): the
- * independent recomputation is M3-ENG-05's.
+ * Self-pinned, so a regression check here (O-87); M3-ENG-05's independent
+ * checker recomputes it from RunReport::replay_batch
+ * (contrib/flowmesh2/checker/fm2_check.py --skeleton).
  */
 constexpr std::array<std::string_view, 3> GOLDEN_CANONICAL_ORDER{"a,b", "c,d", "e,f"};
 
@@ -61,6 +63,56 @@ constexpr uint64_t STEP_EVENT_LIMIT{10'000};
 constexpr int MAX_COLLECT_ATTEMPTS{64};
 
 std::string ErrorText(const Error& error) { return std::string{ToString(error.code)} + " " + std::string{error.detail}; }
+
+std::string Quoted(std::string_view text) { return '"' + std::string{text} + '"'; }
+
+std::string HexList(std::vector<std::vector<unsigned char>> items)
+{
+    std::string out{"["};
+    for (const auto& item : items) out += (out.size() > 1 ? "," : "") + Quoted(HexStr(item));
+    return out + "]";
+}
+
+std::string CursorJson(const FactCursor& c) { return "[" + Quoted(std::to_string(c.height)) + "," + Quoted(std::to_string(c.index)) + "]"; }
+
+std::string AnchorJson(const Anchor& a)
+{
+    return "{\"hash\":" + Quoted(HexStr(a.hash)) + ",\"height\":" + Quoted(std::to_string(a.height)) + "}";
+}
+
+//! RunReport::replay_batch of the node's committed slots.
+std::string ReplayBatch(const SimNode& node, const std::map<ActionId, std::string>& labels)
+{
+    std::string out{"{\"format\":\"fm2-trace-batch/1\""};
+    out += ",\"domain\":" + Quoted(HexStr(node.Domain()));
+    out += ",\"authority_epoch\":" + Quoted(std::to_string(node.GenesisAuthority().epoch));
+    out += ",\"seat_set_root\":" + Quoted(HexStr(node.GenesisAuthority().seat_set_root));
+    out += ",\"genesis_anchor\":" + AnchorJson(SimAnchor(SIM_BASE_HEIGHT));
+    out += ",\"facts_start\":" + CursorJson(FactCursor{SIM_BASE_HEIGHT + 1, 0});
+    out += ",\"markets\":[";
+    for (size_t i{0}; i < node.Markets().size(); ++i) {
+        const MarketDescriptor& m{node.Markets()[i]};
+        out += std::string{i ? "," : ""} + "{\"base\":" + Quoted(HexStr(m.base.id)) + ",\"quote\":" + Quoted(HexStr(m.quote.id)) +
+               ",\"lot\":" + Quoted(std::to_string(m.base_atoms_per_lot)) + ",\"tick\":" + Quoted(std::to_string(m.quote_atoms_per_tick)) + "}";
+    }
+    out += "],\"slots\":[";
+    for (size_t i{0}; i < node.Sealed().size(); ++i) {
+        const SealedSlot& slot{node.Sealed()[i]};
+        const SlotHeaderV2& header{slot.head->Header()};
+        std::vector<std::vector<unsigned char>> originals{slot.decision.body.originals};
+        std::sort(originals.begin(), originals.end());
+        out += std::string{i ? "," : ""} + "{\"anchor\":" + AnchorJson(header.anchor) + ",\"cert_hash\":" + Quoted(HexStr(slot.head->CertHash())) +
+               ",\"facts\":" + HexList(slot.decision.body.facts) + ",\"facts_from\":" + CursorJson(header.facts_from) +
+               ",\"facts_to\":" + CursorJson(header.facts_to) + ",\"originals\":" + HexList(std::move(originals)) + "}";
+    }
+    out += "],\"labels\":{";
+    bool first{true};
+    for (const auto& [id, label] : labels) {
+        out += std::string{first ? "" : ","} + Quoted(HexStr(id.id)) + ":" + Quoted(label);
+        first = false;
+    }
+    return out + "}}";
+}
 
 //! The results of the checks of one run (or of a suite).
 class Checks
@@ -1220,6 +1272,7 @@ void Driver::FillReport(RunReport& report)
             report.canonical_order.push_back(OrderOf(slot.height));
         }
         report.final_state_root = m_node->Owner().Head()->Header().state_root;
+        report.replay_batch = ReplayBatch(*m_node, m_labels);
     }
     report.trace_digest = m_trace.Digest();
     report.trace_events = m_trace.Size();

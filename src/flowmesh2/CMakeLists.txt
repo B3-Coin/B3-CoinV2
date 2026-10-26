@@ -257,6 +257,12 @@ if(BUILD_FLOWMESH2)
   set_target_properties(fm2_sim_cli PROPERTIES OUTPUT_NAME fm2-sim)
   target_link_libraries(fm2_sim_cli PRIVATE core_interface fm2_warnings fm2_simlib)
 
+  # fm2-trace (M3-ENG-05): runs the engine on a batch of slots for the
+  # independent checker in contrib/flowmesh2/checker.
+  add_executable(fm2_trace_cli sim/fm2_trace_main.cpp)
+  set_target_properties(fm2_trace_cli PROPERTIES OUTPUT_NAME fm2-trace)
+  target_link_libraries(fm2_trace_cli PRIVATE core_interface fm2_warnings fm2_simlib univalue)
+
   # Explicit local-only four-seat operator worker. Never linked into b3coind.
   if(UNIX)
     add_executable(fm2_regtest_node dev/regtest_operator.cpp dev/regtest_node_main.cpp)
@@ -391,6 +397,25 @@ if(BUILD_FLOWMESH2)
       -P ${FM2_CONTRIB}/sim_determinism.cmake
   )
   set_tests_properties(flowmesh2_sim_cli_determinism PROPERTIES TIMEOUT 600 LABELS "flowmesh2;isolated;outline;sim")
+
+  # M3-ENG-05: the independent checker (contrib/flowmesh2/checker) must agree
+  # with the engine, through fm2-trace, on every slot of seeded random,
+  # adversarial, dust and caps batches, and must recompute the walking
+  # skeleton's goldens that are pinned from the C++ output (O-87).
+  add_test(NAME flowmesh2_checker_selftest
+    COMMAND ${Python3_EXECUTABLE} -I -B ${FM2_CONTRIB}/checker/test_fm2check.py
+  )
+  set_tests_properties(flowmesh2_checker_selftest PROPERTIES TIMEOUT 60 LABELS "flowmesh2;isolated;checker")
+  add_test(NAME flowmesh2_checker_agreement
+    COMMAND ${Python3_EXECUTABLE} -I -B ${FM2_CONTRIB}/checker/fm2_check.py --trace $<TARGET_FILE:fm2_trace_cli>
+      --seeds 6 --slots 12 --kinds random,adversarial,dust --skeleton
+  )
+  set_tests_properties(flowmesh2_checker_agreement PROPERTIES TIMEOUT 600 LABELS "flowmesh2;isolated;checker")
+  add_test(NAME flowmesh2_checker_caps
+    COMMAND ${Python3_EXECUTABLE} -I -B ${FM2_CONTRIB}/checker/fm2_check.py --trace $<TARGET_FILE:fm2_trace_cli>
+      --seeds 1 --kinds caps
+  )
+  set_tests_properties(flowmesh2_checker_caps PROPERTIES TIMEOUT 600 LABELS "flowmesh2;isolated;checker")
 
   add_test(NAME flowmesh2_unit COMMAND test_flowmesh2 --log_level=test_suite)
   set_tests_properties(flowmesh2_unit PROPERTIES TIMEOUT 120 LABELS "flowmesh2;isolated;outline")
