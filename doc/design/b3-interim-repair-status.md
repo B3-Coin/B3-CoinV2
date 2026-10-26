@@ -99,6 +99,7 @@ the read-only status call above.
 | Below R_h everything is V1, bit for bit | `finality_h1_tests/below_rh_bit_identical` |
 | Carry-over below the minimum set; bootstrap fallback | `finality_h1_tests/carry_over_and_bootstrap_fallback` |
 | Escape restarts the schedule, also at activation and below the floor; restart and reindex reproduce it | `finality_h1_tests/escape_restarts_schedule`, `escape_at_activation`, `escape_takes_snapshot_below_floor`, `rebuild_and_reload_reproduce_escape`, `assembler_escape_round` |
+| On one parent, a late in-force block beats an escape block at equal height in either arrival order; a withheld in-force branch replaces a three-block escape branch; after every switch the tracker equals one rebuilt from scratch | `finality_h1_tests/escape_race_late_in_force_block_wins_at_equal_height`, `escape_race_order_independent`, `escape_race_withheld_branch_replaces_the_escape_branch` (new) |
 | H2 pin above R_h refuses a competing branch | `finality_h1_tests/h2_pin_above_rh_refuses_competitor` |
 | Knobs refused outside regtest and range checked | `finality_h1_tests/h1_knobs_refused_outside_regtest`, `h1_knobs_require_flowmesh_regtest`, `h1_knob_values_are_checked` |
 | Staking, signing and carrier behaviour with a broken lineage | `finality_production_tests` (for example `regtest_carrier_rejects_previous_epoch_and_broken_lineage`) |
@@ -148,6 +149,44 @@ certificate, and it still leaves the producer set frozen at epoch 10.
 - **Finality itself.** H1 restores block production for new stakes; it
   does not finalize anything. Finality resumes only with the fresh lineage
   (dependency document section 6) or V2, both later work.
-- **The escape race.** Section 5.2 of the dependency document leaves a
-  race between an escape block and a late in-force block on the same
-  parent to a model check (its section 13). That check has not been run.
+- **The escape race: checked, and it needs a ruling.** Section 5.2 of the
+  dependency document leaves the race between an escape block and a late
+  in-force block on the same parent to a model check (its section 13).
+  Section 13 as a whole models the V2 finality design. Only its H-H1 part
+  concerns H1, and that part is now checked, in two ways: three
+  `escape_race_*` cases in `finality_h1_tests` on the real code, and a
+  bounded exhaustive model of the rule and the fork choice,
+  `test/b3_h1_escape/escape_race_model.py`. Evidence:
+  `~/B3-evidence/h1-escape-race/` on the build host.
+  - **Determinism holds.** Every switch between the two branches leaves
+    the tracker equal to one rebuilt from scratch, both arrival orders end
+    on the same tip, and the model finds no schedule that differs from its
+    recomputation along the path. A schedule cannot outlive a reorg
+    because every tracker refuses a block that does not extend its synced
+    tip and falls back to a rebuild. The finality tracker does this three
+    ways: on disconnect, on connect, and in Sync. Its stake and binding
+    trackers repeat the check. With all three of the finality tracker's
+    guards removed, the cases still pass.
+  - **The escape loses every race.** Every modern-PoS block has the same
+    work, and at equal height the branch whose first block is earlier
+    wins. An escape block is at least one round later than any
+    non-escape block on the same parent, and only the set in force may
+    make a non-escape block. There is no rule against publishing a block
+    late. So one member in force that answers each escape with a block one
+    round earlier, even after the escape has connected, keeps the chain at
+    one block per R_escape rounds. New stake then waits for rotation, E to
+    2E blocks. On mainnet (R_escape 24 hours, E 1,440) that is four to
+    eight years. The model shows the same bound: 2E times R_escape.
+  - **A withheld branch can replace honest blocks.** A branch from an
+    in-force member that reaches equal height wins, however late it is
+    published, up to the reorganization horizon (1,440 blocks on mainnet).
+    The test replaces three. The eligibility digest does not cover the
+    block's contents, so at equal times the producer can grind for the
+    lower hash. How deep this goes in practice depends on whether the
+    member's branch can keep pace, which depends on its share of the
+    weight in force.
+  - **What the escape assumed.** FD-2 assumes every in-force producer is
+    offline. Against even one adversarial member in force, it gives no
+    liveness. Whether to accept this, or to change the escape or the tie
+    rule, is a consensus decision for the owner; nothing here changes
+    either.
