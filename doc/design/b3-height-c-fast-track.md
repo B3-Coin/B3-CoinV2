@@ -1,0 +1,171 @@
+# Height C: what can be built before DEX-1
+
+**Status: PROPOSAL, no governing authority.** Written 2026-10-26 for the
+project owner, against `r0-rebirth` at 2390ff02. It sets no height, rule or
+parameter. Every consensus item below waits for an owner ruling. B0, though
+not a consensus change, is `OWNER-GATED` in the ledger
+(`src/flowmesh2/TODO.md:133`, `:267`) and is therefore designed here, not
+implemented.
+
+## 1. Why C is scheduled for months 10 to 15
+
+The plan calls the two activations independent: "**P** activates FlowMesh
+V2 on B3. **C** activates the base-chain finality/PoS improvements. They
+are independent" (`doc/design/b3-flowmesh-greenfield-plan-20261016.md:45`).
+It also says "M10 does not gate P" (`:975`). C is late for two other reasons:
+
+- D8 puts DEX-1 (C7) before C5 "on regtest trusted facts" (`:1072`);
+- D26, the PoS V2 scope ruling, is Tier 3: "after DEX-1, before the mainnet
+  milestones" (`:1088`, `:1101`).
+
+So C can move earlier without touching the DEX path, if the work is done
+in parallel and D26 is ruled early. This document lists that work.
+
+## 2. What C must deliver
+
+| Source | Requirement |
+|---|---|
+| Plan §3.4.2 (`:373-377`) | Finality V2: "lock only on an observed quorum; never finalize where you nullified; per-block finality". PoS V2: "fix the stuck producer set and the headcount Sybil". No slashing. |
+| [CC] C5 (`b3-flowmesh-clean-core-20261016.md:86`) | "Native authenticated inputs, immediate invalidation, bounded finality undo and required PoS V2 improvement". Exit: "Reorg/epoch/restart/full-replay comparison and safe membership/bootstrap; producer election is not silently left as completed V2". |
+| Plan M10 (`:967`) | "Sign-versus-reorg linearization proved in the spec before native signing; producer election not silently declared done; U == U′". |
+| Ledger | `B0-B3D-01` bounded undo (`TODO.md:267`), `M10-B3D-01` Finality V2 ("sign-versus-reorg proof first", `:376`), `M10-B3D-02` PoS V2 ("shadow fork; U == U′", `:377`), `M10-SPEC-01` (`:378`). |
+
+B0 is "part of C5" and is scheduled for months 0 to 1.5 (plan `:956`).
+
+## 3. What exists, and the gaps
+
+| Requirement | What exists in this tree | Gap |
+|---|---|---|
+| B0: bounded undo of derived state | Bindings, FN seats, vaults, checkpoints and the bridge state undo one block in place. Both stake trackers and the finality tracker rebuild from H+1 on every disconnect (`src/validation.cpp:5118`, `:5138`). Nothing persists across a restart. Cost measured: about 18 µs per modern block per rebuild, about 0.8 s per one-block reorg on mainnet's length today, a floor (`~/B3-evidence/B0/report.md`). The 97 s gap was a regtest journal "around a shallow reorg" (`b3-flowmesh-redesign-plan-20261015.md:56`). | Undo for the three rebuilding trackers (§4). Persistence for restarts. |
+| PoS V2: stuck producer set | H1 (regtest knob): producer epochs rotate from stake snapshots without certificates, with an escape after R_escape rounds. The V2 design adopts it: "P3-R1 producers … H1 schedule and escape (V2-D3)" (`b3-bridge-v2-finality-dependency.md:484`, `:507`). | The escape gives no liveness against one adversarial member in force (§5). Producer election cannot be called done until that is ruled. |
+| PoS V2: headcount Sybil | A rule is designed: Committee(S) = members with weight ≥ W(S)/128, at most 64 (`b3-bridge-v2-finality-dependency.md:551-556`). "B-22 needs explicit owner approval" (`:557`). | Not implemented: "B-22 is out of scope" (`:912`). |
+| Finality V2 (P3) | The fresh lineage exists on regtest: genesis at R_f, fresh keys, digest V2, transport (`finality_fresh_*` tests). It signs with "The V1 single-vote signer, unchanged in logic" (`:419`). | P3 itself, the voting that locks only on an observed quorum, has no code in b3d. |
+| Sign-versus-reorg proof | `M10-SPEC-01` is written for FlowMesh seat authority (`TODO.md:378`). `M10-B3D-01` asks for a "sign-versus-reorg proof first" for Finality V2. | No proof or model for either. |
+| U == U′ | `b3coin-utxo-verify` compares the UTXO set at H (`src/bitcoin-utxo-verify.cpp`). | Plan §6.6's extended form, covering every tracker, does not exist. Shadow-fork runs need a mainnet copy, so they are owner-run. |
+
+## 4. B0 design (proposed, not implemented)
+
+### 4.1 Scope
+
+Only the three trackers that rebuild on a disconnect change. The others
+already undo in place and are left alone, except that the new tests also
+check them.
+
+### 4.2 B0a: the reorg path
+
+- **StakeTracker** (`src/node/stake_tracker.{h,cpp}`). `ApplyBlock` records
+  per block the entries it spent and the outpoints it created. A new
+  `BlockDisconnected(index)` reverses the last block when the tracker is
+  synced to it, and otherwise marks itself dirty, as today. Both
+  instances get it: Chainstate's (eligibility) and the finality tracker's
+  own.
+- **FinalityTracker** (`src/node/finality_tracker.{h,cpp}`). Each connected
+  block pushes the `State` it replaced. `State` holds the validator sets
+  by `shared_ptr`, so the copy is small: one vector of epoch starts, the
+  optionals and a few flags. `BlockDisconnected` restores that state, steps the
+  stake and binding trackers back, clears the tip-snapshot memo and moves
+  the synced tip to the parent. In fresh-key mode (regtest only) it keeps
+  today's rebuild.
+- **Bound.** The undo history keeps the last `reorg_horizon` blocks (1,440
+  on mainnet), well under 2 MB for the finality state. A deeper
+  disconnect, a gap or a restart falls back to today's full rebuild, which
+  stays as the reference.
+- **Call sites.** `src/validation.cpp:5118` calls the stake tracker's
+  `BlockDisconnected` instead of `MarkDirty`. `:5138` is unchanged in form.
+
+Validity does not change. The tracker returns the same state as a rebuild,
+only sooner. A mismatch would split the node from the network, which is
+why acceptance is undo equal to replay.
+
+### 4.3 B0b: the restart path (outline)
+
+Persist each tracker's state at one block at least `reorg_horizon` below
+the tip, keyed by that block's hash. On start, load it if the block is on
+the active chain and replay forward. That is at most a horizon plus the
+blocks since the save, and it refills the undo history. This needs a
+canonical serialization of `State`, the stake map and the indexes. It is a
+separate design once B0a lands.
+
+### 4.4 Files (B0a)
+
+`src/node/stake_tracker.{h,cpp}`, `src/node/finality_tracker.{h,cpp}`,
+`src/validation.cpp` (one call site), a new `src/test/derived_state_undo_tests.cpp`
+and its entry in `src/test/CMakeLists.txt`.
+
+### 4.5 Acceptance, failing first
+
+1. A rebuild counter on each tracker. A one-block reorg must not rebuild
+   the stake or finality tracker. This fails today.
+2. Undo equals replay. For each depth up to the regtest horizon, after
+   epoch boundaries, a certificate, an H1 rotation and an escape, the
+   tracker after undo equals a tracker rebuilt from scratch. The same
+   check covers the four trackers that already undo in place.
+3. Cost. The one-block reorg time stays flat as the chain grows, measured
+   with the B0 script.
+4. Mutants: dropping one undo entry, or restoring the wrong state, fails
+   test 2.
+5. Owner-run: the same equality on a shadow copy of mainnet.
+
+## 5. The escape rule (V2-D3)
+
+`finality_h1_tests/escape_race_*` and
+`test/b3_h1_escape/escape_race_model.py` show the following. All modern
+blocks carry equal work, and at equal height the branch whose first block
+is earlier wins. An escape block is always later than a non-escape sibling,
+and nothing refuses a late block. So with every honest member in force
+offline, one adversarial member in force holds the chain to one block per
+R_escape rounds until rotation: about 4 to 8 years on mainnet. A withheld
+in-force branch also replaces honest blocks, up to the reorganization
+horizon.
+
+`--compare-fixes` (2390ff02; evidence `~/B3-evidence/h1-escape-race/fix-compare/`)
+reruns the search under three candidate rules. The bounds are small, and
+E=1 makes every epoch one block, which hides the cumulative rule.
+
+| Rule | Slow-producer attack | Withheld-branch reorg | Cost |
+|---|---|---|---|
+| Current | Height 14 in 22 steps (E=2), 18 in 36 (E=3) | Up to 3 honest blocks | — |
+| Escape beats a non-escape sibling | Unchanged | Unchanged in 2 of 3 bounds: the adversary makes its own escape sibling at the same time and the grindable hash decides | Small fork-choice change |
+| Refuse blocks published late | Unchanged | 1 block | Depends on each node's clock; nodes can disagree |
+| Count the escape over the epoch | Height 18 (E=2), 30 (E=3) | Unchanged | Schedule carries one more number |
+
+**Recommendation for prototyping, not a ruling.** Count the escape over
+the epoch. The attacker's slack becomes R_escape rounds per epoch, at most
+24 h added to an epoch of 1,440 blocks on mainnet, instead of 24 h per
+block. New stake then enters by ordinary rotation within E to 2E blocks.
+Withheld-branch reorgs are better bounded by Finality V2 than by a clock
+rule: P3's committed checkpoint is the lower bound for fork choice
+(`b3-bridge-v2-finality-dependency.md:464-467`), so a reorg cannot reach
+below it. A tie-break on the eligibility digest instead of the block hash
+would also stop grinding, since the digest does not cover block contents
+(`src/modern/pos_v1.h:64-72`). That idea is untested.
+
+## 6. A label to reconcile
+
+Plan §3.4.2 says C "Requires C-12 (CLAUDE.md rule 3) and D3/D4 rulings"
+(`:376`), and D26 reads "C-12 / D3 / D4 (PoS V2 scope)" (`:1101`). The
+plan's own D3 and D4 are the stable-quote commit and the matching rule
+(`:1067-1068`). The dependency document's V2-D3 is "PoS V2 scope" (`:507`)
+and V2-D4 the signer incentive. D26 most likely means V2-D3 and V2-D4.
+This is reported, not resolved.
+
+## 7. What the owner would need to decide
+
+1. Authorize `B0-B3D-01` as a review branch, starting with B0a.
+2. Allow C5 work (PoS V2 and Finality V2) on a regtest-only review branch
+   before DEX-1, and rule D26 (C-12, V2-D3) early enough to build against.
+3. Choose the escape direction to prototype (§5).
+4. Approve or replace the bounded committee (B-22, FD-14).
+5. Say who builds P3, and whether its sign-versus-reorg proof comes first
+   as a model, as `M10-B3D-01` asks.
+6. Confirm which D3/D4 the C rows mean (§6).
+
+## 8. Proposed order
+
+1. B0a, with the tests of §4.5.
+2. A model of P3 sign-versus-reorg, in the style of the escape model.
+3. The chosen escape rule on regtest, with the `escape_race_*` cases
+   turned into acceptance tests.
+4. The bounded committee.
+5. P3 on the fresh lineage.
+6. B0b, then extended U == U′ tooling for the owner's shadow-fork run.

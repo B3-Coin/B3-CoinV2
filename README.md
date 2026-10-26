@@ -30,7 +30,12 @@ V2 work in `src/flowmesh2/`, see
 - the interim repair status in
   [doc/design/b3-interim-repair-status.md](doc/design/b3-interim-repair-status.md),
   with tests showing that a lowered finality quorum cannot unfreeze the
-  broken lineage;
+  broken lineage, and the H1 escape-race check (the `escape_race_*` cases
+  and the bounded model in [`test/b3_h1_escape/`](test/b3_h1_escape/));
+- a proposal for bringing height C forward:
+  [doc/design/b3-height-c-fast-track.md](doc/design/b3-height-c-fast-track.md),
+  with the gap list, a B0 undo design and a comparison of escape rules.
+  Nothing in it is implemented or ruled;
 - on Windows, a refusal at startup of a `-datadir` too long for MAX_PATH
   (with a message naming both remedies) and the `longPathAware` manifest
   setting;
