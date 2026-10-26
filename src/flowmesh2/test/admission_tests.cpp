@@ -31,10 +31,12 @@
 #include <flowmesh2/verify/b3verify.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <limits>
 #include <set>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <tuple>
 #include <vector>
@@ -849,6 +851,85 @@ BOOST_AUTO_TEST_CASE(concurrent_admission)
     BOOST_CHECK_LE(stats.sig_verifications, 128U);
     BOOST_CHECK_EQUAL(same.pool->Size(), 32U);
     BOOST_CHECK_EQUAL(same.budget.admitted.load(), 32U);
+}
+
+/** M2-ADM-02 (PLAN-9): under load, a frame whose signer has no account is
+ * refused at A4, before the budget (A7) and the signature (A8). Four threads
+ * submit 10^5 such frames, half validly signed and half with a broken
+ * signature (a signature check first would answer those BAD_SIG), mixed
+ * with 96 valid frames of funded accounts, which prove the counters count.
+ */
+BOOST_AUTO_TEST_CASE(no_account_frames_under_load_verify_no_signature)
+{
+    constexpr size_t THREADS{4};
+    constexpr uint64_t SIGNERS{100};
+    constexpr uint64_t PER_SIGNER{1'000};
+    AdmissionRig r;
+    r.Fund();
+    SlotFixture& a{r.Actions()};
+    const AdmissionStats before{r.Stats()};
+    const uint64_t budget_checks{r.budget.checks.load()};
+
+    std::vector<std::vector<Frame>> unknown(THREADS);
+    size_t k{0};
+    for (uint64_t s{0}; s < SIGNERS; ++s) {
+        const std::string name{"fm2/test/no-account/" + std::to_string(s)};
+        BOOST_REQUIRE(r.rig.owner->Head()->State().engine.ledger.Find(KeyAccount(name)) == nullptr);
+        for (uint64_t n{1}; n <= PER_SIGNER; ++n, ++k) {
+            const Frame frame{PlaceAt(a, name, n, 1, 16)};
+            unknown[k % THREADS].push_back(k % 2 == 0 ? frame : BadSig(frame));
+        }
+    }
+    std::vector<std::vector<Frame>> known(THREADS);
+    size_t valid{0};
+    for (uint64_t n{1}; n <= 32; ++n) {
+        for (const std::string_view name : {"alice", "bob", "carol"}) known[valid++ % THREADS].push_back(PlaceAt(a, name, n, 1, 16));
+    }
+    // Each thread spreads its valid frames evenly among its no-account frames.
+    std::vector<std::vector<Frame>> frames(THREADS);
+    for (size_t t{0}; t < THREADS; ++t) {
+        const size_t stride{unknown[t].size() / known[t].size()};
+        for (size_t i{0}; i < unknown[t].size(); ++i) {
+            if (i % stride == 0 && i / stride < known[t].size()) frames[t].push_back(known[t][i / stride]);
+            frames[t].push_back(unknown[t][i]);
+        }
+    }
+
+    std::atomic<uint64_t> no_account{0};
+    std::atomic<uint64_t> admitted{0};
+    std::atomic<uint64_t> other{0};
+    std::vector<std::thread> threads;
+    const auto start{std::chrono::steady_clock::now()};
+    for (size_t t{0}; t < THREADS; ++t) {
+        threads.emplace_back([&, t] {
+            for (const Frame& frame : frames[t]) {
+                const Result<AdmissionReply> reply{r.admission->Admit(frame)};
+                if (!reply.has_value()) {
+                    ++other;
+                } else if (reply->code == AdmissionCode::NO_ACCOUNT) {
+                    ++no_account;
+                } else if (reply->code == AdmissionCode::ADMITTED) {
+                    ++admitted;
+                } else {
+                    ++other;
+                }
+            }
+        });
+    }
+    for (std::thread& thread : threads) thread.join();
+    const auto elapsed{std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start)};
+
+    const AdmissionStats after{r.Stats()};
+    BOOST_CHECK_EQUAL(no_account.load(), SIGNERS * PER_SIGNER);
+    BOOST_CHECK_EQUAL(admitted.load(), valid);
+    BOOST_CHECK_EQUAL(other.load(), 0U);
+    BOOST_CHECK_EQUAL(after.Count(AdmissionCode::NO_ACCOUNT) - before.Count(AdmissionCode::NO_ACCOUNT), SIGNERS * PER_SIGNER);
+    // Only the valid frames reached the budget and the signature check.
+    BOOST_CHECK_EQUAL(after.sig_verifications - before.sig_verifications, valid);
+    BOOST_CHECK_EQUAL(r.budget.checks.load() - budget_checks, valid);
+    BOOST_CHECK_EQUAL(r.pool->Size(), valid);
+    BOOST_TEST_MESSAGE("no-account frames: " << no_account.load() << ", valid: " << valid << ", signature checks: "
+                                             << after.sig_verifications - before.sig_verifications << ", wall time: " << elapsed.count() << " ms");
 }
 
 BOOST_AUTO_TEST_SUITE_END()
