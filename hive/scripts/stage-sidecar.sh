@@ -14,6 +14,7 @@
 # builds with the app's triple and the MinGW strip, for example from WSL:
 #   STRIP=x86_64-w64-mingw32-strip scripts/stage-sidecar.sh b3-hive-node b3coind.exe x86_64-pc-windows-msvc
 # STRIP=none copies the file as it is, for a binary stripped where it was built.
+export LC_ALL=C
 set -euo pipefail
 name=${1:?usage: $0 <name> /path/to/program [target-triple]}
 src=${2:?usage: $0 <name> /path/to/program [target-triple]}

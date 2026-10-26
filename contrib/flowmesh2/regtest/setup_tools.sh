@@ -17,6 +17,7 @@
 #
 # which the gates read when --tools and --solc are absent (tool_paths.py).
 # Linux x86-64 only. Needs curl, sha256sum and tar.
+export LC_ALL=C
 set -euo pipefail
 
 FOUNDRY_VERSION=1.8.5
