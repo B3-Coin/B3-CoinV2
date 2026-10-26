@@ -301,6 +301,7 @@ if(BUILD_FLOWMESH2)
     test/hashes_tests.cpp
     test/ids_tests.cpp
     test/in_process_api_tests.cpp
+    test/int128_vector_tests.cpp
     test/journal_tests.cpp
     test/lanes_tests.cpp
     test/ledger_property_tests.cpp
@@ -410,6 +411,13 @@ if(BUILD_FLOWMESH2)
       --selftest
   )
   set_tests_properties(flowmesh2_todo_lint PROPERTIES TIMEOUT 60 LABELS "flowmesh2;isolated;outline;lint")
+
+  # M2-LED-09: the shared 128-bit vectors must be what the generator writes.
+  add_test(NAME flowmesh2_int128_vectors
+    COMMAND ${Python3_EXECUTABLE} -I -B ${FM2_CONTRIB}/int128_vectors.py
+      --check ${CMAKE_CURRENT_SOURCE_DIR}/test/util/int128_vectors.h
+  )
+  set_tests_properties(flowmesh2_int128_vectors PROPERTIES TIMEOUT 120 LABELS "flowmesh2;isolated;lint")
 
   # -------------------------------------------------------------------------
   # Guards (slice R2): contrib/flowmesh2/check_guards.py, seven rules.
