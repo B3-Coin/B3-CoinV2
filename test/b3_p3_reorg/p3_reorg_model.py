@@ -8,7 +8,7 @@ section 7, `doc/design/b3-flowmesh-v2-stage0.md:345-430`, `:547-581`; R1
 `doc/design/v2-stage0-r1-consensus.md:47-58`, `:118-140`).
 
 Run: python3 -I -B test/b3_p3_reorg/p3_reorg_model.py (standard library only,
-about 15 minutes and 3 GB; --only LABEL runs one scenario). Nothing here
+about 25 minutes and 3 GB; --only LABEL runs one scenario). Nothing here
 exists in b3d yet: P3 has no C++, so a pass is evidence about the protocol
 as written, not about any implementation.
 
@@ -35,10 +35,18 @@ P3 (single-sequence PBFT-style, Stage 0 section 7):
   with the proof;
 - validity is "pure" (Stage 0: a candidate extending the committed parent
   with its branch data is valid on any tip, `v2-stage0-r1-consensus.md:118`)
-  or, in the tip variant, "the candidate is on my tip". Under pure validity
-  no vote reads a tip, so the state keeps none, an honest leader may propose
-  either block, and a member learning a decision may be on either branch:
-  a forced reorg is then possible by construction, as Stage 0 intends.
+  or, in the tip variant, "the candidate is on my tip", or hybrid (not in
+  Stage 0): a free proposal must be on the voter's tip, but a value that a
+  verified NEW_VIEW forces, or that the voter holds a prepared quorum for,
+  is accepted on any tip. Under pure validity no vote reads a tip, so the
+  state keeps none, an honest leader may propose either block, and a member
+  learning a decision may be on either branch: a forced reorg is then
+  possible by construction, as Stage 0 intends. Within the bound tips move
+  freely, so the tip and hybrid rules reach the same states; they differ
+  only after stabilization, where tips stay put.
+- private branch (some scenarios): a third candidate C that the adversary
+  built and withheld. Every block of it is valid, but no honest tip is ever
+  on it, and only a Byzantine leader proposes it.
 Byzantine members have sent every PREPARE, COMMIT and VIEW_CHANGE report
 they could (a report must carry a real quorum), in every view of the bound;
 they send nothing after stabilization. Crashes are crash-stop.
@@ -46,9 +54,9 @@ they send nothing after stabilization. Crashes are crash-stop.
 Quorum: headcount floor(2n/3)+1 and weight floor(2W/3)+1 (dual), or only one
 of them (`v2-stage0-r1-consensus.md:47-55`).
 
-Bound: VIEWS = 3, or 2 where all four members are honest or tips are kept
-(those at three views exceed 10^7 states); the line of each scenario names
-its bound. The search stops at the first S1 violation.
+Bound: VIEWS = 3, or 2 where all four members are honest, tips are kept or
+the private branch is added (four honest members at three views exceed 10^7
+states); the line of each scenario names its bound. The search stops at the first S1 violation.
 
 Checks, over every reachable state within the bound (breadth-first, so each
 trace below is a shortest one):
@@ -62,6 +70,9 @@ trace below is a shortest one):
   quorum; otherwise it is reported as beyond the fault bound.
 - forced reorg (P3): a member learns a decision for the branch its tip has
   left. B3 must then reorganize back to the decision (Stage 0 `:576-581`).
+- private branch decided (P3): C is decidable, so B3 must reorganize every
+  honest block above the last decided checkpoint onto a branch that no
+  honest fork choice selected.
 
 Exit status 1 when any scenario's result differs from its expected line.
 """
@@ -71,18 +82,19 @@ import functools
 import itertools
 import sys
 
-A, B = 1, 2
-NAME = {0: '-', A: 'A', B: 'B'}
+A, B, C = 1, 2, 3
+NAME = {0: '-', A: 'A', B: 'B', C: 'C'}
 
 
 class Config:
     def __init__(self, label, expect, n=4, weights=None, byz=(), rule='dual', validity='pure',
-                 crashes=0, views=3, mutants=()):
+                 crashes=0, views=3, mutants=(), private=False):
         self.label, self.expect, self.n = label, expect, n
         self.weights = tuple(weights or (1,) * n)
         self.byz, self.rule, self.validity = tuple(byz), rule, validity
         self.crashes, self.views, self.mutants = crashes, views, frozenset(mutants)
         self.honest = tuple(i for i in range(n) if i not in self.byz)
+        self.values = (A, B, C) if private else (A, B)
         short = 1 if 'quorum_minus_one' in self.mutants else 0
         self.qh = 2 * n // 3 + 1 - short
         self.qw = 2 * sum(self.weights) // 3 + 1 - short
@@ -149,14 +161,16 @@ class P3(Explorer):
 
     def tips(self):
         """Pure validity never reads a tip, so the state keeps none (0)."""
-        return A if self.cfg.validity == 'tip' else 0
+        return 0 if self.cfg.validity == 'pure' else A
 
     def own_values(self, rep):
         """What an honest leader proposes when free: the block on its tip."""
         return {rep.tip} if rep.tip else {A, B}
 
-    def valid(self, rep, value):
-        return self.cfg.validity == 'pure' or rep.tip == value
+    def valid(self, rep, value, forced=False):
+        """forced: a verified NEW_VIEW forces the value, or the member holds its prepared quorum."""
+        rule = self.cfg.validity
+        return rule == 'pure' or rep.tip == value or (rule == 'hybrid' and forced)
 
     def mask(self, st, field, view, value):
         mask = 0
@@ -169,7 +183,7 @@ class P3(Explorer):
         return self.cfg.table[self.mask(st, 'prep', view, value) | self.cfg.byz_mask]
 
     def decidable(self, st):
-        return {c for c in (A, B) for v in range(self.cfg.views)
+        return {c for c in self.cfg.values for v in range(self.cfg.views)
                 if self.cfg.table[self.mask(st, 'comm', v, c) | self.cfg.byz_mask]}
 
     def report(self, rep):
@@ -198,18 +212,22 @@ class P3(Explorer):
         reps = st[0]
         honest = tuple((i, (reps[k].vc[view],)) for k, i in enumerate(self.cfg.honest)
                        if reps[k].vc[view] is not None)
-        qcs = tuple((v, c) for v in range(view) for c in (A, B) if self.qc(st, v, c))
+        qcs = tuple((v, c) for v in range(view) for c in self.cfg.values if self.qc(st, v, c))
         return self.justified(view, honest, qcs)
 
     def proposals(self, st, view):
+        """(value, forced) pairs a member in this view may have received."""
         leader = view % self.cfg.n
+        values = self.cfg.values
         if leader in self.cfg.byz:
+            if 'trust_forced_claim' in self.cfg.mutants:
+                return {(c, True) for c in values}
             if view == 0:
-                return {A, B}
+                return {(c, False) for c in values}
             forced, free = self.view_options(st, view)
-            return {A, B} if free else set(forced)
-        value = st[1][view]
-        return {value} if value else set()
+            return {(c, True) for c in forced} | ({(c, False) for c in values} if free else set())
+        proposal = st[1][view]
+        return {proposal} if proposal else set()
 
     def successors(self, st):
         reps, props, crashes = st
@@ -228,22 +246,23 @@ class P3(Explorer):
 
             if v % cfg.n == i and props[v] == 0:
                 if v == 0:
-                    values = self.own_values(r)
+                    options = {(c, False) for c in self.own_values(r)}
                 else:
                     forced, free = self.view_options(st, v)
-                    values = {c for c in forced if self.valid(r, c)} | (self.own_values(r) if free else set())
-                for c in sorted(values):
-                    new_props = props[:v] + (c,) + props[v + 1:]
-                    yield f'm{i} proposes {NAME[c]} in view {v}', (reps, new_props, crashes), None
+                    options = {(c, True) for c in forced if self.valid(r, c, True)}
+                    options |= {(c, False) for c in self.own_values(r)} if free else set()
+                for c, is_forced in sorted(options):
+                    new_props = props[:v] + ((c, is_forced),) + props[v + 1:]
+                    kind = 'forced' if is_forced else 'free'
+                    yield f'm{i} proposes {NAME[c]} ({kind}) in view {v}', (reps, new_props, crashes), None
             if r.prep[v] == 0:
-                for c in sorted(self.proposals(st, v)):
-                    if self.valid(r, c):
-                        prep = r.prep[:v] + (c,) + r.prep[v + 1:]
-                        yield f'm{i} prepares {NAME[c]} in view {v}', (put(prep=prep), props, crashes), None
+                for c in sorted({c for c, is_forced in self.proposals(st, v) if self.valid(r, c, is_forced)}):
+                    prep = r.prep[:v] + (c,) + r.prep[v + 1:]
+                    yield f'm{i} prepares {NAME[c]} in view {v}', (put(prep=prep), props, crashes), None
             c = r.prep[v]
             if c and (r.prepared is None or r.prepared[0] < v) and self.qc(st, v, c):
                 yield f'm{i} is prepared on {NAME[c]} in view {v}', (put(prepared=(v, c)), props, crashes), None
-            if r.prepared and r.prepared[0] == v and r.comm[v] == 0 and self.valid(r, r.prepared[1]):
+            if r.prepared and r.prepared[0] == v and r.comm[v] == 0 and self.valid(r, r.prepared[1], True):
                 c = r.prepared[1]
                 comm = r.comm[:v] + (c,) + r.comm[v + 1:]
                 yield f'm{i} commits {NAME[c]} in view {v}', (put(comm=comm), props, crashes), None
@@ -271,6 +290,8 @@ class P3(Explorer):
         if len(values) > 1:
             yield 'S1', 'violated'
             return
+        if C in values:
+            yield 'private branch decided', 'reachable'
         live = [i for k, i in enumerate(cfg.honest) if not reps[k].crashed]
         if any(r.decided for r in reps):
             return
@@ -278,7 +299,7 @@ class P3(Explorer):
             yield 'L1 beyond the fault bound', 'stalled'
             return
         for v in range(cfg.views):
-            for c in (A, B):
+            for c in cfg.values:
                 if cfg.quorum([i for i in live if reps[cfg.honest.index(i)].comm[v] == c]):
                     return
         by_member = {i: reps[k] for k, i in enumerate(cfg.honest)}
@@ -299,7 +320,7 @@ class P3(Explorer):
                 top = max(r[0] for r in prepared)
                 values = {r[1] for r in prepared if r[0] == top}
             for c in values:
-                if self.cfg.validity == 'pure' or c == settled:
+                if self.cfg.validity != 'tip' or c == settled:
                     return True
         return False
 
@@ -367,6 +388,18 @@ SCENARIOS = [
                 views=2)),
     (P3, Config('P3 tip validity, Byzantine m3', 'S1 holds, L1 violated, forced reorg', validity='tip', byz=(3,),
                 views=2)),
+    (P3, Config('private branch: pure, Byzantine m0', 'S1 holds, L1 holds, forced reorg, private branch decided',
+                byz=(0,), private=True, views=2)),
+    (P3, Config('private branch: tip, Byzantine m0', 'S1 holds, L1 violated, forced reorg', validity='tip',
+                byz=(0,), private=True, views=2)),
+    (P3, Config('private branch: hybrid, Byzantine m0', 'S1 holds, L1 holds, forced reorg', validity='hybrid',
+                byz=(0,), private=True, views=2)),
+    (P3, Config('private branch: hybrid, Byzantine m1', 'S1 holds, L1 holds, forced reorg', validity='hybrid',
+                byz=(1,), private=True, views=2)),
+    (P3, Config('hybrid, no Byzantine', 'S1 holds, L1 holds, forced reorg', validity='hybrid', views=2)),
+    (P3, Config('mutant: hybrid takes a forced claim on trust',
+                'S1 holds, L1 holds, forced reorg, private branch decided', validity='hybrid', byz=(0,),
+                private=True, views=2, mutants=('trust_forced_claim',))),
     (P3, Config('NC1 P3 with two Byzantine of four', 'S1 violated', byz=(0, 3))),
     (P3, Config('NC2 P3 weight-only, heavy m0 Byzantine', 'S1 violated', weights=(4, 1, 1, 1),
                 byz=(0,), rule='weight')),
@@ -398,6 +431,8 @@ def summarize(kind, found):
         parts.append('L1 holds')
     if 'forced reorg' in found:
         parts.append('forced reorg')
+    if 'private branch decided' in found:
+        parts.append('private branch decided')
     return ', '.join(parts)
 
 
