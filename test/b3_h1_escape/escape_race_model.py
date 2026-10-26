@@ -40,6 +40,19 @@ T_MAX steps (memoized on the state). Reported per parameter set:
   recomputed from genesis along its path (H-H1), and the best tip is the
   same for every arrival order of the published set (by construction here:
   the choice depends on the set only).
+
+--compare-fixes runs the same search under candidate rule changes. None of
+them exists in the C++; each would be a consensus change for the owner.
+- escape_wins: at the first divergent block, an escape block beats a
+  non-escape sibling before time and hash are compared.
+- lateness: a block, together with any ancestor not yet accepted, is refused
+  when it is published more than LATE steps after its time. Every honest
+  node sees a publication at the same step here, so this run cannot show
+  the disagreement such a local-clock rule can cause.
+- cumulative: the escape counts the rounds of every block since the epoch
+  started (rotation or escape), so a block is an escape once that sum plus
+  its own round reaches R_ESC.
+It also reports the lowest final chain height any strategy can force.
 """
 import argparse
 import functools
@@ -58,29 +71,39 @@ def hash_of(block):
 
 
 class Model:
-    def __init__(self, E, R_ESC, SAT_A, SAT_C, T_MAX, MAX_ADV):
+    LATE = 1  # steps a publication may trail its block's time ('lateness')
+
+    def __init__(self, E, R_ESC, SAT_A, SAT_C, T_MAX, MAX_ADV, variant=()):
         self.E, self.R, self.SA, self.SC, self.T, self.K = E, R_ESC, SAT_A, SAT_C, T_MAX, MAX_ADV
+        self.v = frozenset(variant)
         self.genesis = ('G',)
-        self.info = {self.genesis: dict(height=0, time=0, sched=None, path=())}
+        self.info = {self.genesis: dict(height=0, time=0, sched=None, path=(), escape=False)}
 
     # Block = (parent, producer, round). Its schedule follows section 19.2.
-    def child_sched(self, parent, rnd):
+    def step(self, parent, rnd):
+        """(schedule, is_escape) of a child of `parent` in round `rnd`."""
         h = self.info[parent]['height'] + 1
         if h == 1:  # R_h: bootstrap from Snapshot(R_h - 1)
-            p = dict(start=1, cur=BOOT, nxt=BOOT, escapes=0)
+            p = dict(start=1, cur=BOOT, nxt=BOOT, escapes=0, cum=0)
         else:
             p = dict(self.info[parent]['sched'])
             if h >= p['start'] + self.E:  # rotation, no certificate
-                p['start'], p['cur'], p['nxt'] = h, p['nxt'], SNAP
-        if rnd >= self.R:  # escape, applied last
-            p.update(start=h, cur=SNAP, nxt=SNAP, escapes=p['escapes'] + 1)
-        return p
+                p['start'], p['cur'], p['nxt'], p['cum'] = h, p['nxt'], SNAP, 0
+        if p['cum'] + rnd >= self.R:  # escape, applied last (cum stays 0 unless 'cumulative')
+            p.update(start=h, cur=SNAP, nxt=SNAP, escapes=p['escapes'] + 1, cum=0)
+            return p, True
+        if 'cumulative' in self.v:
+            p['cum'] += rnd
+        return p, False
+
+    def child_sched(self, parent, rnd):
+        return self.step(parent, rnd)[0]
 
     def eligible(self, parent, key, rnd):
-        p = self.child_sched(parent, rnd)
+        p, escape = self.step(parent, rnd)
         if key not in p['cur']:
             return False
-        if rnd >= self.R:
+        if escape:
             return True
         return rnd >= (self.SA if key == A else self.SC)
 
@@ -89,14 +112,31 @@ class Model:
         if block not in self.info:
             pi = self.info[parent]
             t = pi['time'] + rnd + 1
-            self.info[block] = dict(height=pi['height'] + 1, time=t, sched=self.child_sched(parent, rnd),
-                                    path=pi['path'] + ((t, hash_of(block)),))
+            sched, escape = self.step(parent, rnd)
+            rank = ((0 if escape else 1, t, hash_of(block)) if 'escape_wins' in self.v
+                    else (t, hash_of(block)))
+            self.info[block] = dict(height=pi['height'] + 1, time=t, sched=sched,
+                                    path=pi['path'] + (rank,), escape=escape)
         return block
 
     def _best(self, published):
         cands = list(published) + [self.genesis]
         top = max(self.info[b]['height'] for b in cands)
         return min((b for b in cands if self.info[b]['height'] == top), key=lambda b: self.info[b]['path'])
+
+    def accept(self, published, proposed, t):
+        """The published set honest nodes hold after a publication at step t."""
+        if 'lateness' not in self.v:
+            return proposed
+        ok = set(published)
+        for b in sorted(proposed - published, key=lambda b: self.info[b]['height']):
+            path, x = [], b
+            while x != self.genesis and x not in ok:
+                path.append(x)
+                x = x[0]
+            if all(t <= self.info[y]['time'] + self.LATE for y in path):
+                ok.update(path)
+        return frozenset(ok)
 
     def chain(self, tip):
         out = set()
@@ -127,7 +167,8 @@ class Model:
         return sched == self.info[block]['sched']
 
     def run(self, silent=False):
-        """Worst case over A's strategies: (stall, reorg)."""
+        """Worst case over A's strategies, one (value, moves) pair per metric:
+        stall, C blocks lost, deepest single reorg, minus the final height."""
         @functools.lru_cache(maxsize=None)
         def go(t, published, withheld, adv_used, c_seen, depth):
             # c_seen: C blocks that have been in the best chain at some step.
@@ -137,10 +178,12 @@ class Model:
                 lost = len([b for b in c_seen if b not in final])
                 stays = [self.info[b]['time'] for b in final if b[1] == C]
                 first = min(stays) if stays else self.T + 1
-                return (first, (), lost, (), depth, ())
+                height = self.info[self._best(published)]['height']
+                return (first, (), lost, (), depth, (), -height, ())
             best = None
             for pub, wh, used, act in self.adversary_moves(t, published, withheld, adv_used, silent):
                 before = self.chain(self._best(published))
+                pub = self.accept(published, pub, t)
                 p2 = self.honest_step(pub, t)
                 tip = self._best(p2)
                 now = self.chain(tip)
@@ -148,11 +191,11 @@ class Model:
                 seen = c_seen | frozenset(b for b in now if b[1] == C)
                 r = go(t + 1, p2, wh, used, seen, max(depth, removed))
                 step = ((t, act, tip[1] if tip != self.genesis else '-', self.info[tip]['height']),)
-                cand = (r[0], step + r[1], r[2], step + r[3], r[4], step + r[5])
+                cand = (r[0], step + r[1], r[2], step + r[3], r[4], step + r[5], r[6], step + r[7])
                 if best is None:
                     best = list(cand)
                     continue
-                for i in (0, 2, 4):  # each metric keeps the strategy that maximises it
+                for i in (0, 2, 4, 6):  # each metric keeps the strategy that maximises it
                     if cand[i] > best[i]:
                         best[i], best[i + 1] = cand[i], cand[i + 1]
             return tuple(best)
@@ -196,13 +239,15 @@ class Model:
 
 def slow_producer(m):
     """A's simplest strategy: on every tip where C may not produce in a normal
-    round, A produces in round R_ESC - 1 (one round before C could escape)."""
+    round, A produces in the last round that is not an escape (R_ESC - 1, or
+    earlier under 'cumulative')."""
     published, trace = frozenset(), []
     for t in range(1, m.T + 1):
         tip = m._best(published)
         rnd = t - m.info[tip]['time'] - 1
-        c_normal = any(m.eligible(tip, C, r) for r in range(0, m.R))
-        if rnd == m.R - 1 and not c_normal and m.eligible(tip, A, rnd):
+        normal = [r for r in range(0, m.R) if not m.step(tip, r)[1]]
+        c_normal = any(m.eligible(tip, C, r) for r in normal)
+        if normal and rnd == normal[-1] and not c_normal and m.eligible(tip, A, rnd):
             published |= {m.add(tip, A, rnd)}
         published = m.honest_step(published, t)
         tip = m._best(published)
@@ -210,8 +255,40 @@ def slow_producer(m):
     return trace
 
 
+VARIANTS = ((), ('escape_wins',), ('lateness',), ('cumulative',), ('escape_wins', 'cumulative'))
+
+
+def compare_fixes():
+    grid = [(1, 3, 0, 0, 9, 3), (2, 3, 0, 0, 11, 3), (1, 4, 0, 0, 11, 3)]
+    for variant in VARIANTS:
+        label = '+'.join(variant) or 'current'
+        for E, R, SA, SC, T, K in grid:
+            silent = Model(E, R, SA, SC, T, K, variant).run(silent=True)
+            m = Model(E, R, SA, SC, T, K, variant)
+            worst = m.run()
+            bad_sched = [b for b in m.info if b != m.genesis and not m.check_schedule(b)]
+            print(json.dumps(dict(variant=label, E=E, R_ESC=R, T_MAX=T, MAX_ADV=K,
+                                  first_kept_C_block_time_A_silent=silent[0],
+                                  first_kept_C_block_time_worst=worst[0],
+                                  C_blocks_lost_worst=worst[2], deepest_single_reorg_of_C_blocks=worst[4],
+                                  lowest_final_height=-worst[6], final_height_A_silent=-silent[6],
+                                  schedule_mismatches=len(bad_sched))), flush=True)
+        for E, R in ((1, 3), (2, 3), (3, 4)):
+            m = Model(E, R, 0, 0, 2 * E * R + 2 * R + 4, 99, variant)
+            trace = slow_producer(m)
+            c_first = next((row['t'] for row in trace if row['tip_by'] == C), None)
+            print(json.dumps(dict(variant=label, strategy='slow_producer', E=E, R_ESC=R, steps=m.T,
+                                  first_step_with_a_C_tip=c_first, final_height=trace[-1]['height'])),
+                  flush=True)
+    return 0
+
+
 def main():
-    argparse.ArgumentParser(description=__doc__.splitlines()[0]).parse_args()
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument('--compare-fixes', action='store_true',
+                        help='run the search under the candidate rule changes (see the module docstring)')
+    if parser.parse_args().compare_fixes:
+        return compare_fixes()
     grid = [
         # E, R_ESC, SAT_A, SAT_C, T_MAX, MAX_ADV
         (1, 3, 0, 0, 9, 3),
