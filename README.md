@@ -35,8 +35,10 @@ V2 work in `src/flowmesh2/`, see
   and the bounded model in [`test/b3_h1_escape/`](test/b3_h1_escape/));
 - a proposal for bringing height C forward:
   [doc/design/b3-height-c-fast-track.md](doc/design/b3-height-c-fast-track.md),
-  with the gap list, a B0 undo design and a comparison of escape rules.
-  Nothing in it is implemented or ruled;
+  with the gap list, a B0 undo design, a comparison of escape rules and a
+  bounded model of Finality V2 voting against reorganizations
+  ([`test/b3_p3_reorg/`](test/b3_p3_reorg/)). Nothing in it is implemented
+  or ruled;
 - on Windows, a refusal at startup of a `-datadir` too long for MAX_PATH
   (with a message naming both remedies) and the `longPathAware` manifest
   setting;

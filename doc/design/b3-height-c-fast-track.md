@@ -40,7 +40,7 @@ B0 is "part of C5" and is scheduled for months 0 to 1.5 (plan `:956`).
 | PoS V2: stuck producer set | H1 (regtest knob): producer epochs rotate from stake snapshots without certificates, with an escape after R_escape rounds. The V2 design adopts it: "P3-R1 producers … H1 schedule and escape (V2-D3)" (`b3-bridge-v2-finality-dependency.md:484`, `:507`). | The escape gives no liveness against one adversarial member in force (§5). Producer election cannot be called done until that is ruled. |
 | PoS V2: headcount Sybil | A rule is designed: Committee(S) = members with weight ≥ W(S)/128, at most 64 (`b3-bridge-v2-finality-dependency.md:551-556`). "B-22 needs explicit owner approval" (`:557`). | Not implemented: "B-22 is out of scope" (`:912`). |
 | Finality V2 (P3) | The fresh lineage exists on regtest: genesis at R_f, fresh keys, digest V2, transport (`finality_fresh_*` tests). It signs with "The V1 single-vote signer, unchanged in logic" (`:419`). | P3 itself, the voting that locks only on an observed quorum, has no code in b3d. |
-| Sign-versus-reorg proof | `M10-SPEC-01` is written for FlowMesh seat authority (`TODO.md:378`). `M10-B3D-01` asks for a "sign-versus-reorg proof first" for Finality V2. | No proof or model for either. |
+| Sign-versus-reorg proof | `M10-SPEC-01` is written for FlowMesh seat authority (`TODO.md:378`). `M10-B3D-01` asks for a "sign-versus-reorg proof first" for Finality V2. | No proof for either. A bounded model of P3 against reorganizations at one checkpoint height now exists (§9). It is evidence about Stage 0's text, not the proof the rows ask for. |
 | U == U′ | `b3coin-utxo-verify` compares the UTXO set at H (`src/bitcoin-utxo-verify.cpp`). | Plan §6.6's extended form, covering every tracker, does not exist. Shadow-fork runs need a mainnet copy, so they are owner-run. |
 
 ## 4. B0 design (proposed, not implemented)
@@ -159,13 +159,111 @@ This is reported, not resolved.
 5. Say who builds P3, and whether its sign-versus-reorg proof comes first
    as a model, as `M10-B3D-01` asks.
 6. Confirm which D3/D4 the C rows mean (§6).
+7. Rule whether a valid P3 decision outranks the reorganization horizon for
+   the headers that lead to it (§9.3).
 
 ## 8. Proposed order
 
 1. B0a, with the tests of §4.5.
-2. A model of P3 sign-versus-reorg, in the style of the escape model.
+2. A model of P3 sign-versus-reorg, in the style of the escape model. Done
+   for one checkpoint height (§9). Consecutive checkpoints and the epoch
+   handover are the next model step.
 3. The chosen escape rule on regtest, with the `escape_race_*` cases
    turned into acceptance tests.
 4. The bounded committee.
 5. P3 on the fresh lineage.
 6. B0b, then extended U == U′ tooling for the owner's shadow-fork run.
+
+## 9. Finality V2 (P3) against reorganizations: the model
+
+`test/b3_p3_reorg/p3_reorg_model.py` searches every reachable state within
+its bound. Evidence: `~/B3-evidence/p3-reorg/`. There is no P3 C++, so the
+results are about the protocol text: Stage 0 §7
+(`b3-flowmesh-v2-stage0.md:345-430`, `:547-581`) and R1
+(`v2-stage0-r1-consensus.md:47-58`, `:118-140`). V1's ancestry lock
+(`src/node/finality_signature.cpp:607-680`) runs beside it as the positive
+control.
+
+### 9.1 What is modelled
+
+- Four members, equal weights, and {4,1,1,1} for NC2. The quorum is
+  headcount ⌊2n/3⌋+1 and weight ⌊2W/3⌋+1.
+- One checkpoint height with two candidates, A and B. Both extend the last
+  committed checkpoint. Fork choice ignores votes, so any honest node's tip
+  may move between them at any step.
+- P3:
+  - single-sequence PBFT-style phases;
+  - one PREPARE per member per view;
+  - prepared only on an observed quorum;
+  - COMMIT only in the member's current view, so a member never finalizes
+    in a view it has left;
+  - a timeout reports the highest prepared value with its proof;
+  - a new leader must re-propose the highest prepared value in a quorum of
+    reports.
+- Validity is either pure (Stage 0: a candidate with its branch data is
+  valid on any tip) or the tip variant (vote only for a candidate on one's
+  own tip).
+- Faults:
+  - a Byzantine member counts as having sent every vote and report it can
+    back with a real quorum;
+  - crashes are crash-stop.
+- Progress (L1) is checked after stabilization:
+  - no further faults or Byzantine messages;
+  - tips settle on a branch the adversary picks;
+  - fresh views follow.
+- Bound: three views, or two for the scenarios with four honest members or
+  with tips in the state.
+
+### 9.2 Results
+
+| Scenario | Agreement (S1) | Progress (L1) |
+|---|---|---|
+| PC1: V1, two of four sign A, B wins (811,631) | — | Stalls |
+| PC2: V1, one orphan lock plus one crash (814,191) | — | Stalls |
+| P3, one crash, no Byzantine member | Holds | Holds |
+| P3, one Byzantine member as view-0 leader, view-1 leader, or never leader | Holds | Holds |
+| P3, tip variant, with or without a Byzantine member | Holds | **Stalls** |
+| NC1: P3 with two Byzantine of four | Violated | — |
+| NC2: weight-only quorum, heavy member Byzantine | Violated | — |
+| NC2: dual quorum, heavy member Byzantine | Holds | Stalls, beyond the fault bound |
+| Planted bugs (the new view ignores prepared reports; reports forget the prepared value; both thresholds one short) | Violated, each | — |
+
+The controls and planted bugs show that the checks can fail.
+
+### 9.3 Findings
+
+1. **P3 as written removes V1's orphan lock.** A prepared quorum on A is
+   carried into every later view, or it is freed when the reporting quorum
+   holds no prepared value. No member is locked by its own vote. The search
+   found no reachable state within the bound that blocks progress once a
+   quorum is live.
+2. **That depends on validity not reading the voter's tip.** Under the tip
+   variant, a prepared quorum on a block that B3 then abandons is V1's
+   orphan lock again: each new leader must re-propose it, and the members
+   now on B refuse it. All four members can be honest. R1 already says that
+   receiving a valid candidate "can be PREPARE/COMMIT eligible" whatever the
+   voter's tip (`v2-stage0-r1-consensus.md:124-132`). The model shows that
+   this rule is load-bearing, so it should be an acceptance test of the C++.
+3. **P3 may decide the branch that fork choice left.** B3 must then
+   reorganize back to the decision, which Stage 0 intends
+   (`b3-flowmesh-v2-stage0.md:576-581`). P3 does not bound how late a node
+   learns a decision, and b3d checks the reorganization horizon
+   (`src/validation.cpp:7042`, 1,440 blocks on mainnet) before the finality
+   pin (`:7050`). A node whose branch forked 1,440 or more blocks below its
+   tip when it learns the decision would refuse the headers leading to it.
+   If it also applies the pin, it refuses new blocks on its own branch too,
+   and follows neither. The dependency document finds the same shape for
+   late upgraders (`b3-bridge-v2-finality-dependency.md:230`). Stage 0 does
+   not order the two rules. That is a question for the owner (§7, item 7).
+
+### 9.4 Not covered
+
+- Consecutive checkpoints and their parent links.
+- The epoch handover and H1 producers.
+- The Ethereum verifier and digest V2.
+- The bounded committee (NC3).
+- Amnesia, except as the planted bug.
+- Message loss beyond what "any subset may be received" already gives.
+
+A pass is evidence about the specification within the bound, not about any
+implementation.

@@ -493,3 +493,37 @@ Qt nor Hive sets it.
 Question: refuse `-coinstatsindex` on B3 chains with a clear message, or
 teach the index B3's issuance per era? The second changes what
 `gettxoutsetinfo` reports as subsidy.
+
+## P3 against reorganizations: modelled; the pin and the horizon are not ordered (2026-10-26)
+
+`test/b3_p3_reorg/p3_reorg_model.py` checks Stage 0's P3 voting, and V1's
+ancestry lock beside it, against arbitrary reorganizations at one
+checkpoint height. Evidence: `~/B3-evidence/p3-reorg/`. Details are in
+`doc/design/b3-height-c-fast-track.md` §9.
+
+- **V1 reproduces both incidents.** Two orphan locks of four (811,631), or
+  one orphan lock plus one crash (814,191), and no certificate ever forms on
+  the winning branch.
+- **P3 as written holds.** Agreement and progress after stabilization hold
+  in every reachable state of the bound, with one Byzantine member in any
+  leader position or one crash. A member locks only on an observed quorum,
+  and a view change carries that lock or frees it.
+- **This depends on validity not reading the voter's tip.** If a member
+  votes only for a candidate on its own tip, a prepared quorum on a block B3
+  then abandons becomes V1's orphan lock again: every new view must
+  re-propose it, and the members on the winning branch refuse. Progress then
+  stops with all four members honest. Stage 0 already forbids the tip check
+  (`v2-stage0-r1-consensus.md:118-140`); the model shows that rule is
+  load-bearing.
+- **P3 may decide the branch fork choice left**, so B3 must reorganize back
+  to the decision. Stage 0 intends this (`b3-flowmesh-v2-stage0.md:576-581`).
+  P3 gives no bound on how late a node learns a decision. b3d refuses a
+  header 1,440 blocks below the tip (`src/validation.cpp:7042`) before it
+  checks the finality pin (`:7050`). A node that learns a decision when its
+  branch forked that far below its tip would refuse the headers leading to
+  it. If it also applies the pin, it follows neither branch. This has the same
+  shape as the late-upgrader case (`b3-bridge-v2-finality-dependency.md:230`).
+
+Question: for P3, should a valid CommitQC outrank the reorganization horizon
+for the headers that lead to it, or should the horizon stay first and a
+node that far behind need manual recovery? Stage 0 does not say.
