@@ -1,0 +1,29 @@
+{
+  "format": "b3-public-sepolia-history-provenance/1",
+  "chain_id": 421614,
+  "source_kind": "arbitrum-sepolia",
+  "mainnet_enabled": false,
+  "source_authority": false,
+  "public_rpc_free_history_qualified": false,
+  "maintained_serializer": {
+    "repository": "https://github.com/OffchainLabs/go-ethereum",
+    "commit": "5eee8f546e7602b7deeef7909f291bbebc77e233",
+    "module_version": "v0.0.0-20260916182944-5eee8f546e76",
+    "module_h1": "h1:KkMlxmymHsJXSUXubbnfgLVrScmG6vIBce9JKAfjMhU=",
+    "go_mod_h1": "h1:E0FtdJ1iQuuf20YPKUnkwRLbYLn7BOM2BMBkdvDw7X0=",
+    "selected_by": "Pinned Nitro3.12.1 Geth submodule; raw serialization only, no chain execution claim.",
+    "binary_sha256": "64c86e9946fbf180a72d99bbb6a6f891957580ee3ae5be697a0564f67f1175ac",
+    "binary_build": "20261026-v3; gofmt; offline cached dependencies; full pinned go.mod/go.sum",
+    "original_diagnostic_binary_sha256": "6ffc952991f1dd09c65266fcb72f8489837df17f1aba3c1a3c05cc5a5939abd2"
+  },
+  "primary_sources": [
+    "https://docs.arbitrum.io/run-a-node/nitro/nitro-database-snapshots",
+    "https://docs.arbitrum.io/run-a-node/data-availability",
+    "https://docs.arbitrum.io/chain-info",
+    "https://snapshot.arbitrum.foundation/sepolia-rollup/latest-pruned.txt",
+    "https://snapshot.arbitrum.foundation/sepolia-rollup/2026-10-24-f9ac2a55/metadata.json",
+    "https://drpc.org/chainlist/arbitrum-sepolia-rpc"
+  ],
+  "public_fixture_transport": "Explicitly opted-in, untrusted no-key public Arbitrum Sepolia L2 HTTPS APIs; no Ethereum L1 RPC.",
+  "owned_node_derivation": "Not qualified: current measured official bootstrap archive exceeds this laptop's free disk. No node or snapshot was started."
+}

@@ -408,7 +408,7 @@ install_binary_component(test_bitcoin INTERNAL)
 # Pure offline adapters. These tests mock process/node boundaries and never
 # start Docker, contact public networks, or use operator keys.
 if(UNIX AND TARGET Python3::Interpreter)
-  foreach(bridge_adapter IN ITEMS peer nitro_settlement)
+  foreach(bridge_adapter IN ITEMS peer nitro_settlement sepolia_history)
     add_test(NAME bridge_${bridge_adapter}_adapters
       COMMAND Python3::Interpreter -B -m unittest discover
         -s ${PROJECT_SOURCE_DIR}/contrib/b3bridge/${bridge_adapter}

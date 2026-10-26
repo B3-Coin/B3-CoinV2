@@ -49,27 +49,32 @@ type counters struct {
 	Stages                          sync.Map
 }
 type result struct {
-	Format           string            `json:"format"`
-	Passed           bool              `json:"passed"`
-	ChainID          uint64            `json:"chain_id"`
-	Genesis          string            `json:"genesis_hash"`
-	RequestedHash    string            `json:"requested_hash,omitempty"`
-	Header           string            `json:"header_rlp,omitempty"`
-	HeaderSHA256     string            `json:"header_sha256,omitempty"`
-	PeerSHA256       string            `json:"peer_id_sha256,omitempty"`
-	Protocol         uint              `json:"protocol_version,omitempty"`
-	Source           string            `json:"requested_hash_source,omitempty"`
-	Geth             string            `json:"geth_dependency"`
-	AvailabilityOnly bool              `json:"availability_only"`
-	Authority        bool              `json:"consensus_authority"`
-	NativeRequired   bool              `json:"native_verification_required"`
-	Mainnet          bool              `json:"mainnet_enabled"`
-	Seconds          float64           `json:"elapsed_seconds"`
-	Connected        uint64            `json:"connected_peers"`
-	Handshakes       uint64            `json:"matching_network_handshakes"`
-	Refusals         uint64            `json:"refused_peers"`
-	FailureStages    map[string]uint64 `json:"failure_stages,omitempty"`
-	Failure          string            `json:"failure,omitempty"`
+	Format                  string            `json:"format"`
+	Passed                  bool              `json:"passed"`
+	ChainID                 uint64            `json:"chain_id"`
+	Genesis                 string            `json:"genesis_hash"`
+	RequestedHash           string            `json:"requested_hash,omitempty"`
+	Header                  string            `json:"header_rlp,omitempty"`
+	HeaderSHA256            string            `json:"header_sha256,omitempty"`
+	PeerSHA256              string            `json:"peer_id_sha256,omitempty"`
+	Protocol                uint              `json:"protocol_version,omitempty"`
+	Source                  string            `json:"requested_hash_source,omitempty"`
+	Geth                    string            `json:"geth_dependency"`
+	AvailabilityOnly        bool              `json:"availability_only"`
+	Authority               bool              `json:"consensus_authority"`
+	NativeRequired          bool              `json:"native_verification_required"`
+	Mainnet                 bool              `json:"mainnet_enabled"`
+	Seconds                 float64           `json:"elapsed_seconds"`
+	Connected               uint64            `json:"connected_peers"`
+	Handshakes              uint64            `json:"matching_network_handshakes"`
+	Refusals                uint64            `json:"refused_peers"`
+	FailureStages           map[string]uint64 `json:"failure_stages,omitempty"`
+	Failure                 string            `json:"failure,omitempty"`
+	BlockNumber             uint64            `json:"block_number,omitempty"`
+	BlockHash               string            `json:"block_hash,omitempty"`
+	ReceiptsRoot            string            `json:"receipts_root,omitempty"`
+	Receipts                []string          `json:"receipts,omitempty"`
+	ReceiptCommitmentsMatch bool              `json:"receipt_commitments_match,omitempty"`
 }
 
 func baseResult() result {
@@ -116,6 +121,12 @@ func (rw *boundedRW) ReadMsg() (p2p.Msg, error) {
 	return m, nil
 }
 func (rw *boundedRW) WriteMsg(m p2p.Msg) error {
+	if unavailableETHResponse(m.Code) {
+		if err := validateUnavailableETHReply(&m); err != nil {
+			return err
+		}
+		return rw.MsgReadWriter.WriteMsg(m)
+	}
 	switch m.Code {
 	case eth.StatusMsg, eth.GetBlockHeadersMsg, eth.BlockHeadersMsg, eth.BlockBodiesMsg:
 		return rw.MsgReadWriter.WriteMsg(m)
@@ -266,6 +277,10 @@ func readPeer(ctx context.Context, p *p2p.Peer, rw p2p.MsgReadWriter, version ui
 			if err = message.Discard(); err != nil {
 				return err
 			}
+		case eth.GetReceiptsMsg, eth.GetBlockAccessListsMsg, eth.GetCellsMsg:
+			if _, err = replyUnavailableETHData(message, bounded, version); err != nil {
+				return err
+			}
 		default:
 			phase = "unexpected_message"
 			return errors.New("unexpected read-only peer message")
@@ -273,7 +288,13 @@ func readPeer(ctx context.Context, p *p2p.Peer, rw p2p.MsgReadWriter, version ui
 	}
 }
 
-func collect(ctx context.Context, want common.Hash, tip bool, maxPeers int, fixture string) (result, error) {
+type peerTask func(context.Context, *p2p.Peer, p2p.MsgReadWriter, uint, genesisChain, chan<- result, *counters) error
+
+func collect(ctx context.Context, want common.Hash, tip bool, maxPeers int, fixture string, tasks ...peerTask) (result, error) {
+	if len(tasks) > 1 {
+		return baseResult(), errors.New("one availability task required")
+	}
+
 	key, err := crypto.GenerateKey()
 	if err != nil {
 		return baseResult(), err
@@ -322,6 +343,9 @@ func collect(ctx context.Context, want common.Hash, tip bool, maxPeers int, fixt
 		}
 		protocols = append(protocols, p2p.Protocol{Name: eth.ProtocolName, Version: v, Length: length, DialCandidates: iterator,
 			Run: func(p *p2p.Peer, rw p2p.MsgReadWriter) error {
+				if len(tasks) == 1 {
+					return tasks[0](ctx, p, rw, v, chain, output, stats)
+				}
 				return readPeer(ctx, p, rw, v, chain, want, tip, output, stats)
 			}})
 	}
@@ -336,7 +360,7 @@ func collect(ctx context.Context, want common.Hash, tip bool, maxPeers int, fixt
 	}
 	server := p2p.Server{Config: p2p.Config{PrivateKey: key, MaxPeers: maxPeers, MaxPendingPeers: 4, DialRatio: 1,
 		Name: "b3-execution-header/1", ListenAddr: "127.0.0.1:0", DiscAddr: "0.0.0.0:0",
-		NoDiscovery: fixture != "", DiscoveryV4: fixture == "", BootstrapNodes: nodes, StaticNodes: nodes,
+		NoDiscovery: fixture != "", DiscoveryV4: fixture == "", BootstrapNodes: nodes, StaticNodes: fixtureStaticNodes(fixture, nodes),
 		Protocols: protocols, Dialer: publicDialer{fixture: fixture != "", dialer: net.Dialer{Timeout: 5 * time.Second}}, Logger: logger}}
 	if err = server.Start(); err != nil {
 		return baseResult(), err
@@ -378,14 +402,25 @@ func run() int {
 	var tip bool
 	var fixture string
 	var witnessFile string
+	var receiptsBlock string
 	flag.StringVar(&requested, "hash", "", "exact expected execution header hash; not itself consensus authority")
 	flag.BoolVar(&tip, "untrusted-peer-tip", false, "availability diagnostic only: request an untrusted peer status tip")
 	flag.IntVar(&seconds, "seconds", 90, "total bounded peer discovery/request time (1..300)")
 	flag.IntVar(&maxPeers, "max-peers", 4, "bounded connected peer count (1..8)")
 	flag.StringVar(&fixture, "owned-loopback-peer", "", "test-only exact loopback enode; disables public discovery")
 	flag.StringVar(&witnessFile, "witness-request", "", "bounded data-only account/storage witness request file")
+	flag.StringVar(&receiptsBlock, "receipts-block", "", "untrusted positive Sepolia block number for bounded receipt availability")
 	flag.Parse()
 	value := baseResult()
+	if receiptsBlock != "" {
+		if receiptModeConflict(requested, tip, witnessFile) || flag.NArg() != 0 {
+			out := receiptResult()
+			out.Failure = "receipt request requires its own bounded options"
+			json.NewEncoder(os.Stdout).Encode(out)
+			return 2
+		}
+		return runReceiptBlock(receiptsBlock, seconds, maxPeers, fixture)
+	}
 	if witnessFile != "" {
 		if requested != "" || tip || flag.NArg() != 0 || seconds < 1 || seconds > 300 || maxPeers < 1 || maxPeers > 8 {
 			value.Failure = "witness request requires its own bounded options"
