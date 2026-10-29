@@ -1,10 +1,40 @@
 # Owner questions from the gap-filling run (2026-10-25 to 2026-10-26)
 
-**Status: questions for the project owner; nothing here is ruled.** Each
+**Status: questions for the project owner.** The owner's answers so far
+are in the next section. Everything else is still unruled. Each
 question blocks part of one ledger task, and the rest of that task was
 done. No answer was chosen on the owner's behalf. Paths under
 `~/B3-evidence/` are evidence bundles on the build host, each with a
 verified manifest; they are not in the repository.
+
+## Owner answers (Discord, 2026-10-28 and 2026-10-29, relayed by Mohamed)
+
+Quoted as given. Each answer is followed by the question it settles.
+
+- "the main goal is decentralization." This frames the bridge work on
+  `rebirth`: Arbitrum USDT0 settlement checked by B3's own Ethereum light
+  client and storage proofs, with no trusted RPC.
+- **Version bits (M2-LED-02, question 1): yes.** Asked whether "revision
+  bits" means splitting the overloaded `commitment_version` byte and also
+  bumping the protocol and client versions, he answered "Yes". How to
+  split it (which field carries the state commitment and which the
+  certificate's view format) is still a design to propose. Questions 3 and
+  4 of M2-LED-02 are still open.
+- **Regtest profiles (M2-LED-02, question 2, for regtest): one default
+  profile, changed in place.** "For regtest, I prefer to keep default and
+  change it every update we have for regtest in order to get things more
+  robust", and "Regtest is different network and diff chain similar to
+  testnet." A regtest change updates the default regtest profile, its
+  hash and its vectors, rather than adding a new profile version.
+- **Networks.** "We stabilized regtest for floating things and testnet for
+  testing real things with hardfork heights." Mainnet is not touched.
+- **Height C (`doc/design/b3-height-c-fast-track.md` §7, asks 1 and 2):
+  yes.** "Yes we prepare that like assuming C as hardfork height and
+  testing robustness of code." B0 and the C work are prepared on a review
+  branch, gated at an assumed height C, and tested on regtest and testnet.
+  Asks 3 to 8 there (the escape direction, the committee, who builds P3,
+  the D3/D4 labels, horizon against P3, P3's validity rule) are still
+  open.
 
 ## M4-STO-01: journal recovery (BLOCKED-ON-RULING for three parts)
 

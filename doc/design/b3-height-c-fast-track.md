@@ -151,6 +151,10 @@ This is reported, not resolved.
 
 ## 7. What the owner would need to decide
 
+**Answered 2026-10-29 (Discord, relayed by Mohamed): asks 1 and 2.** "Yes
+we prepare that like assuming C as hardfork height and testing robustness
+of code." Asks 3 to 8 are still open; nothing below chooses them.
+
 1. Authorize `B0-B3D-01` as a review branch, starting with B0a.
 2. Allow C5 work (PoS V2 and Finality V2) on a regtest-only review branch
    before DEX-1, and rule D26 (C-12, V2-D3) early enough to build against.
