@@ -77,14 +77,12 @@ Validity does not change. The tracker returns the same state as a rebuild,
 only sooner. A mismatch would split the node from the network, which is
 why acceptance is undo equal to replay.
 
-### 4.3 B0b: the restart path (outline)
+### 4.3 B0b: the restart path
 
-Persist each tracker's state at one block at least `reorg_horizon` below
-the tip, keyed by that block's hash. On start, load it if the block is on
-the active chain and replay forward. That is at most a horizon plus the
-blocks since the save, and it refills the undo history. This needs a
-canonical serialization of `State`, the stake map and the indexes. It is a
-separate design once B0a lands.
+Designed on 2026-10-31 in `doc/design/b3-b0b-durable-derived-state.md`,
+for review before any code. It replaces the outline that stood here, a
+snapshot one horizon below the tip, with a record at the tip that carries
+its undo history (that doc, §3). Its §11 lists the questions for the owner.
 
 ### 4.4 Files (B0a)
 
