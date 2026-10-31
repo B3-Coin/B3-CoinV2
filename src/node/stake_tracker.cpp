@@ -14,12 +14,24 @@
 
 namespace node {
 
-void StakeTracker::ApplyBlock(const CBlock& block, const int height)
+size_t StakeTracker::UndoDepth(const Consensus::Params& params)
 {
+    if (params.modern_pos && params.modern_pos->reorg_horizon) {
+        return static_cast<size_t>(*params.modern_pos->reorg_horizon);
+    }
+    return DEFAULT_UNDO_DEPTH;
+}
+
+void StakeTracker::ApplyBlock(const CBlock& block, const uint256& hash, const int height, const size_t undo_depth)
+{
+    BlockUndo undo{.hash = hash, .ops = {}};
     for (const CTransactionRef& tx : block.vtx) {
         if (!tx->IsCoinBase()) {
             for (const CTxIn& in : tx->vin) {
-                m_stakes.erase(in.prevout);
+                const auto it{m_stakes.find(in.prevout)};
+                if (it == m_stakes.end()) continue;
+                undo.ops.push_back(UndoOp{.outpoint = it->first, .prior = it->second});
+                m_stakes.erase(it);
             }
         }
         for (uint32_t i{0}; i < tx->vout.size(); ++i) {
@@ -30,10 +42,15 @@ void StakeTracker::ApplyBlock(const CBlock& block, const int height)
             // A connected modern block cannot contain an invalid claiming
             // output (ContextualCheckBlock enforces it); stay total anyway.
             if (!view) continue;
-            m_stakes.emplace(COutPoint{tx->GetHash(), i},
-                             Entry{view->amount, view->validator_key, height});
+            const COutPoint outpoint{tx->GetHash(), i};
+            if (m_stakes.emplace(outpoint, Entry{view->amount, view->validator_key, height}).second) {
+                undo.ops.push_back(UndoOp{.outpoint = outpoint, .prior = std::nullopt});
+            }
         }
     }
+    if (undo_depth == 0) return;
+    m_undo.push_back(std::move(undo));
+    while (m_undo.size() > undo_depth) m_undo.pop_front();
 }
 
 bool StakeTracker::Sync(const CChain& chain, const BlockManager& blockman, const Consensus::Params& params,
@@ -54,19 +71,23 @@ bool StakeTracker::Sync(const CChain& chain, const BlockManager& blockman, const
         start = m_synced_height + 1;
     } else {
         m_stakes.clear();
+        m_undo.clear();
         m_dirty = true;
+        ++m_rebuilds;
     }
 
+    const size_t undo_depth{UndoDepth(params)};
     for (int height{start}; height <= target.nHeight; ++height) {
         const CBlockIndex* pindex{chain[height]};
         CBlock block;
         if (pindex == nullptr || !blockman.ReadBlock(block, *pindex)) {
             LogWarning("StakeTracker: cannot read modern block at height %d; registry unavailable", height);
             m_stakes.clear();
+            m_undo.clear();
             m_dirty = true;
             return false;
         }
-        ApplyBlock(block, height);
+        ApplyBlock(block, pindex->GetBlockHash(), height, undo_depth);
     }
     m_synced_tip = target.GetBlockHash();
     m_synced_height = target.nHeight;
@@ -83,9 +104,33 @@ void StakeTracker::BlockConnected(const CBlock& block, const CBlockIndex& index,
         m_dirty = true;
         return;
     }
-    ApplyBlock(block, index.nHeight);
+    ApplyBlock(block, index.GetBlockHash(), index.nHeight, UndoDepth(params));
     m_synced_tip = index.GetBlockHash();
     m_synced_height = index.nHeight;
+}
+
+void StakeTracker::BlockDisconnected(const CBlockIndex& index)
+{
+    if (m_dirty || index.pprev == nullptr || m_synced_tip != index.GetBlockHash() ||
+        m_undo.empty() || m_undo.back().hash != m_synced_tip) {
+        // Not synced to this block, or its record is no longer kept (a
+        // disconnect deeper than the history): rebuild on the next Sync().
+        m_dirty = true;
+        return;
+    }
+    // Reverse the block's changes in the opposite order of their application,
+    // so an output created and spent inside the block ends absent.
+    const BlockUndo& undo{m_undo.back()};
+    for (auto op{undo.ops.rbegin()}; op != undo.ops.rend(); ++op) {
+        if (op->prior) {
+            m_stakes.emplace(op->outpoint, *op->prior);
+        } else {
+            m_stakes.erase(op->outpoint);
+        }
+    }
+    m_undo.pop_back();
+    m_synced_tip = index.pprev->GetBlockHash();
+    m_synced_height = index.pprev->nHeight;
 }
 
 std::map<ValidatorKey, CAmount> StakeTracker::ActiveWeights(const int eval_height, CAmount& total) const

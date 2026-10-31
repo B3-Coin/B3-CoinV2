@@ -17,6 +17,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <memory>
 #include <optional>
 #include <string>
@@ -106,13 +107,17 @@ struct ProducerSchedule {
  *               valid (only a consensus re-bootstrap rule, not in V1, could
  *               resume it); block production continues under Set_e.
  *
- * Recovery model = StakeTracker's: incremental BlockConnected when in step
- * with the parent; anything else (restart, disconnect, gap) marks dirty and
- * the next Sync() rebuilds by walking the modern span from H+1, so restart,
- * reindex and reconstruction reproduce the identical epoch state and
- * finalized tip. REVISABLE_BEFORE_MAINNET: the full-walk rebuild (with BLS
- * re-verification of every certificate and binding) is O(modern span); a
- * persisted snapshot is the recorded follow-up.
+ * Recovery model = StakeTracker's (B0a): incremental BlockConnected when in
+ * step with the parent, keeping the State each block replaced for the last
+ * StakeTracker::UndoDepth() blocks; BlockDisconnected restores the parent's
+ * State from that history and steps the private stake and binding trackers
+ * back. Anything else (restart, a disconnect deeper than the history, a
+ * gap, fresh-key mode) marks dirty and the next Sync() rebuilds by walking
+ * the modern span from H+1, so restart, reindex and reconstruction
+ * reproduce the identical epoch state and finalized tip; undo must leave
+ * exactly that state. REVISABLE_BEFORE_MAINNET: the restart rebuild (with
+ * BLS re-verification of every certificate and binding) is still
+ * O(modern span); a persisted snapshot (B0b) is the follow-up.
  *
  * Fresh lineage (bridge V2, regtest-only knob): when
  * Consensus::Params::fresh_lineage is set, State::fresh carries the fresh
@@ -211,8 +216,14 @@ public:
     void BlockConnected(const CBlock& block, const CBlockIndex& index,
                         const Consensus::Params& params,
                         const BridgeStateIndex* bridge_index = nullptr);
-    void BlockDisconnected(const CBlockIndex& index) { MarkDirty(); }
+    //! Restore the State of `index`'s parent after `index` was disconnected
+    //! from the tip; dirty when not synced to `index`, when its record is no
+    //! longer kept, or in fresh-key mode (whose index keeps no undo).
+    void BlockDisconnected(const CBlockIndex& index, const Consensus::Params& params);
     void MarkDirty() { m_dirty = true; }
+    //! Full rebuilds started by Sync(), its own and its stake registry's
+    //! (tests: a reorg the undo history covers must not add one).
+    uint64_t Rebuilds() const { return m_rebuilds + m_stakes.Rebuilds(); }
     bool Synced(const uint256& tip_hash) const { return !m_dirty && m_synced_tip == tip_hash; }
     int SyncedHeight() const { return m_synced_height; }
 
@@ -334,6 +345,9 @@ private:
     //! assembler, staking loop, RPC) build and BLS-decode it once.
     std::shared_ptr<const ValidatorSetSnapshot> SyncedTipSnapshot() const;
     void Reset();
+    //! Keep `prior`, the State that the block `hash` replaced, as that
+    //! block's undo record (none in fresh-key mode).
+    void PushUndo(const uint256& hash, State prior, const Consensus::Params& params);
 
     //! SyncedTipSnapshot()'s memo; `filled` with a null `snapshot` means
     //! "no snapshot at that tip". Cleared by Reset().
@@ -345,6 +359,14 @@ private:
     mutable TipSnapshotMemo m_tip_snapshot;
 
     State m_state;
+    //! The State each of the last applied blocks replaced, oldest first;
+    //! the back record is the synced tip's.
+    struct BlockUndo {
+        uint256 hash;
+        State prior;
+    };
+    std::deque<BlockUndo> m_undo;
+    uint64_t m_rebuilds{0};
     StakeTracker m_stakes;
     FinalityBindingTracker m_bindings;
     //! B-37 fresh key bindings; stepped only in fresh-key mode.

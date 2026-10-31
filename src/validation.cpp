@@ -5113,9 +5113,9 @@ bool Chainstate::DisconnectTip(BlockValidationState& state, DisconnectedBlockTra
     m_chain.SetTip(*pindexDelete->pprev);
     m_chainman.UpdateIBDStatus();
 
-    // A disconnect invalidates the incremental modern-PoS stake registry;
-    // it rebuilds from the (now shorter) active chain on next use.
-    if (m_stake_tracker) m_stake_tracker->MarkDirty();
+    // The modern-PoS stake registry reverts the disconnected block from its
+    // bounded undo history (or marks itself for rebuild when it cannot, B0a).
+    if (m_stake_tracker) m_stake_tracker->BlockDisconnected(*pindexDelete);
     // The binding index reverts the disconnected block exactly (or marks
     // itself for rebuild when not in step).
     if (m_finality_bindings) m_finality_bindings->BlockDisconnected(*pindexDelete);
@@ -5135,7 +5135,7 @@ bool Chainstate::DisconnectTip(BlockValidationState& state, DisconnectedBlockTra
         m_bridge_state->BlockDisconnected(*pindexDelete,
                                           m_chainman.GetConsensus());
     }
-    if (m_finality_tracker) m_finality_tracker->BlockDisconnected(*pindexDelete);
+    if (m_finality_tracker) m_finality_tracker->BlockDisconnected(*pindexDelete, m_chainman.GetConsensus());
 
     UpdateTip(pindexDelete->pprev);
     // Let wallets know transactions went from 1-confirmed to

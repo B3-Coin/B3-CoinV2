@@ -106,6 +106,53 @@ and its entry in `src/test/CMakeLists.txt`.
    test 2.
 5. Owner-run: the same equality on a shadow copy of mainnet.
 
+### 4.6 B0a as built (2026-10-30)
+
+Authorized on 2026-10-29 (§7, ask 1). Validity does not change.
+
+- `StakeTracker` keeps, per applied block, the entries it spent and the
+  outpoints it created, in apply order, and `BlockDisconnected` reverses
+  them in the opposite order. So an output created and spent in one block
+  ends absent.
+- `FinalityTracker` keeps the `State` each block replaced. `BlockDisconnected`
+  restores it and steps its private stake and binding trackers back. A full
+  rebuild keeps records only for the last blocks of its walk.
+- Both keep `reorg_horizon` blocks of history, or 1,440 when the horizon is
+  unset. A deeper disconnect, a gap, a restart or fresh-key mode falls back
+  to the old rebuild.
+- `validation.cpp` calls both `BlockDisconnected`s. Each tracker counts its
+  full rebuilds (`Rebuilds()`), for tests.
+
+Findings while building it:
+
+- **The chainstate's own `StakeTracker` has no production reader.**
+  Eligibility and the validator-set snapshots read the finality tracker's
+  private copy. `Chainstate::ModernStakeTracker()` is called only by tests,
+  and validation steps it only once something has created it. It now
+  undoes like the other one. Whether to keep it is the owner's call.
+- **The finality pin limits how deep a test can go.** `InvalidateBlock`
+  refuses to disconnect at or below the finalized checkpoint. The
+  every-depth test therefore certifies only V1 epoch 0 and puts every
+  other event above that checkpoint.
+- **Every `test_bitcoin` process pays about 235 s once** (the legacy
+  prefix). That is not B0a: each B0a case takes 0.2 to 4 s after it.
+
+Tests (`src/test/finality_h1_tests.cpp`, next to the H1 fixture they reuse,
+not the new file §4.4 proposed):
+
+- `b0a_one_block_reorg_does_not_rebuild` (acceptance 1);
+- `b0a_undo_equals_replay_at_every_depth` (acceptance 2). It covers the
+  certificate's block, V1's rotation, H1's activation and rotation, a
+  binding, stake creation, create-and-spend in one block, an escape and an
+  unstake. Each depth is checked after the disconnect and after
+  reconnecting;
+- `b0a_disconnect_beyond_history_rebuilds` (the fallback, and the history
+  refilling after it).
+
+Acceptance 3 (flat reorg time measured with a B0 script) is replaced for
+now by the rebuild counter, which is deterministic. Acceptance 5 is
+owner-run.
+
 ## 5. The escape rule (V2-D3)
 
 `finality_h1_tests/escape_race_*` and

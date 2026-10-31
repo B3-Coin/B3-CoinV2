@@ -132,6 +132,7 @@ void FinalityTracker::Reset()
 {
     m_tip_snapshot = TipSnapshotMemo{};
     m_state = State{};
+    m_undo.clear();
     m_stakes.MarkDirty();
     m_bindings.MarkDirty();
     m_fresh_keys.MarkDirty();
@@ -576,6 +577,7 @@ bool FinalityTracker::Sync(const CChain& chain, const BlockManager& blockman, co
         }
     } else {
         Reset();
+        ++m_rebuilds;
         // Empty state "as of H": the first modern-era block extends it.
         m_synced_height = *final_height;
         if (const CBlockIndex* h{chain[*final_height]}) m_synced_tip = h->GetBlockHash();
@@ -589,6 +591,9 @@ bool FinalityTracker::Sync(const CChain& chain, const BlockManager& blockman, co
             Reset();
             return false;
         }
+        // Only the blocks the undo history can still hold keep their prior State.
+        std::optional<State> prior;
+        if (static_cast<size_t>(target.nHeight - height) < StakeTracker::UndoDepth(params)) prior = m_state;
         if (modern_start && height >= *modern_start &&
             !ApplyModern(block, *pindex, params, bridge_index)) {
             Reset();
@@ -601,6 +606,7 @@ bool FinalityTracker::Sync(const CChain& chain, const BlockManager& blockman, co
         }
         m_synced_tip = pindex->GetBlockHash();
         m_synced_height = height;
+        if (prior) PushUndo(m_synced_tip, std::move(*prior), params);
     }
     // Fresh-key mode: an empty span (target == H) steps nothing, and a knob
     // configured after the last walk leaves the fresh key index behind the
@@ -634,6 +640,7 @@ void FinalityTracker::BlockConnected(const CBlock& block,
         return;
     }
     const std::optional<int> modern_start{Consensus::ModernPosStartHeight(params)};
+    State prior{m_state};
     if (modern_start && index.nHeight >= *modern_start &&
         !ApplyModern(block, index, params, bridge_index)) {
         m_dirty = true;
@@ -645,6 +652,42 @@ void FinalityTracker::BlockConnected(const CBlock& block,
     }
     m_synced_tip = index.GetBlockHash();
     m_synced_height = index.nHeight;
+    PushUndo(m_synced_tip, std::move(prior), params);
+}
+
+void FinalityTracker::PushUndo(const uint256& hash, State prior, const Consensus::Params& params)
+{
+    if (FreshKeyModeConfigured(params)) {
+        m_undo.clear();
+        return;
+    }
+    const size_t depth{StakeTracker::UndoDepth(params)};
+    if (depth == 0) return;
+    m_undo.push_back(BlockUndo{.hash = hash, .prior = std::move(prior)});
+    while (m_undo.size() > depth) m_undo.pop_front();
+}
+
+void FinalityTracker::BlockDisconnected(const CBlockIndex& index, const Consensus::Params& params)
+{
+    if (m_dirty || index.pprev == nullptr || m_synced_tip != index.GetBlockHash() ||
+        FreshKeyModeConfigured(params) || m_undo.empty() || m_undo.back().hash != m_synced_tip) {
+        // Not synced to this block, its record is no longer kept, or the
+        // fresh key index (no undo trail) is in use: rebuild on next Sync().
+        m_dirty = true;
+        return;
+    }
+    const uint256 parent{index.pprev->GetBlockHash()};
+    m_stakes.BlockDisconnected(index);
+    m_bindings.BlockDisconnected(index);
+    if (!m_stakes.Synced(parent) || !m_bindings.Synced(parent)) {
+        m_dirty = true;
+        return;
+    }
+    m_state = std::move(m_undo.back().prior);
+    m_undo.pop_back();
+    m_tip_snapshot = TipSnapshotMemo{};
+    m_synced_tip = parent;
+    m_synced_height = index.pprev->nHeight;
 }
 
 } // namespace node

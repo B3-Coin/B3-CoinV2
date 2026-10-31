@@ -2223,4 +2223,237 @@ BOOST_FIXTURE_TEST_CASE(unanimous_certificate_after_break_refused_h1_unfreezes, 
     BOOST_CHECK(HashOf(s.current) == set0->SetHash());
 }
 
+// ---------------------------------------------------------------------------
+// B0a (doc/design/b3-height-c-fast-track.md section 4): bounded undo of the
+// derived stake and finality state. A disconnect the undo history covers
+// restores the parent's state in place; it must equal a tracker rebuilt from
+// scratch on the new active chain, and must not start a rebuild.
+
+namespace {
+
+struct UndoChainFixture : public H1ChainFixture {
+    //! The live trackers, read without syncing them (a sync would rebuild a
+    //! dirty tracker and hide the missing undo).
+    FinalityTracker& LiveFinality() EXCLUSIVE_LOCKS_REQUIRED(cs_main)
+    {
+        return m_node.chainman->ActiveChainstate().ModernFinality();
+    }
+    node::StakeTracker& LiveStakes() EXCLUSIVE_LOCKS_REQUIRED(cs_main)
+    {
+        return m_node.chainman->ActiveChainstate().ModernStakeTracker();
+    }
+    //! The chainstate's stake registry is created on first use (validation
+    //! reads the finality tracker's own); sync it once so that validation
+    //! keeps it in step from here on.
+    void ArmStakes()
+    {
+        LOCK(cs_main);
+        Chainstate& cs{m_node.chainman->ActiveChainstate()};
+        BOOST_REQUIRE(LiveStakes().Sync(cs.m_chain, cs.m_blockman, m_node.chainman->GetConsensus(), *cs.m_chain.Tip()));
+    }
+    //! Rebuilds of both live trackers (the finality tracker's own and its
+    //! private stake registry's, and the chainstate's stake registry).
+    uint64_t Rebuilds()
+    {
+        LOCK(cs_main);
+        return LiveFinality().Rebuilds() + LiveStakes().Rebuilds();
+    }
+    //! Both live trackers are synced to the tip as they stand, and each
+    //! equals a tracker rebuilt from scratch on the active chain.
+    bool InStepAndAsRebuilt()
+    {
+        {
+            LOCK(cs_main);
+            const uint256 tip{Tip()->GetBlockHash()};
+            if (!LiveFinality().Synced(tip) || !LiveStakes().Synced(tip)) return false;
+        }
+        if (!AsRebuilt()) return false;
+        LOCK(cs_main);
+        Chainstate& cs{m_node.chainman->ActiveChainstate()};
+        node::StakeTracker rebuilt;
+        BOOST_REQUIRE(rebuilt.Sync(cs.m_chain, cs.m_blockman, m_node.chainman->GetConsensus(), *cs.m_chain.Tip()));
+        return LiveStakes().SameRegistry(rebuilt);
+    }
+    //! Disconnect the active block at `height` and every block above it.
+    void InvalidateFrom(const int height)
+    {
+        CBlockIndex* index{WITH_LOCK(cs_main, return m_node.chainman->ActiveChain()[height])};
+        BOOST_REQUIRE(index != nullptr);
+        BlockValidationState state;
+        BOOST_REQUIRE(m_node.chainman->ActiveChainstate().InvalidateBlock(state, index));
+        BOOST_REQUIRE(m_node.chainman->ActiveChainstate().ActivateBestChain(state));
+        BOOST_REQUIRE_EQUAL(Tip()->nHeight, height - 1);
+    }
+    //! Undo InvalidateFrom: the same blocks reconnect.
+    void Reconsider(const uint256& hash)
+    {
+        {
+            LOCK(cs_main);
+            CBlockIndex* index{m_node.chainman->m_blockman.LookupBlockIndex(hash)};
+            BOOST_REQUIRE(index != nullptr);
+            m_node.chainman->ActiveChainstate().ResetBlockFailureFlags(index);
+            m_node.chainman->RecalculateBestHeader();
+        }
+        BlockValidationState state;
+        BOOST_REQUIRE(m_node.chainman->ActiveChainstate().ActivateBestChain(state));
+    }
+    //! A transaction that creates a STAKE output (vout 0) for `vk` from
+    //! funding output `n`.
+    CMutableTransaction StakeTx(const unsigned n, const modern::ValidatorKeyBytes& vk, const CAmount amount)
+    {
+        CMutableTransaction tx{MakeTx(n, {}, {})};
+        tx.vout.insert(tx.vout.begin(), CTxOut{amount, modern::MakeStakeScript(vk, CScript() << OP_TRUE)});
+        tx.vout.back().nValue -= amount;
+        return tx;
+    }
+    //! The owner's spend of STAKE output `stake`:0 (unstaking).
+    static CMutableTransaction Unstake(const CMutableTransaction& stake)
+    {
+        CMutableTransaction tx;
+        tx.version = 2;
+        tx.vin.resize(1);
+        tx.vin[0].prevout = COutPoint{stake.GetHash(), 0};
+        tx.vout.emplace_back(stake.vout[0].nValue - 1'000, CScript() << OP_TRUE);
+        return tx;
+    }
+};
+
+} // namespace
+
+// (B0a-1) A one-block reorganization reverts both trackers in place: no
+// rebuild, and each equals a tracker rebuilt from scratch.
+BOOST_FIXTURE_TEST_CASE(b0a_one_block_reorg_does_not_rebuild, UndoChainFixture)
+{
+    PrepareFinalityChain(/*min_finality_set=*/1, /*reorg_horizon=*/200, /*with_unbound_c=*/true);
+    const int M{m_M};
+    ConfigureH1(M + 5);
+    while (Tip()->nHeight < M + 12) ProduceCertifying(m_vk_a);
+    ArmStakes();
+    BOOST_REQUIRE(InStepAndAsRebuilt());
+    const uint64_t rebuilds{Rebuilds()};
+
+    const int h{Tip()->nHeight};
+    InvalidateFrom(h);
+    BOOST_CHECK(InStepAndAsRebuilt());
+    BOOST_CHECK_EQUAL(Rebuilds(), rebuilds);
+    // A different block at the same height takes its place.
+    Produce(m_vk_b);
+    BOOST_REQUIRE_EQUAL(Tip()->nHeight, h);
+    BOOST_CHECK(InStepAndAsRebuilt());
+    BOOST_CHECK_EQUAL(Rebuilds(), rebuilds);
+}
+
+// (B0a-2) Undo equals replay at every depth the finality pin allows (a
+// disconnect at or below the finalized checkpoint is refused), over a chain
+// that crosses, above that checkpoint: the block carrying V1 epoch 0's
+// handover certificate, V1's rotation to epoch 1, H1's activation and first
+// rotation, a FINALITY_KEY binding, STAKE creations, a block that creates
+// and spends one STAKE output, an escape and an unstake. Only epoch 0 is
+// certified, so the pin stays at its first checkpoint. After each
+// disconnect and after reconnecting the same blocks, both trackers equal a
+// rebuild and no rebuild ran.
+BOOST_FIXTURE_TEST_CASE(b0a_undo_equals_replay_at_every_depth, UndoChainFixture)
+{
+    PrepareFinalityChain(/*min_finality_set=*/1, /*reorg_horizon=*/200, /*with_unbound_c=*/true);
+    const int M{m_M};
+    const int E{SCALED_E};
+    const int R_h{M + 10};
+    constexpr int64_t R_ESC{TEST_ESCAPE_ROUNDS};
+    ConfigureH1(R_h);
+
+    const CMutableTransaction stake_d{StakeTx(4, m_vk_d, STAKE_D)};
+    const CMutableTransaction stake_d2{StakeTx(5, m_vk_d, STAKE_D)};
+    const auto bind_c{MakeBinding(m_validator_c, m_vk_c, &m_bls_c, 0)};
+    const int h_e{R_h + E + 5};
+    // Certify V1 epoch 0 only (its handover rotates V1 at M + E); later
+    // blocks carry no certificate, so the pin stays in epoch 0.
+    const auto produce{[&](std::vector<CMutableTransaction> txs = {}) {
+        if (Tip()->nHeight + 1 <= M + E) {
+            ProduceCertifying(m_vk_a, std::move(txs));
+        } else {
+            Produce(m_vk_a, {}, std::move(txs));
+        }
+    }};
+    while (Tip()->nHeight < h_e - 1) {
+        const int next{Tip()->nHeight + 1};
+        if (next == R_h + 2) {
+            produce({MakeTx(8, {bind_c.cell}, {bind_c.record})});
+        } else if (next == R_h + 4) {
+            produce({stake_d});
+        } else if (next == R_h + 5) {
+            produce({stake_d2, Unstake(stake_d2)}); // created and spent in one block
+        } else {
+            produce();
+        }
+    }
+    // C is bound but outside the producer set in force: its escape block.
+    BOOST_REQUIRE(!ProducersNext().current->IndexOf(m_vk_c).has_value());
+    ProduceInRound(m_vk_c, R_ESC); // h_e
+    BOOST_REQUIRE_EQUAL(FinalityState().producers->last_escape_height, h_e);
+    produce();
+    produce({Unstake(stake_d)}); // h_e + 2
+    while (Tip()->nHeight < h_e + 6) produce();
+
+    const auto before{FinalityState()};
+    BOOST_REQUIRE(before.finalized.has_value());
+    const int pin{before.finalized->height};
+    BOOST_REQUIRE_LT(pin, before.finalized->certified_at); // the certificate's block is undone too
+    BOOST_REQUIRE_LT(before.finalized->certified_at, R_h);
+    BOOST_REQUIRE_EQUAL(before.epoch, 1U);
+    BOOST_REQUIRE_EQUAL(before.epoch_starts.back(), M + E);
+    BOOST_REQUIRE(before.producers.has_value());
+    BOOST_REQUIRE_GE(before.producers->epoch, 2U);
+    ArmStakes();
+    BOOST_REQUIRE(InStepAndAsRebuilt());
+    const uint64_t rebuilds{Rebuilds()};
+    const int tip_height{Tip()->nHeight};
+    const uint256 tip_hash{Tip()->GetBlockHash()};
+
+    for (int depth{1}; depth <= tip_height - pin; ++depth) {
+        const int from{tip_height - depth + 1};
+        const uint256 first{ChainHashAt(from)};
+        InvalidateFrom(from);
+        BOOST_CHECK_MESSAGE(InStepAndAsRebuilt(), "after disconnecting " << depth << " blocks");
+        BOOST_CHECK_EQUAL(Rebuilds(), rebuilds);
+        Reconsider(first);
+        BOOST_REQUIRE(Tip()->GetBlockHash() == tip_hash);
+        BOOST_CHECK_MESSAGE(InStepAndAsRebuilt(), "after reconnecting " << depth << " blocks");
+        BOOST_CHECK_EQUAL(Rebuilds(), rebuilds);
+    }
+    const auto after{FinalityState()};
+    BOOST_CHECK(SameV1(before, after));
+    BOOST_CHECK(SameProducers(before.producers, after.producers));
+}
+
+// (B0a-3) A disconnect deeper than the kept history falls back to the
+// rebuild, which still equals a fresh tracker and refills the history: the
+// next one-block reorganization is again undone in place.
+BOOST_FIXTURE_TEST_CASE(b0a_disconnect_beyond_history_rebuilds, UndoChainFixture)
+{
+    constexpr int HORIZON{4};
+    PrepareFinalityChain(/*min_finality_set=*/1, /*reorg_horizon=*/HORIZON, /*with_unbound_c=*/true);
+    const int M{m_M};
+    ConfigureH1(M + 5);
+    while (Tip()->nHeight < M + 14) ProduceCertifying(m_vk_a);
+    ArmStakes();
+    BOOST_REQUIRE(InStepAndAsRebuilt());
+    const uint64_t rebuilds{Rebuilds()};
+    const uint256 tip_hash{Tip()->GetBlockHash()};
+
+    const int from{Tip()->nHeight - HORIZON};
+    const uint256 first{ChainHashAt(from)};
+    InvalidateFrom(from); // HORIZON + 1 blocks: one more than the history holds
+    BOOST_CHECK(AsRebuilt());
+    BOOST_CHECK_GT(Rebuilds(), rebuilds);
+    Reconsider(first);
+    BOOST_REQUIRE(Tip()->GetBlockHash() == tip_hash);
+    ArmStakes(); // validation never syncs the chainstate's registry
+    BOOST_CHECK(InStepAndAsRebuilt());
+
+    const uint64_t refilled{Rebuilds()};
+    InvalidateFrom(Tip()->nHeight);
+    BOOST_CHECK(InStepAndAsRebuilt());
+    BOOST_CHECK_EQUAL(Rebuilds(), refilled);
+}
+
 BOOST_AUTO_TEST_SUITE_END()
