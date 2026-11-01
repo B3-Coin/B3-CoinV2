@@ -6,6 +6,7 @@
 
 #include <chain.h>
 #include <consensus/era.h>
+#include <hash.h>
 #include <logging.h>
 #include <modern/chain_domain.h>
 #include <modern/mpa.h>
@@ -308,6 +309,19 @@ bool FinalityBindingTracker::ApplyBlock(const CBlock& block, const int height, c
     }
     if (!transitions.empty()) m_index.ConnectBlock(height, transitions);
     return true;
+}
+
+uint256 FinalityBindingTracker::ParamsDigest(const Consensus::Params& params)
+{
+    // Keep in step with ApplyBlock, Sync and BlockConnected: the era and the
+    // replay start read legacy_b3coin and hard_fork_height, the chain domain
+    // reads the genesis hash and legacy_final_hash, and
+    // VerifyBlockFinalityBindings reads no parameter.
+    HashWriter h{};
+    h << std::string{"B3/derived-state/finality-bindings"} << params.hashGenesisBlock << params.legacy_b3coin
+      << params.hard_fork_height.has_value() << int32_t{params.hard_fork_height.value_or(0)}
+      << params.legacy_final_hash.has_value() << params.legacy_final_hash.value_or(uint256{});
+    return h.GetSHA256();
 }
 
 bool FinalityBindingTracker::Sync(const CChain& chain, const BlockManager& blockman, const Consensus::Params& params,

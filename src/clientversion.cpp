@@ -62,6 +62,23 @@ std::string FormatFullVersion()
     return CLIENT_BUILD;
 }
 
+std::optional<std::string> SourceBuildId()
+{
+#if defined(BUILD_GIT_TAG)
+    // GenerateBuildInfo.cmake names a tag only for a clean tagged checkout.
+    return std::string{BUILD_GIT_TAG};
+#elif defined(BUILD_GIT_COMMIT)
+    const std::string commit{BUILD_GIT_COMMIT};
+    if (commit.ends_with("-dirty")) return std::nullopt;
+    return "v" CLIENT_VERSION_STRING "-" + commit;
+#else
+    // git archive expands GIT_COMMIT_ID; anywhere else it stays a placeholder.
+    const std::string commit{GIT_COMMIT_ID};
+    if (commit.empty() || commit.starts_with('$')) return std::nullopt;
+    return "v" CLIENT_VERSION_STRING "-g" + commit;
+#endif
+}
+
 /**
  * Format the subversion field according to BIP 14 spec (https://github.com/bitcoin/bips/blob/master/bip-0014.mediawiki)
  */

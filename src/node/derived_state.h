@@ -1,0 +1,79 @@
+// Copyright (c) 2026 The B3Coin Core developers
+// Distributed under the MIT software license, see the accompanying
+// file COPYING or https://opensource.org/license/mit/.
+#ifndef B3COIN_NODE_DERIVED_STATE_H
+#define B3COIN_NODE_DERIVED_STATE_H
+
+#include <dbwrapper.h>
+#include <uint256.h>
+
+#include <cstdint>
+#include <optional>
+#include <span>
+#include <string_view>
+#include <vector>
+
+namespace node {
+
+/**
+ * B0b: derived chain state persisted across restarts
+ * (doc/design/b3-b0b-durable-derived-state.md).
+ *
+ * A tracker's state at a block is a pure function of the chain up to that
+ * block, so a record naming its block stays valid while that block is on the
+ * active chain. Records are a cache. A node uses one only when its format,
+ * its build and the consensus parameters its tracker reads all match and its
+ * checksum holds; otherwise the tracker rebuilds from blocks as before.
+ */
+enum class DerivedStateId : uint8_t {
+    //! 1 is reserved for the finality tracker; 3 to 6 for the bridge, FN
+    //! seat, FlowMesh vault and FlowMesh checkpoint indexes.
+    FINALITY_BINDINGS = 2,
+};
+
+struct DerivedStateRecord {
+    //! Digest of every consensus parameter the tracker's derivation reads.
+    uint256 params_digest;
+    uint256 block_hash;
+    int height{-1};
+    //! The tracker's canonical encoding of its state at the block.
+    std::vector<unsigned char> payload;
+};
+
+enum class DerivedStateCheck {
+    OK,
+    MALFORMED,    //!< not exactly one complete record
+    BAD_CHECKSUM,
+    OTHER_FORMAT,
+    OTHER_BUILD,  //!< written by another build
+    OTHER_PARAMS, //!< written under other consensus parameters
+};
+std::string_view DerivedStateCheckName(DerivedStateCheck check);
+
+/**
+ * u8 format version || build id || parameters digest || block hash || i32
+ * height || payload || SHA256d of everything before it. The build id names
+ * the exact sources (SourceBuildId()), so a record written by any other
+ * build is refused and no change of derivation can meet a stale record.
+ */
+std::vector<unsigned char> EncodeDerivedStateRecord(const DerivedStateRecord& record, std::string_view build_id);
+DerivedStateCheck DecodeDerivedStateRecord(std::span<const unsigned char> bytes, std::string_view build_id,
+                                           const uint256& params_digest, DerivedStateRecord& record);
+
+//! The `derivedstate` LevelDB: one record per tracker, each write synchronous.
+class DerivedStateStore
+{
+public:
+    explicit DerivedStateStore(const DBParams& params);
+
+    std::optional<std::vector<unsigned char>> Read(DerivedStateId id) const;
+    void Write(DerivedStateId id, const std::vector<unsigned char>& record);
+    void Erase(DerivedStateId id);
+
+private:
+    CDBWrapper m_db;
+};
+
+} // namespace node
+
+#endif // B3COIN_NODE_DERIVED_STATE_H

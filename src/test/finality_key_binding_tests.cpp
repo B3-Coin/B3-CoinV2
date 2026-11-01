@@ -9,6 +9,7 @@
 // fail-closed behaviour.
 
 #include <chainparams.h>
+#include <clientversion.h>
 #include <consensus/params.h>
 #include <crypto/bls.h>
 #include <crypto/common.h>
@@ -18,6 +19,7 @@
 #include <modern/finality_types.h>
 #include <modern/metadata_cell.h>
 #include <modern/mpa.h>
+#include <node/derived_state.h>
 #include <node/finality_binding_index.h>
 #include <primitives/transaction.h>
 #include <uint256.h>
@@ -452,6 +454,101 @@ BOOST_AUTO_TEST_CASE(binding_index_decode_refuses_malformed)
     FinalityBindingIndex shared;
     shared.ConnectBlock(10, {Bind(a, Pk(1), 0, 10), Bind(b, Pk(1), 0, 10)});
     BOOST_CHECK(!FinalityBindingIndex::Decode(shared.Encode(), 10, 10));
+}
+
+// B0b: a record is accepted only whole, from the same build, under the same
+// parameters digest; no damaged byte string is ever accepted.
+BOOST_AUTO_TEST_CASE(derived_state_record_codec)
+{
+    using node::DerivedStateCheck;
+    node::DerivedStateRecord record;
+    record.params_digest = uint256{1};
+    record.block_hash = uint256{2};
+    record.height = 1234;
+    record.payload = {1, 2, 3, 4, 5};
+    const std::vector<unsigned char> bytes{node::EncodeDerivedStateRecord(record, "v1-abc")};
+    const auto check{[](const std::span<const unsigned char> b, const std::string_view build, const uint256& digest) {
+        node::DerivedStateRecord out;
+        return node::DecodeDerivedStateRecord(b, build, digest, out);
+    }};
+    node::DerivedStateRecord decoded;
+    BOOST_REQUIRE(node::DecodeDerivedStateRecord(bytes, "v1-abc", uint256{1}, decoded) == DerivedStateCheck::OK);
+    BOOST_CHECK(decoded.params_digest == record.params_digest);
+    BOOST_CHECK(decoded.block_hash == record.block_hash);
+    BOOST_CHECK_EQUAL(decoded.height, 1234);
+    BOOST_CHECK(decoded.payload == record.payload);
+    BOOST_CHECK(check(bytes, "v1-abd", uint256{1}) == DerivedStateCheck::OTHER_BUILD);
+    BOOST_CHECK(check(bytes, "v1-abc", uint256{3}) == DerivedStateCheck::OTHER_PARAMS);
+    for (size_t i{0}; i < bytes.size(); ++i) {
+        std::vector<unsigned char> flipped{bytes};
+        flipped[i] ^= 0x01;
+        const DerivedStateCheck result{check(flipped, "v1-abc", uint256{1})};
+        BOOST_CHECK(result != DerivedStateCheck::OK);
+        if (i == 0) BOOST_CHECK(result == DerivedStateCheck::OTHER_FORMAT);
+    }
+    for (size_t n{0}; n < bytes.size(); ++n) {
+        BOOST_CHECK(check(std::span{bytes}.first(n), "v1-abc", uint256{1}) != DerivedStateCheck::OK);
+    }
+    std::vector<unsigned char> longer{bytes};
+    longer.push_back(0);
+    BOOST_CHECK(check(longer, "v1-abc", uint256{1}) == DerivedStateCheck::MALFORMED);
+}
+
+BOOST_AUTO_TEST_CASE(derived_state_store_round_trip)
+{
+    const auto id{node::DerivedStateId::FINALITY_BINDINGS};
+    node::DerivedStateStore store{DBParams{
+        .path = m_args.GetDataDirNet() / "derivedstate",
+        .cache_bytes = 1 << 20,
+        .memory_only = true}};
+    BOOST_CHECK(!store.Read(id));
+    const std::vector<unsigned char> value{9, 8, 7};
+    store.Write(id, value);
+    BOOST_CHECK(store.Read(id) == std::optional{value});
+    store.Erase(id);
+    BOOST_CHECK(!store.Read(id));
+}
+
+// The digest covers exactly what the binding derivation reads: the era
+// boundary and the modern chain domain.
+BOOST_AUTO_TEST_CASE(binding_params_digest_reads_four_fields)
+{
+    Consensus::Params params{CreateChainParams(ArgsManager{}, ChainType::REGTEST)->GetConsensus()};
+    params.legacy_b3coin = true;
+    params.hard_fork_height = 100;
+    params.legacy_final_hash = uint256{7};
+    const uint256 base{FinalityBindingTracker::ParamsDigest(params)};
+    const auto differs{[&](const auto& mutate) {
+        Consensus::Params changed{params};
+        mutate(changed);
+        return FinalityBindingTracker::ParamsDigest(changed) != base;
+    }};
+    BOOST_CHECK(differs([](Consensus::Params& p) { p.hashGenesisBlock = uint256{8}; }));
+    BOOST_CHECK(differs([](Consensus::Params& p) { p.legacy_b3coin = false; }));
+    BOOST_CHECK(differs([](Consensus::Params& p) { p.hard_fork_height = 101; }));
+    BOOST_CHECK(differs([](Consensus::Params& p) { p.legacy_final_hash = uint256{9}; }));
+    // Unset is not zero.
+    const auto digest_with{[&](const auto& mutate) {
+        Consensus::Params changed{params};
+        mutate(changed);
+        return FinalityBindingTracker::ParamsDigest(changed);
+    }};
+    BOOST_CHECK(digest_with([](Consensus::Params& p) { p.hard_fork_height = 0; }) !=
+                digest_with([](Consensus::Params& p) { p.hard_fork_height.reset(); }));
+    BOOST_CHECK(digest_with([](Consensus::Params& p) { p.legacy_final_hash = uint256{}; }) !=
+                digest_with([](Consensus::Params& p) { p.legacy_final_hash.reset(); }));
+    // Parameters the derivation does not read leave the digest alone.
+    BOOST_CHECK(!differs([](Consensus::Params& p) { p.h1 = Consensus::H1Params{}; }));
+    BOOST_CHECK(!differs([](Consensus::Params& p) { p.transition_pow_length = 7; }));
+}
+
+BOOST_AUTO_TEST_CASE(source_build_id_names_clean_sources_only)
+{
+    if (const auto id{SourceBuildId()}) {
+        BOOST_CHECK(!id->empty());
+        BOOST_CHECK(!id->ends_with("-dirty"));
+        BOOST_CHECK(id->find('$') == std::string::npos);
+    }
 }
 
 BOOST_AUTO_TEST_SUITE_END()

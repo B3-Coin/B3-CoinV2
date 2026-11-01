@@ -174,6 +174,10 @@ public:
     bool Synced(const uint256& tip_hash) const { return !m_dirty && m_synced_tip == tip_hash; }
     const FinalityBindingIndex& Index() const { return m_index; }
 
+    //! B0b: a digest of every consensus parameter this tracker's derivation
+    //! reads. A persisted state is used only under the same digest.
+    static uint256 ParamsDigest(const Consensus::Params& params);
+
 private:
     //! Verify+apply one block; false (and dirty) on failure.
     bool ApplyBlock(const CBlock& block, int height, const Consensus::Params& params);

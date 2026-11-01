@@ -20,6 +20,7 @@
 // Windows .rc files include this header, but they cannot cope with real C++ code.
 #if !defined(RC_INVOKED)
 
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -33,6 +34,16 @@ extern const std::string UA_NAME;
 
 std::string FormatFullVersion();
 std::string FormatSubVersion(const std::string& name, int nClientVersion, const std::vector<std::string>& comments);
+
+/**
+ * An identifier of the exact sources this binary was built from: the tag of
+ * a clean tagged checkout, otherwise the version and the commit. Nullopt for
+ * a checkout with uncommitted changes to tracked files (what
+ * GenerateBuildInfo.cmake calls dirty) and for a build without git
+ * information, whose sources cannot be told apart. Unlike
+ * FormatFullVersion(), a release version does not hide the commit.
+ */
+std::optional<std::string> SourceBuildId();
 
 std::string CopyrightHolders(const std::string& strPrefix);
 
