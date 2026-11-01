@@ -34,8 +34,11 @@ std::optional<ValidatorSetSnapshot> ValidatorSetSnapshot::Build(const uint64_t e
         const auto pk{bls::PublicKey::Decode(m.bls_pubkey)};
         if (!pk) return std::nullopt; // cannot happen for a binding that passed consensus; fail closed anyway
         // Provenance: every bls_pubkey in the binding index passed its PoP in
-        // consensus when the binding connected (or was re-verified on rebuild);
-        // this is the permitted TrustedFromValidatedChain use.
+        // consensus when the binding connected, or was re-verified on rebuild
+        // or, for the finality tracker's index restored from a B0b record, by
+        // FinalityTracker::Decode at load (P1); this is the permitted
+        // TrustedFromValidatedChain use. The chainstate's binding index,
+        // restored without its proofs (record id 2), must never come here.
         keys.push_back(bls::VerifiedPublicKey::TrustedFromValidatedChain(*pk));
     }
     return Assemble(epoch, std::move(members), std::move(keys));

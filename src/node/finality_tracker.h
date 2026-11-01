@@ -20,6 +20,7 @@
 #include <deque>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <utility>
 #include <vector>
@@ -221,11 +222,52 @@ public:
     //! longer kept, or in fresh-key mode (whose index keeps no undo).
     void BlockDisconnected(const CBlockIndex& index, const Consensus::Params& params);
     void MarkDirty() { m_dirty = true; }
-    //! Full rebuilds started by Sync(), its own and its stake registry's
-    //! (tests: a reorg the undo history covers must not add one).
-    uint64_t Rebuilds() const { return m_rebuilds + m_stakes.Rebuilds(); }
+    //! Full rebuilds started by Sync(), its own and its stake registry's and
+    //! binding index's (tests: a reorg the undo history covers, or a start
+    //! from a persisted state, must not add one).
+    uint64_t Rebuilds() const { return m_rebuilds + m_stakes.Rebuilds() + m_bindings.Rebuilds(); }
     bool Synced(const uint256& tip_hash) const { return !m_dirty && m_synced_tip == tip_hash; }
     int SyncedHeight() const { return m_synced_height; }
+
+    //! B0b: a digest of every consensus parameter the derivation reads: this
+    //! tracker's, its private trackers' and that of the bridge withdrawal
+    //! roots its certificate checks read. A superset: every bridge pin and
+    //! the A1, A2 and A3 heights are included. A persisted state is used
+    //! only under the same digest.
+    static uint256 ParamsDigest(const Consensus::Params& params);
+    /**
+     * B0b: the whole tracker as one canonical byte string, the finality
+     * group's record payload (doc/design/b3-b0b-durable-derived-state.md,
+     * section 4.3): the private binding index, the proofs of possession of
+     * its keys and the private stake registry, each length-prefixed; a
+     * table of every distinct validator set the states refer to, each once,
+     * in the order the states first name it; the state; and the undo
+     * history, oldest first, each prior state's epoch starts given as a
+     * prefix length of the state's. Nullopt when nothing may be persisted:
+     * the fresh lineage or bridge V2 configured, no modern-PoS rules, the
+     * tracker or its private trackers not in step, a key without its proof,
+     * or a prior state whose epoch starts are not a prefix of the state's.
+     */
+    std::optional<std::vector<unsigned char>> Encode(const Consensus::Params& params) const;
+    /**
+     * B0b: the tracker that Encode() wrote when synced to `block`, synced
+     * there with its private trackers; the fresh key index is left to its
+     * own rebuild. Nullopt unless `bytes` is exactly such an encoding (no
+     * byte left over, each set named in table order, none unnamed, none
+     * twice), its undo records name the chain's blocks ending at `block`,
+     * each state holds the invariants the rules keep as of its own block,
+     * and then, under P1 (section 5), every key passes its proof of
+     * possession and every set rebuilt from its members with those keys has
+     * its stored set hash. Every other check runs before any BLS work.
+     */
+    static std::optional<FinalityTracker> Decode(std::span<const unsigned char> bytes, const CBlockIndex& block,
+                                                 const Consensus::Params& params);
+    //! B0b: synced to the same block as `rebuilt` (a tracker rebuilt from
+    //! blocks) with the same state, sets compared by value with binding_seq;
+    //! an undo history that is a suffix of `rebuilt`'s (a reorganization
+    //! leaves a live tracker a shorter one); and the same private stake
+    //! registry, binding index and proofs.
+    bool SameState(const FinalityTracker& rebuilt) const;
 
     /**
      * Consensus judgement of the certificate (if any) carried by `block`,

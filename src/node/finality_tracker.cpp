@@ -6,16 +6,24 @@
 
 #include <chain.h>
 #include <consensus/era.h>
+#include <crypto/bls.h>
+#include <hash.h>
 #include <logging.h>
 #include <modern/chain_domain.h>
 #include <modern/finality_certificate.h>
 #include <modern/pos_v1.h>
 #include <node/blockstorage.h>
 #include <node/bridge_state.h>
+#include <serialize.h>
+#include <streams.h>
 #include <util/check.h>
 
 #include <algorithm>
+#include <array>
+#include <functional>
+#include <ios>
 #include <limits>
+#include <map>
 
 namespace node {
 
@@ -688,6 +696,471 @@ void FinalityTracker::BlockDisconnected(const CBlockIndex& index, const Consensu
     m_tip_snapshot = TipSnapshotMemo{};
     m_synced_tip = parent;
     m_synced_height = index.pprev->nHeight;
+}
+
+// ------------------------------------------------------------ B0b record
+
+namespace {
+
+//! Sets compared by value: the header, the members and each member's
+//! binding_seq, which operator== leaves out.
+bool SameSet(const ValidatorSetSnapshot& a, const ValidatorSetSnapshot& b)
+{
+    if (!(a == b)) return false;
+    for (size_t i{0}; i < a.Size(); ++i) {
+        if (a.Members()[i].binding_seq != b.Members()[i].binding_seq) return false;
+    }
+    return true;
+}
+
+bool SameSetRef(const std::shared_ptr<const ValidatorSetSnapshot>& a,
+                const std::shared_ptr<const ValidatorSetSnapshot>& b)
+{
+    if (!a || !b) return !a && !b;
+    return a == b || SameSet(*a, *b);
+}
+
+//! States compared field by field, sets by value. No persisted state has a
+//! fresh lineage, so a state with one is never the same as another.
+bool SameFinalityState(const FinalityTracker::State& a, const FinalityTracker::State& b)
+{
+    if (a.fresh || b.fresh || a.fresh_unavailable != b.fresh_unavailable ||
+        a.bootstrapped != b.bootstrapped || a.epoch != b.epoch || a.epoch_starts != b.epoch_starts ||
+        !SameSetRef(a.bootstrap, b.bootstrap) || !SameSetRef(a.previous, b.previous) ||
+        !SameSetRef(a.current, b.current) || !SameSetRef(a.next, b.next) ||
+        a.handover_certified != b.handover_certified || a.lineage_broken != b.lineage_broken ||
+        a.finalized != b.finalized || a.producers.has_value() != b.producers.has_value()) {
+        return false;
+    }
+    if (!a.producers) return true;
+    const ProducerSchedule& p{*a.producers};
+    const ProducerSchedule& q{*b.producers};
+    return p.epoch == q.epoch && p.epoch_start == q.epoch_start && SameSetRef(p.current, q.current) &&
+           SameSetRef(p.next, q.next) && p.last_escape_height == q.last_escape_height && p.escapes == q.escapes;
+}
+
+//! A set as read: what FromMembers takes, and the set hash it must give.
+struct StoredSet {
+    uint64_t epoch{0};
+    uint256 hash;
+    std::vector<ValidatorSetMember> members;
+};
+
+//! A state as read, its sets still numbers into the table (0: no set).
+struct StoredState {
+    FinalityTracker::State state;
+    std::array<uint64_t, 4> sets{}; // bootstrap, previous, current, next
+    uint64_t producer_current{0};
+    uint64_t producer_next{0};
+};
+
+/**
+ * The invariants the rules keep for a state as of the block `at` (design
+ * section 6, item 4), checked on the numbers of its sets before any key is
+ * verified: below M the empty state; from M one epoch start per epoch, the
+ * first at M, rising, none above `at`; without Set_0 no set, handover,
+ * break or checkpoint; with it the sets of epochs 0, e and e + 1, and of
+ * e - 1 from epoch 1; a finalized checkpoint on this chain, in the epoch of
+ * its height, certified at or above it and at or below `at`; and the H1
+ * producer schedule exactly where H1 is active, started at or above R_h and
+ * at or below `at`, its sets of epochs k and k + 1.
+ */
+bool StateInvariantsHold(const StoredState& stored, const std::vector<StoredSet>& sets, const CBlockIndex& at,
+                         const int modern_start, const Consensus::Params& params)
+{
+    const FinalityTracker::State& s{stored.state};
+    const auto epoch_of{[&sets](const uint64_t set) -> std::optional<uint64_t> {
+        if (set == 0) return std::nullopt;
+        return sets[set - 1].epoch;
+    }};
+    const bool no_set{std::ranges::all_of(stored.sets, [](const uint64_t set) { return set == 0; })};
+    if (at.nHeight < modern_start) {
+        return !s.bootstrapped && s.epoch == 0 && s.epoch_starts.empty() && no_set && !s.handover_certified &&
+               !s.lineage_broken && !s.finalized && !s.producers;
+    }
+    if (s.epoch_starts.empty() || s.epoch_starts.size() - 1 != s.epoch || s.epoch_starts.front() != modern_start ||
+        s.epoch_starts.back() > at.nHeight ||
+        std::ranges::adjacent_find(s.epoch_starts, std::greater_equal<>{}) != s.epoch_starts.end()) {
+        return false;
+    }
+    const auto [bootstrap, previous, current, next]{stored.sets};
+    if (!s.bootstrapped) {
+        if (s.epoch != 0 || !no_set || s.handover_certified || s.lineage_broken || s.finalized) return false;
+    } else if (epoch_of(bootstrap) != 0 || epoch_of(current) != s.epoch || epoch_of(next) != s.epoch + 1 ||
+               (s.epoch == 0 ? previous != 0 : epoch_of(previous) != s.epoch - 1)) {
+        return false;
+    }
+    if (s.finalized) {
+        const FinalizedCheckpoint& f{*s.finalized};
+        const CBlockIndex* checkpoint{f.height >= modern_start ? at.GetAncestor(f.height) : nullptr};
+        if (checkpoint == nullptr || checkpoint->GetBlockHash() != f.block_hash || f.certified_at < f.height ||
+            f.certified_at > at.nHeight || modern::EpochOfHeight(s.epoch_starts, f.height) != f.epoch) {
+            return false;
+        }
+    }
+    if (s.producers.has_value() != params.H1RulesActive(at.nHeight)) return false;
+    if (s.producers) {
+        const ProducerSchedule& p{*s.producers};
+        if (p.epoch_start < params.h1->activation_height || p.epoch_start > at.nHeight ||
+            (stored.producer_current != 0 && epoch_of(stored.producer_current) != p.epoch) ||
+            (stored.producer_next != 0 && epoch_of(stored.producer_next) != p.epoch + 1)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+} // namespace
+
+uint256 FinalityTracker::ParamsDigest(const Consensus::Params& params)
+{
+    // Keep in step with Sync, BlockConnected, ApplyModern and the
+    // projections; with the private trackers (the binding tracker's digest,
+    // and reorg_horizon for the undo depths); and with the bridge index
+    // behind FinalityWithdrawalRoot, whose roots the certificate checks
+    // read. Every busd_bridge pin, the bridge withdrawal activation and the
+    // A1, A2 and A3 heights are in, read today or not: a superset costs one
+    // rebuild after a change, a missing field a stale state.
+    HashWriter h{};
+    const auto height{[&h](const std::optional<int>& value) {
+        h << value.has_value() << int32_t{value.value_or(0)};
+    }};
+    const auto optional_field{[&h](const auto& value) {
+        h << value.has_value();
+        if (value) h << *value;
+    }};
+    h << std::string{"B3/derived-state/finality-group"} << FinalityBindingTracker::ParamsDigest(params)
+      << int32_t{params.transition_pow_length} << params.modern_pos.has_value();
+    if (params.modern_pos) {
+        const Consensus::ModernPosParams& p{*params.modern_pos};
+        h << p.block_interval_seconds << p.round_seconds << p.f0_num << p.f0_den << p.sentinel_bits
+          << p.max_future_seconds << p.reward << p.halving_interval << p.treasury_percent << p.treasury_script;
+        height(p.reorg_horizon);
+        h << int32_t{p.finality_epoch_blocks} << int32_t{p.checkpoint_interval} << int32_t{p.checkpoint_depth}
+          << int32_t{p.max_epoch_extension} << int32_t{p.min_finality_set};
+    }
+    h << params.h1.has_value();
+    if (params.h1) h << int32_t{params.h1->activation_height} << params.h1->escape_rounds;
+    // Never written under these regtest knobs (Encode), so presence is all.
+    h << params.fresh_lineage.has_value() << params.bridge_v2.has_value();
+    height(params.fn_pod_activation_height);
+    height(params.asset_activation_height);
+    height(params.flowmesh_activation_height);
+    height(params.bridge_withdrawal_activation_height);
+    h << params.busd_bridge.has_value();
+    if (params.busd_bridge) {
+        const Consensus::BridgeAssetParams& b{*params.busd_bridge};
+        h << b.asset.version << b.asset.origin_chain_id << b.asset.vault_address << b.asset.token_address
+          << b.asset.origin_decimals << b.asset.asset_decimals;
+        optional_field(b.origin_deployment_block);
+        optional_field(b.vault_runtime_code_hash);
+        optional_field(b.implementation_or_adapter);
+        optional_field(b.adapter_version);
+        optional_field(b.recipient_encoding_version);
+        optional_field(b.activation_height);
+        optional_field(b.approval_last_height);
+        h << b.mint_caps.has_value();
+        if (b.mint_caps) {
+            h << b.mint_caps->max_per_block << b.mint_caps->max_per_epoch << b.mint_caps->epoch_length_blocks;
+        }
+        h << b.light_client.has_value();
+        if (b.light_client) {
+            const Consensus::EthereumLightClientPins& l{*b.light_client};
+            h << l.trusted_checkpoint_root << l.trusted_checkpoint_slot << l.genesis_validators_root;
+            WriteCompactSize(h, l.fork_schedule.size());
+            for (const Consensus::EthereumForkVersionPin& fork : l.fork_schedule) {
+                h << fork.activation_epoch << fork.fork_version;
+            }
+            h << l.fork_schedule_valid_through_epoch << l.electra_epoch
+              << uint32_t{l.min_sync_committee_participants} << l.max_sync_lag_slots;
+        }
+        h << b.withdrawal_mode.has_value();
+        if (b.withdrawal_mode) h << static_cast<uint8_t>(*b.withdrawal_mode);
+        h << b.managed_withdrawal.has_value();
+        if (b.managed_withdrawal) {
+            const Consensus::BridgeManagedWithdrawalPins& m{*b.managed_withdrawal};
+            h << m.authority_address << m.vault_runtime_code_hash << m.withdrawal_rules_version
+              << m.withdrawal_rules_commitment;
+        }
+        h << b.decentralized_withdrawal.has_value();
+        if (b.decentralized_withdrawal) {
+            const Consensus::BridgeDecentralizedWithdrawalPins& d{*b.decentralized_withdrawal};
+            h << d.ethereum_verifier_address << d.ethereum_verifier_code_hash << d.bootstrap_validator_set_hash
+              << d.withdrawal_rules_version << d.withdrawal_rules_commitment << d.min_bridge_validators
+              << d.max_bridge_validators << d.min_bridge_total_weight << d.max_epoch_lag;
+        }
+    }
+    return h.GetSHA256();
+}
+
+std::optional<std::vector<unsigned char>> FinalityTracker::Encode(const Consensus::Params& params) const
+{
+    // Not persisted (section 4.3): the fresh lineage and bridge V2, regtest
+    // knobs whose state this record does not hold; a chain without
+    // modern-PoS rules; a tracker or private tracker out of step.
+    if (params.fresh_lineage || params.bridge_v2 || !params.modern_pos) return std::nullopt;
+    if (m_dirty || !m_stakes.Synced(m_synced_tip) || !m_bindings.Synced(m_synced_tip)) return std::nullopt;
+    const auto pops{m_bindings.Index().EncodePops()};
+    if (!pops) return std::nullopt;
+
+    // The states first, numbering each distinct set as they first name it
+    // (0: no set). The table that precedes them lists the sets in that order.
+    std::vector<const ValidatorSetSnapshot*> table;
+    std::map<const ValidatorSetSnapshot*, uint64_t> numbers;
+    const auto number{[&](const std::shared_ptr<const ValidatorSetSnapshot>& set) -> uint64_t {
+        if (!set) return 0;
+        if (const auto it{numbers.find(set.get())}; it != numbers.end()) return it->second;
+        // A set copied rather than shared is still one set.
+        size_t n{0};
+        while (n < table.size() && !SameSet(*table[n], *set)) ++n;
+        if (n == table.size()) table.push_back(set.get());
+        numbers.emplace(set.get(), n + 1);
+        return n + 1;
+    }};
+    std::vector<unsigned char> states;
+    VectorWriter w{states, 0};
+    const auto write_state{[&](const State& s, const bool prior) {
+        if (s.fresh || s.fresh_unavailable) return false;
+        w << uint8_t{s.bootstrapped} << s.epoch;
+        WriteCompactSize(w, s.epoch_starts.size());
+        if (prior) {
+            // A prior state is an ancestor's: its epoch starts begin the state's.
+            if (s.epoch_starts.size() > m_state.epoch_starts.size() ||
+                !std::equal(s.epoch_starts.begin(), s.epoch_starts.end(), m_state.epoch_starts.begin())) {
+                return false;
+            }
+        } else {
+            for (const int start : s.epoch_starts) w << int32_t{start};
+        }
+        for (const auto* set : {&s.bootstrap, &s.previous, &s.current, &s.next}) WriteCompactSize(w, number(*set));
+        w << uint8_t{s.handover_certified} << uint8_t{s.lineage_broken} << uint8_t{s.finalized.has_value()};
+        if (s.finalized) {
+            w << int32_t{s.finalized->height} << s.finalized->block_hash << s.finalized->epoch
+              << int32_t{s.finalized->certified_at};
+        }
+        w << uint8_t{s.producers.has_value()};
+        if (s.producers) {
+            const ProducerSchedule& p{*s.producers};
+            w << p.epoch << int32_t{p.epoch_start};
+            WriteCompactSize(w, number(p.current));
+            WriteCompactSize(w, number(p.next));
+            w << int32_t{p.last_escape_height} << p.escapes;
+        }
+        return true;
+    }};
+    if (!write_state(m_state, /*prior=*/false)) return std::nullopt;
+    WriteCompactSize(w, m_undo.size());
+    for (const BlockUndo& undo : m_undo) {
+        w << undo.hash;
+        if (!write_state(undo.prior, /*prior=*/true)) return std::nullopt;
+    }
+
+    std::vector<unsigned char> out;
+    VectorWriter o{out, 0};
+    o << m_bindings.Index().Encode() << *pops << m_stakes.Encode();
+    WriteCompactSize(o, table.size());
+    for (const ValidatorSetSnapshot* set : table) {
+        o << set->Epoch() << set->SetHash();
+        WriteCompactSize(o, set->Size());
+        for (const ValidatorSetMember& m : set->Members()) {
+            o << m.validator_key << m.bls_pubkey << m.weight << m.binding_seq;
+        }
+    }
+    out.insert(out.end(), states.begin(), states.end());
+    return out;
+}
+
+std::optional<FinalityTracker> FinalityTracker::Decode(const std::span<const unsigned char> bytes,
+                                                       const CBlockIndex& block, const Consensus::Params& params)
+{
+    if (params.fresh_lineage || params.bridge_v2 || !params.modern_pos) return std::nullopt;
+    const std::optional<int> final_height{Consensus::LegacyFinalHeight(params)};
+    const std::optional<int> modern_start{Consensus::ModernPosStartHeight(params)};
+    if (!final_height || !modern_start || block.nHeight < *final_height) return std::nullopt;
+
+    std::optional<FinalityBindingIndex> bindings;
+    std::optional<StakeTracker> stakes;
+    std::vector<StoredSet> sets;
+    StoredState tip;
+    std::vector<std::pair<uint256, StoredState>> priors;
+    try {
+        SpanReader r{bytes};
+        std::vector<unsigned char> part;
+        r >> part;
+        bindings = FinalityBindingIndex::Decode(part, *final_height + 1, block.nHeight);
+        if (!bindings) return std::nullopt;
+        r >> part;
+        if (!bindings->DecodePops(part)) return std::nullopt;
+        r >> part;
+        stakes = StakeTracker::Decode(part, block, params);
+        if (!stakes) return std::nullopt;
+
+        const uint64_t count{ReadCompactSize(r)};
+        for (uint64_t i{0}; i < count; ++i) {
+            StoredSet set;
+            r >> set.epoch >> set.hash;
+            const uint64_t members{ReadCompactSize(r)};
+            if (members == 0 || members > modern::MAX_FINALITY_SET) return std::nullopt;
+            for (uint64_t j{0}; j < members; ++j) {
+                ValidatorSetMember m;
+                r >> m.validator_key >> m.bls_pubkey >> m.weight >> m.binding_seq;
+                set.members.push_back(m);
+            }
+            sets.push_back(std::move(set));
+        }
+        std::vector<bool> named(sets.size());
+        const auto read_set{[&](uint64_t& set) {
+            set = ReadCompactSize(r);
+            if (set > sets.size()) return false;
+            if (set != 0) named[set - 1] = true;
+            return true;
+        }};
+        const auto read_flag{[&](bool& flag) {
+            uint8_t byte;
+            r >> byte;
+            flag = byte == 1;
+            return byte <= 1;
+        }};
+        // `starts`: the state's epoch starts, of which a prior state's are a prefix.
+        const auto read_state{[&](StoredState& stored, const std::vector<int>* starts) {
+            State& s{stored.state};
+            bool present;
+            if (!read_flag(s.bootstrapped)) return false;
+            r >> s.epoch;
+            const uint64_t n{ReadCompactSize(r)};
+            if (starts) {
+                if (n > starts->size()) return false;
+                s.epoch_starts.assign(starts->begin(), starts->begin() + n);
+            } else {
+                for (uint64_t i{0}; i < n; ++i) {
+                    int32_t start;
+                    r >> start;
+                    s.epoch_starts.push_back(start);
+                }
+            }
+            for (uint64_t& set : stored.sets) {
+                if (!read_set(set)) return false;
+            }
+            if (!read_flag(s.handover_certified) || !read_flag(s.lineage_broken) || !read_flag(present)) return false;
+            if (present) {
+                FinalizedCheckpoint f;
+                int32_t height;
+                int32_t certified_at;
+                r >> height >> f.block_hash >> f.epoch >> certified_at;
+                f.height = height;
+                f.certified_at = certified_at;
+                s.finalized = f;
+            }
+            if (!read_flag(present)) return false;
+            if (present) {
+                ProducerSchedule p;
+                int32_t start;
+                int32_t escape;
+                r >> p.epoch >> start;
+                if (!read_set(stored.producer_current) || !read_set(stored.producer_next)) return false;
+                r >> escape >> p.escapes;
+                p.epoch_start = start;
+                p.last_escape_height = escape;
+                s.producers = std::move(p);
+            }
+            return true;
+        }};
+        if (!read_state(tip, nullptr)) return std::nullopt;
+        const uint64_t records{ReadCompactSize(r)};
+        if (records > StakeTracker::UndoDepth(params)) return std::nullopt;
+        for (uint64_t i{0}; i < records; ++i) {
+            uint256 hash;
+            r >> hash;
+            StoredState prior;
+            if (!read_state(prior, &tip.state.epoch_starts)) return std::nullopt;
+            priors.emplace_back(hash, std::move(prior));
+        }
+        // Every set is named by some state.
+        if (!r.empty() || std::ranges::find(named, false) != named.end()) return std::nullopt;
+    } catch (const std::ios_base::failure&) {
+        return std::nullopt;
+    }
+
+    // The undo records name the chain's blocks ending at `block`, newest
+    // last, all above H; each prior state is that of its block's parent.
+    std::vector<const CBlockIndex*> parents(priors.size());
+    const CBlockIndex* index{&block};
+    for (size_t i{priors.size()}; i-- > 0;) {
+        if (index == nullptr || index->pprev == nullptr || index->nHeight <= *final_height ||
+            index->GetBlockHash() != priors[i].first) {
+            return std::nullopt;
+        }
+        parents[i] = index->pprev;
+        index = index->pprev;
+    }
+    if (!StateInvariantsHold(tip, sets, block, *modern_start, params)) return std::nullopt;
+    for (size_t i{0}; i < priors.size(); ++i) {
+        if (!StateInvariantsHold(priors[i].second, sets, *parents[i], *modern_start, params)) return std::nullopt;
+    }
+
+    // P1 (section 5): every key the binding index holds passes its proof of
+    // possession, and the sets take their keys from these alone.
+    const auto pops{bindings->KeyPops()};
+    if (!pops) return std::nullopt;
+    std::map<modern::BlsPubkeyBytes, bls::VerifiedPublicKey> keys;
+    for (const auto& [key, pop] : *pops) {
+        const auto pk{bls::PublicKey::Decode(key)};
+        const auto sig{bls::Signature::Decode(pop)};
+        if (!pk || !sig) return std::nullopt;
+        const auto verified{bls::VerifiedPublicKey::FromPoP(*pk, *sig)};
+        if (!verified) return std::nullopt;
+        keys.emplace(key, *verified);
+    }
+    std::vector<std::shared_ptr<const ValidatorSetSnapshot>> snapshots;
+    snapshots.reserve(sets.size());
+    for (StoredSet& set : sets) {
+        auto snapshot{ValidatorSetSnapshot::FromMembers(set.epoch, std::move(set.members), keys)};
+        if (!snapshot || snapshot->SetHash() != set.hash) return std::nullopt;
+        snapshots.push_back(std::make_shared<const ValidatorSetSnapshot>(std::move(*snapshot)));
+    }
+
+    const auto set_of{[&snapshots](const uint64_t set) -> std::shared_ptr<const ValidatorSetSnapshot> {
+        return set == 0 ? nullptr : snapshots[set - 1];
+    }};
+    const auto wire{[&set_of](StoredState& stored) {
+        State& s{stored.state};
+        s.bootstrap = set_of(stored.sets[0]);
+        s.previous = set_of(stored.sets[1]);
+        s.current = set_of(stored.sets[2]);
+        s.next = set_of(stored.sets[3]);
+        if (s.producers) {
+            s.producers->current = set_of(stored.producer_current);
+            s.producers->next = set_of(stored.producer_next);
+        }
+        return std::move(s);
+    }};
+    FinalityTracker tracker;
+    tracker.m_state = wire(tip);
+    for (auto& [hash, prior] : priors) tracker.m_undo.push_back(BlockUndo{.hash = hash, .prior = wire(prior)});
+    tracker.m_stakes = std::move(*stakes);
+    tracker.m_bindings.Install(std::move(*bindings), block);
+    tracker.m_synced_tip = block.GetBlockHash();
+    tracker.m_synced_height = block.nHeight;
+    tracker.m_dirty = false;
+    return tracker;
+}
+
+bool FinalityTracker::SameState(const FinalityTracker& rebuilt) const
+{
+    if (m_dirty || rebuilt.m_dirty || m_synced_tip != rebuilt.m_synced_tip ||
+        m_synced_height != rebuilt.m_synced_height || !SameFinalityState(m_state, rebuilt.m_state) ||
+        m_undo.size() > rebuilt.m_undo.size()) {
+        return false;
+    }
+    const size_t skip{rebuilt.m_undo.size() - m_undo.size()};
+    for (size_t i{0}; i < m_undo.size(); ++i) {
+        const BlockUndo& ours{m_undo[i]};
+        const BlockUndo& theirs{rebuilt.m_undo[skip + i]};
+        if (ours.hash != theirs.hash || !SameFinalityState(ours.prior, theirs.prior)) return false;
+    }
+    return m_stakes.SameState(rebuilt.m_stakes) && m_bindings.Synced(m_synced_tip) &&
+           rebuilt.m_bindings.Synced(m_synced_tip) && m_bindings.Index().SameState(rebuilt.m_bindings.Index()) &&
+           m_bindings.Index().KeyPops() == rebuilt.m_bindings.Index().KeyPops();
 }
 
 } // namespace node

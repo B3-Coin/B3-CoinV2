@@ -37,6 +37,7 @@
 #include <boost/test/unit_test.hpp>
 
 #include <algorithm>
+#include <functional>
 #include <limits>
 #include <map>
 #include <memory>
@@ -44,6 +45,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -2682,6 +2684,605 @@ BOOST_FIXTURE_TEST_CASE(b0b_stake_registry_codec, UndoChainFixture)
         BOOST_CHECK(live.SameState(rebuilt));
         BOOST_CHECK(!rebuilt.SameState(live));
         const auto decoded{node::StakeTracker::Decode(live.Encode(), tip, params)};
+        BOOST_REQUIRE(decoded);
+        BOOST_CHECK(decoded->SameState(rebuilt) && decoded->SameState(live) && live.SameState(*decoded));
+    }
+}
+
+// (B0b-2) The finality group's parameters digest changes with every field its
+// derivation reads, every bridge pin and the A1, A2 and A3 heights included
+// (a superset), tells an unset field from a zero one, and ignores fields
+// outside that set.
+BOOST_AUTO_TEST_CASE(b0b_finality_group_params_digest)
+{
+    using P = Consensus::Params;
+    P params{CreateChainParams(ArgsManager{}, ChainType::REGTEST)->GetConsensus()};
+    // Every field set, each optional one to something other than its zero.
+    params.legacy_b3coin = true;
+    params.hard_fork_height = 100;
+    params.legacy_final_hash = uint256{7};
+    params.transition_pow_length = 5;
+    params.modern_pos = Consensus::ModernPosParams{};
+    params.modern_pos->treasury_percent = 10;
+    params.modern_pos->treasury_script = {0x51};
+    params.h1 = Consensus::H1Params{.activation_height = 140, .escape_rounds = 9};
+    params.fresh_lineage.reset();
+    params.bridge_v2.reset();
+    params.fn_pod_activation_height = 150;
+    params.asset_activation_height = 160;
+    params.flowmesh_activation_height = 170;
+    params.bridge_withdrawal_activation_height = 180;
+    Consensus::BridgeAssetParams& bridge{params.busd_bridge.emplace()};
+    bridge.asset.origin_chain_id = 1;
+    bridge.asset.vault_address[0] = 1;
+    bridge.asset.token_address[0] = 2;
+    bridge.asset.origin_decimals = 6;
+    bridge.asset.asset_decimals = 6;
+    bridge.origin_deployment_block = 11;
+    bridge.vault_runtime_code_hash = uint256{12};
+    bridge.implementation_or_adapter = uint256{13};
+    bridge.adapter_version = 14;
+    bridge.recipient_encoding_version = 15;
+    bridge.activation_height = 16;
+    bridge.approval_last_height = 17;
+    bridge.mint_caps = Consensus::BridgeMintCaps{.max_per_block = 18, .max_per_epoch = 19, .epoch_length_blocks = 20};
+    Consensus::EthereumLightClientPins& light{bridge.light_client.emplace()};
+    light.trusted_checkpoint_root = uint256{21};
+    light.trusted_checkpoint_slot = 22;
+    light.genesis_validators_root = uint256{23};
+    light.fork_schedule = {Consensus::EthereumForkVersionPin{.activation_epoch = 24, .fork_version = {1, 2, 3, 4}}};
+    light.fork_schedule_valid_through_epoch = 25;
+    light.electra_epoch = 26;
+    light.min_sync_committee_participants = 27;
+    light.max_sync_lag_slots = 28;
+    bridge.withdrawal_mode = Consensus::BridgeWithdrawalMode::MANAGED_V1;
+    Consensus::BridgeManagedWithdrawalPins& managed{bridge.managed_withdrawal.emplace()};
+    managed.authority_address[0] = 3;
+    managed.vault_runtime_code_hash = uint256{29};
+    managed.withdrawal_rules_version = 30;
+    managed.withdrawal_rules_commitment = uint256{31};
+    Consensus::BridgeDecentralizedWithdrawalPins& decentralized{bridge.decentralized_withdrawal.emplace()};
+    decentralized.ethereum_verifier_address[0] = 4;
+    decentralized.ethereum_verifier_code_hash = uint256{32};
+    decentralized.bootstrap_validator_set_hash = uint256{33};
+    decentralized.withdrawal_rules_version = 34;
+    decentralized.withdrawal_rules_commitment = uint256{35};
+    decentralized.min_bridge_validators = 36;
+    decentralized.max_bridge_validators = 37;
+    decentralized.min_bridge_total_weight = 38;
+    decentralized.max_epoch_lag = 39;
+
+    using Mutate = std::function<void(P&)>;
+    const auto digest_with{[&](const Mutate& mutate) {
+        P changed{params};
+        mutate(changed);
+        return FinalityTracker::ParamsDigest(changed);
+    }};
+    const uint256 base{FinalityTracker::ParamsDigest(params)};
+    const std::vector<std::pair<std::string_view, Mutate>> fields{
+        // The binding tracker's, through its own digest.
+        {"genesis", [](P& p) { p.hashGenesisBlock = uint256{8}; }},
+        {"legacy_b3coin", [](P& p) { p.legacy_b3coin = false; }},
+        {"hard_fork_height", [](P& p) { p.hard_fork_height = 101; }},
+        {"legacy_final_hash", [](P& p) { p.legacy_final_hash = uint256{9}; }},
+        {"transition_pow_length", [](P& p) { p.transition_pow_length = 6; }},
+        {"modern_pos", [](P& p) { p.modern_pos.reset(); }},
+        {"block_interval_seconds", [](P& p) { ++p.modern_pos->block_interval_seconds; }},
+        {"round_seconds", [](P& p) { ++p.modern_pos->round_seconds; }},
+        {"f0_num", [](P& p) { ++p.modern_pos->f0_num; }},
+        {"f0_den", [](P& p) { ++p.modern_pos->f0_den; }},
+        {"sentinel_bits", [](P& p) { ++p.modern_pos->sentinel_bits; }},
+        {"max_future_seconds", [](P& p) { ++p.modern_pos->max_future_seconds; }},
+        {"reward", [](P& p) { ++p.modern_pos->reward; }},
+        {"halving_interval", [](P& p) { ++p.modern_pos->halving_interval; }},
+        {"treasury_percent", [](P& p) { ++p.modern_pos->treasury_percent; }},
+        {"treasury_script", [](P& p) { p.modern_pos->treasury_script.push_back(0x52); }},
+        {"reorg_horizon", [](P& p) { ++*p.modern_pos->reorg_horizon; }},
+        {"finality_epoch_blocks", [](P& p) { ++p.modern_pos->finality_epoch_blocks; }},
+        {"checkpoint_interval", [](P& p) { ++p.modern_pos->checkpoint_interval; }},
+        {"checkpoint_depth", [](P& p) { ++p.modern_pos->checkpoint_depth; }},
+        {"max_epoch_extension", [](P& p) { ++p.modern_pos->max_epoch_extension; }},
+        {"min_finality_set", [](P& p) { ++p.modern_pos->min_finality_set; }},
+        {"h1", [](P& p) { p.h1.reset(); }},
+        {"h1.activation_height", [](P& p) { ++p.h1->activation_height; }},
+        {"h1.escape_rounds", [](P& p) { ++p.h1->escape_rounds; }},
+        {"fresh_lineage", [](P& p) { p.fresh_lineage.emplace(); }},
+        {"bridge_v2", [](P& p) { p.bridge_v2.emplace(); }},
+        {"fn_pod_activation_height", [](P& p) { ++*p.fn_pod_activation_height; }},
+        {"asset_activation_height", [](P& p) { ++*p.asset_activation_height; }},
+        {"flowmesh_activation_height", [](P& p) { ++*p.flowmesh_activation_height; }},
+        {"bridge_withdrawal_activation_height", [](P& p) { ++*p.bridge_withdrawal_activation_height; }},
+        {"busd_bridge", [](P& p) { p.busd_bridge.reset(); }},
+        {"asset.version", [](P& p) { ++p.busd_bridge->asset.version; }},
+        {"asset.origin_chain_id", [](P& p) { ++p.busd_bridge->asset.origin_chain_id; }},
+        {"asset.vault_address", [](P& p) { ++p.busd_bridge->asset.vault_address[19]; }},
+        {"asset.token_address", [](P& p) { ++p.busd_bridge->asset.token_address[19]; }},
+        {"asset.origin_decimals", [](P& p) { ++p.busd_bridge->asset.origin_decimals; }},
+        {"asset.asset_decimals", [](P& p) { ++p.busd_bridge->asset.asset_decimals; }},
+        {"origin_deployment_block", [](P& p) { ++*p.busd_bridge->origin_deployment_block; }},
+        {"vault_runtime_code_hash", [](P& p) { p.busd_bridge->vault_runtime_code_hash = uint256{40}; }},
+        {"implementation_or_adapter", [](P& p) { p.busd_bridge->implementation_or_adapter = uint256{41}; }},
+        {"adapter_version", [](P& p) { ++*p.busd_bridge->adapter_version; }},
+        {"recipient_encoding_version", [](P& p) { ++*p.busd_bridge->recipient_encoding_version; }},
+        {"bridge activation_height", [](P& p) { ++*p.busd_bridge->activation_height; }},
+        {"approval_last_height", [](P& p) { ++*p.busd_bridge->approval_last_height; }},
+        {"mint_caps", [](P& p) { p.busd_bridge->mint_caps.reset(); }},
+        {"max_per_block", [](P& p) { ++p.busd_bridge->mint_caps->max_per_block; }},
+        {"max_per_epoch", [](P& p) { ++p.busd_bridge->mint_caps->max_per_epoch; }},
+        {"epoch_length_blocks", [](P& p) { ++p.busd_bridge->mint_caps->epoch_length_blocks; }},
+        {"light_client", [](P& p) { p.busd_bridge->light_client.reset(); }},
+        {"trusted_checkpoint_root", [](P& p) { p.busd_bridge->light_client->trusted_checkpoint_root = uint256{42}; }},
+        {"trusted_checkpoint_slot", [](P& p) { ++p.busd_bridge->light_client->trusted_checkpoint_slot; }},
+        {"genesis_validators_root", [](P& p) { p.busd_bridge->light_client->genesis_validators_root = uint256{43}; }},
+        {"fork_schedule", [](P& p) { p.busd_bridge->light_client->fork_schedule.clear(); }},
+        {"fork activation_epoch", [](P& p) { ++p.busd_bridge->light_client->fork_schedule[0].activation_epoch; }},
+        {"fork_version", [](P& p) { ++p.busd_bridge->light_client->fork_schedule[0].fork_version[3]; }},
+        {"fork_schedule_valid_through_epoch",
+         [](P& p) { ++p.busd_bridge->light_client->fork_schedule_valid_through_epoch; }},
+        {"electra_epoch", [](P& p) { ++p.busd_bridge->light_client->electra_epoch; }},
+        {"min_sync_committee_participants",
+         [](P& p) { ++p.busd_bridge->light_client->min_sync_committee_participants; }},
+        {"max_sync_lag_slots", [](P& p) { ++p.busd_bridge->light_client->max_sync_lag_slots; }},
+        {"withdrawal_mode",
+         [](P& p) { p.busd_bridge->withdrawal_mode = Consensus::BridgeWithdrawalMode::DECENTRALIZED_VERIFIER_V1; }},
+        {"managed_withdrawal", [](P& p) { p.busd_bridge->managed_withdrawal.reset(); }},
+        {"managed authority_address", [](P& p) { ++p.busd_bridge->managed_withdrawal->authority_address[19]; }},
+        {"managed vault_runtime_code_hash",
+         [](P& p) { p.busd_bridge->managed_withdrawal->vault_runtime_code_hash = uint256{44}; }},
+        {"managed withdrawal_rules_version",
+         [](P& p) { ++p.busd_bridge->managed_withdrawal->withdrawal_rules_version; }},
+        {"managed withdrawal_rules_commitment",
+         [](P& p) { p.busd_bridge->managed_withdrawal->withdrawal_rules_commitment = uint256{45}; }},
+        {"decentralized_withdrawal", [](P& p) { p.busd_bridge->decentralized_withdrawal.reset(); }},
+        {"ethereum_verifier_address",
+         [](P& p) { ++p.busd_bridge->decentralized_withdrawal->ethereum_verifier_address[19]; }},
+        {"ethereum_verifier_code_hash",
+         [](P& p) { p.busd_bridge->decentralized_withdrawal->ethereum_verifier_code_hash = uint256{46}; }},
+        {"bootstrap_validator_set_hash",
+         [](P& p) { p.busd_bridge->decentralized_withdrawal->bootstrap_validator_set_hash = uint256{47}; }},
+        {"decentralized withdrawal_rules_version",
+         [](P& p) { ++p.busd_bridge->decentralized_withdrawal->withdrawal_rules_version; }},
+        {"decentralized withdrawal_rules_commitment",
+         [](P& p) { p.busd_bridge->decentralized_withdrawal->withdrawal_rules_commitment = uint256{48}; }},
+        {"min_bridge_validators", [](P& p) { ++p.busd_bridge->decentralized_withdrawal->min_bridge_validators; }},
+        {"max_bridge_validators", [](P& p) { ++p.busd_bridge->decentralized_withdrawal->max_bridge_validators; }},
+        {"min_bridge_total_weight",
+         [](P& p) { ++p.busd_bridge->decentralized_withdrawal->min_bridge_total_weight; }},
+        {"max_epoch_lag", [](P& p) { ++p.busd_bridge->decentralized_withdrawal->max_epoch_lag; }},
+    };
+    for (const auto& [name, mutate] : fields) {
+        BOOST_CHECK_MESSAGE(digest_with(mutate) != base, "the digest ignores " << name);
+    }
+    // Unset is not zero.
+    const std::vector<std::pair<std::string_view, std::pair<Mutate, Mutate>>> optionals{
+        {"reorg_horizon", {[](P& p) { p.modern_pos->reorg_horizon = 0; }, [](P& p) { p.modern_pos->reorg_horizon.reset(); }}},
+        {"fn_pod_activation_height",
+         {[](P& p) { p.fn_pod_activation_height = 0; }, [](P& p) { p.fn_pod_activation_height.reset(); }}},
+        {"asset_activation_height",
+         {[](P& p) { p.asset_activation_height = 0; }, [](P& p) { p.asset_activation_height.reset(); }}},
+        {"flowmesh_activation_height",
+         {[](P& p) { p.flowmesh_activation_height = 0; }, [](P& p) { p.flowmesh_activation_height.reset(); }}},
+        {"bridge_withdrawal_activation_height",
+         {[](P& p) { p.bridge_withdrawal_activation_height = 0; },
+          [](P& p) { p.bridge_withdrawal_activation_height.reset(); }}},
+        {"origin_deployment_block",
+         {[](P& p) { p.busd_bridge->origin_deployment_block = 0; },
+          [](P& p) { p.busd_bridge->origin_deployment_block.reset(); }}},
+        {"vault_runtime_code_hash",
+         {[](P& p) { p.busd_bridge->vault_runtime_code_hash = uint256{}; },
+          [](P& p) { p.busd_bridge->vault_runtime_code_hash.reset(); }}},
+        {"implementation_or_adapter",
+         {[](P& p) { p.busd_bridge->implementation_or_adapter = uint256{}; },
+          [](P& p) { p.busd_bridge->implementation_or_adapter.reset(); }}},
+        {"adapter_version",
+         {[](P& p) { p.busd_bridge->adapter_version = 0; }, [](P& p) { p.busd_bridge->adapter_version.reset(); }}},
+        {"recipient_encoding_version",
+         {[](P& p) { p.busd_bridge->recipient_encoding_version = 0; },
+          [](P& p) { p.busd_bridge->recipient_encoding_version.reset(); }}},
+        {"bridge activation_height",
+         {[](P& p) { p.busd_bridge->activation_height = 0; }, [](P& p) { p.busd_bridge->activation_height.reset(); }}},
+        {"approval_last_height",
+         {[](P& p) { p.busd_bridge->approval_last_height = 0; },
+          [](P& p) { p.busd_bridge->approval_last_height.reset(); }}},
+        {"mint_caps",
+         {[](P& p) { p.busd_bridge->mint_caps = Consensus::BridgeMintCaps{}; },
+          [](P& p) { p.busd_bridge->mint_caps.reset(); }}},
+        {"light_client",
+         {[](P& p) { p.busd_bridge->light_client = Consensus::EthereumLightClientPins{}; },
+          [](P& p) { p.busd_bridge->light_client.reset(); }}},
+        {"managed_withdrawal",
+         {[](P& p) { p.busd_bridge->managed_withdrawal = Consensus::BridgeManagedWithdrawalPins{}; },
+          [](P& p) { p.busd_bridge->managed_withdrawal.reset(); }}},
+        {"decentralized_withdrawal",
+         {[](P& p) { p.busd_bridge->decentralized_withdrawal = Consensus::BridgeDecentralizedWithdrawalPins{}; },
+          [](P& p) { p.busd_bridge->decentralized_withdrawal.reset(); }}},
+    };
+    for (const auto& [name, pair] : optionals) {
+        BOOST_CHECK_MESSAGE(digest_with(pair.first) != digest_with(pair.second), "unset " << name << " is zero");
+    }
+    // Parameters the derivation does not read leave the digest alone.
+    BOOST_CHECK(digest_with([](P& p) { ++p.nPowTargetSpacing; }) == base);
+    BOOST_CHECK(digest_with([](P& p) { ++p.nPowTargetTimespan; }) == base);
+}
+
+namespace {
+
+//! The B0a chain (a certificate, a rotation, H1 with an escape, a binding,
+//! stakes created, spent, and created and spent in one block) with A's key
+//! rebound at seq 1, so that sets hold a nonzero binding_seq.
+struct FinalityGroupFixture : public UndoChainFixture {
+    int m_R_h{0};
+    int m_escape{0};
+
+    void BuildGroupChain(const int horizon)
+    {
+        PrepareFinalityChain(/*min_finality_set=*/1, /*reorg_horizon=*/horizon, /*with_unbound_c=*/true);
+        const int M{m_M};
+        const int E{SCALED_E};
+        m_R_h = M + 10;
+        m_escape = m_R_h + E + 5;
+        ConfigureH1(m_R_h);
+        const CMutableTransaction stake_d{StakeTx(4, m_vk_d, STAKE_D)};
+        const CMutableTransaction stake_d2{StakeTx(5, m_vk_d, STAKE_D)};
+        const auto bind_c{MakeBinding(m_validator_c, m_vk_c, &m_bls_c, 0)};
+        const auto rebind_a{MakeBinding(m_validator_a, m_vk_a, &m_bls_a, 1)}; // its own key again
+        // Certify V1 epoch 0 only (its handover rotates V1 at M + E).
+        const auto produce{[&](std::vector<CMutableTransaction> txs = {}) {
+            if (Tip()->nHeight + 1 <= M + E) {
+                ProduceCertifying(m_vk_a, std::move(txs));
+            } else {
+                Produce(m_vk_a, {}, std::move(txs));
+            }
+        }};
+        while (Tip()->nHeight < m_escape - 1) {
+            const int next{Tip()->nHeight + 1};
+            if (next == m_R_h + 2) {
+                produce({MakeTx(8, {bind_c.cell}, {bind_c.record})});
+            } else if (next == m_R_h + 3) {
+                produce({MakeTx(9, {rebind_a.cell}, {rebind_a.record})});
+            } else if (next == m_R_h + 4) {
+                produce({stake_d});
+            } else if (next == m_R_h + 5) {
+                produce({stake_d2, Unstake(stake_d2)}); // created and spent in one block
+            } else {
+                produce();
+            }
+        }
+        // C is bound but outside the producer set in force: its escape block.
+        BOOST_REQUIRE(!ProducersNext().current->IndexOf(m_vk_c).has_value());
+        ProduceInRound(m_vk_c, TEST_ESCAPE_ROUNDS);
+        BOOST_REQUIRE_EQUAL(FinalityState().producers->last_escape_height, m_escape);
+        produce();
+        produce({Unstake(stake_d)});
+        while (Tip()->nHeight < m_escape + 6) produce();
+        ArmStakes();
+        BOOST_REQUIRE(InStepAndAsRebuilt());
+    }
+};
+
+//! Where the parts of a finality group record start (section 4.3). Every
+//! count here is below 253, so each takes one byte.
+struct GroupLayout {
+    size_t pops{0};          //!< the proofs: a count, then key || proof
+    size_t stakes_prefix{0}; //!< the stake registry's length, then its bytes
+    size_t stakes_end{0};
+    size_t table{0};         //!< the set count, then the sets
+    std::vector<size_t> sets;
+    size_t state{0};         //!< the state, after the table
+};
+
+GroupLayout LayoutOf(const std::vector<unsigned char>& bytes)
+{
+    GroupLayout at;
+    SpanReader r{bytes};
+    const auto here{[&] { return bytes.size() - r.size(); }};
+    r.ignore(ReadCompactSize(r)); // the binding index
+    const uint64_t pops{ReadCompactSize(r)};
+    at.pops = here();
+    r.ignore(pops);
+    at.stakes_prefix = here();
+    r.ignore(ReadCompactSize(r));
+    at.stakes_end = here();
+    at.table = here();
+    const uint64_t sets{ReadCompactSize(r)};
+    for (uint64_t i{0}; i < sets; ++i) {
+        at.sets.push_back(here());
+        r.ignore(8 + 32);
+        r.ignore(ReadCompactSize(r) * (32 + 48 + 8 + 4));
+    }
+    at.state = here();
+    return at;
+}
+
+//! Where the fields of a state start that begins at `at` and has a finalized
+//! checkpoint and a producer schedule: its epoch starts written out (the
+//! state) or only counted (a prior state).
+struct StateLayout {
+    size_t epoch_starts{0}; //!< the first start, when written out
+    size_t sets{0};         //!< bootstrap, previous, current, next
+    size_t finalized{0};    //!< its height
+    size_t producer_epoch_start{0};
+    size_t escapes{0};
+};
+
+StateLayout StateFields(const size_t at, const size_t starts, const bool prior)
+{
+    StateLayout s;
+    s.epoch_starts = at + 1 + 8 + 1;
+    s.sets = s.epoch_starts + (prior ? 0 : 4 * starts);
+    s.finalized = s.sets + 4 + 1 + 1 + 1;
+    const size_t producers{s.finalized + 4 + 32 + 8 + 4 + 1};
+    s.producer_epoch_start = producers + 8;
+    s.escapes = s.producer_epoch_start + 4 + 2 + 4;
+    return s;
+}
+
+} // namespace
+
+// (B0b-3) The finality group's record gives back the tracker it was written
+// from: the state, the undo history, every set with its binding_seq, and the
+// private stake registry, binding index and proofs. The chain carries a
+// certificate, a rotation, H1 with an escape, bindings, a rebinding and
+// stake changes. The decoded tracker resumes forward and undoes in place
+// without a rebuild; after a reorganization the live tracker's shorter
+// history decodes as a suffix of a rebuild's. Nothing is written for a
+// tracker out of step or under the fresh lineage or bridge V2. Refused:
+// every truncation, a byte more, another block, a shorter horizon (also for
+// the finality history alone), proofs of possession that fail, a stored set
+// hash that does not match, an undo record or finalized checkpoint off the
+// chain, epoch starts not from M, sets of the wrong epochs, a producer
+// schedule from before R_h, a non-empty prior state below M, and a set no
+// state names. A changed binding_seq or escape count, of the state or of a
+// prior state, decodes but is not the state.
+BOOST_FIXTURE_TEST_CASE(b0b_finality_group_codec, FinalityGroupFixture)
+{
+    constexpr int HORIZON{40};
+    BuildGroupChain(HORIZON);
+    const int M{m_M};
+    {
+        LOCK(cs_main);
+        Chainstate& cs{m_node.chainman->ActiveChainstate()};
+        const Consensus::Params& params{m_node.chainman->GetConsensus()};
+        const CBlockIndex& tip{*cs.m_chain.Tip()};
+        const int H{*Consensus::LegacyFinalHeight(params)};
+        const FinalityTracker& live{LiveFinality()};
+        BOOST_REQUIRE(live.Synced(tip.GetBlockHash()));
+        FinalityTracker rebuilt;
+        BOOST_REQUIRE(rebuilt.Sync(cs.m_chain, cs.m_blockman, params, tip));
+        BOOST_REQUIRE(live.SameState(rebuilt) && rebuilt.SameState(live));
+        // What the record has to keep.
+        const FinalityTracker::State& state{live.Current()};
+        BOOST_REQUIRE(state.finalized && state.epoch == 1 && state.epoch_starts.size() == 2);
+        BOOST_REQUIRE(state.producers && state.producers->escapes == 1);
+        BOOST_REQUIRE(std::ranges::any_of(state.next->Members(), [](const auto& m) { return m.binding_seq == 1; }));
+
+        const auto bytes{live.Encode(params)};
+        BOOST_REQUIRE(bytes);
+        const auto decoded{FinalityTracker::Decode(*bytes, tip, params)};
+        BOOST_REQUIRE(decoded);
+        BOOST_CHECK(decoded->Synced(tip.GetBlockHash()));
+        BOOST_CHECK(decoded->SameState(live) && live.SameState(*decoded) && decoded->SameState(rebuilt));
+        BOOST_CHECK(decoded->Encode(params) == bytes);
+        BOOST_CHECK_EQUAL(decoded->Rebuilds(), 0U);
+        BOOST_CHECK(decoded->PinnedCheckpoint() == live.PinnedCheckpoint());
+        // The next block's producers, the escape's from the private trackers.
+        for (const std::optional<int64_t> round : {std::optional<int64_t>{}, std::optional<int64_t>{TEST_ESCAPE_ROUNDS}}) {
+            const auto ours{decoded->SetInForceAt(tip.nHeight + 1, params, round)};
+            const auto theirs{live.SetInForceAt(tip.nHeight + 1, params, round)};
+            BOOST_REQUIRE(ours && theirs);
+            BOOST_CHECK(*ours == *theirs);
+        }
+
+        // Nothing written for a tracker out of step, or under the knobs.
+        {
+            FinalityTracker dirty{live};
+            dirty.MarkDirty();
+            BOOST_CHECK(!dirty.Encode(params));
+            Consensus::Params fresh{params};
+            fresh.fresh_lineage.emplace();
+            BOOST_CHECK(!live.Encode(fresh));
+            BOOST_CHECK(!FinalityTracker::Decode(*bytes, tip, fresh));
+            Consensus::Params v2{params};
+            v2.bridge_v2.emplace();
+            BOOST_CHECK(!live.Encode(v2));
+            BOOST_CHECK(!FinalityTracker::Decode(*bytes, tip, v2));
+        }
+        // Decoded four blocks back, it catches up forward.
+        {
+            const CBlockIndex& older{*cs.m_chain[tip.nHeight - 4]};
+            FinalityTracker before;
+            BOOST_REQUIRE(before.Sync(cs.m_chain, cs.m_blockman, params, older));
+            const auto older_bytes{before.Encode(params)};
+            BOOST_REQUIRE(older_bytes);
+            auto resumed{FinalityTracker::Decode(*older_bytes, older, params)};
+            BOOST_REQUIRE(resumed);
+            BOOST_REQUIRE(resumed->Sync(cs.m_chain, cs.m_blockman, params, tip));
+            BOOST_CHECK_EQUAL(resumed->Rebuilds(), 0U);
+            BOOST_CHECK(resumed->SameState(rebuilt) && rebuilt.SameState(*resumed));
+        }
+        // It undoes in place through the escape: each parent as rebuilt there.
+        {
+            FinalityTracker undone{*decoded};
+            for (int height{tip.nHeight}; height >= m_escape; --height) {
+                undone.BlockDisconnected(*cs.m_chain[height], params);
+                FinalityTracker at_parent;
+                BOOST_REQUIRE(at_parent.Sync(cs.m_chain, cs.m_blockman, params, *cs.m_chain[height - 1]));
+                BOOST_CHECK_MESSAGE(undone.SameState(at_parent), "after undoing height " << height);
+            }
+            BOOST_CHECK_EQUAL(undone.Rebuilds(), 0U);
+        }
+
+        const auto refused{[&](const std::vector<unsigned char>& doctored, const CBlockIndex& at,
+                               const Consensus::Params& with) {
+            return !FinalityTracker::Decode(doctored, at, with).has_value();
+        }};
+        size_t accepted{0};
+        for (size_t n{0}; n < bytes->size(); ++n) {
+            accepted += !refused({bytes->begin(), bytes->begin() + n}, tip, params);
+        }
+        BOOST_CHECK_EQUAL(accepted, 0U);
+        std::vector<unsigned char> longer{*bytes};
+        longer.push_back(0);
+        BOOST_CHECK(refused(longer, tip, params));
+        BOOST_CHECK(refused(*bytes, *tip.pprev, params));
+        Consensus::Params shorter{params};
+        shorter.modern_pos->reorg_horizon = HORIZON - 1;
+        BOOST_CHECK(refused(*bytes, tip, shorter));
+
+        const GroupLayout at{LayoutOf(*bytes)};
+        // The finality history alone longer than the horizon: with a stake
+        // registry of the shorter history spliced in, it decodes under the
+        // full horizon only.
+        {
+            node::StakeTracker stakes;
+            BOOST_REQUIRE(stakes.Sync(cs.m_chain, cs.m_blockman, shorter, tip));
+            std::vector<unsigned char> spliced{bytes->begin(), bytes->begin() + at.stakes_prefix};
+            VectorWriter{spliced, spliced.size()} << stakes.Encode();
+            spliced.insert(spliced.end(), bytes->begin() + at.stakes_end, bytes->end());
+            BOOST_CHECK(!refused(spliced, tip, params));
+            BOOST_CHECK(refused(spliced, tip, shorter));
+        }
+        // P1: two keys' proofs swapped, each a valid signature by another key.
+        {
+            BOOST_REQUIRE_GE(int{bytes->at(at.pops)}, 2);
+            const size_t first{at.pops + 1 + 48};
+            const size_t second{first + 96 + 48};
+            std::vector<unsigned char> swapped{*bytes};
+            std::swap_ranges(swapped.begin() + first, swapped.begin() + first + 96, swapped.begin() + second);
+            BOOST_CHECK(refused(swapped, tip, params));
+        }
+        // A stored set hash that its members do not give.
+        {
+            std::vector<unsigned char> doctored{*bytes};
+            doctored[at.sets[0] + 8] ^= 1;
+            BOOST_CHECK(refused(doctored, tip, params));
+        }
+        // The tip's hash: the newest undo record of the stake registry, then
+        // of the group. Each is refused off the chain.
+        size_t newest{0};
+        {
+            const uint256 hash{tip.GetBlockHash()};
+            const auto found{Occurrences(*bytes, std::span<const unsigned char>{hash.begin(), hash.end()})};
+            BOOST_REQUIRE_EQUAL(found.size(), 2U);
+            BOOST_REQUIRE_GE(found[1], at.state);
+            newest = found[1];
+            for (const size_t offset : found) {
+                std::vector<unsigned char> doctored{*bytes};
+                doctored[offset] ^= 1;
+                BOOST_CHECK_MESSAGE(refused(doctored, tip, params), "tip hash at " << offset);
+            }
+        }
+        // The state's own fields.
+        const StateLayout fields{StateFields(at.state, state.epoch_starts.size(), /*prior=*/false)};
+        BOOST_REQUIRE_EQUAL(GetLE<int32_t>(*bytes, fields.epoch_starts), M);
+        BOOST_REQUIRE_EQUAL(int{bytes->at(fields.sets + 2)}, 2); // Set_e
+        BOOST_REQUIRE_EQUAL(int{bytes->at(fields.sets + 3)}, 3); // Set_{e+1}
+        BOOST_REQUIRE_EQUAL(GetLE<int32_t>(*bytes, fields.finalized), state.finalized->height);
+        BOOST_REQUIRE_EQUAL(GetLE<int32_t>(*bytes, fields.producer_epoch_start), state.producers->epoch_start);
+        BOOST_REQUIRE_EQUAL(GetLE<uint64_t>(*bytes, fields.escapes), 1U);
+        // The finalized checkpoint off the chain: in the state, and in the
+        // newest prior state, where the hash occurs last (the stake registry
+        // and the undo records hold it too, as a block's hash).
+        {
+            const uint256 hash{state.finalized->block_hash};
+            const auto found{Occurrences(*bytes, std::span<const unsigned char>{hash.begin(), hash.end()})};
+            const size_t own{fields.finalized + 4};
+            BOOST_REQUIRE(std::ranges::find(found, own) != found.end());
+            BOOST_REQUIRE_GT(found.back(), newest);
+            for (const size_t offset : {own, found.back()}) {
+                std::vector<unsigned char> doctored{*bytes};
+                doctored[offset] ^= 1;
+                BOOST_CHECK_MESSAGE(refused(doctored, tip, params), "finalized hash at " << offset);
+            }
+        }
+        {
+            std::vector<unsigned char> doctored{*bytes};
+            PutLE<int32_t>(doctored, fields.epoch_starts, M - 1);
+            BOOST_CHECK(refused(doctored, tip, params));
+            doctored = *bytes;
+            std::swap(doctored[fields.sets + 2], doctored[fields.sets + 3]);
+            BOOST_CHECK(refused(doctored, tip, params));
+            doctored = *bytes;
+            PutLE<int32_t>(doctored, fields.producer_epoch_start, m_R_h - 1);
+            BOOST_CHECK(refused(doctored, tip, params));
+            doctored = *bytes;
+            PutLE<uint64_t>(doctored, fields.escapes, 2);
+            const auto wrong{FinalityTracker::Decode(doctored, tip, params)};
+            BOOST_REQUIRE(wrong);
+            BOOST_CHECK(!wrong->SameState(rebuilt));
+        }
+        // The newest prior state's escape count.
+        {
+            const StateLayout prior{StateFields(newest + 32, 0, /*prior=*/true)};
+            BOOST_REQUIRE_EQUAL(GetLE<uint64_t>(*bytes, prior.escapes), 1U);
+            std::vector<unsigned char> doctored{*bytes};
+            PutLE<uint64_t>(doctored, prior.escapes, 2);
+            const auto wrong{FinalityTracker::Decode(doctored, tip, params)};
+            BOOST_REQUIRE(wrong);
+            BOOST_CHECK(!wrong->SameState(rebuilt));
+        }
+        // A member's binding_seq.
+        {
+            std::optional<size_t> seq_at;
+            for (const size_t set : at.sets) {
+                const size_t members{bytes->at(set + 8 + 32)};
+                for (size_t j{0}; j < members && !seq_at; ++j) {
+                    const size_t offset{set + 8 + 32 + 1 + j * 92 + 32 + 48 + 8};
+                    if (GetLE<uint32_t>(*bytes, offset) == 1) seq_at = offset;
+                }
+            }
+            BOOST_REQUIRE(seq_at);
+            std::vector<unsigned char> doctored{*bytes};
+            PutLE<uint32_t>(doctored, *seq_at, 2);
+            const auto wrong{FinalityTracker::Decode(doctored, tip, params)};
+            BOOST_REQUIRE(wrong);
+            BOOST_CHECK(!wrong->SameState(rebuilt));
+        }
+        // A set no state names: a copy of the first, appended to the table.
+        {
+            std::vector<unsigned char> doctored{bytes->begin(), bytes->begin() + at.state};
+            doctored.insert(doctored.end(), bytes->begin() + at.sets[0], bytes->begin() + at.sets[1]);
+            doctored.insert(doctored.end(), bytes->begin() + at.state, bytes->end());
+            ++doctored[at.table];
+            BOOST_CHECK(refused(doctored, tip, params));
+        }
+        // Below M a prior state is the empty one: a tracker two blocks past M
+        // keeps the priors from H on, and the oldest, as of H, is doctored.
+        {
+            const CBlockIndex& early{*cs.m_chain[M + 2]};
+            FinalityTracker at_early;
+            BOOST_REQUIRE(at_early.Sync(cs.m_chain, cs.m_blockman, params, early));
+            const auto early_bytes{at_early.Encode(params)};
+            BOOST_REQUIRE(early_bytes);
+            BOOST_REQUIRE(FinalityTracker::Decode(*early_bytes, early, params));
+            const uint256 oldest{cs.m_chain[H + 1]->GetBlockHash()};
+            const auto found{Occurrences(*early_bytes, std::span<const unsigned char>{oldest.begin(), oldest.end()})};
+            BOOST_REQUIRE_EQUAL(found.size(), 2U); // the stake registry's oldest undo record, then the group's
+            std::vector<unsigned char> doctored{*early_bytes};
+            BOOST_REQUIRE_EQUAL(int{doctored.at(found[1] + 32)}, 0);
+            doctored[found[1] + 32] = 1; // bootstrapped
+            BOOST_CHECK(refused(doctored, early, params));
+        }
+    }
+
+    // Two blocks undone and one in their place: the live history is one
+    // record short of a rebuild's, a suffix of it, and decodes as such.
+    InvalidateFrom(Tip()->nHeight - 1);
+    Produce(m_vk_b);
+    {
+        LOCK(cs_main);
+        Chainstate& cs{m_node.chainman->ActiveChainstate()};
+        const Consensus::Params& params{m_node.chainman->GetConsensus()};
+        const CBlockIndex& tip{*cs.m_chain.Tip()};
+        const FinalityTracker& live{LiveFinality()};
+        BOOST_REQUIRE(live.Synced(tip.GetBlockHash()));
+        FinalityTracker rebuilt;
+        BOOST_REQUIRE(rebuilt.Sync(cs.m_chain, cs.m_blockman, params, tip));
+        BOOST_CHECK(live.SameState(rebuilt));
+        BOOST_CHECK(!rebuilt.SameState(live));
+        const auto bytes{live.Encode(params)};
+        BOOST_REQUIRE(bytes);
+        const auto decoded{FinalityTracker::Decode(*bytes, tip, params)};
         BOOST_REQUIRE(decoded);
         BOOST_CHECK(decoded->SameState(rebuilt) && decoded->SameState(live) && live.SameState(*decoded));
     }
