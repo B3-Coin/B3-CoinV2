@@ -1,6 +1,6 @@
 # B0b: durable derived state
 
-**Status: DESIGN for owner review; step 1a built, off by default.**
+**Status: DESIGN for owner review; step 1 built, off by default.**
 Written 2026-10-31 against `r0-rebirth` at 070cc37b, the B0a commit. It
 changes no block validity, height, rule or parameter. B0 was authorized on
 2026-10-29 (`doc/design/b3-height-c-fast-track.md` §7, ask 1). B0b adds
@@ -10,9 +10,12 @@ for review.
 Step 1a (§9), the framework and the chainstate binding index, landed on
 2026-11-01 in 4f3219ea, b5cae181 and 9be63a38. It follows the
 recommended answers to §11's questions 2 to 4, and stays behind
-`-persistderivedstate` until question 6 is answered. §13 lists where it
-differs from the first draft of this design. Line references are to
-9be63a38.
+`-persistderivedstate` until question 6 is answered. Step 1b, the
+finality group, landed the same day in 50ce7565, 71e351d5, 2818a2a0,
+ec5d5eef and f8f45427. It follows P1 for question 1, chosen on
+2026-11-01; P1 needs no ruling (§5). §13 lists where both differ from
+the first draft of this design. Line references are to 9be63a38 unless
+they name another commit.
 
 ## 1. What is left of B0
 
@@ -204,13 +207,22 @@ refuses the record anyway.
   (`FinalityBindingTracker::ParamsDigest`). Its tests change each field
   alone and require a different digest, tell an unset field from a zero
   one, and change two unread fields and require the same digest.
-- **Id 1**, the finality group, reads many more. Among them:
-  - the genesis hash, `hard_fork_height`, `legacy_final_hash` and the
-    corridor;
+- **Id 1**, the finality group, reads many more
+  (`FinalityTracker::ParamsDigest`):
+  - id 2's four, through id 2's digest, and the corridor
+    (`transition_pow_length`);
   - all of `ModernPosParams`, `reorg_horizon` included;
-  - `h1`, `fresh_lineage` and the fresh-key height;
-  - the A1, A2 and A3 heights;
-  - `busd_bridge`, the bridge withdrawal activation and their pins.
+  - both fields of `h1`;
+  - whether `fresh_lineage` and `bridge_v2` are set: under either,
+    nothing is written (§4.3);
+  - the A1, A2 and A3 heights and the bridge withdrawal activation;
+  - every field of `busd_bridge`, its pins included.
+
+  The heights and the bridge fields are in whether the derivation reads
+  them today or not: a field too many costs one rebuild after a change,
+  a field missing would load a stale state. Its test changes each of 76
+  fields alone, tells unset from zero for 16 optional ones, and changes
+  two unread fields and requires the same digest.
 
 A derivation that starts to read another parameter must add it to its
 digest. The digest sits next to the derivation, and its comment names the
@@ -227,8 +239,8 @@ functions it must stay in step with.
     wallets resolve keys with it (`validator_set.h`).
   - On load each set is rebuilt from its members, with keys that passed §5.
     The recomputed set hash must equal the stored one.
-  - The class has no public constructor, so this needs a new factory beside
-    `Build`.
+  - `ValidatorSetSnapshot::FromMembers` (71e351d5), a factory beside
+    `Build`, does this.
 - **State.** The scalars, the four set references, `epoch_starts`,
   `finalized` and the producer schedule (`finality_tracker.h:36-65`,
   `:175-208`). The fresh lineage must be absent.
@@ -249,9 +261,17 @@ functions it must stay in step with.
     out one to one.
 - **Not stored.** The tip-snapshot memo, the rebuild counter and the
   fresh-key tracker.
+- **As built** (`FinalityTracker::Encode`), the order is: the private
+  binding index, every key's PoP, the private stake registry, the set
+  table, the state, then the undo history.
+  - Each set is stored with its epoch and set hash. The states name sets
+    by their place in the table.
+  - The PoPs are a table of their own, by key. The binding index keeps
+    each binding's PoP since 50ce7565.
 
-When the fresh lineage or fresh keys are configured, the finality group
-writes no record (§9, step 5).
+When the fresh lineage (fresh keys included) or bridge V2 is configured,
+both regtest-only today, the finality group writes no record (§9,
+step 5).
 
 **The chainstate binding index (id 2):** the records by validator key,
 then the undo trail in apply order (`FinalityBindingIndex::Encode`).
@@ -318,17 +338,27 @@ record is used only when all of these hold:
    - the owner-of-key map is one to one;
    - the undo records name exactly the active chain's blocks ending at the
      record's block;
-   - no undo history is longer than the horizon.
+   - no undo history is longer than the horizon;
+   - each state, the tip's and each prior one, keeps what the rules keep
+     at its block: empty below M, one epoch start per epoch from M, the
+     sets of the epochs around it, a finalized checkpoint on this chain,
+     and the H1 producer schedule exactly where H1 is active.
 
 For id 2, item 4 is the decoder's own checks (§4.3), and its undo trail
 names heights from H+1 to the record's block, rising.
 
-The loader creates the tracker, installs it as synced to that block, and
-syncs it to the tip at once through the forward path of `Sync`
-(`finality_tracker.cpp:566-568`, `finality_binding_index.cpp:343-345`). A
-sync left for later would come too late: `BlockConnected` follows only a
-tracker in step with the parent block, so the first block connected after
-the start would make it rebuild.
+The loader creates the tracker and installs it as synced to that block.
+A tracker still behind the tip when the first block connects would
+rebuild: `BlockConnected` follows only a tracker in step with the parent
+block. So each tracker reaches the tip through the forward path of
+`Sync` (`finality_tracker.cpp:566-568`,
+`finality_binding_index.cpp:343-345`) before any block connects:
+
+- **id 2** in the loader, at once;
+- **id 1** in the first `FindMostWorkChain`, whose
+  `RefreshFinalityAnchor` syncs the bridge and then the finality group.
+  `ConnectBlock` also syncs it to the parent block. Leaving this to them
+  keeps the bridge in step first (see Order).
 
 If any check fails, the loader logs one line naming the tracker and the
 reason, and that tracker rebuilds as it does today. The finality pin keeps
@@ -357,10 +387,10 @@ record when it is synced to the flushed block and any of these holds:
   flush (`init.cpp:390`, `:417`) and a few RPC and cache-resize flushes.
   The pin's `FORCE_FINALITY` flushes are not forced here; they follow K.
 
-All records of one flush go into one synchronous batch; with id 2 alone
-that is one synchronous write. A tracker that is not synced keeps its old
-record, which stays valid while its block is on the active chain. A flush
-never syncs a tracker to have something to write.
+All records of one flush, ids 1 and 2 today, go into one synchronous
+batch. A tracker that is not synced keeps its old record, which stays
+valid while its block is on the active chain. A flush never syncs a
+tracker to have something to write.
 
 **Why K.** Flushes can be frequent:
 
@@ -389,12 +419,22 @@ always re-derives.
   - On a mismatch it logs an error and erases the record. Step 1a then
     leaves the tracker to rebuild when first needed, rather than keeping
     the check's rebuild: a mismatch is a bug, not a path to optimize.
+  - Id 1 is rebuilt at its record's block, the bridge synced first, as
+    `RefreshFinalityAnchor` orders them. A bridge that cannot sync, or a
+    rebuild that fails, leaves the record unused, never erased. No test
+    chain has bridge rules active, so that bridge sync is untested. On
+    mainnet it matters: mainnet's decentralized withdrawal mode makes
+    finality certificates read the bridge's withdrawal roots
+    (`FinalityWithdrawalRoot`).
   - Default on in regtest (§4.1) and off elsewhere. It is for CI and for the
     owner's shadow-chain runs.
   - It is an audit, not a setting to pair with question 6. A start with it
     pays a full rebuild, more than a start without persistence.
 - Without the check, a record that passes its own checks is trusted, as
-  the coins database is (§4.3).
+  the coins database is (§4.3). For id 1 that covers the finalized
+  checkpoint, which can raise the finality pin, and the producer
+  schedule, which decides which blocks are valid. Question 3 is about
+  this trust.
 
 ## 7. The trackers with history back to activation
 
@@ -475,16 +515,19 @@ Phase 1 does not change memory.
 ## 9. Plan
 
 0. **Measure.** Log the tracker, its block count and its time at each
-   rebuild. It is about ten lines, with no consensus effect. Mohamed reads
-   the log of his own node after a restart, which replaces the floors of §1
-   with real numbers. Not done yet.
+   rebuild. It is about ten lines, with no consensus effect. The log of a
+   restart of Mohamed's own node replaces the floors of §1 with real
+   numbers. Not done yet.
 1. **Framework, finality group and chainstate binding index**, in two
    parts:
    - **1a, done on 2026-11-01:** the sidecar, the record, the build and
      parameter binding, load and write, both switches, and tracker id 2.
      Off by default.
-   - **1b:** the finality group, tracker id 1, with P1's PoP retention. It
-     waits on question 1.
+   - **1b, done on 2026-11-01:** the finality group, tracker id 1, with
+     P1's PoP retention. The binding index keeps each PoP, a validator
+     set is restored from its members, the stake registry and the
+     finality group encode and decode, and the group is loaded and
+     written beside id 2. Off by default.
 2. **Seats, vaults and checkpoints, phase 2a**, if step 0 shows that their
    restart cost matters. A cheaper first fix may be enough for checkpoints.
    Their replay re-verifies every seat's PoP for every checkpoint, while a
@@ -570,6 +613,36 @@ failed first by mutants:
 - **What is persisted**: the write rule, and nothing without the switch,
   without a build id, or from a tracker that is not in step.
 
+**Step 1b has** these cases for id 1, each failed first by mutants.
+Step 1a's and 1b's mutants include the six that the list of mutants
+above asks for.
+
+- **Parts.** `from_members_restores_built_set` in `validator_set_tests`,
+  and `b0b_stake_registry_codec` in `finality_h1_tests`.
+- **Parameters** (`b0b_finality_group_params_digest`), as §4.2 says.
+- **Round trip and hostile bytes** (`b0b_finality_group_codec`), on a
+  chain with a certificate, a rotation, H1 with an escape, a binding, a
+  rebinding and stake changes:
+  - the encoding decodes to a tracker equal to the live one and to a
+    rebuild, and encodes to the same bytes;
+  - decoded four blocks back, it catches up forward without a rebuild;
+    it undoes in place through the escape; after a two-block
+    reorganization its history is a suffix of a rebuild's;
+  - every truncation and a byte more are refused, and so is each broken
+    invariant of §6, two PoPs swapped and a set hash its members do not
+    give among them.
+- **Restart**, on a disk-backed fixture (`b0b_finality_group_restart`,
+  `..._older_record_and_write_rule`, `..._unusable_records_are_rebuilt`):
+  - the three checks above, for id 1;
+  - one shutdown writing both records at the tip, in one batch;
+  - an older record brought to the tip without a rebuild, and the write
+    rule;
+  - the rejections that apply to id 1, H1's escape rounds changed and
+    two PoPs swapped among them;
+  - under `-checkderivedstate`, a wrong state that passes the record's
+    own checks is refused; without it, that state is installed. The
+    test pins that trust down.
+
 The crash functional test waits for the `-dbcrashratio` hook and a daemon
 build.
 
@@ -577,7 +650,9 @@ build.
 
 1. **Keys on load (§5).** P1, every PoP re-verified at load (recommended)?
    Or P2, a ruling that the node's own record is validated-chain
-   provenance?
+   provenance? Step 1b builds P1, which needs no ruling. P2 later would
+   swap the load call and drop the stored PoPs; records are bound to the
+   build, so nothing would need migrating.
 2. **Where (§3).** A dedicated LevelDB, as the bridge comment asks
    (recommended)? Or the coins database's batch, or a flat file?
 3. **Trust.** A cache that falls back to a rebuild on any doubt
@@ -590,8 +665,8 @@ build.
    with `-checkderivedstate` pass?
 
 Step 1a follows the recommended answers to questions 2, 3 and 4, and keeps
-the default off for question 6. Adopting another answer would cost about
-this much:
+the default off for question 6. Step 1b adds P1 for question 1. Adopting
+another answer would cost about this much:
 
 - **2, another store:** the store class and its tests, about 100 lines;
 - **3, fail closed:** each refusal at load becomes a startup error;
@@ -630,6 +705,18 @@ Step 1a changed these points:
   - forced flushes are `FORCE_FLUSH` and `FORCE_SYNC`;
   - `-persistderivedstate` defaults off;
   - a check mismatch erases the record and leaves the tracker to rebuild.
+
+Step 1b changed these points:
+
+- §4.2: id 1's digest is listed as built, with the superset it keeps.
+- §4.3: the PoPs are a table of their own, and the states name sets by
+  their place in the set table. Bridge V2 also suppresses the record.
+- §6:
+  - the loader leaves id 1 at its block, and the first
+    `FindMostWorkChain` brings it to the tip, after the bridge;
+  - the check rebuild of id 1 syncs the bridge first too;
+  - step 1a's load messages now name the tracker and end "rebuilt from
+    blocks when first needed".
 
 Not built yet: the `-dbcrashratio` hook, the crash functional test and the
 fuzz targets (§10).
