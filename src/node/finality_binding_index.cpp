@@ -10,8 +10,11 @@
 #include <modern/chain_domain.h>
 #include <modern/mpa.h>
 #include <node/blockstorage.h>
+#include <serialize.h>
+#include <streams.h>
 
 #include <cassert>
+#include <ios>
 #include <map>
 
 namespace node {
@@ -101,6 +104,110 @@ std::map<modern::ValidatorKeyBytes, modern::BindingRecord> FinalityBindingIndex:
         if (!rec.IsRevoked()) out.emplace(vk, rec);
     }
     return out;
+}
+
+namespace {
+template <typename Stream>
+void WriteBindingRecord(Stream& s, const modern::BindingRecord& record)
+{
+    s << record.bls_pubkey << record.seq << int32_t{record.height};
+}
+
+template <typename Stream>
+modern::BindingRecord ReadBindingRecord(Stream& s)
+{
+    modern::BindingRecord record;
+    int32_t height;
+    s >> record.bls_pubkey >> record.seq >> height;
+    record.height = height;
+    return record;
+}
+} // namespace
+
+std::vector<unsigned char> FinalityBindingIndex::Encode() const
+{
+    std::vector<unsigned char> out;
+    VectorWriter w{out, 0};
+    WriteCompactSize(w, m_by_validator.size());
+    for (const auto& [vk, record] : m_by_validator) {
+        w << vk;
+        WriteBindingRecord(w, record);
+    }
+    WriteCompactSize(w, m_heights.size());
+    for (size_t i{0}; i < m_heights.size(); ++i) {
+        w << int32_t{m_heights[i]};
+        WriteCompactSize(w, m_undo[i].size());
+        for (const UndoEntry& entry : m_undo[i]) {
+            w << entry.validator_key << uint8_t{entry.previous.has_value()};
+            if (entry.previous) WriteBindingRecord(w, *entry.previous);
+        }
+    }
+    return out;
+}
+
+std::optional<FinalityBindingIndex> FinalityBindingIndex::Decode(const std::span<const unsigned char> bytes,
+                                                                  const int first_height, const int last_height)
+{
+    FinalityBindingIndex index;
+    try {
+        SpanReader r{bytes};
+        const uint64_t records{ReadCompactSize(r)};
+        for (uint64_t i{0}; i < records; ++i) {
+            modern::ValidatorKeyBytes vk;
+            r >> vk;
+            // Strictly ascending keys: an index has exactly one encoding.
+            if (!index.m_by_validator.empty() && !(index.m_by_validator.rbegin()->first < vk)) return std::nullopt;
+            index.m_by_validator.emplace_hint(index.m_by_validator.end(), vk, ReadBindingRecord(r));
+        }
+        const uint64_t blocks{ReadCompactSize(r)};
+        for (uint64_t i{0}; i < blocks; ++i) {
+            int32_t height;
+            r >> height;
+            if (height < first_height || height > last_height) return std::nullopt;
+            if (!index.m_heights.empty() && height <= index.m_heights.back()) return std::nullopt;
+            std::vector<UndoEntry> undo;
+            const uint64_t entries{ReadCompactSize(r)};
+            for (uint64_t j{0}; j < entries; ++j) {
+                UndoEntry entry;
+                uint8_t has_previous;
+                r >> entry.validator_key >> has_previous;
+                if (has_previous > 1) return std::nullopt;
+                if (has_previous) entry.previous = ReadBindingRecord(r);
+                undo.push_back(std::move(entry));
+            }
+            index.m_heights.push_back(height);
+            index.m_undo.push_back(std::move(undo));
+        }
+        if (!r.empty()) return std::nullopt;
+    } catch (const std::ios_base::failure&) {
+        return std::nullopt;
+    }
+    // Replay the trail's shape: each entry's previous record is the one the
+    // validator's entry before it set, so ConnectBlock could have built it.
+    std::map<modern::ValidatorKeyBytes, int> set_at;
+    for (size_t i{0}; i < index.m_heights.size(); ++i) {
+        for (const UndoEntry& entry : index.m_undo[i]) {
+            const auto it{set_at.find(entry.validator_key)};
+            if (it == set_at.end() ? entry.previous.has_value()
+                                   : !entry.previous || entry.previous->height != it->second) {
+                return std::nullopt;
+            }
+            set_at[entry.validator_key] = index.m_heights[i];
+        }
+    }
+    if (set_at.size() != index.m_by_validator.size()) return std::nullopt;
+    for (const auto& [vk, record] : index.m_by_validator) {
+        const auto it{set_at.find(vk)};
+        if (it == set_at.end() || it->second != record.height) return std::nullopt;
+        if (!record.IsRevoked() && !index.m_owner_of_key.emplace(record.bls_pubkey, vk).second) return std::nullopt;
+    }
+    return index;
+}
+
+bool FinalityBindingIndex::SameState(const FinalityBindingIndex& other) const
+{
+    return m_by_validator == other.m_by_validator && m_owner_of_key == other.m_owner_of_key &&
+           m_heights == other.m_heights && m_undo == other.m_undo;
 }
 
 bool FinalityBindingOverlay::ApplyTransaction(

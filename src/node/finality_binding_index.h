@@ -13,6 +13,7 @@
 #include <string>
 #include <map>
 #include <optional>
+#include <span>
 #include <vector>
 
 class CBlockIndex;
@@ -75,10 +76,26 @@ public:
     //! Full state for equality checks (incl. revoked records).
     const std::map<modern::ValidatorKeyBytes, modern::BindingRecord>& All() const { return m_by_validator; }
 
+    //! The whole index, undo trail included, as one canonical byte string
+    //! (B0b persistence). The key owners are not encoded: Decode derives them.
+    std::vector<unsigned char> Encode() const;
+    //! Inverse of Encode for an index whose blocks lie in [first_height,
+    //! last_height]. Nullopt unless `bytes` is exactly one encoding of an
+    //! index that ConnectBlock could have built: block heights strictly
+    //! increasing; for each validator, its first undo entry without a
+    //! previous record, each later one's previous record set at the block
+    //! of the entry before it, and its current record set at the block of
+    //! its last entry; no nonzero key held by two validators.
+    static std::optional<FinalityBindingIndex> Decode(std::span<const unsigned char> bytes, int first_height,
+                                                      int last_height);
+    //! Equal records, key owners and undo trail.
+    bool SameState(const FinalityBindingIndex& other) const;
+
 private:
     struct UndoEntry {
         modern::ValidatorKeyBytes validator_key{};
         std::optional<modern::BindingRecord> previous; // nullopt = the validator had no binding
+        friend bool operator==(const UndoEntry&, const UndoEntry&) = default;
     };
     void Set(const modern::ValidatorKeyBytes& validator_key, const modern::BindingRecord& record);
     void Restore(const UndoEntry& undo);

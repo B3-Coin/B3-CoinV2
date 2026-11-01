@@ -11,6 +11,7 @@
 #include <chainparams.h>
 #include <consensus/params.h>
 #include <crypto/bls.h>
+#include <crypto/common.h>
 #include <key.h>
 #include <modern/chain_domain.h>
 #include <modern/finality_key.h>
@@ -28,8 +29,10 @@
 
 #include <boost/test/unit_test.hpp>
 
+#include <algorithm>
 #include <array>
 #include <optional>
+#include <utility>
 #include <vector>
 
 using namespace b3test;
@@ -293,6 +296,162 @@ BOOST_FIXTURE_TEST_CASE(txid_unchanged_and_production_fail_closed, BindingFixtur
     // Legacy era: a legacy block cannot carry an MPA at all (codec), and the
     // binding machinery never runs below H+1 (the era gate in ConnectBlock).
     BOOST_CHECK(Consensus::GetB3Era(SYN_H, m_node.chainman->GetConsensus()) == Consensus::B3Era::LEGACY);
+}
+
+// B0b: the index encodes to one canonical byte string, undo trail included,
+// and decodes only into an index that ConnectBlock could have built. The
+// index verifies no cryptography, so plain byte patterns stand in for keys.
+namespace {
+modern::ValidatorKeyBytes Vk(const unsigned char b)
+{
+    modern::ValidatorKeyBytes vk;
+    vk.fill(b);
+    return vk;
+}
+modern::BlsPubkeyBytes Pk(const unsigned char b)
+{
+    modern::BlsPubkeyBytes pk;
+    pk.fill(b);
+    return pk;
+}
+FinalityBindingIndex::Transition Bind(const modern::ValidatorKeyBytes& vk, const modern::BlsPubkeyBytes& pk,
+                                      const uint32_t seq, const int height)
+{
+    return {vk, modern::BindingRecord{pk, seq, height}};
+}
+} // namespace
+
+BOOST_AUTO_TEST_CASE(binding_index_codec_round_trip)
+{
+    const auto a{Vk(0xa1)}, b{Vk(0xb2)}, c{Vk(0xc3)}, d{Vk(0xd4)};
+    const modern::BlsPubkeyBytes revoked{};
+    const std::vector<std::pair<int, std::vector<FinalityBindingIndex::Transition>>> blocks{
+        {10, {Bind(a, Pk(1), 0, 10), Bind(b, Pk(2), 0, 10)}},
+        // Two transitions of one validator in one block; c takes a's old key.
+        {12, {Bind(a, Pk(3), 1, 12), Bind(a, Pk(4), 2, 12), Bind(c, Pk(1), 0, 12)}},
+        {15, {Bind(b, revoked, 1, 15)}},
+        {20, {Bind(d, Pk(2), 0, 20)}}, // d takes the key b revoked
+    };
+    const auto round_trip{[](const FinalityBindingIndex& index, const int last_height) {
+        const std::vector<unsigned char> bytes{index.Encode()};
+        const auto decoded{FinalityBindingIndex::Decode(bytes, 10, last_height)};
+        BOOST_REQUIRE(decoded);
+        BOOST_CHECK(decoded->SameState(index));
+        BOOST_CHECK(decoded->Encode() == bytes);
+        return *decoded;
+    }};
+    FinalityBindingIndex index;
+    std::vector<FinalityBindingIndex> states{index};
+    round_trip(index, 9);
+    for (const auto& [height, transitions] : blocks) {
+        index.ConnectBlock(height, transitions);
+        states.push_back(index);
+        round_trip(index, height);
+    }
+    BOOST_CHECK(!states.front().SameState(index));
+    // A decoded index keeps working: it disconnects and reconnects every
+    // block into exactly the states the original passed through.
+    FinalityBindingIndex decoded{round_trip(index, 20)};
+    BOOST_CHECK(decoded.OwnerOf(Pk(1)) == std::optional{c});
+    BOOST_CHECK(decoded.OwnerOf(Pk(2)) == std::optional{d});
+    BOOST_CHECK(decoded.OwnerOf(Pk(4)) == std::optional{a});
+    BOOST_CHECK(!decoded.OwnerOf(Pk(3)));
+    for (size_t i{blocks.size()}; i-- > 0;) {
+        decoded.DisconnectBlock(blocks[i].first);
+        BOOST_CHECK(decoded.SameState(states[i]));
+    }
+    for (size_t i{0}; i < blocks.size(); ++i) {
+        decoded.ConnectBlock(blocks[i].first, blocks[i].second);
+        BOOST_CHECK(decoded.SameState(states[i + 1]));
+    }
+    // The undo trail is part of the state: the same records reached by
+    // another block are another state.
+    FinalityBindingIndex once, twice;
+    once.ConnectBlock(10, {Bind(a, Pk(1), 0, 10)});
+    twice.ConnectBlock(10, {Bind(a, Pk(1), 0, 10), Bind(a, Pk(1), 0, 10)});
+    BOOST_CHECK(once.All() == twice.All());
+    BOOST_CHECK(!once.SameState(twice));
+}
+
+BOOST_AUTO_TEST_CASE(binding_index_decode_refuses_malformed)
+{
+    const auto a{Vk(0xa1)}, b{Vk(0xb2)};
+    FinalityBindingIndex index;
+    index.ConnectBlock(10, {Bind(a, Pk(1), 0, 10)});
+    index.ConnectBlock(12, {Bind(a, Pk(2), 1, 12), Bind(b, Pk(3), 0, 12)});
+    const std::vector<unsigned char> bytes{index.Encode()};
+    // Layout: 1 count byte, two 88-byte records (a at 1, b at 89), 1 count
+    // byte at 177; block 10 at 178 (entry a, no previous: flag at 215);
+    // block 12 at 216 (entry a with its previous record, whose height sits
+    // at 306; entry b at 310, no previous). 343 bytes.
+    BOOST_REQUIRE_EQUAL(bytes.size(), 343u);
+    BOOST_REQUIRE(FinalityBindingIndex::Decode(bytes, 10, 12));
+    const auto refused{[](const std::vector<unsigned char>& doctored) {
+        return !FinalityBindingIndex::Decode(doctored, 10, 12).has_value();
+    }};
+    const auto patched_le32{[&](const std::vector<std::pair<size_t, uint32_t>>& patches) {
+        std::vector<unsigned char> doctored{bytes};
+        for (const auto& [offset, value] : patches) WriteLE32(doctored.data() + offset, value);
+        return doctored;
+    }};
+    // Every strict prefix, and one byte too many.
+    for (size_t n{0}; n < bytes.size(); ++n) {
+        BOOST_CHECK(refused({bytes.begin(), bytes.begin() + n}));
+    }
+    std::vector<unsigned char> longer{bytes};
+    longer.push_back(0);
+    BOOST_CHECK(refused(longer));
+    // Blocks outside [first_height, last_height].
+    BOOST_CHECK(!FinalityBindingIndex::Decode(bytes, 11, 12));
+    BOOST_CHECK(!FinalityBindingIndex::Decode(bytes, 10, 11));
+    // Records out of order: the encoding is no longer canonical.
+    {
+        std::vector<unsigned char> swapped{bytes};
+        std::swap_ranges(swapped.begin() + 1, swapped.begin() + 89, swapped.begin() + 89);
+        BOOST_CHECK(refused(swapped));
+    }
+    // A previous-record flag other than 0 or 1, on the entry that has a
+    // previous record: read as a boolean, everything else would decode.
+    {
+        std::vector<unsigned char> flag{bytes};
+        BOOST_REQUIRE_EQUAL(int{flag[253]}, 1);
+        flag[253] = 2;
+        BOOST_CHECK(refused(flag));
+    }
+    // Block heights not strictly increasing, with every record consistent
+    // with them (both blocks at 10; the current records' heights at 85 and
+    // 173 moved to match).
+    BOOST_CHECK(refused(patched_le32({{216, 10}, {85, 10}, {173, 10}})));
+    // A previous record not set at the validator's entry before it.
+    BOOST_CHECK(refused(patched_le32({{306, 11}})));
+    // A current record not set at the validator's last entry.
+    BOOST_CHECK(refused(patched_le32({{85, 10}})));
+    // A trail cut below its first block: a's entry at 12 then names a
+    // previous record that no entry set.
+    {
+        std::vector<unsigned char> cut{bytes.begin(), bytes.begin() + 177};
+        cut.push_back(1);
+        cut.insert(cut.end(), bytes.begin() + 216, bytes.end());
+        BOOST_CHECK(refused(cut));
+    }
+    // A validator with entries but no record (b's record dropped).
+    {
+        std::vector<unsigned char> cut;
+        cut.push_back(1);
+        cut.insert(cut.end(), bytes.begin() + 1, bytes.begin() + 89);
+        cut.insert(cut.end(), bytes.begin() + 177, bytes.end());
+        BOOST_CHECK(refused(cut));
+    }
+    // A record for a validator without entries (b's record renamed c).
+    {
+        std::vector<unsigned char> renamed{bytes};
+        std::fill(renamed.begin() + 89, renamed.begin() + 121, 0xc3);
+        BOOST_CHECK(refused(renamed));
+    }
+    // One nonzero key held by two validators.
+    FinalityBindingIndex shared;
+    shared.ConnectBlock(10, {Bind(a, Pk(1), 0, 10), Bind(b, Pk(1), 0, 10)});
+    BOOST_CHECK(!FinalityBindingIndex::Decode(shared.Encode(), 10, 10));
 }
 
 BOOST_AUTO_TEST_SUITE_END()
