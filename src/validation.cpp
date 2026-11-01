@@ -3013,6 +3013,20 @@ void Chainstate::LoadFinalityGroup()
         LogWarning("Persisted finality group at height %d fails its checks; it will be rebuilt", block->nHeight);
         return;
     }
+    // A record never raises the finality pin, which no restart lowers: its
+    // checkpoint is at or below the one this node pinned. A record this node
+    // wrote is, unless the node stopped after a flush wrote it and before the
+    // pin caught up (RefreshFinalityAnchor flushes before it raises the pin);
+    // that one costs a rebuild, which pins the checkpoint again.
+    if (const auto checkpoint{loaded->PinnedCheckpoint()}) {
+        const auto anchor{m_blockman.FinalityAnchor()};
+        if (!anchor || checkpoint->first > anchor->first) {
+            LogWarning("Persisted finality group at height %d not used: its finalized checkpoint at height %d is "
+                       "above the finality pin (%s)",
+                       block->nHeight, checkpoint->first, anchor ? strprintf("height %d", anchor->first) : "none");
+            return;
+        }
+    }
     if (m_check_derived_state) {
         // As RefreshFinalityAnchor: the bridge first, whose withdrawal roots
         // the rebuild's certificate checks read.

@@ -3369,6 +3369,21 @@ struct GroupPersistFixture : public FinalityGroupFixture {
         BOOST_REQUIRE(rebuilt.Sync(cs.m_chain, cs.m_blockman, m_node.chainman->GetConsensus(), *cs.m_chain.Tip()));
         return LiveFinality().Synced(cs.m_chain.Tip()->GetBlockHash()) && LiveFinality().SameState(rebuilt);
     }
+    //! Restart as Restart does; whether the start logged `message`. A miss
+    //! fails the caller's check instead of aborting, so that the checks after
+    //! it still report.
+    bool RestartLogging(const std::string& message, const std::function<void()>& between = {})
+    {
+        bool seen{false};
+        {
+            DebugLogHelper watch{message, [&](const std::string* line) {
+                                     if (line) seen = true;
+                                     return line != nullptr;
+                                 }};
+            Restart(between);
+        }
+        return seen;
+    }
     //! One escape more in the state an encoding holds: a wrong state that
     //! passes the record's own checks.
     static void AddEscape(std::vector<unsigned char>& payload)
@@ -3541,6 +3556,79 @@ BOOST_FIXTURE_TEST_CASE(b0b_finality_group_unusable_records_are_rebuilt, GroupPe
     BOOST_CHECK_EQUAL(GroupRebuilds(), 0U);
     BOOST_CHECK(!GroupAsRebuilt());
     BOOST_CHECK_EQUAL(WITH_LOCK(cs_main, return LiveFinality().Current().producers->escapes), 2U);
+}
+
+// (B0b-7) A record never raises the finality pin, which no restart lowers. A
+// record whose finalized checkpoint is a later block of the chain, in the
+// epoch of its height and certified there, passes the record's own checks;
+// installed without the check against a rebuild (as outside regtest), it
+// would pin that block for good. It is passed over, as is a record with a
+// checkpoint when the pin file is gone, and the tracker rebuilds to the true
+// state and pins the true checkpoint. A record at the pin is installed.
+BOOST_FIXTURE_TEST_CASE(b0b_finality_group_record_never_raises_the_pin, GroupPersistFixture)
+{
+    PrepareRestarted();
+    m_check_derived_state = false;
+    std::optional<std::vector<unsigned char>> good;
+    Restart([&] { good = ReadRecord(); });
+    BOOST_REQUIRE(good);
+    BOOST_REQUIRE_EQUAL(GroupRebuilds(), 0U);
+    const auto pin{[&] { return WITH_LOCK(cs_main, return m_node.chainman->m_blockman.FinalityAnchor()); }};
+    const auto anchor{pin()};
+    BOOST_REQUIRE(anchor);
+    BOOST_REQUIRE(WITH_LOCK(cs_main, return LiveFinality().PinnedCheckpoint()) == anchor);
+
+    // The state's checkpoint moved to the block below the record's.
+    node::DerivedStateRecord record{DecodeRecord(*good)};
+    const int later{record.height - 1};
+    BOOST_REQUIRE_GT(later, anchor->first);
+    uint64_t epoch{0};
+    uint256 hash;
+    {
+        LOCK(cs_main);
+        const FinalityTracker::State& state{LiveFinality().Current()};
+        BOOST_REQUIRE_GE(later, state.epoch_starts.back());
+        epoch = state.epoch;
+        hash = m_node.chainman->ActiveChain()[later]->GetBlockHash();
+    }
+    const GroupLayout at{LayoutOf(record.payload)};
+    const StateLayout fields{StateFields(at.state, record.payload.at(at.state + 1 + 8), /*prior=*/false)};
+    BOOST_REQUIRE_EQUAL(GetLE<int32_t>(record.payload, fields.finalized), anchor->first);
+    PutLE<int32_t>(record.payload, fields.finalized, later);
+    std::copy(hash.begin(), hash.end(), record.payload.begin() + fields.finalized + 4);
+    PutLE<uint64_t>(record.payload, fields.finalized + 4 + 32, epoch);
+    PutLE<int32_t>(record.payload, fields.finalized + 4 + 32 + 8, later);
+    {
+        LOCK(cs_main);
+        const auto forged{FinalityTracker::Decode(record.payload, *m_node.chainman->ActiveChain()[record.height],
+                                                  m_node.chainman->GetConsensus())};
+        BOOST_REQUIRE(forged);
+        BOOST_REQUIRE(forged->PinnedCheckpoint() == std::make_pair(later, hash));
+    }
+    BOOST_CHECK(RestartLogging(strprintf("Persisted finality group at height %d not used: its finalized checkpoint "
+                                         "at height %d is above the finality pin (height %d)",
+                                         record.height, later, anchor->first),
+                               [&] { WriteRecord(node::EncodeDerivedStateRecord(record, BUILD)); }));
+    BOOST_CHECK(pin() == anchor);
+    BOOST_CHECK(GroupRebuilds() > 0);
+    BOOST_CHECK(GroupAsRebuilt());
+
+    // No pin file: the record is passed over, and the rebuild pins again.
+    const fs::path pin_path{m_node.chainman->m_blockman.FinalityPinPath()};
+    BOOST_CHECK(RestartLogging(strprintf("Persisted finality group at height %d not used: its finalized checkpoint "
+                                         "at height %d is above the finality pin (none)",
+                                         record.height, anchor->first),
+                               [&] {
+                                   WriteRecord(*good);
+                                   BOOST_REQUIRE(fs::remove(pin_path));
+                               }));
+    BOOST_CHECK(GroupRebuilds() > 0);
+    BOOST_CHECK(GroupAsRebuilt());
+    BOOST_CHECK(pin() == anchor);
+    Restart([&] { WriteRecord(*good); });
+    BOOST_CHECK_EQUAL(GroupRebuilds(), 0U);
+    BOOST_CHECK(GroupAsRebuilt());
+    BOOST_CHECK(pin() == anchor);
 }
 
 BOOST_AUTO_TEST_SUITE_END()
