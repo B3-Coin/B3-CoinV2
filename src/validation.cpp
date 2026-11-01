@@ -4981,6 +4981,9 @@ void Chainstate::WriteDerivedState(const FlushStateMode mode)
     AssertLockHeld(::cs_main);
     const CBlockIndex* tip{m_chain.Tip()};
     if (!m_derived_state || tip == nullptr) return;
+    // Only for the block the coins are at; not in DisconnectTip's flush, whose
+    // coins are already at the parent of the tip the trackers still hold.
+    if (CoinsTip().GetBestBlock() != tip->GetBlockHash()) return;
     const Consensus::Params& params{m_chainman.GetConsensus()};
     const std::optional<int> final_height{Consensus::LegacyFinalHeight(params)};
     if (!final_height || tip->nHeight <= *final_height) return;
@@ -5182,8 +5185,10 @@ bool Chainstate::FlushStateToDisk(
         }
     }
     if (full_flush_completed) {
-        // B0b: a derived-state record never names a block the coins on disk
-        // have not reached.
+        // B0b: after the coins, for the block they are at (WriteDerivedState).
+        // The coins write is not synced but the record's is, so after a power
+        // loss a record can name a block above the coins on disk: the next
+        // start passes it over, its block not on the active chain.
         WriteDerivedState(mode);
         if (m_chainman.m_options.signals) {
             // Update best block in wallet (so we can detect restored wallets).

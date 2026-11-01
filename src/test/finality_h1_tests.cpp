@@ -3730,4 +3730,55 @@ BOOST_FIXTURE_TEST_CASE(b0b_finality_group_decode_bounds_the_epoch_starts, Final
     BOOST_CHECK(!FinalityTracker::Decode(crafted(M), tip, params));
 }
 
+// (B0b-10) Derived state is written at the coins flushes of a running node,
+// by the write rule, and only for the block the coins are at. A flush that
+// writes no coins (IF_NEEDED with room in the cache, PERIODIC before its
+// time) writes no record, not even a due one; FORCE_FINALITY is not forced,
+// so it writes a record only when one is due (here, once the last record's
+// block has left the chain); FORCE_SYNC is forced. Nothing is written for the
+// block the last record names, nor while the coins are below the tip, as in
+// DisconnectTip's flush.
+BOOST_FIXTURE_TEST_CASE(b0b_derived_state_written_at_coins_flushes, GroupPersistFixture)
+{
+    PrepareRestarted();
+    Chainstate& cs{m_node.chainman->ActiveChainstate()};
+    using Heights = std::vector<int>;
+    // The heights at which `run` persisted derived state.
+    const auto persisted{[&](const std::function<void()>& run) {
+        Heights heights;
+        {
+            DebugLogHelper watch{"derived-state records at height ", [&](const std::string* line) {
+                                     if (line) heights.push_back(std::stoi(line->substr(line->find("at height ") + 10)));
+                                     return false;
+                                 }};
+            run();
+        }
+        return heights;
+    }};
+    const auto flush{[&](const FlushStateMode mode) {
+        return persisted([&] {
+            LOCK(cs_main);
+            BlockValidationState state;
+            BOOST_REQUIRE(cs.FlushStateToDisk(state, mode));
+        });
+    }};
+    const int T{Tip()->nHeight}; // the block of the record installed at the start
+    BOOST_CHECK_MESSAGE(flush(FlushStateMode::FORCE_SYNC).empty(), "FORCE_SYNC wrote the last record's block again");
+    BOOST_CHECK_MESSAGE(persisted([&] { Produce(m_vk_a); }).empty(), "connecting a block wrote a record");
+    BOOST_CHECK_MESSAGE(flush(FlushStateMode::IF_NEEDED).empty(), "IF_NEEDED wrote a record but no coins");
+    BOOST_CHECK_MESSAGE(flush(FlushStateMode::PERIODIC).empty(), "PERIODIC wrote a record but no coins");
+    BOOST_CHECK_MESSAGE(flush(FlushStateMode::FORCE_FINALITY).empty(), "FORCE_FINALITY wrote a record not due");
+    // The coins at the tip's parent, as in DisconnectTip's flush.
+    WITH_LOCK(cs_main, cs.CoinsTip().SetBestBlock(Tip()->pprev->GetBlockHash()));
+    BOOST_CHECK_MESSAGE(flush(FlushStateMode::FORCE_SYNC).empty(), "FORCE_SYNC wrote a record above the coins");
+    WITH_LOCK(cs_main, cs.CoinsTip().SetBestBlock(Tip()->GetBlockHash()));
+    BOOST_CHECK_MESSAGE(flush(FlushStateMode::FORCE_SYNC) == Heights{T + 1}, "FORCE_SYNC did not write the tip");
+    // The record's block off the chain: due, at the next flush that writes coins.
+    BOOST_CHECK_MESSAGE(persisted([&] { InvalidateFrom(T + 1); }).empty(), "disconnecting a block wrote a record");
+    BOOST_CHECK_MESSAGE(flush(FlushStateMode::IF_NEEDED).empty(), "IF_NEEDED wrote a due record but no coins");
+    BOOST_CHECK_MESSAGE(flush(FlushStateMode::PERIODIC).empty(), "PERIODIC wrote a due record but no coins");
+    BOOST_CHECK_MESSAGE(flush(FlushStateMode::FORCE_FINALITY) == Heights{T}, "FORCE_FINALITY did not write the due record");
+    BOOST_CHECK(GroupAsRebuilt());
+}
+
 BOOST_AUTO_TEST_SUITE_END()
