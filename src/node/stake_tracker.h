@@ -17,6 +17,7 @@
 #include <deque>
 #include <map>
 #include <optional>
+#include <span>
 #include <utility>
 #include <vector>
 
@@ -89,6 +90,24 @@ public:
     //! undone tracker with a rebuilt one).
     bool SameRegistry(const StakeTracker& other) const { return m_stakes == other.m_stakes; }
 
+    //! B0b: the registry and its undo history as one byte string, a part of
+    //! the finality group's record: the entries in outpoint order, then the
+    //! undo records, oldest first, each a block hash and its operations in
+    //! apply order.
+    std::vector<unsigned char> Encode() const;
+    //! B0b: the tracker that Encode() wrote when synced to `block`, synced
+    //! there. Nullopt unless `bytes` is exactly such an encoding with
+    //! amounts in MoneyRange, a registry of at most MAX_MONEY in all,
+    //! creation heights in the modern era up to `block`, and at most
+    //! UndoDepth() undo records, which name the chain's blocks ending at
+    //! `block`.
+    static std::optional<StakeTracker> Decode(std::span<const unsigned char> bytes, const CBlockIndex& block,
+                                              const Consensus::Params& params);
+    //! B0b: synced to the same block as `rebuilt`, with the same registry
+    //! and an undo history that is a suffix of `rebuilt`'s (a reorganization
+    //! leaves a live tracker a shorter history than a rebuild).
+    bool SameState(const StakeTracker& rebuilt) const;
+
     //! Blocks of undo history kept: the modern reorganization horizon, or
     //! DEFAULT_UNDO_DEPTH when the horizon is unset. A deeper disconnect
     //! falls back to the rebuild.
@@ -119,10 +138,12 @@ private:
     struct UndoOp {
         COutPoint outpoint;
         std::optional<Entry> prior;
+        friend bool operator==(const UndoOp&, const UndoOp&) = default;
     };
     struct BlockUndo {
         uint256 hash;
         std::vector<UndoOp> ops;
+        friend bool operator==(const BlockUndo&, const BlockUndo&) = default;
     };
 
     //! Apply one modern-era block: spends first (a transaction can never

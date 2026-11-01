@@ -6,6 +6,7 @@
 #include <chainparams.h>
 #include <chainparamsbase.h>
 #include <common/args.h>
+#include <consensus/amount.h>
 #include <consensus/boundary.h>
 #include <consensus/bridge_params.h>
 #include <consensus/era.h>
@@ -18,8 +19,11 @@
 #include <node/chainstate.h>
 #include <node/finality_tracker.h>
 #include <node/miner.h>
+#include <node/stake_tracker.h>
 #include <node/validator_set.h>
+#include <primitives/transaction.h>
 #include <script/script.h>
+#include <streams.h>
 #include <test/util/common.h>
 #include <test/util/finality_fixture.h>
 #include <test/util/logging.h>
@@ -32,10 +36,12 @@
 
 #include <boost/test/unit_test.hpp>
 
+#include <algorithm>
 #include <limits>
 #include <map>
 #include <memory>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -2454,6 +2460,231 @@ BOOST_FIXTURE_TEST_CASE(b0a_disconnect_beyond_history_rebuilds, UndoChainFixture
     InvalidateFrom(Tip()->nHeight);
     BOOST_CHECK(InStepAndAsRebuilt());
     BOOST_CHECK_EQUAL(Rebuilds(), refilled);
+}
+
+// ---------------------------------------------------------------------------
+// B0b (doc/design/b3-b0b-durable-derived-state.md, section 4.3): the finality
+// group's record and its parts. A decoded tracker must equal the one that
+// wrote it, undo history included, and every byte string that is not exactly
+// such an encoding at its block must be refused.
+
+namespace {
+
+//! Every offset at which `needle` starts in `bytes`.
+std::vector<size_t> Occurrences(const std::vector<unsigned char>& bytes, const std::span<const unsigned char> needle)
+{
+    std::vector<size_t> at;
+    for (auto it{bytes.begin()}; (it = std::search(it, bytes.end(), needle.begin(), needle.end())) != bytes.end(); ++it) {
+        at.push_back(static_cast<size_t>(it - bytes.begin()));
+    }
+    return at;
+}
+
+//! The serialization of `value`, to search for.
+template <typename T>
+std::vector<unsigned char> Serialized(const T& value)
+{
+    std::vector<unsigned char> out;
+    VectorWriter{out, 0} << value;
+    return out;
+}
+
+//! The little-endian integer at `at`, as the codecs write integers.
+template <typename T>
+T GetLE(const std::vector<unsigned char>& bytes, const size_t at)
+{
+    uint64_t value{0};
+    for (size_t i{0}; i < sizeof(T); ++i) value |= uint64_t{bytes[at + i]} << (8 * i);
+    return static_cast<T>(value);
+}
+
+template <typename T>
+void PutLE(std::vector<unsigned char>& bytes, const size_t at, const T value)
+{
+    for (size_t i{0}; i < sizeof(T); ++i) bytes[at + i] = static_cast<unsigned char>(static_cast<uint64_t>(value) >> (8 * i));
+}
+
+} // namespace
+
+// (B0b-1) The stake registry's encoding gives back the registry, its undo
+// history and its block. The decoded tracker catches up forward and undoes
+// in place, through an unstake and a block that creates and spends one
+// output, without a rebuild. After a reorganization the live tracker's
+// shorter history is a suffix of a rebuild's, and decodes as such. Every
+// truncation, an extra byte, another block, a shorter horizon, reordered or
+// repeated outpoints, an amount outside MoneyRange, more stake than money,
+// a creation height outside the modern era up to the block, an undo record
+// off the chain and a bad flag are refused.
+BOOST_FIXTURE_TEST_CASE(b0b_stake_registry_codec, UndoChainFixture)
+{
+    constexpr int HORIZON{12};
+    PrepareFinalityChain(/*min_finality_set=*/1, /*reorg_horizon=*/HORIZON, /*with_unbound_c=*/true);
+    const int M{m_M};
+    const CMutableTransaction stake_d{StakeTx(4, m_vk_d, STAKE_D)};
+    const CMutableTransaction stake_d2{StakeTx(5, m_vk_d, STAKE_D)};
+    while (Tip()->nHeight < M + 2) Produce(m_vk_a);
+    Produce(m_vk_a, {}, {stake_d});                     // M + 3
+    Produce(m_vk_a, {}, {stake_d2, Unstake(stake_d2)}); // M + 4: created and spent in one block
+    Produce(m_vk_a);
+    Produce(m_vk_a, {}, {Unstake(stake_d)}); // M + 6
+    while (Tip()->nHeight < M + 9) Produce(m_vk_a);
+    ArmStakes();
+    {
+        LOCK(cs_main);
+        Chainstate& cs{m_node.chainman->ActiveChainstate()};
+        const Consensus::Params& params{m_node.chainman->GetConsensus()};
+        const CBlockIndex& tip{*cs.m_chain.Tip()};
+        const int H{*Consensus::LegacyFinalHeight(params)};
+        const node::StakeTracker& live{LiveStakes()};
+        BOOST_REQUIRE(live.Synced(tip.GetBlockHash()));
+        node::StakeTracker rebuilt;
+        BOOST_REQUIRE(rebuilt.Sync(cs.m_chain, cs.m_blockman, params, tip));
+        BOOST_REQUIRE(live.SameState(rebuilt) && rebuilt.SameState(live));
+
+        const std::vector<unsigned char> bytes{live.Encode()};
+        const auto decoded{node::StakeTracker::Decode(bytes, tip, params)};
+        BOOST_REQUIRE(decoded);
+        BOOST_CHECK(decoded->Synced(tip.GetBlockHash()));
+        BOOST_CHECK(decoded->SameState(live) && live.SameState(*decoded));
+        BOOST_CHECK(decoded->Encode() == bytes);
+        BOOST_CHECK_EQUAL(decoded->Rebuilds(), 0U);
+
+        // Decoded three blocks back, it catches up forward.
+        {
+            const CBlockIndex& older{*cs.m_chain[tip.nHeight - 3]};
+            node::StakeTracker before;
+            BOOST_REQUIRE(before.Sync(cs.m_chain, cs.m_blockman, params, older));
+            auto resumed{node::StakeTracker::Decode(before.Encode(), older, params)};
+            BOOST_REQUIRE(resumed);
+            BOOST_REQUIRE(resumed->Sync(cs.m_chain, cs.m_blockman, params, tip));
+            BOOST_CHECK_EQUAL(resumed->Rebuilds(), 0U);
+            BOOST_CHECK(resumed->SameState(rebuilt) && rebuilt.SameState(*resumed));
+        }
+        // It undoes in place, down to M + 2: each parent as rebuilt there.
+        {
+            node::StakeTracker undone{*decoded};
+            for (int height{tip.nHeight}; height > M + 2; --height) {
+                undone.BlockDisconnected(*cs.m_chain[height]);
+                node::StakeTracker at_parent;
+                BOOST_REQUIRE(at_parent.Sync(cs.m_chain, cs.m_blockman, params, *cs.m_chain[height - 1]));
+                BOOST_CHECK_MESSAGE(undone.SameState(at_parent), "after undoing height " << height);
+            }
+            BOOST_CHECK_EQUAL(undone.Rebuilds(), 0U);
+        }
+
+        const auto refused{[&](const std::vector<unsigned char>& doctored, const CBlockIndex& at,
+                               const Consensus::Params& with) {
+            return !node::StakeTracker::Decode(doctored, at, with).has_value();
+        }};
+        for (size_t n{0}; n < bytes.size(); ++n) {
+            BOOST_CHECK(refused({bytes.begin(), bytes.begin() + n}, tip, params));
+        }
+        std::vector<unsigned char> longer{bytes};
+        longer.push_back(0);
+        BOOST_CHECK(refused(longer, tip, params));
+        // Another block; a horizon shorter than the history, or longer.
+        BOOST_CHECK(refused(bytes, *tip.pprev, params));
+        Consensus::Params other{params};
+        other.modern_pos->reorg_horizon = HORIZON - 1;
+        BOOST_CHECK(refused(bytes, tip, other));
+        other.modern_pos->reorg_horizon = HORIZON + 1;
+        BOOST_CHECK(!refused(bytes, tip, other));
+
+        // The registry: a count byte, then 80-byte entries: outpoint (36),
+        // amount (8), validator key (32), creation height (4). A, B and C
+        // staked at H + 1; both of D's stakes are spent.
+        BOOST_REQUIRE_EQUAL(bytes[0], 3);
+        const auto entry{[](const size_t i) { return size_t{1} + 80 * i; }};
+        {
+            std::vector<unsigned char> swapped{bytes};
+            std::swap_ranges(swapped.begin() + entry(0), swapped.begin() + entry(1), swapped.begin() + entry(1));
+            BOOST_CHECK(refused(swapped, tip, params));
+            std::vector<unsigned char> twice{bytes};
+            std::copy(twice.begin() + entry(0), twice.begin() + entry(1), twice.begin() + entry(1));
+            BOOST_CHECK(refused(twice, tip, params));
+        }
+        {
+            const auto amount{[&](const size_t i) { return entry(i) + 36; }};
+            // Last, so that the running total stays in range.
+            std::vector<unsigned char> negative{bytes};
+            PutLE<int64_t>(negative, amount(2), -1);
+            BOOST_CHECK(refused(negative, tip, params));
+            // Up to MAX_MONEY in all, and not one unit more.
+            const int64_t rest{GetLE<int64_t>(bytes, amount(1)) + GetLE<int64_t>(bytes, amount(2))};
+            std::vector<unsigned char> all{bytes};
+            PutLE<int64_t>(all, amount(0), MAX_MONEY - rest);
+            BOOST_CHECK(!refused(all, tip, params));
+            PutLE<int64_t>(all, amount(0), MAX_MONEY - rest + 1);
+            BOOST_CHECK(refused(all, tip, params));
+        }
+        {
+            const size_t created{entry(0) + 36 + 8 + 32};
+            BOOST_REQUIRE_EQUAL(GetLE<int32_t>(bytes, created), H + 1);
+            std::vector<unsigned char> doctored{bytes};
+            PutLE<int32_t>(doctored, created, H);
+            BOOST_CHECK(refused(doctored, tip, params));
+            PutLE<int32_t>(doctored, created, tip.nHeight + 1);
+            BOOST_CHECK(refused(doctored, tip, params));
+            // Created at the tip itself decodes, but is not the state.
+            PutLE<int32_t>(doctored, created, tip.nHeight);
+            const auto later{node::StakeTracker::Decode(doctored, tip, params)};
+            BOOST_REQUIRE(later);
+            BOOST_CHECK(!later->SameState(rebuilt));
+        }
+        // The newest and the oldest undo record, each naming another block.
+        for (const int height : {tip.nHeight, tip.nHeight - HORIZON + 1}) {
+            const uint256 hash{cs.m_chain[height]->GetBlockHash()};
+            const auto at{Occurrences(bytes, std::span<const unsigned char>{hash.begin(), hash.end()})};
+            BOOST_REQUIRE_EQUAL(at.size(), 1U);
+            std::vector<unsigned char> doctored{bytes};
+            doctored[at[0]] ^= 1;
+            BOOST_CHECK_MESSAGE(refused(doctored, tip, params), "undo record of height " << height);
+        }
+        // D's first stake: created at M + 3 (flag 0), spent at M + 6 (flag 1,
+        // then the entry it removed).
+        {
+            const auto at{Occurrences(bytes, Serialized(COutPoint{stake_d.GetHash(), 0}))};
+            BOOST_REQUIRE_EQUAL(at.size(), 2U);
+            BOOST_REQUIRE_EQUAL(bytes[at[0] + 36], 0);
+            BOOST_REQUIRE_EQUAL(bytes[at[1] + 36], 1);
+            std::vector<unsigned char> flag{bytes};
+            flag[at[1] + 36] = 2;
+            BOOST_CHECK(refused(flag, tip, params));
+            // The entry it removed is checked as a kept one is.
+            std::vector<unsigned char> over{bytes};
+            PutLE<int64_t>(over, at[1] + 37, MAX_MONEY + 1);
+            BOOST_CHECK(refused(over, tip, params));
+            std::vector<unsigned char> early{bytes};
+            PutLE<int32_t>(early, at[1] + 37 + 8 + 32, H);
+            BOOST_CHECK(refused(early, tip, params));
+            // A removed entry one unit off decodes, but is not the state.
+            std::vector<unsigned char> prior{bytes};
+            PutLE<int64_t>(prior, at[1] + 37, GetLE<int64_t>(bytes, at[1] + 37) - 1);
+            const auto wrong{node::StakeTracker::Decode(prior, tip, params)};
+            BOOST_REQUIRE(wrong);
+            BOOST_CHECK(!wrong->SameState(rebuilt));
+        }
+    }
+
+    // Two blocks undone and one in their place: the live history is one
+    // record short of a rebuild's, a suffix of it, and decodes as such.
+    InvalidateFrom(Tip()->nHeight - 1);
+    Produce(m_vk_b);
+    {
+        LOCK(cs_main);
+        Chainstate& cs{m_node.chainman->ActiveChainstate()};
+        const Consensus::Params& params{m_node.chainman->GetConsensus()};
+        const CBlockIndex& tip{*cs.m_chain.Tip()};
+        const node::StakeTracker& live{LiveStakes()};
+        BOOST_REQUIRE(live.Synced(tip.GetBlockHash()));
+        node::StakeTracker rebuilt;
+        BOOST_REQUIRE(rebuilt.Sync(cs.m_chain, cs.m_blockman, params, tip));
+        BOOST_CHECK(live.SameState(rebuilt));
+        BOOST_CHECK(!rebuilt.SameState(live));
+        const auto decoded{node::StakeTracker::Decode(live.Encode(), tip, params)};
+        BOOST_REQUIRE(decoded);
+        BOOST_CHECK(decoded->SameState(rebuilt) && decoded->SameState(live) && live.SameState(*decoded));
+    }
 }
 
 BOOST_AUTO_TEST_SUITE_END()
