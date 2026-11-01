@@ -22,6 +22,7 @@
 
 #include <boost/test/unit_test.hpp>
 
+#include <limits>
 #include <map>
 #include <vector>
 
@@ -200,6 +201,22 @@ BOOST_AUTO_TEST_CASE(from_members_restores_built_set)
         auto weightless{members};
         weightless[2].weight = 0;
         BOOST_CHECK(refused(weightless, keys));
+        // A's key held by B too: each would count one signature.
+        auto shared_key{members};
+        shared_key[1].bls_pubkey = shared_key[0].bls_pubkey;
+        BOOST_CHECK(refused(shared_key, keys));
+        constexpr uint64_t MAX_WEIGHT{ValidatorSetSnapshot::MAX_MEMBER_WEIGHT};
+        static_assert(MAX_WEIGHT == uint64_t{std::numeric_limits<CAmount>::max() / UNIT});
+        auto heaviest{members};
+        heaviest[2].weight = MAX_WEIGHT;
+        BOOST_CHECK(!refused(heaviest, keys));
+        auto heavier{members};
+        heavier[2].weight = MAX_WEIGHT + 1;
+        BOOST_CHECK(refused(heavier, keys));
+        // Weights whose total wraps to A's 3: the quorum would be 3.
+        auto wrapping{members};
+        wrapping[1].weight = wrapping[2].weight = uint64_t{1} << 63;
+        BOOST_CHECK(refused(wrapping, keys));
     }
     {
         auto missing{keys};

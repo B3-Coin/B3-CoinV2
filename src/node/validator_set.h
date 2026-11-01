@@ -14,6 +14,7 @@
 #include <uint256.h>
 
 #include <cstdint>
+#include <limits>
 #include <map>
 #include <optional>
 #include <vector>
@@ -73,13 +74,19 @@ public:
     //! B0b: the snapshot of `members` stamped `epoch`, each member's key
     //! taken from `keys`, which the caller verified by their proofs of
     //! possession (a persisted set is restored this way). Nullopt unless
-    //! there are 1 to MAX_FINALITY_SET members in strictly ascending
-    //! validator-key order, each of nonzero weight and with its own key in
-    //! `keys`. The members of a built snapshot give that snapshot again,
-    //! binding_seq included.
+    //! the members are what Build makes: 1 to MAX_FINALITY_SET of them in
+    //! strictly ascending validator-key order, each of weight 1 to
+    //! MAX_MEMBER_WEIGHT and with its own key in `keys`, no key twice. The
+    //! members of a built snapshot give that snapshot again, binding_seq
+    //! included.
     static std::optional<ValidatorSetSnapshot> FromMembers(
         uint64_t epoch, std::vector<ValidatorSetMember> members,
         const std::map<modern::BlsPubkeyBytes, bls::VerifiedPublicKey>& keys);
+    //! The largest weight Build gives a member: the whole-B3 weight of the
+    //! largest CAmount. MAX_FINALITY_SET such weights add up far below
+    //! 2^64, so a set's total weight never wraps.
+    static constexpr uint64_t MAX_MEMBER_WEIGHT{
+        static_cast<uint64_t>(std::numeric_limits<CAmount>::max() / modern::FINALITY_WEIGHT_UNIT)};
 
     const modern::ValidatorSetHeader& Header() const { return m_header; }
     const std::vector<ValidatorSetMember>& Members() const { return m_members; }

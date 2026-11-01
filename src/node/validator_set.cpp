@@ -8,6 +8,7 @@
 #include <node/stake_tracker.h>
 
 #include <algorithm>
+#include <set>
 
 namespace node {
 
@@ -51,11 +52,16 @@ std::optional<ValidatorSetSnapshot> ValidatorSetSnapshot::FromMembers(
     if (members.empty() || members.size() > modern::MAX_FINALITY_SET) return std::nullopt;
     std::vector<bls::VerifiedPublicKey> member_keys;
     member_keys.reserve(members.size());
+    std::set<modern::BlsPubkeyBytes> member_bls;
     for (size_t i{0}; i < members.size(); ++i) {
         const ValidatorSetMember& m{members[i]};
-        // Only what Build makes: ascending validator keys, whole-B3 weights.
+        // Only what Build makes: ascending validator keys; whole-B3 weights
+        // of a CAmount, so the total cannot wrap and shrink the quorum; and
+        // one member per key, as the binding index gives a key one owner,
+        // so no signature counts twice.
         if (i > 0 && !(members[i - 1].validator_key < m.validator_key)) return std::nullopt;
-        if (m.weight == 0) return std::nullopt;
+        if (m.weight == 0 || m.weight > MAX_MEMBER_WEIGHT) return std::nullopt;
+        if (!member_bls.insert(m.bls_pubkey).second) return std::nullopt;
         const auto key{keys.find(m.bls_pubkey)};
         if (key == keys.end() || key->second.Key().Compressed() != m.bls_pubkey) return std::nullopt;
         member_keys.push_back(key->second);
