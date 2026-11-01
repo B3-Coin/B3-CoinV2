@@ -15,10 +15,10 @@ finality group, landed the same day in 50ce7565, 71e351d5, 2818a2a0,
 ec5d5eef and f8f45427. It follows P1 for question 1, chosen on
 2026-11-01; P1 needs no ruling (§5). A review of step 1 the same day
 added four fixes with their tests (77070016, 0647a33e, cfc47691 and
-54c6d329), a test of the mainnet shape (57f46241) and a faster test
-setup (7a7c816f). §13 lists where both steps and the review differ from
-the first draft of this design. Line references are to 9be63a38 unless
-they name another commit.
+54c6d329), a test of the mainnet shape (57f46241), a faster test setup
+(7a7c816f) and the tests under mainnet's bridge rules (§10). §13 lists
+where both steps and the review differ from the first draft of this
+design. Line references are to 9be63a38 unless they name another commit.
 
 ## 1. What is left of B0
 
@@ -451,11 +451,11 @@ always re-derives.
     the check's rebuild: a mismatch is a bug, not a path to optimize.
   - Id 1 is rebuilt at its record's block, the bridge synced first, as
     `RefreshFinalityAnchor` orders them. A bridge that cannot sync, or a
-    rebuild that fails, leaves the record unused, never erased. No test
-    chain has bridge rules active, so that bridge sync is untested. On
-    mainnet it matters: mainnet's decentralized withdrawal mode makes
-    finality certificates read the bridge's withdrawal roots
-    (`FinalityWithdrawalRoot`).
+    rebuild that fails, leaves the record unused, never erased. On
+    mainnet the order matters: its bridge rules, in verifier mode from
+    its modern start, make finality certificates read the bridge's
+    withdrawal roots (`FinalityWithdrawalRoot`). §10 tests this sync and
+    the forward sync's under those rules.
   - Default on in regtest (§4.1) and off elsewhere. It is for CI and for the
     owner's shadow-chain runs.
   - It is an audit, not a setting to pair with question 6. A start with it
@@ -696,7 +696,14 @@ above asks for.
   flush of a running node, and no record while the coins are below the
   tip.
 - `b0b_finality_group_mainnet_shape`: a record with no H1, V1 past two
-  rotations and a broken lineage, the shape of mainnet today.
+  rotations and a broken lineage, under the bridge rules in verifier
+  mode: the shape of mainnet today.
+- `b0b_finality_group_under_verifier_bridge`: under those bridge rules,
+  no tracker checks a certificate without the bridge index, and a zero
+  root is refused. The check rebuild syncs the bridge first. An older
+  record is brought over a certificate to the tip by the first
+  `FindMostWorkChain`, the bridge first, without a rebuild; the loader
+  does not sync it, as nothing has synced the bridge by then.
 
 The crash functional test waits for the `-dbcrashratio` hook and a daemon
 build.

@@ -16,6 +16,7 @@
 #include <kernel/chainparams.h>
 #include <modern/finality_schedule.h>
 #include <modern/pos_v1.h>
+#include <node/bridge_state.h>
 #include <node/chainstate.h>
 #include <node/derived_state.h>
 #include <node/finality_tracker.h>
@@ -532,14 +533,44 @@ struct H1ChainFixture : public FinalityChainFixture {
         BOOST_REQUIRE(index != nullptr);
         return index;
     }
+    //! A bridge state rebuilt from blocks to the tip when the bridge rules
+    //! are active there, for the certificate checks to read its withdrawal
+    //! roots (validation passes the chainstate's own); null otherwise.
+    std::unique_ptr<node::BridgeStateTracker> RebuiltBridge() EXCLUSIVE_LOCKS_REQUIRED(cs_main)
+    {
+        Chainstate& cs{m_node.chainman->ActiveChainstate()};
+        const Consensus::Params& consensus{m_node.chainman->GetConsensus()};
+        if (!Consensus::BridgeRulesActive(cs.m_chain.Height(), consensus)) return nullptr;
+        auto bridge{std::make_unique<node::BridgeStateTracker>()};
+        BOOST_REQUIRE(bridge->Sync(cs.m_chain, cs.m_blockman, consensus, *cs.m_chain.Tip()));
+        return bridge;
+    }
+    //! The withdrawal root a certificate for the checkpoint at `height`
+    //! carries: zero unless the bridge rules are active there in verifier
+    //! mode, then the bridge's root at `height`.
+    uint256 WithdrawalRootAt(const int height)
+    {
+        LOCK(cs_main);
+        const Consensus::Params& consensus{m_node.chainman->GetConsensus()};
+        std::optional<uint256> root{node::FinalityWithdrawalRoot(height, consensus, /*bridge_index=*/nullptr)};
+        if (!root) {
+            const auto bridge{RebuiltBridge()};
+            BOOST_REQUIRE(bridge);
+            root = node::FinalityWithdrawalRoot(height, consensus, &bridge->Index());
+        }
+        BOOST_REQUIRE(root);
+        return *root;
+    }
     //! H-H1: the live tracker's state equals that of a tracker rebuilt from
     //! scratch on the active chain (no schedule left over from another branch).
     bool AsRebuilt()
     {
         LOCK(cs_main);
         Chainstate& cs{m_node.chainman->ActiveChainstate()};
+        const auto bridge{RebuiltBridge()};
         FinalityTracker rebuilt;
-        BOOST_REQUIRE(rebuilt.Sync(cs.m_chain, cs.m_blockman, m_node.chainman->GetConsensus(), *cs.m_chain.Tip()));
+        BOOST_REQUIRE(rebuilt.Sync(cs.m_chain, cs.m_blockman, m_node.chainman->GetConsensus(), *cs.m_chain.Tip(),
+                                   bridge ? &bridge->Index() : nullptr));
         const auto& live{Finality().Current()};
         return SameV1(live, rebuilt.Current()) && SameProducers(live.producers, rebuilt.Current().producers);
     }
@@ -607,8 +638,8 @@ struct H1ChainFixture : public FinalityChainFixture {
     }
     //! Produce one block by `key` (with `txs`); once the current V1 epoch's
     //! first checkpoint is deep enough, include its handover certificate
-    //! (signed by every member), so an intact V1 lineage rotates every E
-    //! blocks.
+    //! (signed by every member, with the withdrawal root due), so an intact
+    //! V1 lineage rotates every E blocks.
     void ProduceCertifying(const modern::PosValidatorKey& key, std::vector<CMutableTransaction> txs = {})
     {
         const auto s{FinalityState()};
@@ -618,7 +649,9 @@ struct H1ChainFixture : public FinalityChainFixture {
             int cp{s.epoch_starts.back()};
             while (!modern::IsCheckpointHeight(cp, m_M, SCALED_INTERVAL)) ++cp;
             if (next - cp >= SCALED_DEPTH && (!s.finalized || cp > s.finalized->height)) {
-                payload.push_back(MakeCertificate({cp, s.epoch, s.next->SetHash()}, *s.current));
+                CertSpec spec{cp, s.epoch, s.next->SetHash()};
+                spec.withdrawal_root = WithdrawalRootAt(cp);
+                payload.push_back(MakeCertificate(spec, *s.current));
             }
         }
         Produce(key, payload, std::move(txs));
@@ -2919,9 +2952,11 @@ struct FinalityGroupFixture : public UndoChainFixture {
 
     explicit FinalityGroupFixture(TestOpts opts = {}) : UndoChainFixture{std::move(opts)} {}
 
-    void BuildGroupChain(const int horizon)
+    //! `configure` runs at the corridor's end, before the first modern block.
+    void BuildGroupChain(const int horizon, const std::function<void()>& configure = {})
     {
         PrepareFinalityChain(/*min_finality_set=*/1, /*reorg_horizon=*/horizon, /*with_unbound_c=*/true);
+        if (configure) configure();
         const int M{m_M};
         const int E{SCALED_E};
         m_R_h = M + 10;
@@ -3332,9 +3367,9 @@ struct GroupPersistFixture : public FinalityGroupFixture {
     //! without the B3 validation-schema marker reconnects every post-H block
     //! once (node/chainstate.cpp), which rebuilds the trackers; later starts
     //! do not, as on a node that has run this release before.
-    void PrepareRestarted()
+    void PrepareRestarted(const std::function<void()>& configure = {})
     {
-        BuildGroupChain(HORIZON);
+        BuildGroupChain(HORIZON, configure);
         Restart();
     }
     fs::path StorePath() { return m_args.GetDataDirNet() / "derivedstate"; }
@@ -3365,14 +3400,15 @@ struct GroupPersistFixture : public FinalityGroupFixture {
     {
         LOCK(cs_main);
         Chainstate& cs{m_node.chainman->ActiveChainstate()};
+        const auto bridge{RebuiltBridge()};
         FinalityTracker rebuilt;
-        BOOST_REQUIRE(rebuilt.Sync(cs.m_chain, cs.m_blockman, m_node.chainman->GetConsensus(), *cs.m_chain.Tip()));
+        BOOST_REQUIRE(rebuilt.Sync(cs.m_chain, cs.m_blockman, m_node.chainman->GetConsensus(), *cs.m_chain.Tip(),
+                                   bridge ? &bridge->Index() : nullptr));
         return LiveFinality().Synced(cs.m_chain.Tip()->GetBlockHash()) && LiveFinality().SameState(rebuilt);
     }
-    //! Restart as Restart does; whether the start logged `message`. A miss
-    //! fails the caller's check instead of aborting, so that the checks after
-    //! it still report.
-    bool RestartLogging(const std::string& message, const std::function<void()>& between = {})
+    //! Whether `run` logged `message`. A miss fails the caller's check
+    //! instead of aborting, so that the checks after it still report.
+    static bool Logs(const std::string& message, const std::function<void()>& run)
     {
         bool seen{false};
         {
@@ -3380,9 +3416,14 @@ struct GroupPersistFixture : public FinalityGroupFixture {
                                      if (line) seen = true;
                                      return line != nullptr;
                                  }};
-            Restart(between);
+            run();
         }
         return seen;
+    }
+    //! Restart as Restart does; whether the start logged `message`.
+    bool RestartLogging(const std::string& message, const std::function<void()>& between = {})
+    {
+        return Logs(message, [&] { Restart(between); });
     }
     //! One escape more in the state an encoding holds: a wrong state that
     //! passes the record's own checks.
@@ -3392,6 +3433,52 @@ struct GroupPersistFixture : public FinalityGroupFixture {
         const StateLayout fields{StateFields(at.state, payload.at(at.state + 1 + 8), /*prior=*/false)};
         BOOST_REQUIRE_EQUAL(GetLE<uint64_t>(payload, fields.escapes), 1U);
         PutLE<uint64_t>(payload, fields.escapes, 2);
+    }
+    //! The bridge rules in verifier mode from `activation`, deposits and
+    //! withdrawals alike, as on mainnet from its modern start (811,001). The
+    //! pins are those of OutboundRpcFixture::ConfigureBridge in
+    //! bridge_ethereum_calldata_tests.
+    void ConfigureVerifierBridge(const int activation)
+    {
+        const auto filled{[](const unsigned char byte) {
+            uint256 out;
+            std::fill(out.begin(), out.end(), byte);
+            return out;
+        }};
+        Consensus::BridgeAssetParams bridge;
+        bridge.asset = Consensus::ETHEREUM_MAINNET_BUSD_IDENTITY;
+        bridge.origin_deployment_block = 1;
+        bridge.vault_runtime_code_hash = filled(0x70);
+        bridge.implementation_or_adapter = filled(0x71);
+        bridge.adapter_version = 1;
+        bridge.recipient_encoding_version = Consensus::BRIDGE_RECIPIENT_VERSION_P2PKH_V1;
+        bridge.activation_height = activation;
+        bridge.mint_caps = Consensus::BridgeMintCaps{
+            .max_per_block = 5'000'000, .max_per_epoch = 20'000'000, .epoch_length_blocks = 30};
+        Consensus::EthereumLightClientPins& light{bridge.light_client.emplace()};
+        light.trusted_checkpoint_root = filled(0x72);
+        light.trusted_checkpoint_slot = 1;
+        light.genesis_validators_root = Consensus::ETHEREUM_MAINNET_GENESIS_VALIDATORS_ROOT;
+        light.fork_schedule = {{0, {0, 0, 0, 0}}};
+        light.fork_schedule_valid_through_epoch = 1'000'000;
+        light.min_sync_committee_participants = Consensus::ETHEREUM_SYNC_COMMITTEE_SUPERMAJORITY;
+        light.max_sync_lag_slots = 8'192;
+        bridge.withdrawal_mode = Consensus::BridgeWithdrawalMode::DECENTRALIZED_VERIFIER_V1;
+        Consensus::BridgeDecentralizedWithdrawalPins& withdrawal{bridge.decentralized_withdrawal.emplace()};
+        withdrawal.ethereum_verifier_address.fill(0x74);
+        withdrawal.ethereum_verifier_code_hash = filled(0x75);
+        withdrawal.bootstrap_validator_set_hash = filled(0x76);
+        withdrawal.withdrawal_rules_version = Consensus::DECENTRALIZED_WITHDRAWAL_RULES_VERSION_V1;
+        withdrawal.withdrawal_rules_commitment = Consensus::DECENTRALIZED_WITHDRAWAL_RULES_COMMITMENT_V1;
+        withdrawal.min_bridge_validators = 4;
+        withdrawal.max_bridge_validators = 64;
+        withdrawal.min_bridge_total_weight = 34;
+        withdrawal.max_epoch_lag = 86'400;
+        BOOST_REQUIRE(Consensus::BridgeMintParamsReady(bridge));
+        Consensus::Params& c{MutableConsensus()};
+        c.busd_bridge = std::move(bridge);
+        c.bridge_withdrawal_activation_height = activation;
+        BOOST_REQUIRE(Consensus::BridgeWithdrawalRulesActive(activation, c));
     }
 };
 
@@ -3782,19 +3869,21 @@ BOOST_FIXTURE_TEST_CASE(b0b_derived_state_written_at_coins_flushes, GroupPersist
 }
 
 // (B0b-11) The mainnet shape, which no other record here has: no H1, so no
-// state holds a producer schedule; V1 certifies epochs 0 and 1 and rotates
-// twice, so the previous set (Set_1) is not the bootstrap set and the
-// finalized checkpoint lies in epoch 1; then epoch 2 goes uncertified until
-// the lineage breaks, E plus the maximum extension after its start. C binds
-// in epoch 0 and B revokes in epoch 1, so Set_2 holds C and Set_3 lacks B.
-// The undo history spans the second rotation and the break. The record
-// round-trips, and each later start installs it without a rebuild, checked
-// against one or not.
+// state holds a producer schedule; the bridge rules in verifier mode from M,
+// as on mainnet, so each certificate carries the bridge's withdrawal root;
+// V1 certifies epochs 0 and 1 and rotates twice, so the previous set (Set_1)
+// is not the bootstrap set and the finalized checkpoint lies in epoch 1; then
+// epoch 2 goes uncertified until the lineage breaks, E plus the maximum
+// extension after its start. C binds in epoch 0 and B revokes in epoch 1, so
+// Set_2 holds C and Set_3 lacks B. The undo history spans the second rotation
+// and the break. The record round-trips, and each later start installs it
+// without a rebuild, checked against one or not.
 BOOST_FIXTURE_TEST_CASE(b0b_finality_group_mainnet_shape, GroupPersistFixture)
 {
     constexpr int DEPTH{70};
     PrepareFinalityChain(/*min_finality_set=*/1, /*reorg_horizon=*/DEPTH, /*with_unbound_c=*/true);
     BOOST_REQUIRE(!m_node.chainman->GetConsensus().h1);
+    ConfigureVerifierBridge(m_M);
     const int M{m_M};
     const int E{SCALED_E};
     const int broken{M + 3 * E + SCALED_MAX_EXTENSION};
@@ -3829,8 +3918,10 @@ BOOST_FIXTURE_TEST_CASE(b0b_finality_group_mainnet_shape, GroupPersistFixture)
         BOOST_REQUIRE(state.bootstrap && state.previous && state.current && state.next);
         BOOST_REQUIRE_EQUAL(state.previous->Epoch(), 1U);
         BOOST_REQUIRE(state.current->IndexOf(m_vk_c) && !state.next->IndexOf(m_vk_b));
+        const auto bridge{RebuiltBridge()};
+        BOOST_REQUIRE(bridge);
         FinalityTracker rebuilt;
-        BOOST_REQUIRE(rebuilt.Sync(cs.m_chain, cs.m_blockman, params, tip));
+        BOOST_REQUIRE(rebuilt.Sync(cs.m_chain, cs.m_blockman, params, tip, &bridge->Index()));
         const auto bytes{live.Encode(params)};
         BOOST_REQUIRE(bytes);
         const auto decoded{FinalityTracker::Decode(*bytes, tip, params)};
@@ -3848,6 +3939,74 @@ BOOST_FIXTURE_TEST_CASE(b0b_finality_group_mainnet_shape, GroupPersistFixture)
     Restart();
     BOOST_CHECK_EQUAL(GroupRebuilds(), 0U);
     BOOST_CHECK(GroupAsRebuilt());
+}
+
+// (B0b-12) The finality group under the bridge rules in verifier mode, which
+// mainnet has had from its modern start: each certificate carries the
+// bridge's withdrawal root at its checkpoint, which no tracker can check
+// without the bridge index, and a zero root is refused. A start that checks
+// the record syncs the bridge before the rebuild it checks the record
+// against. An older record is installed at its block, and the first
+// FindMostWorkChain brings it over a certificate to the tip, the bridge
+// first, without a rebuild; the loader could not, as the bridge is not
+// synced yet when it runs.
+BOOST_FIXTURE_TEST_CASE(b0b_finality_group_under_verifier_bridge, GroupPersistFixture)
+{
+    PrepareRestarted([&] { ConfigureVerifierBridge(m_M); });
+    const int M{m_M};
+    const int E{SCALED_E};
+    {
+        LOCK(cs_main);
+        Chainstate& cs{m_node.chainman->ActiveChainstate()};
+        const Consensus::Params& params{m_node.chainman->GetConsensus()};
+        const FinalityTracker::State& state{LiveFinality().Current()};
+        BOOST_REQUIRE(state.finalized && state.finalized->height == M && state.epoch == 1);
+        const auto bridge{RebuiltBridge()};
+        BOOST_REQUIRE(bridge);
+        const auto root{node::FinalityWithdrawalRoot(M, params, &bridge->Index())};
+        BOOST_REQUIRE(root);
+        BOOST_CHECK(!root->IsNull());
+        FinalityTracker blind;
+        bool blind_synced{true};
+        BOOST_CHECK(Logs("carries an invalid certificate (withdrawal-root-unavailable)", [&] {
+            blind_synced = blind.Sync(cs.m_chain, cs.m_blockman, params, *cs.m_chain.Tip());
+        }));
+        BOOST_CHECK(!blind_synced);
+    }
+
+    // Checked against a rebuild, as under -checkderivedstate: installed.
+    BOOST_CHECK(RestartLogging(strprintf("Loaded the finality group persisted at height %d", Tip()->nHeight)));
+    BOOST_CHECK_EQUAL(GroupRebuilds(), 0U);
+    BOOST_CHECK(GroupAsRebuilt());
+
+    // Unchecked, as outside regtest: the record of block T, then epoch 1's
+    // certificate in block T + 1.
+    m_check_derived_state = false;
+    std::optional<std::vector<unsigned char>> older;
+    Restart([&] { older = ReadRecord(); });
+    BOOST_REQUIRE(older);
+    const int T{DecodeRecord(*older).height};
+    BOOST_REQUIRE_EQUAL(T, Tip()->nHeight);
+    BOOST_REQUIRE_EQUAL(GroupRebuilds(), 0U);
+    const auto at_t{FinalityState()};
+    BOOST_REQUIRE(at_t.epoch == 1 && at_t.epoch_starts.back() == M + E);
+    BOOST_REQUIRE(!at_t.handover_certified && !at_t.lineage_broken && at_t.current && at_t.next);
+    const int checkpoint{M + E};
+    const CBlock zero_root{
+        BuildPosBlock(m_vk_a, {MakeCertificate({checkpoint, at_t.epoch, at_t.next->SetHash()}, *at_t.current)})};
+    if (zero_root.GetBlockTime() > GetTime()) SetMockTime(zero_root.GetBlockTime());
+    const std::string refusal{Probe(zero_root)};
+    BOOST_CHECK_MESSAGE(refusal.find("withdrawal-root-mismatch") != std::string::npos,
+                        "zero root: '" << refusal << "'");
+    ProduceCertifying(m_vk_a);
+    BOOST_REQUIRE_EQUAL(Tip()->nHeight, T + 1);
+    BOOST_REQUIRE(FinalityState().finalized && FinalityState().finalized->height == checkpoint);
+    const std::pair<int, uint256> pin{checkpoint, ChainHashAt(checkpoint)};
+    Produce(m_vk_a);
+    Restart([&] { WriteRecord(*older); });
+    BOOST_CHECK_EQUAL(GroupRebuilds(), 0U);
+    BOOST_CHECK(GroupAsRebuilt());
+    BOOST_CHECK(WITH_LOCK(cs_main, return LiveFinality().PinnedCheckpoint()) == pin);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

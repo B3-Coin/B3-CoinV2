@@ -279,6 +279,9 @@ struct FinalityChainFixture : public BindingFixture {
         bool sign_a{true};
         bool sign_b{true};
         bool sign_c{true};
+        //! The withdrawal root the certificate carries: zero unless the bridge
+        //! rules are active at the checkpoint in verifier mode.
+        uint256 withdrawal_root{};
     };
     //! Build cell + record for a certificate over `snapshot` (the signing set).
     std::pair<CScript, CMpaRecord> MakeCertificate(const CertSpec& spec, const node::ValidatorSetSnapshot& signing_set,
@@ -288,7 +291,7 @@ struct FinalityChainFixture : public BindingFixture {
         fb.height = static_cast<uint64_t>(spec.checkpoint_height);
         fb.block_hash = block_hash ? *block_hash
                                    : WITH_LOCK(cs_main, return m_node.chainman->ActiveChain()[spec.checkpoint_height]->GetBlockHash());
-        fb.withdrawal_root = uint256{};
+        fb.withdrawal_root = spec.withdrawal_root;
         fb.validator_set_hash = spec.successor_hash;
         fb.epoch = spec.epoch;
         modern::FinalityCertificate cert;
