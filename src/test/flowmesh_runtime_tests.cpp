@@ -11484,6 +11484,11 @@ BOOST_AUTO_TEST_CASE(public_submitters_reach_the_attribution_bound)
         const auto submitted{runtime.SubmitLocalActionChecked(f.market, action, flowmesh::ClientNoticeOrigin::PUBLIC, who)};
         BOOST_REQUIRE(submitted.admission.kind == node::FlowMeshLocalAdmission::Kind::ENQUEUE);
         BOOST_REQUIRE(submitted.queued && *submitted.queued == flowmesh::QueueResult::ACCEPTED);
+        // An accepted submission holds one of the runtime's eight local
+        // sources until its worker takes it. Let the worker catch up, or a
+        // descheduled worker thread leaves all eight held and the next
+        // submission is refused.
+        BOOST_REQUIRE(runtime.WaitForIdle(std::chrono::seconds{5}));
         if (++queued % 128 == 0) {
             f.Drain();
             f.clocks[local].m_now += std::chrono::seconds{2};

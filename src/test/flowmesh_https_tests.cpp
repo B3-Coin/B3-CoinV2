@@ -10320,6 +10320,7 @@ BOOST_AUTO_TEST_CASE(remote_levels_cover_every_verified_curve_and_ignore_reporte
     // standing curves (ladders included), never the reported projection.
     LiveMarket live{*this, m_path_root / "wide-book-service"};
     std::string error;
+    auto local{node::MakeLocalFlowMeshBackend(*live.service)};
     const auto settle = [&] {
         const auto deadline{std::chrono::steady_clock::now() + std::chrono::seconds{60}};
         for (;;) {
@@ -10330,12 +10331,16 @@ BOOST_AUTO_TEST_CASE(remote_levels_cover_every_verified_curve_and_ignore_reporte
             std::this_thread::sleep_for(std::chrono::milliseconds{20});
         }
     };
-    // Local submissions share the node's action token bucket: a refused
-    // one waits for its refill and is sent again (never another action).
+    // Local submissions share the node's action token bucket and its eight
+    // local sources, each held until the worker takes its action: a refused
+    // one waits and is sent again (never another action).
     const auto submit = [&](const flowmesh::Action& action) {
         const auto deadline{std::chrono::steady_clock::now() + std::chrono::seconds{30}};
         while (!live.service->SubmitLocalAction(market, action, error)) {
-            BOOST_REQUIRE_MESSAGE(error == "FlowMesh action is rate limited" && std::chrono::steady_clock::now() < deadline, error);
+            BOOST_REQUIRE_MESSAGE((error == "FlowMesh action is rate limited" ||
+                                   error == "FlowMesh action queue is full or unavailable") &&
+                                      std::chrono::steady_clock::now() < deadline,
+                                  error);
             std::this_thread::sleep_for(std::chrono::milliseconds{50});
         }
     };
@@ -10350,6 +10355,7 @@ BOOST_AUTO_TEST_CASE(remote_levels_cover_every_verified_curve_and_ignore_reporte
     // One ask per account (no bids: nothing clears), a four-price ladder for
     // every tenth, many sharing a price with others.
     size_t ladders{0};
+    std::vector<uint256> asks;
     for (size_t i{0}; i < book_keys.size(); ++i) {
         flowmesh::Action ask;
         ask.signer = flowmesh::AccountForKey(XOnlyPubKey{book_keys[i].GetPubKey()});
@@ -10363,8 +10369,23 @@ BOOST_AUTO_TEST_CASE(remote_levels_cover_every_verified_curve_and_ignore_reporte
         ask.curve = *curve;
         BOOST_REQUIRE(flowmesh::SignAction(book_keys[i], domain, config, ask));
         submit(ask);
+        asks.push_back(ask.Id());
     }
     BOOST_REQUIRE_EQUAL(ladders, 15U);
+    // An accepted submission waits in the runtime queue before the pool, and
+    // pending_actions counts only the pool, so settle() alone can return
+    // before the last ask is pooled. Wait for every ask's certified
+    // inclusion first; an ask that never certifies fails here.
+    for (const auto& id : asks) {
+        const auto deadline{std::chrono::steady_clock::now() + std::chrono::seconds{60}};
+        for (;;) {
+            const auto receipt{local->ActionStatus(market, id, false)};
+            if (receipt.state == "certified_inclusion") break;
+            BOOST_REQUIRE_MESSAGE(std::chrono::steady_clock::now() < deadline,
+                                  "an ask did not certify: " + receipt.state + " " + receipt.reason);
+            std::this_thread::sleep_for(std::chrono::milliseconds{20});
+        }
+    }
     settle();
 
     ReportedDataTamper tamper{live.Endpoint()};
@@ -10374,7 +10395,6 @@ BOOST_AUTO_TEST_CASE(remote_levels_cover_every_verified_curve_and_ignore_reporte
     BOOST_REQUIRE_MESSAGE(relay.Start(error), error);
     auto remote{node::MakeRemoteFlowMeshBackend(*m_node.chainman, {Endpoint(relay.Port())}, m_path_root / "wide-book-client", error)};
     BOOST_REQUIRE_MESSAGE(remote, error);
-    auto local{node::MakeLocalFlowMeshBackend(*live.service)};
     const auto account{flowmesh::AccountForKey(XOnlyPubKey{book_keys[0].GetPubKey()})};
 
     // Every verified standing curve, page by page at one head.
