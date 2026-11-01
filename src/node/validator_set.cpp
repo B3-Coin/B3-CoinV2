@@ -15,7 +15,7 @@ std::optional<ValidatorSetSnapshot> ValidatorSetSnapshot::Build(const uint64_t e
                                                                 const std::map<ValidatorKey, CAmount>& active_weights,
                                                                 const FinalityBindingIndex& bindings)
 {
-    ValidatorSetSnapshot snap;
+    std::vector<ValidatorSetMember> members;
     // std::map iteration is ascending by validator_key bytes (std::array operator<),
     // which IS the frozen member order.
     for (const auto& [vk, amount] : active_weights) {
@@ -24,23 +24,53 @@ std::optional<ValidatorSetSnapshot> ValidatorSetSnapshot::Build(const uint64_t e
         if (w == 0) continue;
         const auto binding{bindings.Get(vk)};
         if (!binding || binding->IsRevoked()) continue;
-        snap.m_members.push_back(ValidatorSetMember{vk, binding->bls_pubkey, w, binding->seq});
+        members.push_back(ValidatorSetMember{vk, binding->bls_pubkey, w, binding->seq});
     }
-    if (snap.m_members.empty() || snap.m_members.size() > modern::MAX_FINALITY_SET) return std::nullopt;
+    if (members.empty() || members.size() > modern::MAX_FINALITY_SET) return std::nullopt;
 
-    uint64_t total{0};
     std::vector<bls::VerifiedPublicKey> keys;
-    keys.reserve(snap.m_members.size());
-    snap.m_leaves.reserve(snap.m_members.size());
-    for (size_t i = 0; i < snap.m_members.size(); ++i) {
-        const auto& m{snap.m_members[i]};
-        total += m.weight;
+    keys.reserve(members.size());
+    for (const auto& m : members) {
         const auto pk{bls::PublicKey::Decode(m.bls_pubkey)};
         if (!pk) return std::nullopt; // cannot happen for a binding that passed consensus; fail closed anyway
         // Provenance: every bls_pubkey in the binding index passed its PoP in
         // consensus when the binding connected (or was re-verified on rebuild);
         // this is the permitted TrustedFromValidatedChain use.
         keys.push_back(bls::VerifiedPublicKey::TrustedFromValidatedChain(*pk));
+    }
+    return Assemble(epoch, std::move(members), std::move(keys));
+}
+
+std::optional<ValidatorSetSnapshot> ValidatorSetSnapshot::FromMembers(
+    const uint64_t epoch, std::vector<ValidatorSetMember> members,
+    const std::map<modern::BlsPubkeyBytes, bls::VerifiedPublicKey>& keys)
+{
+    if (members.empty() || members.size() > modern::MAX_FINALITY_SET) return std::nullopt;
+    std::vector<bls::VerifiedPublicKey> member_keys;
+    member_keys.reserve(members.size());
+    for (size_t i{0}; i < members.size(); ++i) {
+        const ValidatorSetMember& m{members[i]};
+        // Only what Build makes: ascending validator keys, whole-B3 weights.
+        if (i > 0 && !(members[i - 1].validator_key < m.validator_key)) return std::nullopt;
+        if (m.weight == 0) return std::nullopt;
+        const auto key{keys.find(m.bls_pubkey)};
+        if (key == keys.end() || key->second.Key().Compressed() != m.bls_pubkey) return std::nullopt;
+        member_keys.push_back(key->second);
+    }
+    return Assemble(epoch, std::move(members), std::move(member_keys));
+}
+
+std::optional<ValidatorSetSnapshot> ValidatorSetSnapshot::Assemble(const uint64_t epoch,
+                                                                   std::vector<ValidatorSetMember> members,
+                                                                   std::vector<bls::VerifiedPublicKey> keys)
+{
+    ValidatorSetSnapshot snap;
+    snap.m_members = std::move(members);
+    uint64_t total{0};
+    snap.m_leaves.reserve(snap.m_members.size());
+    for (size_t i = 0; i < snap.m_members.size(); ++i) {
+        const auto& m{snap.m_members[i]};
+        total += m.weight;
         snap.m_leaves.push_back(modern::ValidatorSetLeaf(static_cast<uint32_t>(i), m.bls_pubkey, m.weight));
     }
     const auto aggregate{bls::AggregatePublicKeys(keys)};

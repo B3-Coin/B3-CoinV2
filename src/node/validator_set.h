@@ -5,6 +5,7 @@
 #define B3COIN_NODE_VALIDATOR_SET_H
 
 #include <consensus/amount.h>
+#include <crypto/bls.h>
 #include <modern/finality_certificate.h>
 #include <modern/finality_key.h>
 #include <modern/finality_types.h>
@@ -69,6 +70,16 @@ public:
     //! Convenience: enumerate from a synced StakeTracker at `height` and a synced binding index.
     static std::optional<ValidatorSetSnapshot> BuildAt(uint64_t epoch, const StakeTracker& stakes, int height,
                                                        const FinalityBindingIndex& bindings);
+    //! B0b: the snapshot of `members` stamped `epoch`, each member's key
+    //! taken from `keys`, which the caller verified by their proofs of
+    //! possession (a persisted set is restored this way). Nullopt unless
+    //! there are 1 to MAX_FINALITY_SET members in strictly ascending
+    //! validator-key order, each of nonzero weight and with its own key in
+    //! `keys`. The members of a built snapshot give that snapshot again,
+    //! binding_seq included.
+    static std::optional<ValidatorSetSnapshot> FromMembers(
+        uint64_t epoch, std::vector<ValidatorSetMember> members,
+        const std::map<modern::BlsPubkeyBytes, bls::VerifiedPublicKey>& keys);
 
     const modern::ValidatorSetHeader& Header() const { return m_header; }
     const std::vector<ValidatorSetMember>& Members() const { return m_members; }
@@ -95,6 +106,10 @@ public:
 
 private:
     ValidatorSetSnapshot() = default;
+    //! The leaves, header, set hash and view of 1 to MAX_FINALITY_SET
+    //! members in order, with their keys in the same order.
+    static std::optional<ValidatorSetSnapshot> Assemble(uint64_t epoch, std::vector<ValidatorSetMember> members,
+                                                        std::vector<bls::VerifiedPublicKey> keys);
     modern::ValidatorSetHeader m_header{};
     std::vector<ValidatorSetMember> m_members;
     std::vector<uint256> m_leaves;

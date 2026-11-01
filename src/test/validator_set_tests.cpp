@@ -142,6 +142,77 @@ BOOST_AUTO_TEST_CASE(binding_sequence_metadata_preserves_consensus_snapshot)
     BOOST_CHECK(carried.Leaves() == rebound->Leaves());
 }
 
+// B0b: a set restored from its members and their verified keys is the set
+// Build made, binding_seq and view included. Members Build cannot make, or a
+// key that is missing or not the member's own, give no set.
+BOOST_AUTO_TEST_CASE(from_members_restores_built_set)
+{
+    const auto kA{BlsK(1)}, kB{BlsK(2)}, kC{BlsK(3)};
+    FinalityBindingIndex bindings;
+    bindings.ConnectBlock(10, {{VK(0x01), {kA.GetPublicKey().Compressed(), 0, 10}},
+                               {VK(0x02), {kB.GetPublicKey().Compressed(), 0, 10}},
+                               {VK(0x03), {kC.GetPublicKey().Compressed(), 0, 10}}});
+    bindings.ConnectBlock(11, {{VK(0x02), {kB.GetPublicKey().Compressed(), 4, 11}}}); // B rebinds at seq 4
+    const std::map<node::ValidatorKey, CAmount> weights{{VK(0x01), 3 * UNIT}, {VK(0x02), 5 * UNIT}, {VK(0x03), 9 * UNIT}};
+    const auto built{ValidatorSetSnapshot::Build(7, weights, bindings)};
+    BOOST_REQUIRE(built);
+    std::map<modern::BlsPubkeyBytes, bls::VerifiedPublicKey> keys;
+    for (const bls::SecretKey* k : {&kA, &kB, &kC}) {
+        keys.emplace(k->GetPublicKey().Compressed(), bls::VerifiedPublicKey::FromPoP(k->GetPublicKey(), k->SignPoP()).value());
+    }
+    const auto same{[](const ValidatorSetSnapshot& a, const ValidatorSetSnapshot& b) {
+        if (!(a == b) || a.SetHash() != b.SetHash() || a.Leaves() != b.Leaves() ||
+            a.View().validator_count != b.View().validator_count || a.View().quorum_weight != b.View().quorum_weight ||
+            a.View().weights != b.View().weights || a.View().keys.size() != b.View().keys.size()) {
+            return false;
+        }
+        for (size_t i{0}; i < a.Size(); ++i) {
+            if (a.Members()[i].binding_seq != b.Members()[i].binding_seq) return false;
+            if (!(a.View().keys[i].Key() == b.View().keys[i].Key())) return false;
+        }
+        return true;
+    }};
+    const auto restored{ValidatorSetSnapshot::FromMembers(7, built->Members(), keys)};
+    BOOST_REQUIRE(restored);
+    BOOST_CHECK(same(*restored, *built));
+    BOOST_CHECK_EQUAL(restored->Members()[1].binding_seq, 4u);
+    // Another epoch gives the re-stamped set; unused keys are ignored.
+    keys.emplace(BlsK(9).GetPublicKey().Compressed(),
+                 bls::VerifiedPublicKey::FromPoP(BlsK(9).GetPublicKey(), BlsK(9).SignPoP()).value());
+    const auto e8{ValidatorSetSnapshot::FromMembers(8, built->Members(), keys)};
+    BOOST_REQUIRE(e8);
+    BOOST_CHECK(same(*e8, built->WithEpoch(8)));
+
+    const auto refused{[&](std::vector<node::ValidatorSetMember> members,
+                           const std::map<modern::BlsPubkeyBytes, bls::VerifiedPublicKey>& with) {
+        return !ValidatorSetSnapshot::FromMembers(7, std::move(members), with).has_value();
+    }};
+    const std::vector<node::ValidatorSetMember> members{built->Members()};
+    BOOST_CHECK(!refused(members, keys));
+    BOOST_CHECK(refused({}, keys));
+    {
+        auto swapped{members};
+        std::swap(swapped[0], swapped[1]);
+        BOOST_CHECK(refused(swapped, keys));
+        auto twice{members};
+        twice[1].validator_key = twice[0].validator_key;
+        BOOST_CHECK(refused(twice, keys));
+        auto weightless{members};
+        weightless[2].weight = 0;
+        BOOST_CHECK(refused(weightless, keys));
+    }
+    {
+        auto missing{keys};
+        missing.erase(kB.GetPublicKey().Compressed());
+        BOOST_CHECK(refused(members, missing));
+        // B's entry holding C's key.
+        auto other{keys};
+        other.erase(kB.GetPublicKey().Compressed());
+        other.emplace(kB.GetPublicKey().Compressed(), keys.at(kC.GetPublicKey().Compressed()));
+        BOOST_CHECK(refused(members, other));
+    }
+}
+
 BOOST_AUTO_TEST_CASE(fail_closed_and_immutability)
 {
     FinalityBindingIndex bindings;
@@ -184,7 +255,20 @@ BOOST_AUTO_TEST_CASE(fail_closed_and_immutability)
         const auto last_it{w.rbegin()};
         modern::ValidatorKeyBytes drop{last_it->first};
         w.erase(drop);
-        BOOST_CHECK(ValidatorSetSnapshot::Build(0, w, big).has_value());
+        const auto full{ValidatorSetSnapshot::Build(0, w, big)};
+        BOOST_REQUIRE(full.has_value());
+        // B0b: FromMembers restores a full set, and refuses one member more
+        // (above every validator key, with a key it holds).
+        std::map<modern::BlsPubkeyBytes, bls::VerifiedPublicKey> keys;
+        for (size_t i{0}; i < full->Size(); ++i) keys.emplace(full->Members()[i].bls_pubkey, full->View().keys[i]);
+        const auto restored{ValidatorSetSnapshot::FromMembers(0, full->Members(), keys)};
+        BOOST_REQUIRE(restored.has_value());
+        BOOST_CHECK(*restored == *full);
+        auto more{full->Members()};
+        node::ValidatorSetMember extra{more.back()};
+        extra.validator_key.fill(0xff);
+        more.push_back(extra);
+        BOOST_CHECK(!ValidatorSetSnapshot::FromMembers(0, more, keys).has_value());
     }
 }
 
