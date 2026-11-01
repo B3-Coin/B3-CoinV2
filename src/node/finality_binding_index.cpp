@@ -14,9 +14,11 @@
 #include <serialize.h>
 #include <streams.h>
 
+#include <algorithm>
 #include <cassert>
 #include <ios>
 #include <map>
+#include <set>
 
 namespace node {
 
@@ -76,6 +78,12 @@ void FinalityBindingIndex::ConnectBlock(const int height, const std::vector<Tran
     for (const Transition& t : transitions) {
         undo.push_back(UndoEntry{t.validator_key, Get(t.validator_key)});
         Set(t.validator_key, t.record);
+        // B0b (P1): keep the key's proof. A zero one (a revocation, or a
+        // transition built without a proof) is never kept, so KeyPops()
+        // reports a key without one.
+        if (std::ranges::any_of(t.pop, [](const unsigned char c) { return c != 0; })) {
+            m_pops.emplace(t.record.bls_pubkey, t.pop);
+        }
     }
     m_heights.push_back(height);
     m_undo.push_back(std::move(undo));
@@ -96,6 +104,7 @@ void FinalityBindingIndex::Clear()
     m_owner_of_key.clear();
     m_heights.clear();
     m_undo.clear();
+    m_pops.clear();
 }
 
 std::map<modern::ValidatorKeyBytes, modern::BindingRecord> FinalityBindingIndex::SnapshotActive() const
@@ -211,6 +220,72 @@ bool FinalityBindingIndex::SameState(const FinalityBindingIndex& other) const
            m_heights == other.m_heights && m_undo == other.m_undo;
 }
 
+std::set<modern::BlsPubkeyBytes> FinalityBindingIndex::HeldKeys() const
+{
+    std::set<modern::BlsPubkeyBytes> keys;
+    for (const auto& [vk, record] : m_by_validator) {
+        if (!record.IsRevoked()) keys.insert(record.bls_pubkey);
+    }
+    for (const std::vector<UndoEntry>& block : m_undo) {
+        for (const UndoEntry& entry : block) {
+            if (entry.previous && !entry.previous->IsRevoked()) keys.insert(entry.previous->bls_pubkey);
+        }
+    }
+    return keys;
+}
+
+std::optional<std::vector<std::pair<modern::BlsPubkeyBytes, FinalityBindingIndex::PopBytes>>>
+FinalityBindingIndex::KeyPops() const
+{
+    const std::set<modern::BlsPubkeyBytes> keys{HeldKeys()};
+    std::vector<std::pair<modern::BlsPubkeyBytes, PopBytes>> out;
+    out.reserve(keys.size());
+    for (const modern::BlsPubkeyBytes& key : keys) {
+        const auto it{m_pops.find(key)};
+        if (it == m_pops.end()) return std::nullopt;
+        out.emplace_back(key, it->second);
+    }
+    return out;
+}
+
+std::optional<std::vector<unsigned char>> FinalityBindingIndex::EncodePops() const
+{
+    const auto pops{KeyPops()};
+    if (!pops) return std::nullopt;
+    std::vector<unsigned char> out;
+    VectorWriter w{out, 0};
+    WriteCompactSize(w, pops->size());
+    for (const auto& [key, pop] : *pops) w << key << pop;
+    return out;
+}
+
+bool FinalityBindingIndex::DecodePops(const std::span<const unsigned char> bytes)
+{
+    std::map<modern::BlsPubkeyBytes, PopBytes> pops;
+    try {
+        SpanReader r{bytes};
+        const uint64_t count{ReadCompactSize(r)};
+        for (uint64_t i{0}; i < count; ++i) {
+            modern::BlsPubkeyBytes key;
+            PopBytes pop;
+            r >> key >> pop;
+            // Strictly ascending keys and no zero proof: only what
+            // EncodePops() writes, in its one order.
+            if (!pops.empty() && !(pops.rbegin()->first < key)) return false;
+            if (std::ranges::none_of(pop, [](const unsigned char c) { return c != 0; })) return false;
+            pops.emplace_hint(pops.end(), key, pop);
+        }
+        if (!r.empty()) return false;
+    } catch (const std::ios_base::failure&) {
+        return false;
+    }
+    // Exactly the keys this index holds: none missing, none foreign.
+    const std::set<modern::BlsPubkeyBytes> held{HeldKeys()};
+    if (!std::ranges::equal(held, pops, {}, {}, [](const auto& entry) { return entry.first; })) return false;
+    m_pops = std::move(pops);
+    return true;
+}
+
 bool FinalityBindingOverlay::ApplyTransaction(
     const CTransaction& tx,
     std::vector<FinalityBindingIndex::Transition>& out,
@@ -267,7 +342,7 @@ bool FinalityBindingOverlay::ApplyTransaction(
         }
         m_pending[vk] = record;
         if (!record.IsRevoked()) m_pending_owner[record.bls_pubkey] = vk;
-        collected.push_back(FinalityBindingIndex::Transition{vk, record});
+        collected.push_back(FinalityBindingIndex::Transition{vk, record, pair.evidence.pop});
     }
     out = std::move(collected);
     return true;

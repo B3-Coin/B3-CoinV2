@@ -319,7 +319,22 @@ modern::BlsPubkeyBytes Pk(const unsigned char b)
     pk.fill(b);
     return pk;
 }
+//! A stand-in proof of possession for a stand-in key: nonzero, one per key.
+FinalityBindingIndex::PopBytes PopFor(const modern::BlsPubkeyBytes& pk)
+{
+    FinalityBindingIndex::PopBytes pop;
+    pop.fill(static_cast<unsigned char>(pk[0] ^ 0x5a));
+    return pop;
+}
+//! A transition with its key's proof; a revocation carries a zero one.
 FinalityBindingIndex::Transition Bind(const modern::ValidatorKeyBytes& vk, const modern::BlsPubkeyBytes& pk,
+                                      const uint32_t seq, const int height)
+{
+    const modern::BindingRecord record{pk, seq, height};
+    return {vk, record, record.IsRevoked() ? FinalityBindingIndex::PopBytes{} : PopFor(pk)};
+}
+//! The same transition built without its proof.
+FinalityBindingIndex::Transition Bare(const modern::ValidatorKeyBytes& vk, const modern::BlsPubkeyBytes& pk,
                                       const uint32_t seq, const int height)
 {
     return {vk, modern::BindingRecord{pk, seq, height}};
@@ -457,6 +472,150 @@ BOOST_AUTO_TEST_CASE(binding_index_decode_refuses_malformed)
     FinalityBindingIndex shared;
     shared.ConnectBlock(10, {Bind(a, Pk(1), 0, 10), Bind(b, Pk(1), 0, 10)});
     BOOST_CHECK(!FinalityBindingIndex::Decode(shared.Encode(), 10, 10));
+}
+
+// B0b (P1): the index keeps the proof of possession of every key that a
+// record holds, or held before a transition of the trail: every key a
+// validator set built from it can hold, now or after an undo. The proofs
+// stay out of Encode(), the chainstate's record, and out of SameState().
+BOOST_AUTO_TEST_CASE(binding_index_keeps_each_keys_proof)
+{
+    const auto a{Vk(0xa1)}, b{Vk(0xb2)}, c{Vk(0xc3)};
+    const modern::BlsPubkeyBytes revoked{};
+    FinalityBindingIndex index;
+    const auto holds{[](const FinalityBindingIndex& i, const std::vector<unsigned char>& keys) {
+        std::vector<std::pair<modern::BlsPubkeyBytes, FinalityBindingIndex::PopBytes>> want;
+        want.reserve(keys.size());
+        for (const unsigned char k : keys) want.emplace_back(Pk(k), PopFor(Pk(k)));
+        const auto got{i.KeyPops()};
+        return got && *got == want;
+    }};
+    BOOST_CHECK(holds(index, {}));
+    index.ConnectBlock(10, {Bind(a, Pk(1), 0, 10), Bind(b, Pk(2), 0, 10)});
+    BOOST_CHECK(holds(index, {1, 2}));
+    // a rotates twice in one block and c binds the key a released: key 3
+    // is held only between a's two transitions.
+    index.ConnectBlock(12, {Bind(a, Pk(3), 1, 12), Bind(a, Pk(4), 2, 12), Bind(c, Pk(1), 0, 12)});
+    BOOST_CHECK(holds(index, {1, 2, 3, 4}));
+    // b revokes: its key is only in the trail now.
+    index.ConnectBlock(15, {Bind(b, revoked, 1, 15)});
+    BOOST_CHECK(holds(index, {1, 2, 3, 4}));
+    // An undo drops exactly the keys its block brought in.
+    index.DisconnectBlock(15);
+    BOOST_CHECK(holds(index, {1, 2, 3, 4}));
+    index.DisconnectBlock(12);
+    BOOST_CHECK(holds(index, {1, 2}));
+    index.ConnectBlock(12, {Bind(a, Pk(3), 1, 12)});
+    BOOST_CHECK(holds(index, {1, 2, 3}));
+
+    // The same transitions without proofs: the same Encode() and state, and
+    // no proofs to name or encode.
+    FinalityBindingIndex bare;
+    bare.ConnectBlock(10, {Bare(a, Pk(1), 0, 10), Bare(b, Pk(2), 0, 10)});
+    bare.ConnectBlock(12, {Bare(a, Pk(3), 1, 12)});
+    BOOST_CHECK(bare.Encode() == index.Encode());
+    BOOST_CHECK(bare.SameState(index));
+    BOOST_CHECK(!bare.KeyPops());
+    BOOST_CHECK(!bare.EncodePops());
+
+    // Decode(Encode()) has no proofs until DecodePops(EncodePops()).
+    const auto pops{index.EncodePops()};
+    BOOST_REQUIRE(pops);
+    auto decoded{FinalityBindingIndex::Decode(index.Encode(), 10, 12)};
+    BOOST_REQUIRE(decoded);
+    BOOST_CHECK(!decoded->KeyPops());
+    BOOST_REQUIRE(decoded->DecodePops(*pops));
+    BOOST_CHECK(decoded->KeyPops() == index.KeyPops());
+    BOOST_CHECK(decoded->EncodePops() == pops);
+    // It keeps the proofs of later blocks, and loses those an undo drops.
+    decoded->ConnectBlock(20, {Bind(b, Pk(5), 1, 20)});
+    BOOST_CHECK(holds(*decoded, {1, 2, 3, 5}));
+    decoded->DisconnectBlock(20);
+    decoded->DisconnectBlock(12);
+    BOOST_CHECK(holds(*decoded, {1, 2}));
+    // Clear forgets them: an index rebuilt without proofs has none.
+    index.Clear();
+    index.ConnectBlock(10, {Bare(a, Pk(1), 0, 10)});
+    BOOST_CHECK(!index.KeyPops());
+}
+
+BOOST_AUTO_TEST_CASE(binding_index_proofs_decode_refuses_malformed)
+{
+    const auto a{Vk(0xa1)}, b{Vk(0xb2)};
+    FinalityBindingIndex index;
+    index.ConnectBlock(10, {Bind(a, Pk(1), 0, 10)});
+    index.ConnectBlock(12, {Bind(a, Pk(2), 1, 12), Bind(b, Pk(3), 0, 12)});
+    const auto encoded{index.EncodePops()};
+    BOOST_REQUIRE(encoded);
+    const std::vector<unsigned char>& bytes{*encoded};
+    // Layout: 1 count byte, then three 144-byte entries (a 48-byte key,
+    // then its 96-byte proof) for keys 1, 2 and 3 at 1, 145 and 289.
+    BOOST_REQUIRE_EQUAL(bytes.size(), 433u);
+    // Refused, and the index keeps no proof.
+    const auto refused{[&](const std::vector<unsigned char>& doctored) {
+        auto decoded{FinalityBindingIndex::Decode(index.Encode(), 10, 12)};
+        BOOST_REQUIRE(decoded);
+        return !decoded->DecodePops(doctored) && !decoded->KeyPops();
+    }};
+    BOOST_CHECK(!refused(bytes));
+    // Every strict prefix, and one byte too many.
+    for (size_t n{0}; n < bytes.size(); ++n) {
+        BOOST_CHECK(refused({bytes.begin(), bytes.begin() + n}));
+    }
+    std::vector<unsigned char> longer{bytes};
+    longer.push_back(0);
+    BOOST_CHECK(refused(longer));
+    // Keys out of order, and one key twice.
+    {
+        std::vector<unsigned char> swapped{bytes};
+        std::swap_ranges(swapped.begin() + 1, swapped.begin() + 145, swapped.begin() + 145);
+        BOOST_CHECK(refused(swapped));
+        std::vector<unsigned char> twice{bytes};
+        std::copy(twice.begin() + 1, twice.begin() + 145, twice.begin() + 145);
+        BOOST_CHECK(refused(twice));
+    }
+    // A key missing, a key too many, and a key the index never held in
+    // place of one it holds.
+    {
+        std::vector<unsigned char> fewer{bytes.begin(), bytes.end() - 144};
+        fewer[0] = 2;
+        BOOST_CHECK(refused(fewer));
+        std::vector<unsigned char> more{bytes};
+        more[0] = 4;
+        const auto extra{Pk(9)};
+        const auto extra_pop{PopFor(extra)};
+        more.insert(more.end(), extra.begin(), extra.end());
+        more.insert(more.end(), extra_pop.begin(), extra_pop.end());
+        BOOST_CHECK(refused(more));
+        std::vector<unsigned char> other{bytes};
+        std::fill(other.begin() + 289, other.begin() + 337, 0x09);
+        BOOST_CHECK(refused(other));
+    }
+    // A zero proof.
+    {
+        std::vector<unsigned char> zero{bytes};
+        std::fill(zero.begin() + 193, zero.begin() + 289, 0);
+        BOOST_CHECK(refused(zero));
+    }
+}
+
+// B0b (P1): the proofs come from the blocks' evidence. Each binding brings
+// its key's proof into the index; a revocation brings none, and the key it
+// released keeps its proof while the trail holds the key.
+BOOST_FIXTURE_TEST_CASE(binding_proofs_come_from_the_evidence, BindingFixture)
+{
+    Prepare();
+    const auto k1{Bls(1)}, k2{Bls(2)};
+    const auto a0{MakeBinding(m_validator_a, m_vk_a, &k1, 0)};
+    const auto b0{MakeBinding(m_validator_b, m_vk_b, &k2, 0)};
+    const auto a1{MakeBinding(m_validator_a, m_vk_a, nullptr, 1)};
+    BOOST_REQUIRE(SubmitCorridor({MakeTx(0, {a0.cell}, {a0.record}), MakeTx(1, {b0.cell}, {b0.record})}));
+    BOOST_REQUIRE(SubmitCorridor({MakeTx(2, {a1.cell}, {a1.record})}));
+    std::vector<std::pair<modern::BlsPubkeyBytes, FinalityBindingIndex::PopBytes>> want{
+        {k1.GetPublicKey().Compressed(), k1.SignPoP().Compressed()},
+        {k2.GetPublicKey().Compressed(), k2.SignPoP().Compressed()}};
+    std::sort(want.begin(), want.end());
+    BOOST_CHECK(Index().KeyPops() == want);
 }
 
 // B0b: a record is accepted only whole, from the same build, under the same

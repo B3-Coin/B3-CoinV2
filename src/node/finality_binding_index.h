@@ -9,11 +9,14 @@
 #include <primitives/block.h>
 #include <uint256.h>
 
+#include <array>
 #include <cstdint>
 #include <string>
 #include <map>
 #include <optional>
+#include <set>
 #include <span>
+#include <utility>
 #include <vector>
 
 class CBlockIndex;
@@ -48,9 +51,14 @@ namespace node {
 class FinalityBindingIndex
 {
 public:
+    //! A binding's 96-byte BLS proof of possession (all zero for a revocation).
+    using PopBytes = std::array<unsigned char, modern::BLS_SIGNATURE_SIZE>;
     struct Transition {
         modern::ValidatorKeyBytes validator_key{};
         modern::BindingRecord record{}; // record.height is the block height of the transition
+        //! B0b: the proof of possession the transition carried, kept per key
+        //! (KeyPops) so that a persisted index can re-verify every key.
+        PopBytes pop{};
     };
 
     //! Current binding of a validator (revoked records are returned too; see IsRevoked()).
@@ -88,8 +96,24 @@ public:
     //! its last entry; no nonzero key held by two validators.
     static std::optional<FinalityBindingIndex> Decode(std::span<const unsigned char> bytes, int first_height,
                                                       int last_height);
-    //! Equal records, key owners and undo trail.
+    //! Equal records, key owners and undo trail. The proofs are not
+    //! compared (an index decoded from Encode() has none): see KeyPops().
     bool SameState(const FinalityBindingIndex& other) const;
+
+    //! B0b (P1): every nonzero key that a record holds, or held before a
+    //! transition of the undo trail, with the proof of possession its
+    //! binding carried, in key order. These are the keys a validator set
+    //! built from this index can hold, now or after an undo. Nullopt when
+    //! a key has no proof (an index built or decoded without them).
+    std::optional<std::vector<std::pair<modern::BlsPubkeyBytes, PopBytes>>> KeyPops() const;
+    //! KeyPops() as one canonical byte string, kept apart from Encode():
+    //! the chainstate's record stores no proofs. Nullopt as KeyPops().
+    std::optional<std::vector<unsigned char>> EncodePops() const;
+    //! Take the proofs of an index decoded by Decode(). True only when
+    //! `bytes` is exactly EncodePops() of these keys and proofs: ascending
+    //! keys, each one this index holds, none missing, no zero proof. On
+    //! false the index is unchanged. No proof is verified here.
+    bool DecodePops(std::span<const unsigned char> bytes);
 
 private:
     struct UndoEntry {
@@ -99,11 +123,17 @@ private:
     };
     void Set(const modern::ValidatorKeyBytes& validator_key, const modern::BindingRecord& record);
     void Restore(const UndoEntry& undo);
+    //! The keys KeyPops() names.
+    std::set<modern::BlsPubkeyBytes> HeldKeys() const;
 
     std::map<modern::ValidatorKeyBytes, modern::BindingRecord> m_by_validator;
     std::map<modern::BlsPubkeyBytes, modern::ValidatorKeyBytes> m_owner_of_key;
     std::vector<int> m_heights;                      // connected block heights, in order
     std::vector<std::vector<UndoEntry>> m_undo;      // parallel to m_heights; entries in apply order
+    //! The proof each nonzero key arrived with, from a transition or from
+    //! DecodePops(). A valid proof is unique to its key, so the first kept
+    //! is the only one; a key an undo released keeps its entry.
+    std::map<modern::BlsPubkeyBytes, PopBytes> m_pops;
 };
 
 /**
