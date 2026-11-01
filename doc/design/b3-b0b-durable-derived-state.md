@@ -1,11 +1,18 @@
 # B0b: durable derived state
 
-**Status: DESIGN for owner review; no code.** Written 2026-10-31 against
-`r0-rebirth` at 070cc37b, the B0a commit. It changes no block validity,
-height, rule or parameter. B0 was authorized on 2026-10-29
-(`doc/design/b3-height-c-fast-track.md` §7, ask 1). B0b adds files that a
-node trusts at startup, so their format and trust rules are up for review
-before any code.
+**Status: DESIGN for owner review; step 1a built, off by default.**
+Written 2026-10-31 against `r0-rebirth` at 070cc37b, the B0a commit. It
+changes no block validity, height, rule or parameter. B0 was authorized on
+2026-10-29 (`doc/design/b3-height-c-fast-track.md` §7, ask 1). B0b adds
+files that a node trusts at startup, so their format and trust rules are up
+for review.
+
+Step 1a (§9), the framework and the chainstate binding index, landed on
+2026-11-01 in 4f3219ea, b5cae181 and 9be63a38. It follows the
+recommended answers to §11's questions 2 to 4, and stays behind
+`-persistderivedstate` until question 6 is answered. §13 lists where it
+differs from the first draft of this design. Line references are to
+9be63a38.
 
 ## 1. What is left of B0
 
@@ -73,13 +80,14 @@ Goals:
 3. A reorganization right after a start is undone in place, as B0a does
    while running.
 4. A crash leaves the previous record or the new one, never a mix.
-5. No record survives a change of build or of consensus parameters.
+5. No record survives a change of build, or of a consensus parameter its
+   tracker reads.
 6. Later, bounded memory for the trackers whose history grows per block
    (§7).
 
 Non-goals:
 
-- **Pruning.** It stays refused (`src/init.cpp:1094-1098`,
+- **Pruning.** It stays refused (`src/init.cpp:1096-1100`,
   `src/node/blockstorage.cpp:788-801`). B0b removes the reason those
   comments give only once every tracker is durable.
 - **Snapshot chainstates (assumeutxo).** They never write or load records.
@@ -152,18 +160,19 @@ the coins database holds.
 **Value:**
 
 - `u8` format version;
-- the build string, `FormatFullVersion()` (§4.1);
+- the build id, `SourceBuildId()` (§4.1);
 - `uint256` parameters digest (§4.2);
 - `uint256` hash and `i32` height of the block the state is synced to;
 - the payload (§4.3);
-- SHA256 of everything before it.
+- SHA256d of everything before it.
 
 ### 4.1 Bound to the build
 
-`FormatFullVersion()` is `v<version>` for a release and
-`v<version>-<commit>` for a development build
-(`src/clientversion.cpp:40-62`). A record written by another build is never
-loaded.
+`SourceBuildId()` (`src/clientversion.cpp`) names the exact sources: the
+tag of a clean tagged checkout, otherwise `v<version>-<commit>`, or
+`v<version>-g<hash>` for a `git archive`. A build with uncommitted changes
+to tracked files, or with no git information, has no id and persists
+nothing. A record written by another build is never loaded.
 
 - **The cost:** the first start after an upgrade rebuilds once, as every
   start does today.
@@ -171,27 +180,41 @@ loaded.
   "rules version" has to be bumped by hand in every commit that touches a
   tracker.
 
-One gap: uncommitted local edits keep their commit's string. To cover it,
-`-checkderivedstate` (§6) defaults on in regtest, as `-checkblockindex` and
-`-checkmempool` do (`src/init.cpp:711`, `:713`).
+The first draft used `FormatFullVersion()`. It gives one string to:
+
+- every untagged build of a release version;
+- every build of a commit with local edits, whatever the edits;
+- every build without git information.
+
+`SourceBuildId()` tells all of these apart, or gives no id.
+`-checkderivedstate` (§6) still defaults on in regtest, as
+`-checkblockindex` and `-checkmempool` do (`src/init.cpp:711`, `:715`).
 
 ### 4.2 Bound to the parameters
 
 Within one build, regtest and testnet parameters can change between starts,
-for example `-b3h1height` or an assumed height C. The digest is a SHA256
-over every consensus parameter a tracker reads:
+for example `-b3h1height` or an assumed height C. Each tracker's digest is a
+SHA256 over exactly the consensus parameters its derivation reads, each
+optional one with its presence. Within one build that set is fixed, so a
+parameter outside it cannot change the tracker's state; across builds §4.1
+refuses the record anyway.
 
-- the genesis hash and the message start;
-- `hard_fork_height`, `legacy_final_hash` and the corridor;
-- all of `ModernPosParams`, `reorg_horizon` included;
-- `h1`, `fresh_lineage` and the fresh-key height;
-- the A1, A2 and A3 heights;
-- `busd_bridge`, the bridge withdrawal activation and their pins.
+- **Id 2** reads four: `legacy_b3coin`, `hard_fork_height`, the genesis
+  hash and `legacy_final_hash`
+  (`FinalityBindingTracker::ParamsDigest`). Its tests change each field
+  alone and require a different digest, tell an unset field from a zero
+  one, and change two unread fields and require the same digest.
+- **Id 1**, the finality group, reads many more. Among them:
+  - the genesis hash, `hard_fork_height`, `legacy_final_hash` and the
+    corridor;
+  - all of `ModernPosParams`, `reorg_horizon` included;
+  - `h1`, `fresh_lineage` and the fresh-key height;
+  - the A1, A2 and A3 heights;
+  - `busd_bridge`, the bridge withdrawal activation and their pins.
 
-No such digest exists in the tree yet. One test per field changes that field
-alone and requires a different digest. A field added to the parameters later
-still has to be added by hand; the per-field tests keep the list
-reviewable.
+A derivation that starts to read another parameter must add it to its
+digest. The digest sits next to the derivation, and its comment names the
+functions it must stay in step with.
 
 ### 4.3 Payloads
 
@@ -220,7 +243,7 @@ reviewable.
 - **Private binding index.**
   - The records by validator key.
   - The whole undo trail, which gains an entry only for a block that
-    carries a binding (`finality_binding_index.cpp:201`).
+    carries a binding (`finality_binding_index.cpp:310`).
   - Every key's PoP (§5).
   - The owner-of-key map is not stored. It is derived on load and must come
     out one to one.
@@ -230,7 +253,18 @@ reviewable.
 When the fresh lineage or fresh keys are configured, the finality group
 writes no record (§9, step 5).
 
-**The chainstate binding index (id 2):** the same binding-index payload.
+**The chainstate binding index (id 2):** the records by validator key,
+then the undo trail in apply order (`FinalityBindingIndex::Encode`).
+
+- No PoPs. Its readers check keys against it: mempool policy, the binding
+  checks of `ConnectBlock` and the status call. None admits a key into an
+  aggregate, so §5 does not apply.
+- The owner-of-key map is not stored. The decoder derives it, and refuses
+  a key held twice or an undo trail that does not lead to the records.
+- `ConnectBlock` reads this index for consensus. A loaded index that was
+  wrong would make the node reject a valid block or accept an invalid
+  one, as a wrong coins database would. That is why a record is used only
+  after the checks of §6, and why question 3 of §11 matters.
 
 ## 5. Where a loaded BLS key comes from
 
@@ -248,7 +282,7 @@ Today every aggregate key has passed a PoP check in the running process:
 
 - the binding replay re-verifies each PoP (`modern/finality_key.h:156-157`);
 - the seat replay "rechecks the type-7 PoP rather than trusting carrier
-  bytes from disk" (`src/validation.cpp:4009-4011`).
+  bytes from disk" (`src/validation.cpp:4114-4116`).
 
 A record is not network input. Nor is it "blocks that already passed full
 validation". There are two ways to handle its keys:
@@ -286,16 +320,29 @@ record is used only when all of these hold:
      record's block;
    - no undo history is longer than the horizon.
 
-The loader creates the tracker and installs it as synced to that block. The
-existing forward path of `Sync` then replays only the blocks after it
-(`finality_tracker.cpp:566-568`, `finality_binding_index.cpp:213-216`).
+For id 2, item 4 is the decoder's own checks (§4.3), and its undo trail
+names heights from H+1 to the record's block, rising.
+
+The loader creates the tracker, installs it as synced to that block, and
+syncs it to the tip at once through the forward path of `Sync`
+(`finality_tracker.cpp:566-568`, `finality_binding_index.cpp:343-345`). A
+sync left for later would come too late: `BlockConnected` follows only a
+tracker in step with the parent block, so the first block connected after
+the start would make it rebuild.
 
 If any check fails, the loader logs one line naming the tracker and the
 reason, and that tracker rebuilds as it does today. The finality pin keeps
 its own fail-closed file; records fail open to the slow path.
 
+**What a record does not save.** A level-4 `VerifyDB` reconnects blocks
+below the tip, and reconnecting a block that carries a binding rebuilds the
+index. That happens with `-checklevel=4` (the default is 3), and in the
+one-time post-H validation-schema pass (`src/node/chainstate.cpp:380-415`).
+That pass runs only on a coins database without a current marker, which is
+once per database for a node that keeps running marker-writing releases.
+
 **Order.** `RefreshFinalityAnchor` already syncs the bridge before the
-finality tracker (`validation.cpp:2728`). That stays, so a loaded finality
+finality tracker (`validation.cpp:2729`). That stays, so a loaded finality
 group extends against a bridge that has caught up, whether that bridge was
 loaded or rebuilt.
 
@@ -306,26 +353,29 @@ record when it is synced to the flushed block and any of these holds:
 - it has no record;
 - its record's block is not an ancestor of the flushed block;
 - its record is at least K = 144 blocks old;
-- the flush is the shutdown flush (`init.cpp:390`, `:417`).
+- the flush is forced: `FORCE_FLUSH` or `FORCE_SYNC`. That is the shutdown
+  flush (`init.cpp:390`, `:417`) and a few RPC and cache-resize flushes.
+  The pin's `FORCE_FINALITY` flushes are not forced here; they follow K.
 
-All records of one flush go into one synchronous batch. A tracker that is
-not synced keeps its old record, which stays valid while its block is on
-the active chain.
+All records of one flush go into one synchronous batch; with id 2 alone
+that is one synchronous write. A tracker that is not synced keeps its old
+record, which stays valid while its block is on the active chain. A flush
+never syncs a tracker to have something to write.
 
 **Why K.** Flushes can be frequent:
 
 - `RaiseFinalityAnchorDurably` forces a flush each time the pin rises
-  (`validation.cpp:2755-2766`). With finality working, that can be every
+  (`validation.cpp:2756-2767`). With finality working, that can be every
   checkpoint, about every 10 blocks.
-- Periodic flushes come every 50 to 70 minutes (`validation.cpp:129-130`).
+- Periodic flushes come every 50 to 70 minutes (`validation.cpp:130-131`).
 
 K keeps records from being rewritten at every one of them. An unclean stop
 therefore replays at most K blocks, plus the blocks since the last flush.
 
 **Crash during a write.** The batch lands whole or not at all. The coins
 database may name a different block than the records; nothing requires them
-to agree (§3). The sidecar gets the same `-dbcrashratio` hook as the coins
-database.
+to agree (§3). The sidecar is to get the same `-dbcrashratio` hook as the
+coins database; step 1a does not have it yet.
 
 **`-reindex` and `-reindex-chainstate`** wipe `derivedstate/`, so a reindex
 always re-derives.
@@ -333,12 +383,18 @@ always re-derives.
 **Switches:**
 
 - `-persistderivedstate=0` turns off both load and write. Today's
-  behaviour stays one flag away.
+  behaviour stays one flag away. Step 1a makes 0 the default until
+  question 6 is answered.
 - `-checkderivedstate` rebuilds every loaded tracker and requires equality.
-  - On a mismatch it logs an error, keeps the rebuilt state and erases the
-    record.
+  - On a mismatch it logs an error and erases the record. Step 1a then
+    leaves the tracker to rebuild when first needed, rather than keeping
+    the check's rebuild: a mismatch is a bug, not a path to optimize.
   - Default on in regtest (§4.1) and off elsewhere. It is for CI and for the
     owner's shadow-chain runs.
+  - It is an audit, not a setting to pair with question 6. A start with it
+    pays a full rebuild, more than a start without persistence.
+- Without the check, a record that passes its own checks is trusted, as
+  the coins database is (§4.3).
 
 ## 7. The trackers with history back to activation
 
@@ -421,10 +477,14 @@ Phase 1 does not change memory.
 0. **Measure.** Log the tracker, its block count and its time at each
    rebuild. It is about ten lines, with no consensus effect. Mohamed reads
    the log of his own node after a restart, which replaces the floors of §1
-   with real numbers.
-1. **Framework, finality group and chainstate binding index.** This covers
-   the sidecar, the record, the build and parameter binding, P1's PoP
-   retention, load and write, both switches, and tracker ids 1 and 2.
+   with real numbers. Not done yet.
+1. **Framework, finality group and chainstate binding index**, in two
+   parts:
+   - **1a, done on 2026-11-01:** the sidecar, the record, the build and
+     parameter binding, load and write, both switches, and tracker id 2.
+     Off by default.
+   - **1b:** the finality group, tracker id 1, with P1's PoP retention. It
+     waits on question 1.
 2. **Seats, vaults and checkpoints, phase 2a**, if step 0 shows that their
    restart cost matters. A cheaper first fix may be enough for checkpoints.
    Their replay re-verifies every seat's PoP for every checkpoint, while a
@@ -489,6 +549,30 @@ restart:
 - the writer writes a tracker that is not synced to the flushed block;
 - an undo record keeps a cut-short `epoch_starts`.
 
+**Step 1a has** unit cases for id 2 in `finality_key_binding_tests`, each
+failed first by mutants:
+
+- **Round trip and hostile bytes**, covered deterministically rather than
+  by fuzzing:
+  - every truncation and every flipped bit of a record;
+  - malformed index encodings.
+
+  There is no fuzz target yet: the build host does not build the fuzz
+  binary, and a new target needs CMake.
+- **Restart**, on a disk-backed `BindingFixture`. It covers the three
+  checks above for id 2, and an older record that is caught up. It also
+  covers the rejections that apply to id 2:
+  - another build, or other parameters;
+  - a flipped byte;
+  - a block off the active chain, or a wrong height;
+  - a malformed payload;
+  - a wrong state, under `-checkderivedstate`.
+- **What is persisted**: the write rule, and nothing without the switch,
+  without a build id, or from a tracker that is not in step.
+
+The crash functional test waits for the `-dbcrashratio` hook and a daemon
+build.
+
 ## 11. Questions for the owner
 
 1. **Keys on load (§5).** P1, every PoP re-verified at load (recommended)?
@@ -505,6 +589,18 @@ restart:
 6. **Default.** On for every network, once the tests and a shadow-chain run
    with `-checkderivedstate` pass?
 
+Step 1a follows the recommended answers to questions 2, 3 and 4, and keeps
+the default off for question 6. Adopting another answer would cost about
+this much:
+
+- **2, another store:** the store class and its tests, about 100 lines;
+- **3, fail closed:** each refusal at load becomes a startup error;
+- **4, a rules version:** a hand-kept number in place of the build id,
+  bumped by every change to a derivation or its encoding;
+- **6:** one default.
+
+Question 1 does not arise for id 2 (§4.3).
+
 ## 12. Found on the way
 
 - **The bridge's undo is shorter than the horizon.** It keeps 288 blocks
@@ -518,3 +614,22 @@ restart:
   (`fn_seat_index.h:144`) grows with every distinct anchor queried.
 - **The chainstate `StakeTracker` is still unsynced in production**
   (fast-track doc §4.6).
+
+## 13. Changes from the first draft (e0560888)
+
+Step 1a changed these points:
+
+- §4.1: the build id is `SourceBuildId()`, not `FormatFullVersion()`. A
+  build with local edits persists nothing.
+- §4: the checksum is SHA256d.
+- §4.2: one digest per tracker, over exactly the parameters it reads.
+- §4.3: id 2 stores no PoPs, because it feeds no aggregate.
+- §6:
+  - the loader syncs a tracker to the tip at once;
+  - a level-4 `VerifyDB` still rebuilds;
+  - forced flushes are `FORCE_FLUSH` and `FORCE_SYNC`;
+  - `-persistderivedstate` defaults off;
+  - a check mismatch erases the record and leaves the tracker to rebuild.
+
+Not built yet: the `-dbcrashratio` hook, the crash functional test and the
+fuzz targets (§10).
