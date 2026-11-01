@@ -13,7 +13,10 @@ recommended answers to §11's questions 2 to 4, and stays behind
 `-persistderivedstate` until question 6 is answered. Step 1b, the
 finality group, landed the same day in 50ce7565, 71e351d5, 2818a2a0,
 ec5d5eef and f8f45427. It follows P1 for question 1, chosen on
-2026-11-01; P1 needs no ruling (§5). §13 lists where both differ from
+2026-11-01; P1 needs no ruling (§5). A review of step 1 the same day
+added four fixes with their tests (77070016, 0647a33e, cfc47691 and
+54c6d329), a test of the mainnet shape (57f46241) and a faster test
+setup (7a7c816f). §13 lists where both steps and the review differ from
 the first draft of this design. Line references are to 9be63a38 unless
 they name another commit.
 
@@ -316,8 +319,12 @@ validation". There are two ways to handle its keys:
     use (`bls_certificate.cpp:155-160`).
   - Every key a retained set refers to is in the binding index, either
     current or in the undo trail, which is never trimmed.
-  - Cost at load: one PoP check per distinct key, 47 on mainnet's epoch-10
-    set. It is bounded by the size of the sets, not by the chain.
+  - Cost at load: one PoP check per key the binding index holds, current
+    or in its trail (`HeldKeys`). The trail is never trimmed, so that is
+    every unrevoked key bound since activation, not only the keys of the
+    sets: at least the 47 of mainnet's epoch-10 set, and one more for each
+    later binding to a new key. It grows with the bindings on the chain,
+    not with its blocks.
 - **P2: an owner ruling.** A record this node wrote counts as
   validated-chain provenance, so `TrustedFromValidatedChain` may wrap its
   keys. Simpler and cheaper, but it widens an owner invariant.
@@ -334,15 +341,29 @@ record is used only when all of these hold:
 3. the payload decodes completely, with no bytes left over;
 4. its invariants hold:
    - every key passes `FromPoP`;
-   - every recomputed set hash equals the stored one;
+   - every recomputed set hash equals the stored one, and every set is
+     one Build could make: no weight above `MAX_MEMBER_WEIGHT`, which
+     keeps the total from wrapping, and no BLS key twice;
    - the owner-of-key map is one to one;
    - the undo records name exactly the active chain's blocks ending at the
      record's block;
    - no undo history is longer than the horizon;
    - each state, the tip's and each prior one, keeps what the rules keep
-     at its block: empty below M, one epoch start per epoch from M, the
-     sets of the epochs around it, a finalized checkpoint on this chain,
-     and the H1 producer schedule exactly where H1 is active.
+     at its block: empty below M, one epoch start per epoch from M, each
+     at least E above the one before, the sets of the epochs around it, a
+     finalized checkpoint on this chain, and the H1 producer schedule
+     exactly where H1 is active;
+   - a prior state has exactly the tip state's epoch starts that are at
+     or below its block's parent. The decoder checks both start rules on
+     the tip's list before any prior state copies from it, so a record
+     cannot make the loader copy a long list once per undo record, and it
+     counts the prior states' starts in one pass;
+5. for id 1, the finalized checkpoint is at or below the finality pin,
+   and a pin exists if a checkpoint does. A record never raises the pin,
+   which no restart lowers. A record this node wrote passes, except one
+   written by the flush that `RefreshFinalityAnchor` makes before it
+   raises the pin, when the node stops in between; that one costs a
+   rebuild, which pins the checkpoint again.
 
 For id 2, item 4 is the decoder's own checks (§4.3), and its undo trail
 names heights from H+1 to the record's block, rising.
@@ -362,7 +383,8 @@ block. So each tracker reaches the tip through the forward path of
 
 If any check fails, the loader logs one line naming the tracker and the
 reason, and that tracker rebuilds as it does today. The finality pin keeps
-its own fail-closed file; records fail open to the slow path.
+its own fail-closed file; records fail open to the slow path, and never
+raise the pin (item 5).
 
 **What a record does not save.** A level-4 `VerifyDB` reconnects blocks
 below the tip, and reconnecting a block that carries a binding rebuilds the
@@ -377,8 +399,12 @@ group extends against a bridge that has caught up, whether that bridge was
 loaded or rebuilt.
 
 **Write.** The write happens in `FlushStateToDisk`, after the coins are
-written, and only for a fully validated chainstate. A tracker writes its
-record when it is synced to the flushed block and any of these holds:
+written, and only for a fully validated chainstate whose coins are at the
+chain's tip, the flushed block. `ConnectTip` and `DisconnectTip` flush
+while the two differ (the coins already at the new block, or already at
+the parent of the block being disconnected), so their flushes write no
+record. A tracker writes its record when it is synced to the flushed
+block and any of these holds:
 
 - it has no record;
 - its record's block is not an ancestor of the flushed block;
@@ -404,8 +430,12 @@ therefore replays at most K blocks, plus the blocks since the last flush.
 
 **Crash during a write.** The batch lands whole or not at all. The coins
 database may name a different block than the records; nothing requires them
-to agree (§3). The sidecar is to get the same `-dbcrashratio` hook as the
-coins database; step 1a does not have it yet.
+to agree (§3). The records are written synchronously and the coins are
+not, so after a power loss the records can name a block above the coins
+on disk. That block is not on the active chain at the next start, so
+the records are passed over (item 2). The sidecar is to get the same
+`-dbcrashratio` hook as the coins database; step 1a does not have it
+yet.
 
 **`-reindex` and `-reindex-chainstate`** wipe `derivedstate/`, so a reindex
 always re-derives.
@@ -431,10 +461,13 @@ always re-derives.
   - It is an audit, not a setting to pair with question 6. A start with it
     pays a full rebuild, more than a start without persistence.
 - Without the check, a record that passes its own checks is trusted, as
-  the coins database is (§4.3). For id 1 that covers the finalized
-  checkpoint, which can raise the finality pin, and the producer
-  schedule, which decides which blocks are valid. Question 3 is about
-  this trust.
+  the coins database is (§4.3). Its checksum is SHA256d, not keyed: it
+  catches a damaged record, not a forged one, and the datadir is trusted
+  as it is for the coins. For id 1 the trust covers the producer
+  schedule, which decides which blocks are valid, and the finalized
+  checkpoint, which decides which certificates may follow. A checkpoint
+  above the pin is refused (item 5), so a record cannot raise the pin; one
+  at or below it is trusted. Question 3 is about this trust.
 
 ## 7. The trackers with history back to activation
 
@@ -643,6 +676,28 @@ above asks for.
     own checks is refused; without it, that state is installed. The
     test pins that trust down.
 
+**The step 1 review added** these cases, each failed first by mutants:
+
+- `b0b_finality_group_record_never_raises_the_pin`: a record whose
+  checkpoint is above the pin (the block below the record's), valid in
+  every other respect, is passed over, and so is a record with a
+  checkpoint when the pin file is gone; a record at the pin is
+  installed.
+- `b0b_finality_group_epoch_starts_follow_the_chain` and
+  `b0b_finality_group_decode_bounds_the_epoch_starts`: a rotation one
+  block early and a stale prior state are refused, and so is a record
+  whose tip state lists four million epoch starts that each of its undo
+  records claims, without copying them (peak memory, against the decoder
+  before the fix).
+- `from_members_restores_built_set` in `validator_set_tests` also
+  refuses a set that holds a key twice, a weight above the bound, and
+  weights whose total wraps.
+- `b0b_derived_state_written_at_coins_flushes`: the write rule at each
+  flush of a running node, and no record while the coins are below the
+  tip.
+- `b0b_finality_group_mainnet_shape`: a record with no H1, V1 past two
+  rotations and a broken lineage, the shape of mainnet today.
+
 The crash functional test waits for the `-dbcrashratio` hook and a daemon
 build.
 
@@ -656,7 +711,12 @@ build.
 2. **Where (§3).** A dedicated LevelDB, as the bridge comment asks
    (recommended)? Or the coins database's batch, or a flat file?
 3. **Trust.** A cache that falls back to a rebuild on any doubt
-   (recommended)? Or fail closed, like the pin?
+   (recommended)? Or fail closed, like the pin? Since the review a record
+   cannot raise the pin (§6, item 5). Three middle grounds are open,
+   cheapest first: read the block that carries the finalized checkpoint's
+   certificate and check the certificate there; run the check rebuild on
+   the first record each build loads; or check every loaded record by a
+   rebuild in the background after the start, and stop on a mismatch.
 4. **Upgrades (§4.1).** Records bound to the exact build, so one rebuild
    per upgrade (recommended)? Or a rules version that survives upgrades?
 5. **Scope and order (§9).** Should steps 2 and 3 wait for step 0's
@@ -689,6 +749,10 @@ Question 1 does not arise for id 2 (§4.3).
   (`fn_seat_index.h:144`) grows with every distinct anchor queried.
 - **The chainstate `StakeTracker` is still unsynced in production**
   (fast-track doc §4.6).
+- **The legacy prefix cost every test process minutes.** The first
+  legacy-prefix case of a process searched the scrypt nonces of the
+  32-block prefix, about four minutes of CPU. The test cache now starts
+  from a checked table of them (7a7c816f).
 
 ## 13. Changes from the first draft (e0560888)
 
@@ -715,8 +779,22 @@ Step 1b changed these points:
   - the loader leaves id 1 at its block, and the first
     `FindMostWorkChain` brings it to the tip, after the bridge;
   - the check rebuild of id 1 syncs the bridge first too;
-  - step 1a's load messages now name the tracker and end "rebuilt from
-    blocks when first needed".
+  - step 1a's load messages now name the tracker. Those for a missing,
+    unreadable or unusable record end "rebuilt from blocks when first
+    needed"; the others end "will be rebuilt", except the pin's (item 5).
+
+The step 1 review changed these points:
+
+- §5: the PoP cost at load grows with the never-trimmed trail.
+- §6:
+  - item 4 holds the epoch starts to the chain (0647a33e) and the sets
+    to what Build makes (cfc47691), and item 5 keeps a record from
+    raising the pin (77070016);
+  - no record is written while the coins and the chain's tip differ, and
+    a power loss can leave records above the coins (54c6d329);
+  - the trust paragraph names the unkeyed checksum.
+- §10 lists the review's cases; §11 lists three middle grounds for
+  question 3; §12 notes the legacy prefix's cost to every test process.
 
 Not built yet: the `-dbcrashratio` hook, the crash functional test and the
 fuzz targets (§10).
