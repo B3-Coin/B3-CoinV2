@@ -177,6 +177,11 @@ public:
     //! B0b: a digest of every consensus parameter this tracker's derivation
     //! reads. A persisted state is used only under the same digest.
     static uint256 ParamsDigest(const Consensus::Params& params);
+    //! B0b: take `index`, the state persisted at `block` and checked by the
+    //! caller, as the state there; the tracker is then in step at `block`.
+    void Install(FinalityBindingIndex index, const CBlockIndex& block);
+    //! Rebuilds from scratch (Sync's fallback) so far, for tests.
+    uint64_t Rebuilds() const { return m_rebuilds; }
 
 private:
     //! Verify+apply one block; false (and dirty) on failure.
@@ -186,6 +191,7 @@ private:
     uint256 m_synced_tip{};
     int m_synced_height{-1};
     bool m_dirty{true};
+    uint64_t m_rebuilds{0};
 };
 
 } // namespace node

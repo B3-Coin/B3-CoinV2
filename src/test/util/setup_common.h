@@ -113,6 +113,11 @@ struct ChainTestingSetup : public BasicTestingSetup {
     kernel::CacheSizes m_kernel_cache_sizes{node::CalculateCacheSizes(m_args).kernel};
     bool m_coins_db_in_memory{true};
     bool m_block_tree_db_in_memory{true};
+    //! B0b derived-state options for LoadVerifyActivateChainstate (off by
+    //! default; a test build is never clean, so tests name their build id).
+    bool m_persist_derived_state{false};
+    std::optional<std::string> m_derived_state_build_id{};
+    bool m_check_derived_state{false};
     std::function<void()> m_make_chainman{};
 
     explicit ChainTestingSetup(ChainType chainType = ChainType::MAIN, TestOpts = {});

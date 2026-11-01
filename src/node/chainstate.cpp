@@ -105,6 +105,12 @@ static ChainstateLoadResult CompleteChainstateInitialization(
             LogError("%s\n", err.what());
             return {ChainstateLoadStatus::FAILURE, _("Error opening coins database")};
         }
+        chainstate->InitDerivedStateStore(
+            /*in_memory=*/options.coins_db_in_memory,
+            /*wipe=*/options.wipe_chainstate_db,
+            /*persist=*/options.persist_derived_state,
+            /*build_id=*/options.derived_state_build_id,
+            /*check=*/options.check_derived_state);
 
         if (options.coins_error_cb) {
             chainstate->CoinsErrorCatcher().AddReadErrCallback(options.coins_error_cb);
@@ -133,6 +139,7 @@ static ChainstateLoadResult CompleteChainstateInitialization(
                 return {ChainstateLoadStatus::FAILURE, _("Error initializing block database")};
             }
             assert(chainstate->m_chain.Tip() != nullptr);
+            chainstate->LoadDerivedState();
         }
     }
 

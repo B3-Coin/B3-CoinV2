@@ -24,6 +24,7 @@
 #include <primitives/transaction.h>
 #include <uint256.h>
 #include <validation.h>
+#include <validationinterface.h>
 
 #include <test/util/finality_fixture.h>
 #include <test/util/modern_pos_setup.h>
@@ -33,7 +34,9 @@
 
 #include <algorithm>
 #include <array>
+#include <functional>
 #include <optional>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -549,6 +552,286 @@ BOOST_AUTO_TEST_CASE(source_build_id_names_clean_sources_only)
         BOOST_CHECK(!id->ends_with("-dirty"));
         BOOST_CHECK(id->find('$') == std::string::npos);
     }
+}
+
+// B0b: the chainstate's finality bindings kept across restarts.
+namespace {
+//! A disk-backed BindingFixture that persists derived state.
+struct PersistFixture : BindingFixture {
+    static constexpr std::string_view BUILD{"b0b-test-build"};
+    static constexpr node::DerivedStateId ID{node::DerivedStateId::FINALITY_BINDINGS};
+
+    PersistFixture() : BindingFixture{{.coins_db_in_memory = false, .block_tree_db_in_memory = false}}
+    {
+        // ChainTestingSetup keeps its coins in memory whatever TestOpts say
+        // (see finality_pin_persist_tests); reopen them on disk.
+        Reload([&] {
+            m_coins_db_in_memory = false;
+            m_persist_derived_state = true;
+            m_derived_state_build_id = std::string{BUILD};
+            m_check_derived_state = true;
+        });
+    }
+    //! Start again; `between` runs while no chainstate holds the store.
+    void Reload(const std::function<void()>& between = {})
+    {
+        if (m_node.validation_signals) m_node.validation_signals->SyncWithValidationInterfaceQueue();
+        m_node.chainman.reset();
+        if (between) between();
+        m_make_chainman();
+        LoadVerifyActivateChainstate();
+    }
+    //! Shut down (a forced flush), then Reload.
+    void Restart(const std::function<void()>& between = {})
+    {
+        WITH_LOCK(cs_main, m_node.chainman->ActiveChainstate().ForceFlushStateToDisk());
+        Reload(between);
+    }
+    //! Prepare(), then restart at H. A coins database without the B3
+    //! validation-schema marker gets a one-time level-4 pass over every
+    //! post-H block at its next start (node/chainstate.cpp), and
+    //! reconnecting a block with bindings below the tip rebuilds the index.
+    //! At H there is no such block: the restart only sets the marker, as
+    //! on a node that has run this release before.
+    void PrepareAtH()
+    {
+        Prepare();
+        Restart();
+    }
+    fs::path StorePath() { return m_args.GetDataDirNet() / "derivedstate"; }
+    //! The store, opened while no chainstate holds it.
+    node::DerivedStateStore OpenStore()
+    {
+        return node::DerivedStateStore{DBParams{.path = StorePath(), .cache_bytes = 1 << 20}};
+    }
+    std::optional<std::vector<unsigned char>> ReadRecord() { return OpenStore().Read(ID); }
+    void WriteRecord(const std::vector<unsigned char>& bytes) { OpenStore().Write(ID, bytes); }
+    node::DerivedStateRecord DecodeRecord(const std::vector<unsigned char>& bytes)
+    {
+        node::DerivedStateRecord record;
+        BOOST_REQUIRE(node::DecodeDerivedStateRecord(bytes, BUILD,
+                                                     FinalityBindingTracker::ParamsDigest(m_node.chainman->GetConsensus()),
+                                                     record) == node::DerivedStateCheck::OK);
+        return record;
+    }
+    uint64_t Rebuilds()
+    {
+        LOCK(cs_main);
+        return m_node.chainman->ActiveChainstate().ModernFinalityBindings().Rebuilds();
+    }
+    //! The tracker is in step with the tip without a Sync.
+    bool InStep()
+    {
+        LOCK(cs_main);
+        return m_node.chainman->ActiveChainstate().ModernFinalityBindings().Synced(Tip()->GetBlockHash());
+    }
+    //! The bindings rebuilt from blocks by a fresh tracker.
+    FinalityBindingIndex Rebuilt()
+    {
+        LOCK(cs_main);
+        FinalityBindingTracker fresh;
+        BOOST_REQUIRE(fresh.Sync(m_node.chainman->ActiveChain(), m_node.chainman->m_blockman,
+                                 m_node.chainman->GetConsensus(), *Tip()));
+        return fresh.Index();
+    }
+};
+} // namespace
+
+BOOST_FIXTURE_TEST_CASE(b0b_restart_installs_persisted_bindings, PersistFixture)
+{
+    PrepareAtH();
+    // As outside regtest: the record is used without a rebuild to check it.
+    m_check_derived_state = false;
+    const auto k1{Bls(1)}, k2{Bls(2)};
+    const auto a0{MakeBinding(m_validator_a, m_vk_a, &k1, 0)};
+    const auto a1{MakeBinding(m_validator_a, m_vk_a, &k2, 1)};
+    const auto b0{MakeBinding(m_validator_b, m_vk_b, &k1, 0)};
+    const auto b1{MakeBinding(m_validator_b, m_vk_b, nullptr, 1)};
+    // A binding in the first modern block, then a rotation and the freed
+    // key bound again; ConnectBlock syncs the tracker on the way.
+    BOOST_REQUIRE(SubmitCorridor({MakeTx(0, {a0.cell}, {a0.record})}));
+    BOOST_REQUIRE(SubmitCorridor({MakeTx(1, {a1.cell}, {a1.record}), MakeTx(2, {b0.cell}, {b0.record})}));
+    const FinalityBindingIndex before{Index()};
+    BOOST_REQUIRE_EQUAL(before.Size(), 2u);
+    Restart();
+    // Installed from the record, in step with the tip, no rebuild.
+    BOOST_CHECK(InStep());
+    BOOST_CHECK(Index().SameState(before));
+    BOOST_CHECK_EQUAL(Rebuilds(), 0u);
+    // A reorganization right after the restart is undone in place, from the
+    // persisted undo trail: the rotation and the freed key's binding come
+    // off, then go back on.
+    CBlockIndex* top{WITH_LOCK(cs_main, return m_node.chainman->ActiveChain().Tip())};
+    {
+        BlockValidationState state;
+        BOOST_REQUIRE(m_node.chainman->ActiveChainstate().InvalidateBlock(state, top));
+        BOOST_REQUIRE(m_node.chainman->ActiveChainstate().ActivateBestChain(state));
+    }
+    BOOST_REQUIRE_EQUAL(Tip()->nHeight, top->nHeight - 1);
+    BOOST_CHECK(InStep());
+    BOOST_CHECK(Index().SameState(Rebuilt()));
+    BOOST_CHECK_EQUAL(Index().Size(), 1u);
+    {
+        LOCK(cs_main);
+        m_node.chainman->ActiveChainstate().ResetBlockFailureFlags(top);
+        m_node.chainman->RecalculateBestHeader();
+    }
+    {
+        BlockValidationState state;
+        BOOST_REQUIRE(m_node.chainman->ActiveChainstate().ActivateBestChain(state));
+    }
+    BOOST_REQUIRE(Tip() == top);
+    BOOST_CHECK(InStep());
+    BOOST_CHECK(Index().SameState(before));
+    BOOST_CHECK_EQUAL(Rebuilds(), 0u);
+    // It follows new blocks, with and without bindings, still without one.
+    BOOST_REQUIRE(SubmitCorridor({}));
+    BOOST_REQUIRE(SubmitCorridor({MakeTx(3, {b1.cell}, {b1.record})}));
+    BOOST_CHECK(Index().SameState(Rebuilt()));
+    BOOST_CHECK_EQUAL(Index().Size(), 2u);
+    BOOST_CHECK_EQUAL(Rebuilds(), 0u);
+}
+
+BOOST_FIXTURE_TEST_CASE(b0b_older_record_catches_up_and_shutdown_writes_the_tip, PersistFixture)
+{
+    PrepareAtH();
+    const auto k1{Bls(1)}, k2{Bls(2)};
+    const auto a0{MakeBinding(m_validator_a, m_vk_a, &k1, 0)};
+    const auto b0{MakeBinding(m_validator_b, m_vk_b, &k2, 0)};
+    BOOST_REQUIRE(SubmitCorridor({MakeTx(0, {a0.cell}, {a0.record})}));
+    const int older_height{Tip()->nHeight};
+    std::optional<std::vector<unsigned char>> older;
+    Restart([&] { older = ReadRecord(); });
+    BOOST_REQUIRE(older);
+    // Two more blocks, then a restart that finds the older record (as after
+    // a crash between two writes): installed, then replayed to the tip.
+    BOOST_REQUIRE(SubmitCorridor({}));
+    BOOST_REQUIRE(SubmitCorridor({MakeTx(1, {b0.cell}, {b0.record})}));
+    Restart([&] { WriteRecord(*older); });
+    BOOST_CHECK(InStep());
+    // A block without bindings reaches the tracker only through
+    // BlockConnected, which needs it in step with the tip.
+    BOOST_REQUIRE(SubmitCorridor({}));
+    BOOST_CHECK(Index().SameState(Rebuilt()));
+    BOOST_CHECK_EQUAL(Rebuilds(), 0u);
+    // A shutdown writes the tip, though the record on disk is fewer than
+    // DERIVED_STATE_WRITE_INTERVAL blocks old.
+    std::optional<std::vector<unsigned char>> latest;
+    Restart([&] { latest = ReadRecord(); });
+    BOOST_REQUIRE(latest);
+    BOOST_CHECK_EQUAL(DecodeRecord(*older).height, older_height);
+    BOOST_CHECK_EQUAL(DecodeRecord(*latest).height, Tip()->nHeight);
+}
+
+BOOST_FIXTURE_TEST_CASE(b0b_unusable_records_are_rebuilt, PersistFixture)
+{
+    PrepareAtH();
+    const auto k1{Bls(1)}, k2{Bls(2)};
+    const auto a0{MakeBinding(m_validator_a, m_vk_a, &k1, 0)};
+    const auto b0{MakeBinding(m_validator_b, m_vk_b, &k2, 0)};
+    BOOST_REQUIRE(SubmitCorridor({MakeTx(0, {a0.cell}, {a0.record})}));
+    BOOST_REQUIRE(SubmitCorridor({MakeTx(1, {b0.cell}, {b0.record})}));
+    std::optional<std::vector<unsigned char>> good;
+    Restart([&] { good = ReadRecord(); });
+    BOOST_REQUIRE(good);
+    BOOST_REQUIRE_EQUAL(Rebuilds(), 0u);
+    const FinalityBindingIndex truth{Index()};
+    const node::DerivedStateRecord record{DecodeRecord(*good)};
+    const auto with{[&](const auto& mutate, const std::string_view build = BUILD) {
+        node::DerivedStateRecord forged{record};
+        mutate(forged);
+        return node::EncodeDerivedStateRecord(forged, build);
+    }};
+    // Each record below, found at a restart, is passed over: the tracker
+    // rebuilds from blocks, to the true state.
+    const auto refused{[&](const std::vector<unsigned char>& forged, const std::string_view what) {
+        Restart([&] { WriteRecord(forged); });
+        BOOST_CHECK_MESSAGE(!InStep(), what << ": installed");
+        BOOST_CHECK_MESSAGE(Index().SameState(truth), what << ": not the true state");
+        BOOST_CHECK_MESSAGE(Rebuilds() == 1, what << ": " << Rebuilds() << " rebuilds");
+    }};
+    std::vector<unsigned char> flipped{*good};
+    flipped.back() ^= 1;
+    refused(flipped, "bad checksum");
+    refused(with([](auto&) {}, "another-build"), "another build");
+    refused(with([](auto& r) { r.params_digest = uint256::ONE; }), "other parameters");
+    refused(with([](auto& r) { r.block_hash = uint256::ONE; }), "unknown block");
+    refused(with([](auto& r) { r.height -= 1; }), "wrong height");
+    refused(with([](auto& r) { r.payload.push_back(0); }), "malformed payload");
+    // A record that passes all its own checks but holds a wrong state, no
+    // bindings at all: -checkderivedstate rebuilds and refuses it.
+    refused(with([](auto& r) { r.payload = FinalityBindingIndex{}.Encode(); }), "wrong state");
+    // Without -checkderivedstate from here on, so that a record is refused
+    // by its own checks or not at all.
+    m_check_derived_state = false;
+    // A block that has left the active chain.
+    {
+        BlockValidationState state;
+        CBlockIndex* top{WITH_LOCK(cs_main, return m_node.chainman->m_blockman.LookupBlockIndex(record.block_hash))};
+        BOOST_REQUIRE(m_node.chainman->ActiveChainstate().InvalidateBlock(state, top));
+        BOOST_REQUIRE(m_node.chainman->ActiveChainstate().ActivateBestChain(state));
+    }
+    BOOST_REQUIRE_EQUAL(Tip()->nHeight, record.height - 1);
+    Restart([&] { WriteRecord(*good); });
+    BOOST_CHECK(!InStep());
+    BOOST_CHECK(Index().SameState(Rebuilt()));
+    BOOST_CHECK_EQUAL(Rebuilds(), 1u);
+    // A record that passes its own checks is then trusted, as the coins
+    // database is: this one claims no bindings at the tip, where there is one.
+    const auto wrong{with([&](auto& r) {
+        r.block_hash = Tip()->GetBlockHash();
+        r.height = Tip()->nHeight;
+        r.payload = FinalityBindingIndex{}.Encode();
+    })};
+    Restart([&] { WriteRecord(wrong); });
+    BOOST_CHECK(InStep());
+    BOOST_CHECK(Index().SameState(FinalityBindingIndex{}));
+    BOOST_CHECK(!Rebuilt().SameState(FinalityBindingIndex{}));
+    BOOST_CHECK_EQUAL(Rebuilds(), 0u);
+}
+
+BOOST_FIXTURE_TEST_CASE(b0b_nothing_persisted_without_switch_build_or_synced_tracker, PersistFixture)
+{
+    PrepareAtH();
+    const auto k1{Bls(1)};
+    const auto a0{MakeBinding(m_validator_a, m_vk_a, &k1, 0)};
+    // No block with bindings and nothing asking for them: the tracker
+    // (created by InStep(), which does not sync it) is not in step with the
+    // tip, and a flush does not sync it to have something to write.
+    BOOST_REQUIRE(SubmitCorridor({}));
+    BOOST_REQUIRE(!InStep());
+    std::optional<std::vector<unsigned char>> found;
+    Restart([&] { found = ReadRecord(); });
+    BOOST_CHECK(!found);
+    // Without -persistderivedstate there is no store.
+    BOOST_REQUIRE(SubmitCorridor({MakeTx(0, {a0.cell}, {a0.record})}));
+    m_persist_derived_state = false;
+    Restart([&] { fs::remove_all(StorePath()); });
+    BOOST_CHECK(!Index().All().empty());
+    BOOST_CHECK_EQUAL(Rebuilds(), 1u);
+    Restart([&] { BOOST_CHECK(!fs::exists(StorePath())); });
+    // Nor for a build that cannot name its sources.
+    m_persist_derived_state = true;
+    m_derived_state_build_id.reset();
+    Restart();
+    BOOST_CHECK(!Index().All().empty());
+    BOOST_CHECK_EQUAL(Rebuilds(), 1u);
+    Restart([&] { BOOST_CHECK(!fs::exists(StorePath())); });
+}
+
+BOOST_AUTO_TEST_CASE(b0b_write_rule)
+{
+    using node::DerivedStateWriteDue;
+    constexpr int k{node::DERIVED_STATE_WRITE_INTERVAL};
+    BOOST_CHECK_EQUAL(k, 144);
+    // A forced flush writes; so does one finding no record, or a record
+    // whose block has left the active chain.
+    BOOST_CHECK(DerivedStateWriteDue(/*forced=*/true, /*written_height=*/1000, /*written_on_chain=*/true, /*tip_height=*/1001));
+    BOOST_CHECK(DerivedStateWriteDue(false, std::nullopt, false, 1001));
+    BOOST_CHECK(DerivedStateWriteDue(false, 1000, false, 1001));
+    // Otherwise, every DERIVED_STATE_WRITE_INTERVAL blocks.
+    BOOST_CHECK(!DerivedStateWriteDue(false, 1000, true, 1000 + k - 1));
+    BOOST_CHECK(DerivedStateWriteDue(false, 1000, true, 1000 + k));
 }
 
 BOOST_AUTO_TEST_SUITE_END()

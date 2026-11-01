@@ -47,6 +47,7 @@
 #include <modern/finality_certificate.h>
 #include <modern/finality_fresh_key.h>
 #include <modern/payload_root.h>
+#include <node/derived_state.h>
 #include <node/finality_binding_index.h>
 #include <node/finality_fresh_key_index.h>
 #include <node/flowmesh_vault_index.h>
@@ -2872,6 +2873,110 @@ void Chainstate::InitCoinsCache(size_t cache_size_bytes)
     m_coins_views->InitCache();
 }
 
+void Chainstate::InitDerivedStateStore(const bool in_memory, const bool wipe, const bool persist,
+                                       const std::optional<std::string>& build_id, const bool check)
+{
+    AssertLockHeld(::cs_main);
+    if (m_from_snapshot_blockhash) return;
+    m_derived_state.reset();
+    m_derived_bindings_block = nullptr;
+    const fs::path path{m_chainman.m_options.datadir / "derivedstate"};
+    if (!persist || !build_id) {
+        if (persist) {
+            LogWarning("-persistderivedstate ignored: this build cannot name its sources (uncommitted changes or no git information)");
+        }
+        // Records of an earlier run stay valid while their blocks stay on
+        // the active chain, but a wiped chainstate starts from nothing.
+        if (wipe && !in_memory) {
+            std::error_code ec;
+            fs::remove_all(path, ec);
+            if (ec) LogWarning("Cannot delete %s (%s)", fs::PathToString(path), ec.message());
+        }
+        return;
+    }
+    try {
+        m_derived_state = std::make_unique<node::DerivedStateStore>(DBParams{
+            .path = path,
+            .cache_bytes = 1 << 20,
+            .memory_only = in_memory,
+            .wipe_data = wipe});
+    } catch (const std::exception& e) {
+        LogWarning("Cannot open %s (%s); derived state is rebuilt from blocks", fs::PathToString(path), e.what());
+        return;
+    }
+    m_derived_state_build_id = *build_id;
+    m_check_derived_state = check;
+}
+
+void Chainstate::LoadDerivedState()
+{
+    AssertLockHeld(::cs_main);
+    if (!m_derived_state || m_chain.Tip() == nullptr) return;
+    const node::DerivedStateId id{node::DerivedStateId::FINALITY_BINDINGS};
+    std::optional<std::vector<unsigned char>> bytes;
+    try {
+        bytes = m_derived_state->Read(id);
+    } catch (const std::exception& e) {
+        LogWarning("Cannot read the persisted finality bindings (%s); they will be rebuilt", e.what());
+        return;
+    }
+    if (!bytes) {
+        LogInfo("No persisted finality bindings; they will be rebuilt when first needed");
+        return;
+    }
+    const Consensus::Params& params{m_chainman.GetConsensus()};
+    node::DerivedStateRecord record;
+    const node::DerivedStateCheck check{node::DecodeDerivedStateRecord(
+        *bytes, m_derived_state_build_id, node::FinalityBindingTracker::ParamsDigest(params), record)};
+    if (check != node::DerivedStateCheck::OK) {
+        LogInfo("Persisted finality bindings not used (%s); they will be rebuilt when first needed",
+                node::DerivedStateCheckName(check));
+        return;
+    }
+    const CBlockIndex* block{m_blockman.LookupBlockIndex(record.block_hash)};
+    const std::optional<int> final_height{Consensus::LegacyFinalHeight(params)};
+    if (block == nullptr || block->nHeight != record.height || !m_chain.Contains(block) || !final_height ||
+        block->nHeight <= *final_height) {
+        LogInfo("Persisted finality bindings at height %d not used: their block is not a modern block of the active chain",
+                record.height);
+        return;
+    }
+    std::optional<node::FinalityBindingIndex> index{
+        node::FinalityBindingIndex::Decode(record.payload, *final_height + 1, block->nHeight)};
+    if (!index) {
+        LogWarning("Persisted finality bindings at height %d are malformed; they will be rebuilt", block->nHeight);
+        return;
+    }
+    if (m_check_derived_state) {
+        node::FinalityBindingTracker rebuilt;
+        if (!rebuilt.Sync(m_chain, m_blockman, params, *block)) {
+            LogWarning("Persisted finality bindings at height %d not used: no rebuild to check them against",
+                       block->nHeight);
+            return;
+        }
+        if (!rebuilt.Index().SameState(*index)) {
+            LogError("Persisted finality bindings at height %d differ from a rebuild; record erased", block->nHeight);
+            try {
+                m_derived_state->Erase(id);
+            } catch (const std::exception& e) {
+                LogWarning("Cannot erase the persisted finality bindings (%s)", e.what());
+            }
+            return;
+        }
+    }
+    node::FinalityBindingTracker& tracker{ModernFinalityBindings()};
+    tracker.Install(std::move(*index), *block);
+    m_derived_bindings_block = block;
+    const int behind{m_chain.Height() - block->nHeight};
+    if (!tracker.Sync(m_chain, m_blockman, params, *m_chain.Tip())) {
+        LogWarning("Persisted finality bindings at height %d could not be brought to the tip; they will be rebuilt",
+                   block->nHeight);
+        return;
+    }
+    LogInfo("Loaded the finality bindings persisted at height %d, then replayed %d blocks to the tip",
+            block->nHeight, behind);
+}
+
 void Chainstate::ResetCoinsViews()
 {
     const auto mutation{m_chainman.ObserveChainMutation(kernel::ChainMutationKind::COINS_VIEW)};
@@ -4784,6 +4889,39 @@ CoinsCacheSizeState Chainstate::GetCoinsCacheSizeState(
     return CoinsCacheSizeState::OK;
 }
 
+void Chainstate::WriteDerivedState(const FlushStateMode mode)
+{
+    AssertLockHeld(::cs_main);
+    const CBlockIndex* tip{m_chain.Tip()};
+    if (!m_derived_state || !m_finality_bindings || tip == nullptr || tip == m_derived_bindings_block) return;
+    // Only an index in step with the tip is written; a flush never syncs one.
+    if (!m_finality_bindings->Synced(tip->GetBlockHash())) return;
+    const Consensus::Params& params{m_chainman.GetConsensus()};
+    const std::optional<int> final_height{Consensus::LegacyFinalHeight(params)};
+    if (!final_height || tip->nHeight <= *final_height) return;
+    const CBlockIndex* written{m_derived_bindings_block};
+    const bool forced{mode == FlushStateMode::FORCE_FLUSH || mode == FlushStateMode::FORCE_SYNC};
+    if (!node::DerivedStateWriteDue(forced, written ? std::optional{written->nHeight} : std::nullopt,
+                                    written != nullptr && m_chain.Contains(written), tip->nHeight)) {
+        return;
+    }
+    node::DerivedStateRecord record;
+    record.params_digest = node::FinalityBindingTracker::ParamsDigest(params);
+    record.block_hash = tip->GetBlockHash();
+    record.height = tip->nHeight;
+    record.payload = m_finality_bindings->Index().Encode();
+    try {
+        m_derived_state->Write(node::DerivedStateId::FINALITY_BINDINGS,
+                               node::EncodeDerivedStateRecord(record, m_derived_state_build_id));
+    } catch (const std::exception& e) {
+        LogWarning("Cannot persist the finality bindings at height %d (%s); a restart rebuilds them", tip->nHeight,
+                   e.what());
+        return;
+    }
+    m_derived_bindings_block = tip;
+    LogDebug(BCLog::COINDB, "Persisted the finality bindings at height %d", tip->nHeight);
+}
+
 bool Chainstate::FlushStateToDisk(
     BlockValidationState &state,
     FlushStateMode mode,
@@ -4938,6 +5076,9 @@ bool Chainstate::FlushStateToDisk(
         }
     }
     if (full_flush_completed) {
+        // B0b: a derived-state record never names a block the coins on disk
+        // have not reached.
+        WriteDerivedState(mode);
         if (m_chainman.m_options.signals) {
             // Update best block in wallet (so we can detect restored wallets).
             m_chainman.m_options.signals->ChainStateFlushed(this->GetRole(), GetLocator(m_chain.Tip()));

@@ -63,6 +63,7 @@ namespace kernel {
 struct ChainstateRole;
 } // namespace kernel
 namespace node {
+class DerivedStateStore;
 class SnapshotMetadata;
 class StakeTracker;
 class FinalityBindingTracker;
@@ -620,6 +621,15 @@ protected:
     //! Lazily created finality-signature pool (liveness only); see FinalitySignatures().
     std::unique_ptr<node::FinalitySignaturePool> m_finality_sigs GUARDED_BY(::cs_main);
 
+    //! B0b: the derived-state store; null while persistence is off.
+    std::unique_ptr<node::DerivedStateStore> m_derived_state GUARDED_BY(::cs_main);
+    std::string m_derived_state_build_id GUARDED_BY(::cs_main);
+    bool m_check_derived_state GUARDED_BY(::cs_main){false};
+    //! The block of the finality bindings record in the store, if any.
+    const CBlockIndex* m_derived_bindings_block GUARDED_BY(::cs_main){nullptr};
+    //! B0b: persist the finality bindings after a coins flush, when due.
+    void WriteDerivedState(FlushStateMode mode) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+
 public:
     //! Reference to a BlockManager instance which itself is shared across all
     //! Chainstate instances.
@@ -733,6 +743,21 @@ public:
     //! Initialize the in-memory coins cache (to be done after the health of the on-disk database
     //! is verified).
     void InitCoinsCache(size_t cache_size_bytes) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+
+    /**
+     * B0b (doc/design/b3-b0b-durable-derived-state.md): open the derived-state
+     * store, `derivedstate/` in the data directory, for a chainstate not
+     * created from a snapshot. Persistence needs `persist` and a build id
+     * (SourceBuildId()); without either the store stays closed, and `wipe`
+     * still deletes the records of an earlier run. A store that cannot be
+     * opened is logged and left closed: records are a cache, and the
+     * trackers rebuild as they did before.
+     */
+    void InitDerivedStateStore(bool in_memory, bool wipe, bool persist, const std::optional<std::string>& build_id,
+                               bool check) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+    //! B0b: install the persisted finality bindings when their record can be
+    //! used, then bring them to the tip. Call after LoadChainTip().
+    void LoadDerivedState() EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
 
     //! @returns whether or not the CoinsViews object has been fully initialized and we can
     //!          safely flush this object to disk.

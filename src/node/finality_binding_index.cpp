@@ -324,6 +324,14 @@ uint256 FinalityBindingTracker::ParamsDigest(const Consensus::Params& params)
     return h.GetSHA256();
 }
 
+void FinalityBindingTracker::Install(FinalityBindingIndex index, const CBlockIndex& block)
+{
+    m_index = std::move(index);
+    m_synced_tip = block.GetBlockHash();
+    m_synced_height = block.nHeight;
+    m_dirty = false;
+}
+
 bool FinalityBindingTracker::Sync(const CChain& chain, const BlockManager& blockman, const Consensus::Params& params,
                                   const CBlockIndex& target)
 {
@@ -338,6 +346,7 @@ bool FinalityBindingTracker::Sync(const CChain& chain, const BlockManager& block
     } else {
         m_index.Clear();
         m_dirty = true;
+        ++m_rebuilds;
     }
     for (int height{start}; height <= target.nHeight; ++height) {
         const CBlockIndex* pindex{chain[height]};

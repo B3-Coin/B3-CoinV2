@@ -10,6 +10,8 @@
 
 #include <cstdint>
 #include <functional>
+#include <optional>
+#include <string>
 #include <tuple>
 
 class CTxMemPool;
@@ -35,6 +37,14 @@ struct ChainstateLoadOptions {
     int64_t check_blocks{DEFAULT_CHECKBLOCKS};
     int64_t check_level{DEFAULT_CHECKLEVEL};
     std::function<void()> coins_error_cb;
+    //! B0b (doc/design/b3-b0b-durable-derived-state.md): keep derived state
+    //! across restarts (-persistderivedstate). Records are bound to
+    //! `derived_state_build_id`, SourceBuildId() in the node; without one,
+    //! nothing is persisted.
+    bool persist_derived_state{false};
+    std::optional<std::string> derived_state_build_id;
+    //! Check each loaded record against a rebuild (-checkderivedstate).
+    bool check_derived_state{false};
 };
 
 //! Chainstate load status. Simple applications can just check for the success

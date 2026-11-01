@@ -76,6 +76,13 @@ DerivedStateCheck DecodeDerivedStateRecord(const std::span<const unsigned char> 
     return DerivedStateCheck::OK;
 }
 
+bool DerivedStateWriteDue(const bool forced, const std::optional<int> written_height, const bool written_on_chain,
+                          const int tip_height)
+{
+    if (forced || !written_height || !written_on_chain) return true;
+    return tip_height - *written_height >= DERIVED_STATE_WRITE_INTERVAL;
+}
+
 DerivedStateStore::DerivedStateStore(const DBParams& params) : m_db{params} {}
 
 std::optional<std::vector<unsigned char>> DerivedStateStore::Read(const DerivedStateId id) const

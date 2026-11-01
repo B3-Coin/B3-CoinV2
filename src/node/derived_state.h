@@ -60,6 +60,20 @@ std::vector<unsigned char> EncodeDerivedStateRecord(const DerivedStateRecord& re
 DerivedStateCheck DecodeDerivedStateRecord(std::span<const unsigned char> bytes, std::string_view build_id,
                                            const uint256& params_digest, DerivedStateRecord& record);
 
+//! Blocks between two periodic records: after a crash, a node replays at
+//! most this many blocks on top of its last record, plus those since its
+//! last flush.
+inline constexpr int DERIVED_STATE_WRITE_INTERVAL{144};
+
+/**
+ * The write rule, applied at each coins flush to a tracker in step with the
+ * tip. A forced flush (the shutdown flush, an explicit one) writes;
+ * otherwise a record is due when the store has none, when its block has
+ * left the active chain, or when it is DERIVED_STATE_WRITE_INTERVAL or
+ * more blocks below the tip.
+ */
+bool DerivedStateWriteDue(bool forced, std::optional<int> written_height, bool written_on_chain, int tip_height);
+
 //! The `derivedstate` LevelDB: one record per tracker, each write synchronous.
 class DerivedStateStore
 {
