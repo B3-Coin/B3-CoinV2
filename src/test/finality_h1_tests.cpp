@@ -3781,4 +3781,73 @@ BOOST_FIXTURE_TEST_CASE(b0b_derived_state_written_at_coins_flushes, GroupPersist
     BOOST_CHECK(GroupAsRebuilt());
 }
 
+// (B0b-11) The mainnet shape, which no other record here has: no H1, so no
+// state holds a producer schedule; V1 certifies epochs 0 and 1 and rotates
+// twice, so the previous set (Set_1) is not the bootstrap set and the
+// finalized checkpoint lies in epoch 1; then epoch 2 goes uncertified until
+// the lineage breaks, E plus the maximum extension after its start. C binds
+// in epoch 0 and B revokes in epoch 1, so Set_2 holds C and Set_3 lacks B.
+// The undo history spans the second rotation and the break. The record
+// round-trips, and each later start installs it without a rebuild, checked
+// against one or not.
+BOOST_FIXTURE_TEST_CASE(b0b_finality_group_mainnet_shape, GroupPersistFixture)
+{
+    constexpr int DEPTH{70};
+    PrepareFinalityChain(/*min_finality_set=*/1, /*reorg_horizon=*/DEPTH, /*with_unbound_c=*/true);
+    BOOST_REQUIRE(!m_node.chainman->GetConsensus().h1);
+    const int M{m_M};
+    const int E{SCALED_E};
+    const int broken{M + 3 * E + SCALED_MAX_EXTENSION};
+    const auto bind_c{MakeBinding(m_validator_c, m_vk_c, &m_bls_c, 0)};
+    const auto revoke_b{MakeBinding(m_validator_b, m_vk_b, nullptr, 1)};
+    while (Tip()->nHeight < broken + 5) {
+        const int next{Tip()->nHeight + 1};
+        std::vector<CMutableTransaction> txs;
+        if (next == M + 5) txs.push_back(MakeTx(8, {bind_c.cell}, {bind_c.record}));
+        if (next == M + E + 5) txs.push_back(MakeTx(9, {revoke_b.cell}, {revoke_b.record}));
+        // Certify epochs 0 and 1 only (their handovers rotate V1 at M + E and M + 2E).
+        if (next <= M + 2 * E) {
+            ProduceCertifying(m_vk_a, std::move(txs));
+        } else {
+            Produce(m_vk_a, {}, std::move(txs));
+        }
+    }
+    // The oldest prior state kept is of a block before the second rotation.
+    BOOST_REQUIRE_LT(Tip()->nHeight - DEPTH, M + 2 * E);
+    ArmStakes();
+    BOOST_REQUIRE(InStepAndAsRebuilt());
+    {
+        LOCK(cs_main);
+        Chainstate& cs{m_node.chainman->ActiveChainstate()};
+        const Consensus::Params& params{m_node.chainman->GetConsensus()};
+        const CBlockIndex& tip{*cs.m_chain.Tip()};
+        const FinalityTracker& live{LiveFinality()};
+        const FinalityTracker::State& state{live.Current()};
+        BOOST_REQUIRE(state.epoch_starts == (std::vector<int>{M, M + E, M + 2 * E}));
+        BOOST_REQUIRE(state.lineage_broken && !state.handover_certified && !state.producers);
+        BOOST_REQUIRE(state.finalized && state.finalized->epoch == 1);
+        BOOST_REQUIRE(state.bootstrap && state.previous && state.current && state.next);
+        BOOST_REQUIRE_EQUAL(state.previous->Epoch(), 1U);
+        BOOST_REQUIRE(state.current->IndexOf(m_vk_c) && !state.next->IndexOf(m_vk_b));
+        FinalityTracker rebuilt;
+        BOOST_REQUIRE(rebuilt.Sync(cs.m_chain, cs.m_blockman, params, tip));
+        const auto bytes{live.Encode(params)};
+        BOOST_REQUIRE(bytes);
+        const auto decoded{FinalityTracker::Decode(*bytes, tip, params)};
+        BOOST_REQUIRE(decoded);
+        BOOST_CHECK(decoded->SameState(rebuilt) && rebuilt.SameState(*decoded));
+        BOOST_CHECK(decoded->Encode(params) == bytes);
+    }
+    // The first start of this coins database rebuilds (PrepareRestarted); the
+    // later ones install the record the shutdown before them wrote.
+    Restart();
+    Restart();
+    BOOST_CHECK_EQUAL(GroupRebuilds(), 0U);
+    BOOST_CHECK(GroupAsRebuilt());
+    m_check_derived_state = false;
+    Restart();
+    BOOST_CHECK_EQUAL(GroupRebuilds(), 0U);
+    BOOST_CHECK(GroupAsRebuilt());
+}
+
 BOOST_AUTO_TEST_SUITE_END()
