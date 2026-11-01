@@ -1021,15 +1021,16 @@ std::optional<FinalityTracker> FinalityTracker::Decode(const std::span<const uns
             flag = byte == 1;
             return byte <= 1;
         }};
-        // `starts`: the state's epoch starts, of which a prior state's are a prefix.
-        const auto read_state{[&](StoredState& stored, const std::vector<int>* starts) {
+        // `starts`: the state's epoch starts, of which a prior state has the
+        // `count` at or below its block's parent.
+        const auto read_state{[&](StoredState& stored, const std::vector<int>* starts, const size_t count) {
             State& s{stored.state};
             bool present;
             if (!read_flag(s.bootstrapped)) return false;
             r >> s.epoch;
             const uint64_t n{ReadCompactSize(r)};
             if (starts) {
-                if (n > starts->size()) return false;
+                if (n != count) return false;
                 s.epoch_starts.assign(starts->begin(), starts->begin() + n);
             } else {
                 for (uint64_t i{0}; i < n; ++i) {
@@ -1065,14 +1066,33 @@ std::optional<FinalityTracker> FinalityTracker::Decode(const std::span<const uns
             }
             return true;
         }};
-        if (!read_state(tip, nullptr)) return std::nullopt;
+        if (!read_state(tip, nullptr, 0)) return std::nullopt;
+        // Before a prior state copies a prefix of them, the state's epoch
+        // starts are held to the chain's: M first, then each at least E above
+        // the one before (Projected rotates no sooner). StateInvariantsHold
+        // checks the rest.
+        const std::vector<int>& starts{tip.state.epoch_starts};
+        const int64_t E{params.modern_pos->finality_epoch_blocks};
+        if (!starts.empty() &&
+            (starts.front() != *modern_start ||
+             std::ranges::adjacent_find(starts, [E](const int a, const int b) { return int64_t{b} - a < E; }) !=
+                 starts.end())) {
+            return std::nullopt;
+        }
         const uint64_t records{ReadCompactSize(r)};
         if (records > StakeTracker::UndoDepth(params)) return std::nullopt;
+        // The starts at or below each prior state's parent, counted in one
+        // pass: the parents rise with i, and so do the starts.
+        size_t prior_starts{0};
         for (uint64_t i{0}; i < records; ++i) {
             uint256 hash;
             r >> hash;
+            // The undo records end at `block`, oldest first (checked below):
+            // this one's block is records - 1 - i below `block`.
+            const int64_t parent{int64_t{block.nHeight} - static_cast<int64_t>(records - i)};
+            while (prior_starts < starts.size() && starts[prior_starts] <= parent) ++prior_starts;
             StoredState prior;
-            if (!read_state(prior, &tip.state.epoch_starts)) return std::nullopt;
+            if (!read_state(prior, &starts, prior_starts)) return std::nullopt;
             priors.emplace_back(hash, std::move(prior));
         }
         // Every set is named by some state.

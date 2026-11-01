@@ -3631,4 +3631,103 @@ BOOST_FIXTURE_TEST_CASE(b0b_finality_group_record_never_raises_the_pin, GroupPer
     BOOST_CHECK(pin() == anchor);
 }
 
+// (B0b-8) A record's epoch starts are the chain's: the state's at least E
+// apart (a rotation comes no sooner), and each prior state's exactly those at
+// or below its block's parent. A state that rotated one block early, and a
+// prior state just after a rotation replaced by the one before it, pass the
+// record's other checks and are refused for this.
+BOOST_FIXTURE_TEST_CASE(b0b_finality_group_epoch_starts_follow_the_chain, FinalityGroupFixture)
+{
+    constexpr int HORIZON{10};
+    BuildGroupChain(HORIZON);
+    const int M{m_M};
+    const int E{SCALED_E};
+    LOCK(cs_main);
+    Chainstate& cs{m_node.chainman->ActiveChainstate()};
+    const Consensus::Params& params{m_node.chainman->GetConsensus()};
+    const CBlockIndex& tip{*cs.m_chain.Tip()};
+    const FinalityTracker::State& state{LiveFinality().Current()};
+    BOOST_REQUIRE(state.epoch_starts == (std::vector<int>{M, M + E}));
+    BOOST_REQUIRE(state.finalized && state.finalized->height < M + E - 1);
+    {
+        // Rotated at M + E - 1. Every prior state in the history is of a
+        // block above M + E, so only the spacing tells.
+        BOOST_REQUIRE_GE(tip.nHeight - HORIZON, M + E);
+        const auto bytes{LiveFinality().Encode(params)};
+        BOOST_REQUIRE(bytes && FinalityTracker::Decode(*bytes, tip, params));
+        const GroupLayout at{LayoutOf(*bytes)};
+        const StateLayout fields{StateFields(at.state, state.epoch_starts.size(), /*prior=*/false)};
+        BOOST_REQUIRE_EQUAL(GetLE<int32_t>(*bytes, fields.epoch_starts + 4), M + E);
+        std::vector<unsigned char> early{*bytes};
+        PutLE<int32_t>(early, fields.epoch_starts + 4, M + E - 1);
+        BOOST_CHECK(!FinalityTracker::Decode(early, tip, params));
+    }
+    {
+        // At M + E + 5 the history holds the rotation: the prior state of
+        // block M + E + 1, as of the rotation block, replaced by the prior
+        // state of block M + E, as of the block before.
+        const CBlockIndex& after{*cs.m_chain[M + E + 5]};
+        FinalityTracker at_after;
+        BOOST_REQUIRE(at_after.Sync(cs.m_chain, cs.m_blockman, params, after));
+        const auto bytes{at_after.Encode(params)};
+        BOOST_REQUIRE(bytes && FinalityTracker::Decode(*bytes, after, params));
+        const auto group_record{[&](const int height) {
+            const uint256 hash{cs.m_chain[height]->GetBlockHash()};
+            const auto found{Occurrences(*bytes, std::span<const unsigned char>{hash.begin(), hash.end()})};
+            BOOST_REQUIRE_EQUAL(found.size(), 2U); // the stake registry's undo record, then the group's
+            return found[1];
+        }};
+        const size_t before_rotation{group_record(M + E)};
+        const size_t rotation{group_record(M + E + 1)};
+        const size_t next{group_record(M + E + 2)};
+        std::vector<unsigned char> stale{bytes->begin(), bytes->begin() + rotation + 32};
+        stale.insert(stale.end(), bytes->begin() + before_rotation + 32, bytes->begin() + rotation);
+        stale.insert(stale.end(), bytes->begin() + next, bytes->end());
+        BOOST_CHECK(!FinalityTracker::Decode(stale, after, params));
+    }
+}
+
+// (B0b-9) Decode holds the epoch starts it reads to the chain's before a
+// prior state copies a prefix of them. Two records name 4M starts, and each
+// of their HORIZON prior states claims all of them: one's starts end at M
+// (none from M), the other's run far above its block (a prior state has two
+// at most). Both are refused before the HORIZON copies of 16 MB each are
+// made (the R1 evidence measures this case's peak memory).
+BOOST_FIXTURE_TEST_CASE(b0b_finality_group_decode_bounds_the_epoch_starts, FinalityGroupFixture)
+{
+    constexpr int HORIZON{40};
+    BuildGroupChain(HORIZON);
+    const int M{m_M};
+    const int E{SCALED_E};
+    LOCK(cs_main);
+    const Consensus::Params& params{m_node.chainman->GetConsensus()};
+    const CBlockIndex& tip{*m_node.chainman->ActiveChain().Tip()};
+    const auto bytes{LiveFinality().Encode(params)};
+    BOOST_REQUIRE(bytes);
+    const GroupLayout at{LayoutOf(*bytes)};
+    const size_t count_at{at.state + 1 + 8};
+    const StateLayout fields{StateFields(at.state, bytes->at(count_at), /*prior=*/false)};
+    constexpr int64_t STARTS{4'000'000};
+    // The state with `first`, first + E, ... as its starts, and HORIZON prior
+    // states (no set, checkpoint or producer schedule) that claim them all.
+    const auto crafted{[&](const int64_t first) {
+        std::vector<unsigned char> out{bytes->begin(), bytes->begin() + count_at};
+        VectorWriter w{out, out.size()};
+        WriteCompactSize(w, STARTS);
+        for (int64_t i{0}; i < STARTS; ++i) w << static_cast<int32_t>(first + i * E);
+        out.insert(out.end(), bytes->begin() + fields.sets, bytes->begin() + fields.escapes + 8);
+        VectorWriter priors{out, out.size()};
+        WriteCompactSize(priors, HORIZON);
+        for (int i{0}; i < HORIZON; ++i) {
+            priors << uint256{} << uint8_t{0} << uint64_t{0};
+            WriteCompactSize(priors, STARTS);
+            priors << uint8_t{0} << uint8_t{0} << uint8_t{0} << uint8_t{0} << uint8_t{0} << uint8_t{0} << uint8_t{0}
+                   << uint8_t{0};
+        }
+        return out;
+    }};
+    BOOST_CHECK(!FinalityTracker::Decode(crafted(M - (STARTS - 1) * E), tip, params));
+    BOOST_CHECK(!FinalityTracker::Decode(crafted(M), tip, params));
+}
+
 BOOST_AUTO_TEST_SUITE_END()
