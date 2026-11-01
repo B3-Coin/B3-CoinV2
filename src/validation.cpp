@@ -2880,6 +2880,7 @@ void Chainstate::InitDerivedStateStore(const bool in_memory, const bool wipe, co
     if (m_from_snapshot_blockhash) return;
     m_derived_state.reset();
     m_derived_bindings_block = nullptr;
+    m_derived_finality_block = nullptr;
     const fs::path path{m_chainman.m_options.datadir / "derivedstate"};
     if (!persist || !build_id) {
         if (persist) {
@@ -2912,37 +2913,55 @@ void Chainstate::LoadDerivedState()
 {
     AssertLockHeld(::cs_main);
     if (!m_derived_state || m_chain.Tip() == nullptr) return;
-    const node::DerivedStateId id{node::DerivedStateId::FINALITY_BINDINGS};
+    LoadFinalityBindings();
+    LoadFinalityGroup();
+}
+
+const CBlockIndex* Chainstate::UsableDerivedRecord(const node::DerivedStateId id, const uint256& params_digest,
+                                                   const std::string_view name, node::DerivedStateRecord& record)
+{
+    AssertLockHeld(::cs_main);
     std::optional<std::vector<unsigned char>> bytes;
     try {
         bytes = m_derived_state->Read(id);
     } catch (const std::exception& e) {
-        LogWarning("Cannot read the persisted finality bindings (%s); they will be rebuilt", e.what());
-        return;
+        LogWarning("Cannot read the persisted %s (%s); rebuilt from blocks when first needed", name, e.what());
+        return nullptr;
     }
     if (!bytes) {
-        LogInfo("No persisted finality bindings; they will be rebuilt when first needed");
-        return;
+        LogInfo("No persisted %s; rebuilt from blocks when first needed", name);
+        return nullptr;
     }
-    const Consensus::Params& params{m_chainman.GetConsensus()};
-    node::DerivedStateRecord record;
-    const node::DerivedStateCheck check{node::DecodeDerivedStateRecord(
-        *bytes, m_derived_state_build_id, node::FinalityBindingTracker::ParamsDigest(params), record)};
+    const node::DerivedStateCheck check{
+        node::DecodeDerivedStateRecord(*bytes, m_derived_state_build_id, params_digest, record)};
     if (check != node::DerivedStateCheck::OK) {
-        LogInfo("Persisted finality bindings not used (%s); they will be rebuilt when first needed",
+        LogInfo("Persisted %s not used (%s); rebuilt from blocks when first needed", name,
                 node::DerivedStateCheckName(check));
-        return;
+        return nullptr;
     }
     const CBlockIndex* block{m_blockman.LookupBlockIndex(record.block_hash)};
-    const std::optional<int> final_height{Consensus::LegacyFinalHeight(params)};
+    const std::optional<int> final_height{Consensus::LegacyFinalHeight(m_chainman.GetConsensus())};
     if (block == nullptr || block->nHeight != record.height || !m_chain.Contains(block) || !final_height ||
         block->nHeight <= *final_height) {
-        LogInfo("Persisted finality bindings at height %d not used: their block is not a modern block of the active chain",
+        LogInfo("Persisted %s at height %d not used: the block is not a modern block of the active chain", name,
                 record.height);
-        return;
+        return nullptr;
     }
+    return block;
+}
+
+void Chainstate::LoadFinalityBindings()
+{
+    AssertLockHeld(::cs_main);
+    const Consensus::Params& params{m_chainman.GetConsensus()};
+    const node::DerivedStateId id{node::DerivedStateId::FINALITY_BINDINGS};
+    node::DerivedStateRecord record;
+    const CBlockIndex* block{
+        UsableDerivedRecord(id, node::FinalityBindingTracker::ParamsDigest(params), "finality bindings", record)};
+    if (block == nullptr) return;
+    const int final_height{*Consensus::LegacyFinalHeight(params)};
     std::optional<node::FinalityBindingIndex> index{
-        node::FinalityBindingIndex::Decode(record.payload, *final_height + 1, block->nHeight)};
+        node::FinalityBindingIndex::Decode(record.payload, final_height + 1, block->nHeight)};
     if (!index) {
         LogWarning("Persisted finality bindings at height %d are malformed; they will be rebuilt", block->nHeight);
         return;
@@ -2975,6 +2994,60 @@ void Chainstate::LoadDerivedState()
     }
     LogInfo("Loaded the finality bindings persisted at height %d, then replayed %d blocks to the tip",
             block->nHeight, behind);
+}
+
+void Chainstate::LoadFinalityGroup()
+{
+    AssertLockHeld(::cs_main);
+    const Consensus::Params& params{m_chainman.GetConsensus()};
+    const node::DerivedStateId id{node::DerivedStateId::FINALITY_GROUP};
+    node::DerivedStateRecord record;
+    const CBlockIndex* block{
+        UsableDerivedRecord(id, node::FinalityTracker::ParamsDigest(params), "finality group", record)};
+    if (block == nullptr) return;
+    // Decode makes the record's own checks: the invariants of every state, an
+    // undo history that ends at `block` on this chain, and each key's proof
+    // of possession (design section 5, P1).
+    std::optional<node::FinalityTracker> loaded{node::FinalityTracker::Decode(record.payload, *block, params)};
+    if (!loaded) {
+        LogWarning("Persisted finality group at height %d fails its checks; it will be rebuilt", block->nHeight);
+        return;
+    }
+    if (m_check_derived_state) {
+        // As RefreshFinalityAnchor: the bridge first, whose withdrawal roots
+        // the rebuild's certificate checks read.
+        const node::BridgeStateIndex* bridge_index{nullptr};
+        if (Consensus::BridgeRulesActive(block->nHeight, params)) {
+            if (!ModernBridgeState().Sync(m_chain, m_blockman, params, *m_chain.Tip())) {
+                LogWarning("Persisted finality group at height %d not used: no bridge state to check it against",
+                           block->nHeight);
+                return;
+            }
+            bridge_index = &ModernBridgeState().Index();
+        }
+        node::FinalityTracker rebuilt;
+        if (!rebuilt.Sync(m_chain, m_blockman, params, *block, bridge_index)) {
+            LogWarning("Persisted finality group at height %d not used: no rebuild to check it against",
+                       block->nHeight);
+            return;
+        }
+        if (!loaded->SameState(rebuilt)) {
+            LogError("Persisted finality group at height %d differs from a rebuild; record erased", block->nHeight);
+            try {
+                m_derived_state->Erase(id);
+            } catch (const std::exception& e) {
+                LogWarning("Cannot erase the persisted finality group (%s)", e.what());
+            }
+            return;
+        }
+    }
+    ModernFinality() = std::move(*loaded);
+    m_derived_finality_block = block;
+    // Not brought to the tip here: the first FindMostWorkChain does it
+    // (RefreshFinalityAnchor, the bridge first) through Sync's forward path,
+    // before any block connects.
+    LogInfo("Loaded the finality group persisted at height %d, %d blocks below the tip", block->nHeight,
+            m_chain.Height() - block->nHeight);
 }
 
 void Chainstate::ResetCoinsViews()
@@ -4893,33 +4966,52 @@ void Chainstate::WriteDerivedState(const FlushStateMode mode)
 {
     AssertLockHeld(::cs_main);
     const CBlockIndex* tip{m_chain.Tip()};
-    if (!m_derived_state || !m_finality_bindings || tip == nullptr || tip == m_derived_bindings_block) return;
-    // Only an index in step with the tip is written; a flush never syncs one.
-    if (!m_finality_bindings->Synced(tip->GetBlockHash())) return;
+    if (!m_derived_state || tip == nullptr) return;
     const Consensus::Params& params{m_chainman.GetConsensus()};
     const std::optional<int> final_height{Consensus::LegacyFinalHeight(params)};
     if (!final_height || tip->nHeight <= *final_height) return;
-    const CBlockIndex* written{m_derived_bindings_block};
     const bool forced{mode == FlushStateMode::FORCE_FLUSH || mode == FlushStateMode::FORCE_SYNC};
-    if (!node::DerivedStateWriteDue(forced, written ? std::optional{written->nHeight} : std::nullopt,
-                                    written != nullptr && m_chain.Contains(written), tip->nHeight)) {
-        return;
+    // Only a tracker in step with the tip is written; a flush never syncs one.
+    const auto due{[&](const CBlockIndex* written) {
+        return written != tip &&
+               node::DerivedStateWriteDue(forced, written ? std::optional{written->nHeight} : std::nullopt,
+                                          written != nullptr && m_chain.Contains(written), tip->nHeight);
+    }};
+    const auto record{[&](const uint256& params_digest, std::vector<unsigned char> payload) {
+        node::DerivedStateRecord r;
+        r.params_digest = params_digest;
+        r.block_hash = tip->GetBlockHash();
+        r.height = tip->nHeight;
+        r.payload = std::move(payload);
+        return node::EncodeDerivedStateRecord(r, m_derived_state_build_id);
+    }};
+    std::vector<std::pair<node::DerivedStateId, std::vector<unsigned char>>> records;
+    const bool bindings{m_finality_bindings && m_finality_bindings->Synced(tip->GetBlockHash()) &&
+                        due(m_derived_bindings_block)};
+    if (bindings) {
+        records.emplace_back(node::DerivedStateId::FINALITY_BINDINGS,
+                             record(node::FinalityBindingTracker::ParamsDigest(params),
+                                    m_finality_bindings->Index().Encode()));
     }
-    node::DerivedStateRecord record;
-    record.params_digest = node::FinalityBindingTracker::ParamsDigest(params);
-    record.block_hash = tip->GetBlockHash();
-    record.height = tip->nHeight;
-    record.payload = m_finality_bindings->Index().Encode();
+    // Encode() gives nothing under the fresh lineage or bridge V2.
+    std::optional<std::vector<unsigned char>> group;
+    if (m_finality_tracker && m_finality_tracker->Synced(tip->GetBlockHash()) && due(m_derived_finality_block)) {
+        group = m_finality_tracker->Encode(params);
+    }
+    if (group) {
+        records.emplace_back(node::DerivedStateId::FINALITY_GROUP,
+                             record(node::FinalityTracker::ParamsDigest(params), std::move(*group)));
+    }
+    if (records.empty()) return;
     try {
-        m_derived_state->Write(node::DerivedStateId::FINALITY_BINDINGS,
-                               node::EncodeDerivedStateRecord(record, m_derived_state_build_id));
+        m_derived_state->Write(records);
     } catch (const std::exception& e) {
-        LogWarning("Cannot persist the finality bindings at height %d (%s); a restart rebuilds them", tip->nHeight,
-                   e.what());
+        LogWarning("Cannot persist derived state at height %d (%s); a restart rebuilds it", tip->nHeight, e.what());
         return;
     }
-    m_derived_bindings_block = tip;
-    LogDebug(BCLog::COINDB, "Persisted the finality bindings at height %d", tip->nHeight);
+    if (bindings) m_derived_bindings_block = tip;
+    if (group) m_derived_finality_block = tip;
+    LogDebug(BCLog::COINDB, "Persisted %u derived-state records at height %d", records.size(), tip->nHeight);
 }
 
 bool Chainstate::FlushStateToDisk(

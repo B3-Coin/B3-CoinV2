@@ -97,6 +97,13 @@ void DerivedStateStore::Write(const DerivedStateId id, const std::vector<unsigne
     m_db.Write(RecordKey(id), record, /*fSync=*/true);
 }
 
+void DerivedStateStore::Write(const std::span<const std::pair<DerivedStateId, std::vector<unsigned char>>> records)
+{
+    CDBBatch batch{m_db};
+    for (const auto& [id, record] : records) batch.Write(RecordKey(id), record);
+    m_db.WriteBatch(batch, /*fSync=*/true);
+}
+
 void DerivedStateStore::Erase(const DerivedStateId id)
 {
     m_db.Erase(RecordKey(id), /*fSync=*/true);

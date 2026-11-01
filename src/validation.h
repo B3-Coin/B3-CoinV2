@@ -47,6 +47,7 @@
 #include <set>
 #include <span>
 #include <string>
+#include <string_view>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -63,6 +64,8 @@ namespace kernel {
 struct ChainstateRole;
 } // namespace kernel
 namespace node {
+enum class DerivedStateId : uint8_t;
+struct DerivedStateRecord;
 class DerivedStateStore;
 class SnapshotMetadata;
 class StakeTracker;
@@ -625,10 +628,22 @@ protected:
     std::unique_ptr<node::DerivedStateStore> m_derived_state GUARDED_BY(::cs_main);
     std::string m_derived_state_build_id GUARDED_BY(::cs_main);
     bool m_check_derived_state GUARDED_BY(::cs_main){false};
-    //! The block of the finality bindings record in the store, if any.
+    //! The blocks of the records in the store, if any: the finality bindings
+    //! and the finality group.
     const CBlockIndex* m_derived_bindings_block GUARDED_BY(::cs_main){nullptr};
-    //! B0b: persist the finality bindings after a coins flush, when due.
+    const CBlockIndex* m_derived_finality_block GUARDED_BY(::cs_main){nullptr};
+    //! B0b: persist the finality bindings and the finality group after a
+    //! coins flush, each when due, in one batch.
     void WriteDerivedState(FlushStateMode mode) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+    //! B0b: the block of tracker `id`'s record, with the record in `record`,
+    //! when the record can be used at all: its format, build, parameters
+    //! digest and checksum match, and its block is a modern block of the
+    //! active chain. Otherwise nullptr, logged with the tracker's `name`.
+    const CBlockIndex* UsableDerivedRecord(node::DerivedStateId id, const uint256& params_digest,
+                                           std::string_view name, node::DerivedStateRecord& record)
+        EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+    void LoadFinalityBindings() EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+    void LoadFinalityGroup() EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
 
 public:
     //! Reference to a BlockManager instance which itself is shared across all
@@ -755,8 +770,10 @@ public:
      */
     void InitDerivedStateStore(bool in_memory, bool wipe, bool persist, const std::optional<std::string>& build_id,
                                bool check) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
-    //! B0b: install the persisted finality bindings when their record can be
-    //! used, then bring them to the tip. Call after LoadChainTip().
+    //! B0b: install the persisted finality bindings and finality group when
+    //! their records can be used. The bindings are brought to the tip here,
+    //! the finality group by the first FindMostWorkChain. Call after
+    //! LoadChainTip().
     void LoadDerivedState() EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
 
     //! @returns whether or not the CoinsViews object has been fully initialized and we can

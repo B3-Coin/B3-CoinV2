@@ -11,6 +11,7 @@
 #include <optional>
 #include <span>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace node {
@@ -26,9 +27,13 @@ namespace node {
  * checksum holds; otherwise the tracker rebuilds from blocks as before.
  */
 enum class DerivedStateId : uint8_t {
-    //! 1 is reserved for the finality tracker; 3 to 6 for the bridge, FN
-    //! seat, FlowMesh vault and FlowMesh checkpoint indexes.
+    //! The finality tracker with its private stake registry and binding
+    //! index (FinalityTracker::Encode).
+    FINALITY_GROUP = 1,
+    //! The chainstate's binding index (FinalityBindingIndex::Encode).
     FINALITY_BINDINGS = 2,
+    // 3 to 6 are reserved for the bridge, FN seat, FlowMesh vault and
+    // FlowMesh checkpoint indexes.
 };
 
 struct DerivedStateRecord {
@@ -82,6 +87,8 @@ public:
 
     std::optional<std::vector<unsigned char>> Read(DerivedStateId id) const;
     void Write(DerivedStateId id, const std::vector<unsigned char>& record);
+    //! Several records in one synchronous batch: all of them land, or none.
+    void Write(std::span<const std::pair<DerivedStateId, std::vector<unsigned char>>> records);
     void Erase(DerivedStateId id);
 
 private:

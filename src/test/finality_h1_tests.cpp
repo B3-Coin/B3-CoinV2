@@ -17,6 +17,7 @@
 #include <modern/finality_schedule.h>
 #include <modern/pos_v1.h>
 #include <node/chainstate.h>
+#include <node/derived_state.h>
 #include <node/finality_tracker.h>
 #include <node/miner.h>
 #include <node/stake_tracker.h>
@@ -33,6 +34,7 @@
 #include <util/chaintype.h>
 #include <util/strencodings.h>
 #include <validation.h>
+#include <validationinterface.h>
 
 #include <boost/test/unit_test.hpp>
 
@@ -2240,6 +2242,7 @@ BOOST_FIXTURE_TEST_CASE(unanimous_certificate_after_break_refused_h1_unfreezes, 
 namespace {
 
 struct UndoChainFixture : public H1ChainFixture {
+    explicit UndoChainFixture(TestOpts opts = {}) : H1ChainFixture{std::move(opts)} {}
     //! The live trackers, read without syncing them (a sync would rebuild a
     //! dirty tracker and hide the missing undo).
     FinalityTracker& LiveFinality() EXCLUSIVE_LOCKS_REQUIRED(cs_main)
@@ -2914,6 +2917,8 @@ struct FinalityGroupFixture : public UndoChainFixture {
     int m_R_h{0};
     int m_escape{0};
 
+    explicit FinalityGroupFixture(TestOpts opts = {}) : UndoChainFixture{std::move(opts)} {}
+
     void BuildGroupChain(const int horizon)
     {
         PrepareFinalityChain(/*min_finality_set=*/1, /*reorg_horizon=*/horizon, /*with_unbound_c=*/true);
@@ -3286,6 +3291,256 @@ BOOST_FIXTURE_TEST_CASE(b0b_finality_group_codec, FinalityGroupFixture)
         BOOST_REQUIRE(decoded);
         BOOST_CHECK(decoded->SameState(rebuilt) && decoded->SameState(live) && live.SameState(*decoded));
     }
+}
+
+namespace {
+
+//! FinalityGroupFixture on disk, keeping derived state across restarts (as
+//! PersistFixture in finality_key_binding_tests).
+struct GroupPersistFixture : public FinalityGroupFixture {
+    static constexpr std::string_view BUILD{"b0b-test-build"};
+    static constexpr node::DerivedStateId ID{node::DerivedStateId::FINALITY_GROUP};
+    static constexpr int HORIZON{40};
+
+    GroupPersistFixture() : FinalityGroupFixture{{.coins_db_in_memory = false, .block_tree_db_in_memory = false}}
+    {
+        // ChainTestingSetup keeps its coins in memory whatever TestOpts say
+        // (see finality_pin_persist_tests); reopen them on disk.
+        Reload([&] {
+            m_coins_db_in_memory = false;
+            m_persist_derived_state = true;
+            m_derived_state_build_id = std::string{BUILD};
+            m_check_derived_state = true;
+        });
+    }
+    //! Start again; `between` runs while no chainstate holds the store.
+    void Reload(const std::function<void()>& between = {})
+    {
+        if (m_node.validation_signals) m_node.validation_signals->SyncWithValidationInterfaceQueue();
+        m_node.chainman.reset();
+        if (between) between();
+        m_make_chainman();
+        LoadVerifyActivateChainstate();
+    }
+    //! Shut down (a forced flush), then Reload.
+    void Restart(const std::function<void()>& between = {})
+    {
+        WITH_LOCK(cs_main, m_node.chainman->ActiveChainstate().ForceFlushStateToDisk());
+        Reload(between);
+    }
+    //! The group chain, then a restart. The first start of a coins database
+    //! without the B3 validation-schema marker reconnects every post-H block
+    //! once (node/chainstate.cpp), which rebuilds the trackers; later starts
+    //! do not, as on a node that has run this release before.
+    void PrepareRestarted()
+    {
+        BuildGroupChain(HORIZON);
+        Restart();
+    }
+    fs::path StorePath() { return m_args.GetDataDirNet() / "derivedstate"; }
+    //! The store, opened while no chainstate holds it.
+    node::DerivedStateStore OpenStore()
+    {
+        return node::DerivedStateStore{DBParams{.path = StorePath(), .cache_bytes = 1 << 20}};
+    }
+    std::optional<std::vector<unsigned char>> ReadRecord() { return OpenStore().Read(ID); }
+    void WriteRecord(const std::vector<unsigned char>& bytes) { OpenStore().Write(ID, bytes); }
+    node::DerivedStateRecord DecodeRecord(const std::vector<unsigned char>& bytes)
+    {
+        node::DerivedStateRecord record;
+        BOOST_REQUIRE(node::DecodeDerivedStateRecord(bytes, BUILD,
+                                                     FinalityTracker::ParamsDigest(m_node.chainman->GetConsensus()),
+                                                     record) == node::DerivedStateCheck::OK);
+        return record;
+    }
+    //! Rebuilds of the live finality tracker, its private trackers' included.
+    uint64_t GroupRebuilds()
+    {
+        LOCK(cs_main);
+        return LiveFinality().Rebuilds();
+    }
+    //! The live finality tracker is in step with the tip and equals a tracker
+    //! rebuilt from blocks, its undo history a suffix of the rebuild's.
+    bool GroupAsRebuilt()
+    {
+        LOCK(cs_main);
+        Chainstate& cs{m_node.chainman->ActiveChainstate()};
+        FinalityTracker rebuilt;
+        BOOST_REQUIRE(rebuilt.Sync(cs.m_chain, cs.m_blockman, m_node.chainman->GetConsensus(), *cs.m_chain.Tip()));
+        return LiveFinality().Synced(cs.m_chain.Tip()->GetBlockHash()) && LiveFinality().SameState(rebuilt);
+    }
+    //! One escape more in the state an encoding holds: a wrong state that
+    //! passes the record's own checks.
+    static void AddEscape(std::vector<unsigned char>& payload)
+    {
+        const GroupLayout at{LayoutOf(payload)};
+        const StateLayout fields{StateFields(at.state, payload.at(at.state + 1 + 8), /*prior=*/false)};
+        BOOST_REQUIRE_EQUAL(GetLE<uint64_t>(payload, fields.escapes), 1U);
+        PutLE<uint64_t>(payload, fields.escapes, 2);
+    }
+};
+
+} // namespace
+
+// (B0b-4) The finality group kept across a restart. On the group chain, the
+// record the shutdown writes is installed at the next start without a
+// rebuild, with the state, the undo history and the private trackers the
+// tracker had. A one-block reorganization right after the start is undone
+// and redone in place, and the chain extends, still without a rebuild. The
+// next shutdown writes both records at the new tip, in one batch.
+BOOST_FIXTURE_TEST_CASE(b0b_finality_group_restart, GroupPersistFixture)
+{
+    PrepareRestarted();
+    // As outside regtest: the record is used without a rebuild to check it.
+    m_check_derived_state = false;
+    const FinalityTracker before{WITH_LOCK(cs_main, return FinalityTracker{LiveFinality()})};
+    BOOST_REQUIRE(before.Synced(Tip()->GetBlockHash()));
+    Restart();
+    BOOST_CHECK_EQUAL(GroupRebuilds(), 0U);
+    BOOST_CHECK(GroupAsRebuilt());
+    {
+        LOCK(cs_main);
+        const FinalityTracker& live{LiveFinality()};
+        BOOST_CHECK(live.SameState(before) && before.SameState(live));
+        BOOST_CHECK(live.PinnedCheckpoint() == before.PinnedCheckpoint());
+    }
+    const uint256 top{Tip()->GetBlockHash()};
+    InvalidateFrom(Tip()->nHeight);
+    BOOST_CHECK(GroupAsRebuilt());
+    Reconsider(top);
+    BOOST_REQUIRE(Tip()->GetBlockHash() == top);
+    BOOST_CHECK(GroupAsRebuilt());
+    BOOST_CHECK(WITH_LOCK(cs_main, return LiveFinality().SameState(before)));
+    Produce(m_vk_a);
+    Produce(m_vk_a);
+    BOOST_CHECK(GroupAsRebuilt());
+    BOOST_CHECK_EQUAL(GroupRebuilds(), 0U);
+
+    // Both records were loaded at this start, at the old tip, so both are due
+    // at the shutdown.
+    std::optional<std::vector<unsigned char>> group, bindings;
+    Restart([&] {
+        group = ReadRecord();
+        bindings = OpenStore().Read(node::DerivedStateId::FINALITY_BINDINGS);
+    });
+    BOOST_REQUIRE(group && bindings);
+    BOOST_CHECK_EQUAL(DecodeRecord(*group).height, Tip()->nHeight);
+    node::DerivedStateRecord index;
+    BOOST_REQUIRE(node::DecodeDerivedStateRecord(
+                      *bindings, BUILD, node::FinalityBindingTracker::ParamsDigest(m_node.chainman->GetConsensus()),
+                      index) == node::DerivedStateCheck::OK);
+    BOOST_CHECK_EQUAL(index.height, Tip()->nHeight);
+    BOOST_CHECK_EQUAL(GroupRebuilds(), 0U);
+}
+
+// (B0b-5) An older record, as after a crash between two writes, is installed
+// and brought to the tip by the first FindMostWorkChain without a rebuild. A
+// shutdown writes the tip although the record is fewer than
+// DERIVED_STATE_WRITE_INTERVAL blocks old. A tracker out of step with the tip
+// at a flush is not written: the store keeps the record it has.
+BOOST_FIXTURE_TEST_CASE(b0b_finality_group_older_record_and_write_rule, GroupPersistFixture)
+{
+    PrepareRestarted();
+    std::optional<std::vector<unsigned char>> older;
+    Restart([&] { older = ReadRecord(); });
+    BOOST_REQUIRE(older);
+    const int older_height{DecodeRecord(*older).height};
+    BOOST_REQUIRE_EQUAL(older_height, Tip()->nHeight);
+    Produce(m_vk_a);
+    Produce(m_vk_a);
+    Restart([&] { WriteRecord(*older); });
+    BOOST_CHECK_EQUAL(GroupRebuilds(), 0U);
+    BOOST_CHECK(GroupAsRebuilt());
+
+    std::optional<std::vector<unsigned char>> latest;
+    Restart([&] { latest = ReadRecord(); });
+    BOOST_REQUIRE(latest);
+    BOOST_CHECK_EQUAL(DecodeRecord(*latest).height, older_height + 2);
+    BOOST_CHECK_EQUAL(Tip()->nHeight, older_height + 2);
+
+    // Synced one block back (a rebuild there), the tracker is out of step
+    // with the tip at the shutdown flush.
+    Produce(m_vk_a);
+    {
+        LOCK(cs_main);
+        Chainstate& cs{m_node.chainman->ActiveChainstate()};
+        BOOST_REQUIRE(LiveFinality().Sync(cs.m_chain, cs.m_blockman, m_node.chainman->GetConsensus(),
+                                          *cs.m_chain.Tip()->pprev));
+    }
+    std::optional<std::vector<unsigned char>> kept;
+    Restart([&] { kept = ReadRecord(); });
+    BOOST_REQUIRE(kept);
+    BOOST_CHECK_EQUAL(DecodeRecord(*kept).height, Tip()->nHeight - 1);
+    BOOST_CHECK(GroupAsRebuilt());
+}
+
+// (B0b-6) Records the finality group cannot use are passed over, and the
+// tracker rebuilds from blocks to the true state: a bad checksum, another
+// build, other parameters (forged, and H1's escape rounds changed, which only
+// the finality group's digest covers), a malformed or truncated payload, two
+// keys' proofs of possession swapped, and, under -checkderivedstate, a wrong
+// state that passes the record's own checks. Without the check, a record
+// whose block left the active chain is passed over, and one that passes its
+// own checks is trusted, as the coins database is.
+BOOST_FIXTURE_TEST_CASE(b0b_finality_group_unusable_records_are_rebuilt, GroupPersistFixture)
+{
+    PrepareRestarted();
+    std::optional<std::vector<unsigned char>> good;
+    Restart([&] { good = ReadRecord(); });
+    BOOST_REQUIRE(good);
+    BOOST_REQUIRE_EQUAL(GroupRebuilds(), 0U);
+    const node::DerivedStateRecord record{DecodeRecord(*good)};
+    const auto with{[&](const auto& mutate, const std::string_view build = BUILD) {
+        node::DerivedStateRecord forged{record};
+        mutate(forged);
+        return node::EncodeDerivedStateRecord(forged, build);
+    }};
+    const auto refused{[&](const std::vector<unsigned char>& forged, const std::string_view what) {
+        Restart([&] { WriteRecord(forged); });
+        BOOST_CHECK_MESSAGE(GroupRebuilds() > 0, what << ": installed");
+        BOOST_CHECK_MESSAGE(GroupAsRebuilt(), what << ": not the true state");
+    }};
+    std::vector<unsigned char> flipped{*good};
+    flipped.back() ^= 1;
+    refused(flipped, "bad checksum");
+    refused(with([](auto&) {}, "another-build"), "another build");
+    refused(with([](auto& r) { r.params_digest = uint256::ONE; }), "other parameters");
+    refused(with([](auto& r) { r.payload.push_back(0); }), "malformed payload");
+    refused(with([](auto& r) { r.payload.pop_back(); }), "truncated payload");
+    refused(with([](auto& r) {
+                const GroupLayout at{LayoutOf(r.payload)};
+                BOOST_REQUIRE_GE(int{r.payload.at(at.pops)}, 2);
+                const size_t first{at.pops + 1 + 48};
+                std::swap_ranges(r.payload.begin() + first, r.payload.begin() + first + 96,
+                                 r.payload.begin() + first + 96 + 48);
+            }),
+            "proofs of possession swapped");
+    refused(with([](auto& r) { AddEscape(r.payload); }), "wrong state");
+    ConfigureH1(m_R_h, TEST_ESCAPE_ROUNDS - 1); // the round-12 block is still C's escape
+    refused(*good, "escape rounds changed");
+    ConfigureH1(m_R_h);
+
+    m_check_derived_state = false;
+    InvalidateFrom(record.height);
+    {
+        ASSERT_DEBUG_LOG(strprintf("Persisted finality group at height %d not used: the block is not a modern "
+                                   "block of the active chain", record.height));
+        Restart([&] { WriteRecord(*good); });
+    }
+    BOOST_CHECK(GroupRebuilds() > 0);
+    BOOST_CHECK(GroupAsRebuilt());
+    auto payload{WITH_LOCK(cs_main, return LiveFinality().Encode(m_node.chainman->GetConsensus()))};
+    BOOST_REQUIRE(payload);
+    AddEscape(*payload);
+    const auto wrong{with([&](auto& r) {
+        r.block_hash = Tip()->GetBlockHash();
+        r.height = Tip()->nHeight;
+        r.payload = *payload;
+    })};
+    Restart([&] { WriteRecord(wrong); });
+    BOOST_CHECK_EQUAL(GroupRebuilds(), 0U);
+    BOOST_CHECK(!GroupAsRebuilt());
+    BOOST_CHECK_EQUAL(WITH_LOCK(cs_main, return LiveFinality().Current().producers->escapes), 2U);
 }
 
 BOOST_AUTO_TEST_SUITE_END()
