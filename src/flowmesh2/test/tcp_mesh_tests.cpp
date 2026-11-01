@@ -545,9 +545,9 @@ BOOST_AUTO_TEST_CASE(authenticated_reconnect_replaces_half_open_peer_without_tru
     const auto received{p.Pump(1)};
     BOOST_REQUIRE_EQUAL(received.size(), 1U);
     BOOST_CHECK(received[0].bytes == WireBytes{3});
-    unsigned char byte{0};
-    const ssize_t old_read{recv(old.fd, &byte, 1, 0)};
-    BOOST_CHECK(old_read == 0 || (old_read < 0 && errno == ECONNRESET));
+    // The Poll that installed the replacement closed the old socket, but the
+    // kernel may deliver its FIN or reset after Pump returns: wait for it.
+    BOOST_CHECK(old.ClosedByMesh());
 }
 
 BOOST_AUTO_TEST_CASE(tampered_ciphertext_and_oversize_packet_are_disconnected)
