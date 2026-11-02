@@ -25,6 +25,7 @@ add_executable(fuzz
   bridge.cpp
   bridge_light_client.cpp
   bridge_record.cpp
+  bridge_state.cpp
   buffered_file.cpp
   chain.cpp
   checkqueue.cpp
