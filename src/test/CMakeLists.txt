@@ -67,6 +67,7 @@ add_executable(test_bitcoin
   bridge_state_observation_tests.cpp
   bridge_state_proof_tests.cpp
   bridge_state_tests.cpp
+  bridge_v1_gate_tests.cpp
   bridge_v2_gate_tests.cpp
   bridge_v2_tests.cpp
   update_downloader_tests.cpp
