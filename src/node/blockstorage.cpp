@@ -254,7 +254,7 @@ bool BlockTreeDB::LoadBlockIndexGuts(const Consensus::Params& consensusParams, s
         reported = percent;
         progress(percent);
     }};
-    const auto insert_batch{[&] {
+    const auto insert_batch{[&]() EXCLUSIVE_LOCKS_REQUIRED(::cs_main) {
         hashes.assign(batch.size(), uint256{});
         const size_t threads{std::min(workers, (batch.size() + 255) / 256)};
         const auto hash_range{[&](const size_t first) {
