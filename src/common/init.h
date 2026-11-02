@@ -22,10 +22,10 @@ inline constexpr size_t WINDOWS_MAX_PATH_LENGTH{259};
 //! The longest path, in characters, that the node creates below its
 //! network data directory with the default options: the asset metadata
 //! index's LevelDB manifest,
-//! `\indexes\asset_metadata\<64 hex>\db\MANIFEST-000002` (107 characters),
-//! with 5 characters of room for LevelDB's file numbers to grow. User-named
-//! wallets and the finality signer's state files (up to 186 characters,
-//! staking only) can be longer and are not counted.
+//! `/indexes/asset_metadata/<64 hex>/db/MANIFEST-000002` (107 characters,
+//! backslashes on Windows), with 5 characters of room for LevelDB's file
+//! numbers to grow. User-named wallets and the finality signer's state files
+//! (up to 186 characters, staking only) can be longer and are not counted.
 inline constexpr size_t DATADIR_LONGEST_RELATIVE_PATH{112};
 //! The longest network data directory the node accepts on Windows when long
 //! paths are disabled.
