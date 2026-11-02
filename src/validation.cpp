@@ -4994,7 +4994,7 @@ void Chainstate::WriteDerivedState(const FlushStateMode mode)
                node::DerivedStateWriteDue(forced, written ? std::optional{written->nHeight} : std::nullopt,
                                           written != nullptr && m_chain.Contains(written), tip->nHeight);
     }};
-    const auto record{[&](const uint256& params_digest, std::vector<unsigned char> payload) {
+    const auto record{[&](const uint256& params_digest, std::vector<unsigned char> payload) EXCLUSIVE_LOCKS_REQUIRED(::cs_main) {
         node::DerivedStateRecord r;
         r.params_digest = params_digest;
         r.block_hash = tip->GetBlockHash();
