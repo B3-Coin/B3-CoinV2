@@ -2469,9 +2469,10 @@ BOOST_FIXTURE_TEST_CASE(b0a_undo_equals_replay_at_every_depth, UndoChainFixture)
     BOOST_CHECK(SameProducers(before.producers, after.producers));
 }
 
-// (B0a-3) A disconnect deeper than the kept history falls back to the
-// rebuild, which still equals a fresh tracker and refills the history: the
-// next one-block reorganization is again undone in place.
+// (B0a-3) A disconnect exactly as deep as the kept history is undone in
+// place. One block deeper falls back to the rebuild, which still equals a
+// fresh tracker and refills the history: the next one-block reorganization
+// is again undone in place.
 BOOST_FIXTURE_TEST_CASE(b0a_disconnect_beyond_history_rebuilds, UndoChainFixture)
 {
     constexpr int HORIZON{4};
@@ -2483,6 +2484,16 @@ BOOST_FIXTURE_TEST_CASE(b0a_disconnect_beyond_history_rebuilds, UndoChainFixture
     BOOST_REQUIRE(InStepAndAsRebuilt());
     const uint64_t rebuilds{Rebuilds()};
     const uint256 tip_hash{Tip()->GetBlockHash()};
+
+    const int deepest{Tip()->nHeight - HORIZON + 1};
+    const uint256 deepest_hash{ChainHashAt(deepest)};
+    InvalidateFrom(deepest); // HORIZON blocks: all the history holds
+    BOOST_CHECK(InStepAndAsRebuilt());
+    BOOST_CHECK_EQUAL(Rebuilds(), rebuilds);
+    Reconsider(deepest_hash);
+    BOOST_REQUIRE(Tip()->GetBlockHash() == tip_hash);
+    BOOST_CHECK(InStepAndAsRebuilt());
+    BOOST_CHECK_EQUAL(Rebuilds(), rebuilds);
 
     const int from{Tip()->nHeight - HORIZON};
     const uint256 first{ChainHashAt(from)};
