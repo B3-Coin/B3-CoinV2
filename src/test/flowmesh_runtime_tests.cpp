@@ -1047,8 +1047,11 @@ public:
 
     void Drain()
     {
+        // The bound only stops a hung worker. A step can cost the runtimes
+        // seconds of CPU (nine of them more), so on a loaded machine a
+        // worker can stay busy past five seconds without being hung.
         for (size_t pass{0}; pass < 4; ++pass) for (const auto& runtime : runtimes) {
-            if (runtime) BOOST_REQUIRE(runtime->WaitForIdle(std::chrono::seconds{5}));
+            if (runtime) BOOST_REQUIRE(runtime->WaitForIdle(std::chrono::seconds{60}));
         }
         if (after_drain) after_drain();
     }
@@ -4604,6 +4607,11 @@ BOOST_AUTO_TEST_CASE(evidence_retry_rotates_markets_and_preserves_pacing_gates)
             }
             BOOST_REQUIRE(flowmesh::SignAction(account_key, domain, market_configs[i].state.ConfigId(), ask));
             BOOST_REQUIRE(runtime.SubmitLocalAction(markets[i], ask) == flowmesh::QueueResult::ACCEPTED);
+            // An accepted submission holds one of the runtime's eight local
+            // sources until its worker takes it. Let the worker catch up, or
+            // a descheduled worker thread leaves all eight held and the next
+            // submission is refused.
+            BOOST_REQUIRE(runtime.WaitForIdle(std::chrono::seconds{2}));
         }
     }
     BOOST_REQUIRE(runtime.WaitForIdle(std::chrono::seconds{2}));
@@ -5457,6 +5465,15 @@ BOOST_AUTO_TEST_CASE(future_proposal_proactively_catches_up_stale_validator)
         const auto stale{runtimes[3]->MarketStatus(market)};
         return stale && stale->next_sequence == 0;
     }));
+    // A runtime publishes its new head before it relays the certificate, so
+    // the wait above can end with relays still to come. Let every runtime go
+    // idle while D is still offline; otherwise one can reach D and catch it
+    // up before the checks below.
+    for (size_t pass{0}; pass < runtimes.size(); ++pass) {
+        for (const auto& runtime : runtimes) {
+            BOOST_REQUIRE(runtime->WaitForIdle(std::chrono::seconds{2}));
+        }
+    }
 
     std::optional<node::StoredProductionEntry> genesis;
     BOOST_REQUIRE(stores[1]->ReadEntry(0, seats.seats, genesis, error));
@@ -6378,12 +6395,19 @@ BOOST_AUTO_TEST_CASE(baseline_same_deposit_adjacent_anchors_split_nine_seat_quor
     network.SetFilter([](size_t from, size_t to, const auto&) { return from != 1 && to != 1; });
     for (auto& clock : clocks) clock.m_now += node::FlowMeshCommitteeRelayBudget::REPEAT_DELAY;
     runtimes[0]->NotifyTick(); // Round 1: seat 2 retries the exact retained A.
+    // Wait for what this step makes certain: the uncommitted seats lock A
+    // and their three votes reach runtime 0. Runtime 0's own three votes
+    // need not count at runtime 2 yet. When they wait in its queue beside
+    // A, the votes pop first (their lane comes first) and are dropped as
+    // votes for no candidate, and while the clocks stand still nothing
+    // resends them. The healed rounds below do, and the final checks
+    // require all six at runtime 2.
     BOOST_REQUIRE(WaitUntil([&] {
-        for (const size_t i : {size_t{0}, size_t{2}}) {
-            const auto data{runtimes[i]->MarketData(market, std::nullopt, {}, error)};
-            if (!data || data->snapshot.runtime.max_verified_attestations != 6) return false;
-        }
-        return true;
+        const auto left{runtimes[0]->MarketData(market, std::nullopt, {}, error)};
+        const auto uncommitted{runtimes[2]->MarketData(market, std::nullopt, {}, error)};
+        return left && left->snapshot.runtime.max_verified_attestations == 6 &&
+               uncommitted &&
+               uncommitted->snapshot.runtime.local_locked_candidate == locked_hashes[0];
     }));
     drain();
     BOOST_REQUIRE(stores[2]->ReadLock(position, remaining_lock, error));
@@ -10104,6 +10128,18 @@ BOOST_AUTO_TEST_CASE(preagreement_local_queued_action_survives_certified_head_ad
             if (result == flowmesh::QueueResult::ACCEPTED) certificate_queued = true;
             return false; // do not enqueue a second copy through RuntimeNetwork
         }
+        // While node zero's worker is held it cannot settle slot one, so
+        // every slot-one committee frame sent to it would wait in its queue
+        // and spend one of its sender's committee admissions there. These
+        // clocks never move, so that budget never refills, and slot two
+        // needs it; the certificate above makes the frames stale.
+        if (to == 0 && wire.header.sequence == 1 &&
+            (wire.kind == flowmesh::WireMessageKind::PROPOSAL ||
+             wire.kind == flowmesh::WireMessageKind::ATTESTATION ||
+             wire.kind == flowmesh::WireMessageKind::AGREEMENT)) {
+            std::lock_guard lock{barrier_mutex};
+            if (entered && !released) return false;
+        }
         if (from == 0 && wire.kind == flowmesh::WireMessageKind::ACTION && wire.payload == *payload) {
             std::lock_guard lock{barrier_mutex};
             tail_relays.push_back(wire);
@@ -11808,8 +11844,13 @@ BOOST_AUTO_TEST_CASE(action_relay_window_accepts_two_slots_with_proof_and_restam
     const auto counters = [&] { return runtime.DeliverySnapshots(f.market).front().action_admission; };
     // action_relay_window_refuses_action_in_retained_interval: the retained
     // entry since the sender's head included it: refused, counted only.
+    // Runtime 0 may already have counted stale copies: in the tick that
+    // proposes entry one the others forward their duplicates of it with
+    // head one, and when runtime 0's worker falls behind it takes entry
+    // one's certificate first (its lane comes first). Count this send only.
+    const auto refused_before{counters().header_refused_unproven};
     send(uncredited, 1);
-    BOOST_CHECK_EQUAL(counters().header_refused_unproven, 1U);
+    BOOST_CHECK_EQUAL(counters().header_refused_unproven, refused_before + 1);
     BOOST_CHECK_EQUAL(runtime.MarketStatus(f.market)->pending_actions, 0U);
     // A fresh deposit one slot behind is proven and restamped.
     const auto fresh{Deposit(COutPoint{f.outpoint.hash, 1})};
