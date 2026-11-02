@@ -3,15 +3,24 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <chain.h>
+#include <chainparams.h>
 #include <test/fuzz/FuzzedDataProvider.h>
 #include <test/fuzz/fuzz.h>
 #include <test/fuzz/util.h>
+#include <util/chaintype.h>
 
 #include <cstdint>
 #include <optional>
 #include <vector>
 
-FUZZ_TARGET(chain)
+namespace {
+void initialize_chain()
+{
+    SelectParams(ChainType::REGTEST);
+}
+} // namespace
+
+FUZZ_TARGET(chain, .init = initialize_chain)
 {
     FuzzedDataProvider fuzzed_data_provider(buffer.data(), buffer.size());
     std::optional<CDiskBlockIndex> disk_block_index = ConsumeDeserializable<CDiskBlockIndex>(fuzzed_data_provider);
@@ -23,7 +32,7 @@ FUZZ_TARGET(chain)
     disk_block_index->phashBlock = &zero;
     {
         LOCK(::cs_main);
-        (void)disk_block_index->ConstructBlockHash();
+        (void)disk_block_index->ConstructBlockHash(Params().GetConsensus());
         (void)disk_block_index->GetBlockPos();
         (void)disk_block_index->GetBlockTime();
         (void)disk_block_index->GetBlockTimeMax();
