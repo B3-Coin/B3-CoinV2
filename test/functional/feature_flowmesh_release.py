@@ -261,6 +261,8 @@ class FlowMeshReleaseTest(BitcoinTestFramework):
         decoded = node.decoderawtransaction(prepared["hex"])
         assert_equal(decoded["txid"], prepared["txid"])
         assert_equal(decoded["ptxid"], prepared["ptxid"])
+        if prepared.get("operation") in ("deposit-sweep", "withdrawal"):
+            self.assert_fee_input_script_checked(node, prepared["hex"], decoded)
 
         assert_equal(node.sendrawtransaction(prepared["hex"]), prepared["txid"])
         node.syncwithvalidationinterfacequeue()
@@ -268,6 +270,31 @@ class FlowMeshReleaseTest(BitcoinTestFramework):
         assert_equal(node.getrawtransaction(prepared["txid"]), prepared["hex"])
         assert_equal(node.gettransaction(prepared["txid"])["hex"], prepared["hex"])
         return prepared
+
+    @staticmethod
+    def assert_fee_input_script_checked(node, tx_hex, decoded):
+        """Only the keyless vault input of a type-9 spend skips its script.
+
+        One changed hex digit inside the fee input's signature must fail
+        script validation. If every input of a vault spend skipped its script,
+        anyone could attach another owner's coin as the fee input and pay it
+        out.
+        """
+        signed = [vin for vin in decoded["vin"]
+                  if vin.get("txinwitness") or vin["scriptSig"]["hex"]]
+        assert 0 < len(signed) < len(decoded["vin"]), decoded["vin"]
+        if signed[0].get("txinwitness"):
+            original = signed[0]["txinwitness"][0]
+        else:
+            original = signed[0]["scriptSig"]["hex"]
+        # Hex digit 22 lies inside the signature's R value, both in a witness
+        # signature and in a signature pushed by a scriptSig.
+        changed = "1" if original[22] == "0" else "0"
+        tampered = original[:22] + changed + original[23:]
+        assert_equal(tx_hex.count(original), 1)
+        result = node.testmempoolaccept([tx_hex.replace(original, tampered)])[0]
+        assert_equal(result["allowed"], False)
+        assert "script-verify-flag-failed" in result["reject-reason"], result
 
     def publish_checkpoint(self, market_id, prepare=False):
         self.wait_until(
