@@ -23,6 +23,7 @@ add_executable(fuzz
   blockfilter.cpp
   bloom_filter.cpp
   bridge.cpp
+  bridge_record.cpp
   buffered_file.cpp
   chain.cpp
   checkqueue.cpp
