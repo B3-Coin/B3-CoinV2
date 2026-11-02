@@ -246,8 +246,11 @@ struct Fixture {
         BOOST_REQUIRE_MESSAGE(vaults.ConnectBlock(delta, error), error);
     }
 
-    flowmesh::ActiveFnBlsSeatSet Active(const int anchor_height,
-                                        const uint64_t epoch) const
+    //! `anchor_hash`, if given, replaces the canonical hash at
+    //! `anchor_height` (the seats are still those of the canonical block).
+    flowmesh::ActiveFnBlsSeatSet Active(
+        const int anchor_height, const uint64_t epoch,
+        const std::optional<uint256>& anchor_hash = std::nullopt) const
     {
         const auto snapshot{seats.SnapshotAt(chain.indexes[anchor_height])};
         BOOST_REQUIRE(snapshot.has_value());
@@ -258,8 +261,9 @@ struct Fixture {
         }
         flowmesh::BlsSeatSetCheck check{flowmesh::BlsSeatSetCheck::BAD_SET_HASH};
         const auto active{flowmesh::BuildActiveFnBlsSeatSet(
-            domain, market, epoch, anchor_height, chain.hashes[anchor_height],
-            bindings, check)};
+            domain, market, epoch, anchor_height,
+            anchor_hash.value_or(chain.hashes[anchor_height]), bindings,
+            check)};
         BOOST_REQUIRE_MESSAGE(active.has_value(),
                               flowmesh::BlsSeatSetCheckName(check));
         return *active;
@@ -360,16 +364,21 @@ struct Fixture {
         return core;
     }
 
-    modern::FlowMeshCheckpointCoreV1 Genesis(const int anchor_height) const
+    //! The empty genesis on the seats at `anchor_height`. Consensus accepts
+    //! only the defaults: epoch zero, produced at the seat anchor itself.
+    modern::FlowMeshCheckpointCoreV1 Genesis(
+        const int anchor_height, const uint64_t epoch = 0,
+        const std::optional<int> production_height = std::nullopt) const
     {
-        const auto active{Active(anchor_height, 0)};
+        const auto active{Active(anchor_height, epoch)};
         const flowmesh::FlowMeshState initial_state{
             vault, asset, modern::NativeAsset(),
             flowmesh::FLOWMESH_V1_MAX_CURVE_POINTS};
         const flowmesh::ProductionEpochGate gate{domain, market, active};
         const TestAnchorPolicy policy{chain.chain};
-        const flowmesh::AnchorRef anchor{anchor_height,
-                                          chain.hashes[anchor_height]};
+        const int produced_at{production_height.value_or(anchor_height)};
+        const flowmesh::AnchorRef anchor{produced_at,
+                                          chain.hashes[produced_at]};
         const flowmesh::ProductionAnchorContext context{
             chain.chain.Height(), std::nullopt, &policy};
         const CScript treasury_script{
@@ -389,12 +398,14 @@ struct Fixture {
         modern::FlowMeshCheckpointCoreV1 core;
         core.domain = domain;
         core.market_id = market;
-        core.epoch = 0;
+        core.epoch = epoch;
         core.sequence = 0;
         core.microblock_hash = built->entry.GetHash();
-        core.anchor = {static_cast<uint64_t>(anchor_height), anchor.hash};
+        core.anchor = {static_cast<uint64_t>(anchor_height),
+                       chain.hashes[anchor_height]};
         core.seat_set_hash = active.set_hash;
-        core.production_anchor = core.anchor;
+        core.production_anchor = {static_cast<uint64_t>(produced_at),
+                                  anchor.hash};
         core.previous_state_root = built->entry.previous_state_root;
         core.actions_root = built->entry.actions_root;
         core.result_root = built->entry.result_root;
@@ -445,6 +456,39 @@ CMpaRecord ProofRecord(const modern::FlowMeshVaultProofV1& proof)
     BOOST_REQUIRE(bytes.has_value());
     return CMpaRecord{modern::MPA_TYPE_FLOWMESH_VAULT_PROOF,
                       modern::MPA_VERSION_V1, *bytes};
+}
+
+//! A certified checkpoint record with `change` applied to its core after
+//! signing. The production identity, and the certificate's copy of it, are
+//! rebound and the signature kept: it still verifies only if the change
+//! leaves the identity as it was.
+template <typename Change>
+CMpaRecord Altered(const CMpaRecord& record, const size_t seat_count,
+                   const Change& change)
+{
+    auto decoded{
+        modern::DecodeFlowMeshCheckpointRecordV1(record.payload, seat_count)};
+    BOOST_REQUIRE(decoded.has_value());
+    change(decoded->core);
+    Fixture::BindProductionIdentity(decoded->core);
+    decoded->certificate.microblock_hash = decoded->core.microblock_hash;
+    const auto bytes{
+        modern::EncodeFlowMeshCheckpointRecordV1(*decoded, seat_count)};
+    BOOST_REQUIRE(bytes.has_value());
+    return CMpaRecord{modern::MPA_TYPE_FLOWMESH_CHECKPOINT,
+                      modern::MPA_VERSION_V1, *bytes};
+}
+
+//! A certified checkpoint record naming another previous checkpoint. Neither
+//! the certificate nor the production identity covers that field, so the
+//! record stays validly certified: no key is needed to do this.
+CMpaRecord Relabelled(const CMpaRecord& record, const size_t seat_count,
+                      const modern::FlowMeshCheckpointId& previous)
+{
+    return Altered(record, seat_count,
+                   [&](modern::FlowMeshCheckpointCoreV1& core) {
+                       core.previous_checkpoint_id = previous;
+                   });
 }
 
 node::FlowMeshCheckpointBlockDelta Verify(
@@ -588,6 +632,20 @@ BOOST_AUTO_TEST_CASE(checkpoint_heads_ranges_bls_and_exact_undo)
                                    fixture.params, fixture.seats,
                                    fixture.vaults, ignored, error));
     BOOST_CHECK(error.find("certificate is invalid") != std::string::npos);
+
+    // Nor may a range start inside the head's: its effects would take
+    // positions the head's deposit already holds.
+    Connect(index, Verify(index, fixture,
+                          Block({Tx({fixture.CheckpointRecord(second_core)})}),
+                          C0 + 1, 0xac));
+    const std::vector<modern::FlowMeshEffectV1> later{fixture.Deposit(2)};
+    const auto overlapping{fixture.Core(A3, 0, 2, *second_id, later, 0)};
+    BOOST_CHECK(!index.VerifyBlock(
+        Block({Tx({fixture.CheckpointRecord(overlapping)})}), C0 + 2,
+        Filled(0xad), fixture.chain.chain, fixture.params, fixture.seats,
+        fixture.vaults, ignored, error));
+    BOOST_CHECK_EQUAL(error,
+                      "FlowMesh checkpoint effect range is not consecutive");
 }
 
 BOOST_AUTO_TEST_CASE(settlement_scan_accepts_exact_pre_activation_boundary)
@@ -1032,6 +1090,355 @@ BOOST_AUTO_TEST_CASE(connected_head_drains_old_set_before_exact_handoff)
                           C0 + 3, 0xb5));
     BOOST_REQUIRE(index.Head(fixture.market).has_value());
     BOOST_CHECK_EQUAL(index.Head(fixture.market)->core.epoch, 1U);
+}
+
+BOOST_AUTO_TEST_CASE(first_checkpoint_is_an_execution_at_zero_on_one_anchor)
+{
+    const Fixture fixture;
+    node::FlowMeshCheckpointIndex index;
+    node::FlowMeshCheckpointBlockDelta ignored;
+    std::string error;
+
+    // Neither the certificate nor the deterministic genesis covers
+    // previous_checkpoint_id, so anyone holding the honest certified genesis
+    // can relabel it.
+    const CMpaRecord honest{fixture.CheckpointRecord(fixture.Genesis(A3))};
+    const CMpaRecord relabelled{
+        Relabelled(honest, fixture.Active(A3, 0).Size(), Filled(0x6b))};
+    BOOST_CHECK(!index.VerifyBlock(
+        Block({Tx({relabelled})}), C0, Filled(0xe3), fixture.chain.chain,
+        fixture.params, fixture.seats, fixture.vaults, ignored, error));
+    BOOST_CHECK_EQUAL(error,
+                      "first FlowMesh checkpoint does not name the null head");
+
+    // A quorum can certify an empty genesis at another epoch, or produced at
+    // a later anchor than its seats. The rebuilt genesis takes its epoch from
+    // the same seat set and its production anchor from the record, so only
+    // these two rules refuse them.
+    const auto later_epoch{fixture.Genesis(A3, 5)};
+    BOOST_CHECK(!index.VerifyBlock(
+        Block({Tx({fixture.CheckpointRecord(later_epoch)})}), C0 + 1,
+        Filled(0xe4), fixture.chain.chain, fixture.params, fixture.seats,
+        fixture.vaults, ignored, error));
+    BOOST_CHECK_EQUAL(error, "first FlowMesh checkpoint must use epoch zero");
+
+    const auto later_production{fixture.Genesis(A3, 0, A3 + 1)};
+    BOOST_CHECK(!index.VerifyBlock(
+        Block({Tx({fixture.CheckpointRecord(later_production)})}), C0 + 1,
+        Filled(0xe6), fixture.chain.chain, fixture.params, fixture.seats,
+        fixture.vaults, ignored, error));
+    BOOST_CHECK_EQUAL(
+        error, "first FlowMesh checkpoint must use one seat/production anchor");
+
+    // The rebuilt genesis is an execution at sequence zero whose effects
+    // start at zero, so it refuses the next three records too; their own
+    // rules refuse them first.
+    auto first_handoff{fixture.Genesis(A3)};
+    first_handoff.kind = modern::FlowMeshCheckpointKind::EPOCH_HANDOFF;
+    first_handoff.handoff = modern::FlowMeshCheckpointHandoffV1{
+        1, {static_cast<uint64_t>(A3 + 1), fixture.chain.hashes[A3 + 1]},
+        fixture.Active(A3 + 1, 1).set_hash};
+    BOOST_CHECK(!index.VerifyBlock(
+        Block({Tx({fixture.CheckpointRecord(first_handoff)})}), C0 + 1,
+        Filled(0xe0), fixture.chain.chain, fixture.params, fixture.seats,
+        fixture.vaults, ignored, error));
+    BOOST_CHECK_EQUAL(error,
+                      "first FlowMesh checkpoint must be an execution checkpoint");
+
+    auto later_sequence{fixture.Genesis(A3)};
+    later_sequence.sequence = 1;
+    later_sequence.parent_hash = Filled(0x81); // a later entry has a parent
+    BOOST_CHECK(!index.VerifyBlock(
+        Block({Tx({fixture.CheckpointRecord(later_sequence)})}), C0 + 1,
+        Filled(0xe1), fixture.chain.chain, fixture.params, fixture.seats,
+        fixture.vaults, ignored, error));
+    BOOST_CHECK_EQUAL(error, "first FlowMesh checkpoint must use sequence zero");
+
+    auto later_effects{fixture.Genesis(A3)};
+    later_effects.effect_start = 1;
+    later_effects.effect_root = modern::EmptyFlowMeshEffectRoot(1);
+    BOOST_CHECK(!index.VerifyBlock(
+        Block({Tx({fixture.CheckpointRecord(later_effects)})}), C0 + 1,
+        Filled(0xe2), fixture.chain.chain, fixture.params, fixture.seats,
+        fixture.vaults, ignored, error));
+    BOOST_CHECK_EQUAL(
+        error, "first FlowMesh checkpoint effect range does not start at zero");
+
+    // The honest record, identical to the relabelled one but for its
+    // previous id, is the market's genesis.
+    BOOST_CHECK_EQUAL(Verify(index, fixture, Block({Tx({honest})}), C0, 0xe8)
+                          .checkpoints.size(),
+                      1U);
+}
+
+BOOST_AUTO_TEST_CASE(relabelled_checkpoint_cannot_rewind_the_head)
+{
+    const Fixture fixture;
+    node::FlowMeshCheckpointIndex index;
+    node::FlowMeshCheckpointBlockDelta ignored;
+
+    // Genesis and two empty checkpoints on one anchor.
+    const auto first{fixture.Genesis(A3)};
+    const auto first_id{modern::FlowMeshCheckpointIdV1(first)};
+    BOOST_REQUIRE(first_id.has_value());
+    const auto second{fixture.Core(A3, 0, 1, *first_id, {}, 0)};
+    const auto second_id{modern::FlowMeshCheckpointIdV1(second)};
+    BOOST_REQUIRE(second_id.has_value());
+    const auto third{fixture.Core(A3, 0, 2, *second_id, {}, 0)};
+    const auto third_id{modern::FlowMeshCheckpointIdV1(third)};
+    BOOST_REQUIRE(third_id.has_value());
+    const CMpaRecord second_record{fixture.CheckpointRecord(second)};
+    const CMpaRecord third_record{fixture.CheckpointRecord(third)};
+    Connect(index, Verify(index, fixture,
+                          Block({Tx({fixture.CheckpointRecord(first),
+                                     second_record, third_record})}),
+                          C0, 0xfa));
+
+    // Relabelled to extend the head, a connected record still fits its
+    // effect range, anchors and seats. Only the sequence rule stops anyone
+    // from rewinding the market to that record's state, or repeating the
+    // head itself.
+    const size_t seat_count{fixture.Active(A3, 0).Size()};
+    const CMpaRecord older{Relabelled(second_record, seat_count, *third_id)};
+    std::string older_error;
+    BOOST_CHECK(!index.VerifyBlock(
+        Block({Tx({older})}), C0 + 1, Filled(0xfb), fixture.chain.chain,
+        fixture.params, fixture.seats, fixture.vaults, ignored, older_error));
+    BOOST_CHECK_EQUAL(older_error,
+                      "FlowMesh checkpoint sequence is not strictly increasing");
+    const CMpaRecord repeated{Relabelled(third_record, seat_count, *third_id)};
+    std::string repeated_error;
+    BOOST_CHECK(!index.VerifyBlock(
+        Block({Tx({repeated})}), C0 + 1, Filled(0xfc), fixture.chain.chain,
+        fixture.params, fixture.seats, fixture.vaults, ignored,
+        repeated_error));
+    BOOST_CHECK_EQUAL(repeated_error,
+                      "FlowMesh checkpoint sequence is not strictly increasing");
+}
+
+BOOST_AUTO_TEST_CASE(handoff_names_its_next_set_and_changes_membership)
+{
+    // Keys rotate at A3+1 and again at A3+5: A3+1..A3+4 hold one membership.
+    const Fixture fixture{A3 + 5};
+    node::FlowMeshCheckpointIndex index;
+    node::FlowMeshCheckpointBlockDelta ignored;
+    std::string error;
+
+    const auto first{fixture.Genesis(A3)};
+    const auto first_id{modern::FlowMeshCheckpointIdV1(first)};
+    BOOST_REQUIRE(first_id.has_value());
+    Connect(index, Verify(index, fixture,
+                          Block({Tx({fixture.CheckpointRecord(first)})}),
+                          C0, 0xe9));
+
+    auto rotate{fixture.Core(A3, 0, 1, *first_id, {}, 0)};
+    rotate.kind = modern::FlowMeshCheckpointKind::EPOCH_HANDOFF;
+    rotate.handoff = modern::FlowMeshCheckpointHandoffV1{
+        1,
+        {static_cast<uint64_t>(A3 + 1), fixture.chain.hashes[A3 + 1]},
+        fixture.Active(A3 + 1, 1).set_hash};
+    Fixture::BindProductionIdentity(rotate);
+
+    // A next set hash that is not the anchored set's (here the right seats
+    // hashed for the wrong epoch) would strand the market: no execution
+    // could ever activate it.
+    auto wrong_set{rotate};
+    wrong_set.handoff->next_seat_set_hash = fixture.Active(A3 + 1, 2).set_hash;
+    Fixture::BindProductionIdentity(wrong_set);
+    BOOST_CHECK(!index.VerifyBlock(
+        Block({Tx({fixture.CheckpointRecord(wrong_set)})}), C0 + 1,
+        Filled(0xea), fixture.chain.chain, fixture.params, fixture.seats,
+        fixture.vaults, ignored, error));
+    BOOST_CHECK_EQUAL(error,
+                      "FlowMesh handoff names the wrong next anchored seat set");
+
+    const auto rotate_id{modern::FlowMeshCheckpointIdV1(rotate)};
+    BOOST_REQUIRE(rotate_id.has_value());
+    Connect(index, Verify(index, fixture,
+                          Block({Tx({fixture.CheckpointRecord(rotate)})}),
+                          C0 + 1, 0xeb));
+    const auto activate{fixture.Core(A3 + 1, 1, 2, *rotate_id, {}, 0)};
+    const auto activate_id{modern::FlowMeshCheckpointIdV1(activate)};
+    BOOST_REQUIRE(activate_id.has_value());
+    Connect(index, Verify(index, fixture,
+                          Block({Tx({fixture.CheckpointRecord(activate)})}),
+                          C0 + 2, 0xec));
+
+    // While epoch 1's keys are still the latest signable membership, it
+    // cannot hand off to the same keys (A3+2 holds them too). A block at
+    // C0+4 still signs against A3+4: the latest signable seats are those
+    // FLOWMESH_ANCHOR_DEPTH + 1 blocks below it.
+    auto same_keys{fixture.Core(A3 + 1, 1, 3, *activate_id, {}, 0)};
+    same_keys.kind = modern::FlowMeshCheckpointKind::EPOCH_HANDOFF;
+    same_keys.handoff = modern::FlowMeshCheckpointHandoffV1{
+        2,
+        {static_cast<uint64_t>(A3 + 2), fixture.chain.hashes[A3 + 2]},
+        fixture.Active(A3 + 2, 2).set_hash};
+    Fixture::BindProductionIdentity(same_keys);
+    BOOST_CHECK(!index.VerifyBlock(
+        Block({Tx({fixture.CheckpointRecord(same_keys)})}), C0 + 4,
+        Filled(0xed), fixture.chain.chain, fixture.params, fixture.seats,
+        fixture.vaults, ignored, error));
+    BOOST_CHECK_EQUAL(
+        error, "FlowMesh handoff does not change the active seat membership");
+
+    // From C0+5 the A3+5 rotation is signable, and epoch 1 hands off to it.
+    auto rotate_again{same_keys};
+    rotate_again.handoff = modern::FlowMeshCheckpointHandoffV1{
+        2,
+        {static_cast<uint64_t>(A3 + 5), fixture.chain.hashes[A3 + 5]},
+        fixture.Active(A3 + 5, 2).set_hash};
+    Fixture::BindProductionIdentity(rotate_again);
+    BOOST_CHECK_EQUAL(
+        Verify(index, fixture,
+               Block({Tx({fixture.CheckpointRecord(rotate_again)})}), C0 + 5,
+               0xee)
+            .checkpoints.size(),
+        1U);
+}
+
+BOOST_AUTO_TEST_CASE(checkpoint_anchors_name_canonical_blocks)
+{
+    const Fixture fixture;
+    node::FlowMeshCheckpointIndex index;
+    node::FlowMeshCheckpointBlockDelta ignored;
+    std::string error;
+
+    const auto first{fixture.Genesis(A3)};
+    const auto first_id{modern::FlowMeshCheckpointIdV1(first)};
+    BOOST_REQUIRE(first_id.has_value());
+    Connect(index, Verify(index, fixture,
+                          Block({Tx({fixture.CheckpointRecord(first)})}),
+                          C0, 0xef));
+
+    // The records below are verified in a block at C0+1. The newest anchor
+    // such a block can name is exactly FLOWMESH_ANCHOR_DEPTH below it.
+    const int candidate{C0 + 1};
+    const int newest{candidate - Consensus::FLOWMESH_ANCHOR_DEPTH};
+
+    // Anchors are that deep, but a deeper reorganization can still abandon
+    // one. A committee that certified on the abandoned branch names that
+    // branch's block at a canonical height. It checked its deposits against
+    // that block, so its effects may credit deposits that do not exist on
+    // this chain.
+    const uint256 abandoned{Filled(0x6f)};
+    auto off_chain{fixture.Core(A3, 0, 1, *first_id, {}, 0)};
+    off_chain.production_anchor = {static_cast<uint64_t>(newest), abandoned};
+    Fixture::BindProductionIdentity(off_chain);
+    BOOST_CHECK(!index.VerifyBlock(
+        Block({Tx({fixture.CheckpointRecord(off_chain)})}), candidate,
+        Filled(0xf3), fixture.chain.chain, fixture.params, fixture.seats,
+        fixture.vaults, ignored, error));
+    BOOST_CHECK_EQUAL(error,
+                      "FlowMesh checkpoint production anchor is not canonical");
+
+    // The same holds for the seats a handoff names: the abandoned block's
+    // seats here equal the canonical block's, only its hash differs.
+    auto off_chain_seats{fixture.Core(A3, 0, 1, *first_id, {}, 0)};
+    off_chain_seats.kind = modern::FlowMeshCheckpointKind::EPOCH_HANDOFF;
+    off_chain_seats.handoff = modern::FlowMeshCheckpointHandoffV1{
+        1, {static_cast<uint64_t>(newest), abandoned},
+        fixture.Active(newest, 1, abandoned).set_hash};
+    Fixture::BindProductionIdentity(off_chain_seats);
+    BOOST_CHECK(!index.VerifyBlock(
+        Block({Tx({fixture.CheckpointRecord(off_chain_seats)})}), candidate,
+        Filled(0xf7), fixture.chain.chain, fixture.params, fixture.seats,
+        fixture.vaults, ignored, error));
+    BOOST_CHECK_EQUAL(error,
+                      "FlowMesh checkpoint seat-set anchor is not canonical");
+
+    // One block newer is not deep enough.
+    auto shallow{fixture.Core(A3, 0, 1, *first_id, {}, 0)};
+    shallow.production_anchor = {static_cast<uint64_t>(newest + 1),
+                                 fixture.chain.hashes[newest + 1]};
+    Fixture::BindProductionIdentity(shallow);
+    BOOST_CHECK(!index.VerifyBlock(
+        Block({Tx({fixture.CheckpointRecord(shallow)})}), candidate,
+        Filled(0xfd), fixture.chain.chain, fixture.params, fixture.seats,
+        fixture.vaults, ignored, error));
+    BOOST_CHECK_EQUAL(error,
+                      "FlowMesh checkpoint production anchor is not deep enough");
+
+    // Named by its canonical hash, the newest anchor is accepted for both.
+    auto on_chain_seats{off_chain_seats};
+    on_chain_seats.handoff->next_anchor.block_hash =
+        fixture.chain.hashes[newest];
+    on_chain_seats.handoff->next_seat_set_hash =
+        fixture.Active(newest, 1).set_hash;
+    Fixture::BindProductionIdentity(on_chain_seats);
+    BOOST_CHECK_EQUAL(
+        Verify(index, fixture,
+               Block({Tx({fixture.CheckpointRecord(on_chain_seats)})}),
+               candidate, 0xf9)
+            .checkpoints.size(),
+        1U);
+    auto on_chain{off_chain};
+    on_chain.production_anchor.block_hash = fixture.chain.hashes[newest];
+    Fixture::BindProductionIdentity(on_chain);
+    const auto on_chain_id{modern::FlowMeshCheckpointIdV1(on_chain)};
+    BOOST_REQUIRE(on_chain_id.has_value());
+    Connect(index, Verify(index, fixture,
+                          Block({Tx({fixture.CheckpointRecord(on_chain)})}),
+                          candidate, 0xf8));
+
+    // Production anchors never move back: the next checkpoint cannot be
+    // produced against an older B3 view than its head's.
+    const auto behind{fixture.Core(A3, 0, 2, *on_chain_id, {}, 0)};
+    BOOST_CHECK(!index.VerifyBlock(
+        Block({Tx({fixture.CheckpointRecord(behind)})}), candidate + 1,
+        Filled(0xfe), fixture.chain.chain, fixture.params, fixture.seats,
+        fixture.vaults, ignored, error));
+    BOOST_CHECK_EQUAL(error,
+                      "FlowMesh checkpoint production anchor is not monotonic");
+}
+
+BOOST_AUTO_TEST_CASE(checkpoint_names_its_chain_domain_and_anchored_seat_set)
+{
+    const Fixture fixture;
+    node::FlowMeshCheckpointIndex index;
+    node::FlowMeshCheckpointBlockDelta ignored;
+    std::string error;
+
+    const auto first{fixture.Genesis(A3)};
+    const auto first_id{modern::FlowMeshCheckpointIdV1(first)};
+    BOOST_REQUIRE(first_id.has_value());
+    Connect(index, Verify(index, fixture,
+                          Block({Tx({fixture.CheckpointRecord(first)})}),
+                          C0, 0xd0));
+
+    // Each record below is the head's certified successor with one field
+    // changed after signing. Later checks refuse both too, the certificate
+    // check among them, but these rules refuse them first.
+    const CMpaRecord next{
+        fixture.CheckpointRecord(fixture.Core(A3, 0, 1, *first_id))};
+    const size_t seat_count{fixture.Active(A3, 0).Size()};
+    const CMpaRecord other_domain{Altered(
+        next, seat_count, [](modern::FlowMeshCheckpointCoreV1& core) {
+            core.domain = Filled(0x6e);
+        })};
+    BOOST_CHECK(!index.VerifyBlock(
+        Block({Tx({other_domain})}), C0 + 1, Filled(0xd1),
+        fixture.chain.chain, fixture.params, fixture.seats, fixture.vaults,
+        ignored, error));
+    BOOST_CHECK_EQUAL(error, "FlowMesh checkpoint names the wrong chain domain");
+
+    // Another anchor's seats are a real set, but not this anchor's.
+    const CMpaRecord other_seats{Altered(
+        next, seat_count, [&](modern::FlowMeshCheckpointCoreV1& core) {
+            core.seat_set_hash = fixture.Active(A3 + 1, 0).set_hash;
+        })};
+    BOOST_CHECK(!index.VerifyBlock(
+        Block({Tx({other_seats})}), C0 + 1, Filled(0xd2),
+        fixture.chain.chain, fixture.params, fixture.seats, fixture.vaults,
+        ignored, error));
+    BOOST_CHECK_EQUAL(error,
+                      "FlowMesh checkpoint names the wrong anchored seat set");
+
+    // Unchanged, the record extends the head.
+    BOOST_CHECK_EQUAL(
+        Verify(index, fixture, Block({Tx({next})}), C0 + 1, 0xd3)
+            .checkpoints.size(),
+        1U);
 }
 
 BOOST_AUTO_TEST_CASE(vault_proof_requires_a_connected_checkpoint_and_nullifies_once)
