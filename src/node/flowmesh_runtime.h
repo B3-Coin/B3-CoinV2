@@ -735,7 +735,7 @@ private:
     //! Halt the market a failed work item belonged to, or every market when
     //! the item was not market-scoped. Never lets the exception leave the worker.
     void ContainWorkerException(const std::optional<flowmesh::MarketId>& market_id,
-                                const std::string& what);
+                                const std::string& what) EXCLUSIVE_LOCKS_REQUIRED(!m_health_mutex);
     //! EnqueueWireMessage, with the frame marked counted (QueuedWireMessage).
     flowmesh::QueueResult Enqueue(flowmesh::WirePeerId peer, flowmesh::WireMessage message, bool counted,
                                  uint64_t local_retention_id = 0);
