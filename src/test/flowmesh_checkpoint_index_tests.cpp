@@ -1092,6 +1092,14 @@ BOOST_AUTO_TEST_CASE(vault_proof_requires_a_connected_checkpoint_and_nullifies_o
     const auto spend_delta{Verify(index, fixture, Block({Tx({proof_record})}),
                                   C0 + 1, 0xc3)};
     BOOST_REQUIRE_EQUAL(spend_delta.nullifiers.size(), 1U);
+    // Two uses in one block must fail the block rule itself: the index's own
+    // duplicate check runs only in the connect hook, after the block's coins
+    // have moved.
+    BOOST_CHECK(!index.VerifyBlock(
+        Block({Tx({proof_record}, 1), Tx({proof_record}, 2)}), C0 + 1,
+        Filled(0xc6), fixture.chain.chain, fixture.params, fixture.seats,
+        fixture.vaults, delta, error));
+    BOOST_CHECK_EQUAL(error, "FlowMesh vault effect is already nullified");
     Connect(index, spend_delta);
     BOOST_CHECK(index.IsNullified(spend_delta.nullifiers[0]));
 
@@ -1227,12 +1235,42 @@ BOOST_AUTO_TEST_CASE(deposit_sweep_is_exact_and_fee_is_owner_funded)
     BOOST_CHECK(!node::CheckFlowMeshVaultTransaction(
         CTransaction{scripted}, prevs, 1, C0 + 1, fixture.params, index,
         authorization, error));
+    CMutableTransaction witnessed{spend};
+    witnessed.vin[0].scriptWitness.stack.push_back({0x01});
+    std::string witness_error;
+    BOOST_CHECK(!node::CheckFlowMeshVaultTransaction(
+        CTransaction{witnessed}, prevs, 1, C0 + 1, fixture.params, index,
+        authorization, witness_error));
+    BOOST_CHECK_EQUAL(witness_error,
+                      "DEX_VAULT input scriptSig and witness must be empty");
 
     CMutableTransaction fee_leak{spend};
     fee_leak.vout[1].nValue = 10;
     BOOST_CHECK(!node::CheckFlowMeshVaultTransaction(
         CTransaction{fee_leak}, prevs, 1, C0 + 1, fixture.params, index,
         authorization, error));
+
+    // Without its owner input the sweep balances at a zero fee. The fee rule
+    // alone would accept that, so the separate-input rule must refuse it.
+    CMutableTransaction unfunded{spend};
+    unfunded.vin.pop_back();
+    unfunded.vout.pop_back();
+    const std::vector<Coin> deposit_only{prevs.front()};
+    BOOST_CHECK(!node::CheckFlowMeshVaultTransaction(
+        CTransaction{unfunded}, deposit_only, 0, C0 + 1, fixture.params,
+        index, authorization, error));
+    BOOST_CHECK_EQUAL(
+        error,
+        "FlowMesh vault miner fee requires a separate native owner input");
+
+    // A keyless custody spend carries its type-9 proof and no other record.
+    CMutableTransaction bundled{spend};
+    bundled.mpa.insert(bundled.mpa.begin(), fixture.CheckpointRecord(genesis));
+    BOOST_CHECK(!node::CheckFlowMeshVaultTransaction(
+        CTransaction{bundled}, prevs, 1, C0 + 1, fixture.params, index,
+        authorization, error));
+    BOOST_CHECK_EQUAL(
+        error, "FlowMesh vault transaction must contain only its type-9 proof");
 }
 
 BOOST_AUTO_TEST_CASE(withdrawal_forces_destination_change_and_one_time_use)
@@ -1321,6 +1359,33 @@ BOOST_AUTO_TEST_CASE(withdrawal_forces_destination_change_and_one_time_use)
     BOOST_CHECK(!node::CheckFlowMeshVaultTransaction(
         CTransaction{short_change}, prevs, 1, C0 + 1, fixture.params, index,
         authorization, error));
+
+    // The change returns as one output, in the receipt's change shard.
+    CMutableTransaction other_shard{spend};
+    other_shard.vout[1] = *modern::MakeDexVaultOutput(
+        fixture.asset, 60, fixture.vault, modern::VAULT_KIND_POOL_CHANGE,
+        static_cast<uint16_t>(receipt.deterministic_change_shard + 1));
+    std::string shard_error;
+    BOOST_CHECK(!node::CheckFlowMeshVaultTransaction(
+        CTransaction{other_shard}, prevs, 1, C0 + 1, fixture.params, index,
+        authorization, shard_error));
+    BOOST_CHECK_EQUAL(
+        shard_error,
+        "FlowMesh withdrawal has invalid or duplicate vault change");
+    const auto half_change{modern::MakeDexVaultOutput(
+        fixture.asset, 30, fixture.vault, modern::VAULT_KIND_POOL_CHANGE,
+        receipt.deterministic_change_shard)};
+    BOOST_REQUIRE(half_change.has_value());
+    CMutableTransaction split_change{spend};
+    split_change.vout[1] = *half_change;
+    split_change.vout.insert(split_change.vout.begin() + 2, *half_change);
+    std::string split_error;
+    BOOST_CHECK(!node::CheckFlowMeshVaultTransaction(
+        CTransaction{split_change}, prevs, 1, C0 + 1, fixture.params, index,
+        authorization, split_error));
+    BOOST_CHECK_EQUAL(
+        split_error,
+        "FlowMesh withdrawal has invalid or duplicate vault change");
 
     const auto user_deposit{modern::MakeDexVaultOutput(
         fixture.asset, 100, fixture.vault,
@@ -1516,6 +1581,404 @@ BOOST_AUTO_TEST_CASE(replay_and_malformed_delta_application_are_exact)
     BOOST_CHECK_EQUAL(guarded.NullifierCount(), 0U);
     BOOST_REQUIRE(guarded.Head(fixture.market).has_value());
     BOOST_CHECK(guarded.Head(fixture.market)->checkpoint_id == *checkpoint_id);
+}
+
+BOOST_AUTO_TEST_CASE(withdrawal_stays_inside_its_markets_vault)
+{
+    // Every market quotes native B3, so every market's vault holds native
+    // pool change. Only the receipt's vault id keeps one market's withdrawal
+    // off another market's coins and its change out of another market's
+    // vault; each spend below is otherwise exact.
+    const Fixture fixture;
+    node::FlowMeshCheckpointIndex index;
+    const auto genesis{fixture.Genesis(A3)};
+    const auto genesis_id{modern::FlowMeshCheckpointIdV1(genesis)};
+    BOOST_REQUIRE(genesis_id.has_value());
+    const CScript destination_script{OwnerScript(0x61)};
+    modern::FlowMeshWithdrawalReceiptV1 receipt;
+    receipt.receipt_id = Filled(0x62);
+    receipt.market_id = fixture.market;
+    receipt.epoch = 0;
+    receipt.sequence = 1;
+    receipt.account = Filled(0x63);
+    receipt.asset = modern::NativeAsset();
+    receipt.amount = 40;
+    receipt.destination_owner_commitment =
+        modern::AssetOwnerCommitment(destination_script);
+    receipt.vault_id = fixture.vault;
+    receipt.deterministic_change_shard = 25;
+    const std::vector<modern::FlowMeshEffectV1> effects{receipt};
+    const auto core{fixture.Core(A3, 0, 1, *genesis_id, effects, 0)};
+    const auto checkpoint_id{modern::FlowMeshCheckpointIdV1(core)};
+    BOOST_REQUIRE(checkpoint_id.has_value());
+    Connect(index, Verify(index, fixture,
+                          Block({Tx({fixture.CheckpointRecord(genesis),
+                                     fixture.CheckpointRecord(core)})}),
+                          C0, 0x64));
+
+    modern::FlowMeshVaultProofV1 proof;
+    proof.kind = modern::FlowMeshVaultProofKind::WITHDRAWAL;
+    proof.checkpoint_id = *checkpoint_id;
+    proof.effect = receipt;
+    proof.leaf_index = 0;
+    proof.branch = *modern::BuildFlowMeshEffectBranch(0, effects, 0);
+
+    const auto other_market{
+        flowmesh::ComputeFlowMeshMarketId(fixture.domain, Filled(0x36))};
+    BOOST_REQUIRE(other_market.has_value());
+    const auto other_vault{
+        flowmesh::ComputeFlowMeshVaultId(fixture.domain, *other_market)};
+    BOOST_REQUIRE(other_vault.has_value());
+    BOOST_REQUIRE(*other_vault != fixture.vault);
+    const auto own_pool{modern::MakeDexVaultOutput(
+        modern::NativeAsset(), 100, fixture.vault,
+        modern::VAULT_KIND_POOL_CHANGE, 7)};
+    const auto other_pool{modern::MakeDexVaultOutput(
+        modern::NativeAsset(), 100, *other_vault,
+        modern::VAULT_KIND_POOL_CHANGE, 7)};
+    const auto change{modern::MakeDexVaultOutput(
+        modern::NativeAsset(), 60, fixture.vault,
+        modern::VAULT_KIND_POOL_CHANGE,
+        receipt.deterministic_change_shard)};
+    const auto two_coin_change{modern::MakeDexVaultOutput(
+        modern::NativeAsset(), 160, fixture.vault,
+        modern::VAULT_KIND_POOL_CHANGE,
+        receipt.deterministic_change_shard)};
+    BOOST_REQUIRE(own_pool.has_value());
+    BOOST_REQUIRE(other_pool.has_value());
+    BOOST_REQUIRE(change.has_value());
+    BOOST_REQUIRE(two_coin_change.has_value());
+    const Coin own{*own_pool, A3, /*fCoinBaseIn=*/false};
+    const Coin other{*other_pool, A3, /*fCoinBaseIn=*/false};
+    const Coin fee{CTxOut{10, OwnerScript(0x67)}, A3, /*fCoinBaseIn=*/false};
+
+    CMutableTransaction spend;
+    spend.version = 2;
+    spend.vin.emplace_back(COutPoint{Txid::FromUint256(Filled(0x65)), 0});
+    spend.vin.emplace_back(COutPoint{Txid::FromUint256(Filled(0x66)), 0});
+    spend.vout = {CTxOut{receipt.amount, destination_script}, *change,
+                  CTxOut{9, OwnerScript(0x67)}};
+    spend.mpa = {ProofRecord(proof)};
+
+    node::FlowMeshVaultAuthorization authorization;
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(node::CheckFlowMeshVaultTransaction(
+                              CTransaction{spend}, {own, fee}, 1, C0 + 1,
+                              fixture.params, index, authorization, error),
+                          error);
+    BOOST_CHECK(!node::CheckFlowMeshVaultTransaction(
+        CTransaction{spend}, {other, fee}, 1, C0 + 1, fixture.params, index,
+        authorization, error));
+    BOOST_CHECK_EQUAL(error,
+                      "FlowMesh withdrawal input is not matching pool change");
+
+    // Beside a coin of the receipt's vault, with all of it returned there as
+    // change, the other market's coin is still refused. Two coins of the
+    // receipt's own vault pass.
+    CMutableTransaction two_coins{spend};
+    two_coins.vin.insert(two_coins.vin.begin() + 1,
+                         CTxIn{COutPoint{Txid::FromUint256(Filled(0x68)), 0}});
+    two_coins.vout[1] = *two_coin_change;
+    BOOST_CHECK(!node::CheckFlowMeshVaultTransaction(
+        CTransaction{two_coins}, {own, other, fee}, 1, C0 + 1, fixture.params,
+        index, authorization, error));
+    BOOST_CHECK_EQUAL(error,
+                      "FlowMesh withdrawal input is not matching pool change");
+    BOOST_CHECK_MESSAGE(node::CheckFlowMeshVaultTransaction(
+                            CTransaction{two_coins}, {own, own, fee}, 1,
+                            C0 + 1, fixture.params, index, authorization,
+                            error),
+                        error);
+
+    // The receipt's own coin cannot return its change to the other vault.
+    const auto other_change{modern::MakeDexVaultOutput(
+        modern::NativeAsset(), 60, *other_vault,
+        modern::VAULT_KIND_POOL_CHANGE,
+        receipt.deterministic_change_shard)};
+    BOOST_REQUIRE(other_change.has_value());
+    CMutableTransaction moved_change{spend};
+    moved_change.vout[1] = *other_change;
+    BOOST_CHECK(!node::CheckFlowMeshVaultTransaction(
+        CTransaction{moved_change}, {own, fee}, 1, C0 + 1, fixture.params,
+        index, authorization, error));
+    BOOST_CHECK_EQUAL(
+        error, "FlowMesh withdrawal has invalid or duplicate vault change");
+}
+
+BOOST_AUTO_TEST_CASE(deposit_sweep_moves_only_the_accepted_coin_to_its_vault)
+{
+    // A second deposit coin with the same account, asset, amount, vault and
+    // shard is still another deposit. Vault inputs are keyless, so anyone
+    // could otherwise sweep it with this acceptance and leave the accepted
+    // coin behind with its acceptance used up. The swept coin must also stay
+    // in the acceptance's vault, not move to another market's pool.
+    const Fixture fixture;
+    node::FlowMeshCheckpointIndex index;
+    const auto genesis{fixture.Genesis(A3)};
+    const auto genesis_id{modern::FlowMeshCheckpointIdV1(genesis)};
+    BOOST_REQUIRE(genesis_id.has_value());
+    const modern::FlowMeshDepositAcceptanceV1 acceptance{fixture.Deposit(1)};
+    const std::vector<modern::FlowMeshEffectV1> effects{acceptance};
+    const auto core{fixture.Core(A3, 0, 1, *genesis_id, effects, 0)};
+    const auto checkpoint_id{modern::FlowMeshCheckpointIdV1(core)};
+    BOOST_REQUIRE(checkpoint_id.has_value());
+    Connect(index, Verify(index, fixture,
+                          Block({Tx({fixture.CheckpointRecord(genesis),
+                                     fixture.CheckpointRecord(core)})}),
+                          C0, 0x69));
+
+    modern::FlowMeshVaultProofV1 proof;
+    proof.kind = modern::FlowMeshVaultProofKind::DEPOSIT_SWEEP;
+    proof.checkpoint_id = *checkpoint_id;
+    proof.effect = acceptance;
+    proof.leaf_index = 0;
+    proof.branch = *modern::BuildFlowMeshEffectBranch(0, effects, 0);
+
+    const auto deposit{modern::MakeDexVaultOutput(
+        acceptance.asset, acceptance.amount, acceptance.vault_id,
+        modern::VAULT_KIND_USER_DEPOSIT, acceptance.shard,
+        acceptance.account)};
+    const auto pool{modern::MakeDexVaultOutput(
+        acceptance.asset, acceptance.amount, acceptance.vault_id,
+        modern::VAULT_KIND_POOL_CHANGE, acceptance.shard)};
+    BOOST_REQUIRE(deposit.has_value());
+    BOOST_REQUIRE(pool.has_value());
+
+    CMutableTransaction spend;
+    spend.version = 2;
+    spend.vin.emplace_back(acceptance.deposit_outpoint);
+    spend.vin.emplace_back(COutPoint{Txid::FromUint256(Filled(0x6a)), 0});
+    spend.vout = {*pool, CTxOut{9, CScript() << OP_TRUE}};
+    spend.mpa = {ProofRecord(proof)};
+    const std::vector<Coin> prevs{
+        Coin{*deposit, A3, /*fCoinBaseIn=*/false},
+        Coin{CTxOut{10, CScript() << OP_TRUE}, A3, /*fCoinBaseIn=*/false}};
+
+    node::FlowMeshVaultAuthorization authorization;
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(node::CheckFlowMeshVaultTransaction(
+                              CTransaction{spend}, prevs, 1, C0 + 1,
+                              fixture.params, index, authorization, error),
+                          error);
+
+    CMutableTransaction twin{spend};
+    twin.vin[0].prevout = COutPoint{acceptance.deposit_outpoint.hash,
+                                    acceptance.deposit_outpoint.n + 1};
+    BOOST_CHECK(!node::CheckFlowMeshVaultTransaction(
+        CTransaction{twin}, prevs, 1, C0 + 1, fixture.params, index,
+        authorization, error));
+    BOOST_CHECK_EQUAL(
+        error, "FlowMesh deposit sweep input does not match its acceptance");
+
+    const auto other_market{
+        flowmesh::ComputeFlowMeshMarketId(fixture.domain, Filled(0x36))};
+    BOOST_REQUIRE(other_market.has_value());
+    const auto other_vault{
+        flowmesh::ComputeFlowMeshVaultId(fixture.domain, *other_market)};
+    BOOST_REQUIRE(other_vault.has_value());
+    BOOST_REQUIRE(*other_vault != acceptance.vault_id);
+    const auto other_pool{modern::MakeDexVaultOutput(
+        acceptance.asset, acceptance.amount, *other_vault,
+        modern::VAULT_KIND_POOL_CHANGE, acceptance.shard)};
+    BOOST_REQUIRE(other_pool.has_value());
+    CMutableTransaction moved{spend};
+    moved.vout[0] = *other_pool;
+    BOOST_CHECK(!node::CheckFlowMeshVaultTransaction(
+        CTransaction{moved}, prevs, 1, C0 + 1, fixture.params, index,
+        authorization, error));
+    BOOST_CHECK_EQUAL(
+        error,
+        "FlowMesh deposit sweep does not recreate the exact pool output");
+}
+
+BOOST_AUTO_TEST_CASE(deposit_sweep_refuses_acceptances_misstating_their_coin)
+{
+    // A checkpoint connects on its seats' signatures; nothing compares its
+    // deposit acceptances with the chain's deposit coins. The sweep's input
+    // check alone binds an acceptance to the coin it moves. Each acceptance
+    // below names a real deposit coin but misstates one fact of it, and the
+    // sweep it would authorize is otherwise exact.
+    const Fixture fixture;
+    node::FlowMeshCheckpointIndex index;
+    const auto genesis{fixture.Genesis(A3)};
+    const auto genesis_id{modern::FlowMeshCheckpointIdV1(genesis)};
+    BOOST_REQUIRE(genesis_id.has_value());
+    const auto other_market{
+        flowmesh::ComputeFlowMeshMarketId(fixture.domain, Filled(0x36))};
+    BOOST_REQUIRE(other_market.has_value());
+    const auto other_vault{
+        flowmesh::ComputeFlowMeshVaultId(fixture.domain, *other_market)};
+    BOOST_REQUIRE(other_vault.has_value());
+    const uint256 other_account{Filled(0x78)};
+
+    // The coin is in another market's vault.
+    modern::FlowMeshDepositAcceptanceV1 vault_lie{fixture.Deposit(1)};
+    vault_lie.shard =
+        modern::FlowMeshUserDepositShard(*other_vault, vault_lie.account);
+    // The coin belongs to another account.
+    modern::FlowMeshDepositAcceptanceV1 account_lie{fixture.Deposit(1)};
+    account_lie.acceptance_id = Filled(0x79);
+    account_lie.deposit_outpoint =
+        COutPoint{Txid::FromUint256(Filled(0x7a)), 0};
+    account_lie.shard =
+        modern::FlowMeshUserDepositShard(account_lie.vault_id, other_account);
+    // The coin is in another shard.
+    modern::FlowMeshDepositAcceptanceV1 shard_lie{fixture.Deposit(1)};
+    shard_lie.acceptance_id = Filled(0x7b);
+    shard_lie.deposit_outpoint =
+        COutPoint{Txid::FromUint256(Filled(0x7c)), 0};
+    shard_lie.shard = static_cast<uint16_t>((shard_lie.shard + 1) % 256);
+    const std::vector<modern::FlowMeshEffectV1> effects{vault_lie, account_lie,
+                                                        shard_lie};
+    const auto core{fixture.Core(A3, 0, 1, *genesis_id, effects, 0)};
+    const auto checkpoint_id{modern::FlowMeshCheckpointIdV1(core)};
+    BOOST_REQUIRE(checkpoint_id.has_value());
+    Connect(index, Verify(index, fixture,
+                          Block({Tx({fixture.CheckpointRecord(genesis),
+                                     fixture.CheckpointRecord(core)})}),
+                          C0, 0x7d));
+
+    // Sweep the coin of `coin_account` in `coin_vault` (in its deterministic
+    // shard) at the outpoint `lie` names, into the pool output `lie` names.
+    const std::string mismatch{
+        "FlowMesh deposit sweep input does not match its acceptance"};
+    const auto refused = [&](const modern::FlowMeshDepositAcceptanceV1& lie,
+                             const uint32_t leaf, const uint256& coin_vault,
+                             const uint256& coin_account) {
+        modern::FlowMeshVaultProofV1 proof;
+        proof.kind = modern::FlowMeshVaultProofKind::DEPOSIT_SWEEP;
+        proof.checkpoint_id = *checkpoint_id;
+        proof.effect = lie;
+        proof.leaf_index = leaf;
+        proof.branch = *modern::BuildFlowMeshEffectBranch(0, effects, leaf);
+        const auto coin{modern::MakeDexVaultOutput(
+            lie.asset, lie.amount, coin_vault,
+            modern::VAULT_KIND_USER_DEPOSIT,
+            modern::FlowMeshUserDepositShard(coin_vault, coin_account),
+            coin_account)};
+        const auto pool{modern::MakeDexVaultOutput(
+            lie.asset, lie.amount, lie.vault_id,
+            modern::VAULT_KIND_POOL_CHANGE, lie.shard)};
+        BOOST_REQUIRE(coin.has_value());
+        BOOST_REQUIRE(pool.has_value());
+        CMutableTransaction spend;
+        spend.version = 2;
+        spend.vin.emplace_back(lie.deposit_outpoint);
+        spend.vin.emplace_back(COutPoint{Txid::FromUint256(Filled(0x7e)), 0});
+        spend.vout = {*pool, CTxOut{9, CScript() << OP_TRUE}};
+        spend.mpa = {ProofRecord(proof)};
+        const std::vector<Coin> prevs{
+            Coin{*coin, A3, /*fCoinBaseIn=*/false},
+            Coin{CTxOut{10, CScript() << OP_TRUE}, A3, /*fCoinBaseIn=*/false}};
+        node::FlowMeshVaultAuthorization authorization;
+        std::string error;
+        const bool allowed{node::CheckFlowMeshVaultTransaction(
+            CTransaction{spend}, prevs, 1, C0 + 1, fixture.params, index,
+            authorization, error)};
+        return !allowed && error == mismatch;
+    };
+    BOOST_CHECK_MESSAGE(refused(vault_lie, 0, *other_vault, vault_lie.account),
+                        "an acceptance misstating the coin's vault");
+    BOOST_CHECK_MESSAGE(refused(account_lie, 1, account_lie.vault_id,
+                                other_account),
+                        "an acceptance misstating the coin's account");
+    BOOST_CHECK_MESSAGE(refused(shard_lie, 2, shard_lie.vault_id,
+                                shard_lie.account),
+                        "an acceptance misstating the coin's shard");
+}
+
+BOOST_AUTO_TEST_CASE(vault_proof_effect_must_be_in_its_checkpoint)
+{
+    // A vault effect counts only if its checkpoint's seats signed it. A copy
+    // of a signed receipt with another destination still names a connected
+    // checkpoint, its leaf index and its branch, and the spend below pays
+    // that destination exactly. The transaction rule and the block rule
+    // must each refuse it on their own.
+    const Fixture fixture;
+    node::FlowMeshCheckpointIndex index;
+    const auto genesis{fixture.Genesis(A3)};
+    const auto genesis_id{modern::FlowMeshCheckpointIdV1(genesis)};
+    BOOST_REQUIRE(genesis_id.has_value());
+    const CScript destination_script{OwnerScript(0x6b)};
+    modern::FlowMeshWithdrawalReceiptV1 receipt;
+    receipt.receipt_id = Filled(0x6c);
+    receipt.market_id = fixture.market;
+    receipt.epoch = 0;
+    receipt.sequence = 1;
+    receipt.account = Filled(0x6d);
+    receipt.asset = modern::NativeAsset();
+    receipt.amount = 40;
+    receipt.destination_owner_commitment =
+        modern::AssetOwnerCommitment(destination_script);
+    receipt.vault_id = fixture.vault;
+    receipt.deterministic_change_shard = 26;
+    const std::vector<modern::FlowMeshEffectV1> effects{receipt};
+    const auto core{fixture.Core(A3, 0, 1, *genesis_id, effects, 0)};
+    const auto checkpoint_id{modern::FlowMeshCheckpointIdV1(core)};
+    BOOST_REQUIRE(checkpoint_id.has_value());
+    Connect(index, Verify(index, fixture,
+                          Block({Tx({fixture.CheckpointRecord(genesis),
+                                     fixture.CheckpointRecord(core)})}),
+                          C0, 0x6e));
+
+    modern::FlowMeshVaultProofV1 proof;
+    proof.kind = modern::FlowMeshVaultProofKind::WITHDRAWAL;
+    proof.checkpoint_id = *checkpoint_id;
+    proof.effect = receipt;
+    proof.leaf_index = 0;
+    proof.branch = *modern::BuildFlowMeshEffectBranch(0, effects, 0);
+
+    const auto pool_in{modern::MakeDexVaultOutput(
+        modern::NativeAsset(), 100, fixture.vault,
+        modern::VAULT_KIND_POOL_CHANGE, 7)};
+    const auto change{modern::MakeDexVaultOutput(
+        modern::NativeAsset(), 60, fixture.vault,
+        modern::VAULT_KIND_POOL_CHANGE,
+        receipt.deterministic_change_shard)};
+    BOOST_REQUIRE(pool_in.has_value());
+    BOOST_REQUIRE(change.has_value());
+    const std::vector<Coin> prevs{
+        Coin{*pool_in, A3, /*fCoinBaseIn=*/false},
+        Coin{CTxOut{10, OwnerScript(0x6f)}, A3, /*fCoinBaseIn=*/false}};
+
+    CMutableTransaction spend;
+    spend.version = 2;
+    spend.vin.emplace_back(COutPoint{Txid::FromUint256(Filled(0x70)), 0});
+    spend.vin.emplace_back(COutPoint{Txid::FromUint256(Filled(0x74)), 0});
+    spend.vout = {CTxOut{receipt.amount, destination_script}, *change,
+                  CTxOut{9, OwnerScript(0x6f)}};
+    spend.mpa = {ProofRecord(proof)};
+
+    node::FlowMeshVaultAuthorization authorization;
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(node::CheckFlowMeshVaultTransaction(
+                              CTransaction{spend}, prevs, 1, C0 + 1,
+                              fixture.params, index, authorization, error),
+                          error);
+    Verify(index, fixture, Block({MakeTransactionRef(spend)}), C0 + 1, 0x75);
+
+    const CScript thief_script{OwnerScript(0x76)};
+    modern::FlowMeshWithdrawalReceiptV1 forged_receipt{receipt};
+    forged_receipt.destination_owner_commitment =
+        modern::AssetOwnerCommitment(thief_script);
+    modern::FlowMeshVaultProofV1 forged_proof{proof};
+    forged_proof.effect = forged_receipt;
+    CMutableTransaction forged{spend};
+    forged.vout[0] = CTxOut{receipt.amount, thief_script};
+    forged.mpa = {ProofRecord(forged_proof)};
+    BOOST_CHECK(!node::CheckFlowMeshVaultTransaction(
+        CTransaction{forged}, prevs, 1, C0 + 1, fixture.params, index,
+        authorization, error));
+    BOOST_CHECK_EQUAL(error,
+                      "FlowMesh vault proof is not included in its checkpoint");
+    node::FlowMeshCheckpointBlockDelta delta;
+    std::string block_error;
+    BOOST_CHECK(!index.VerifyBlock(Block({MakeTransactionRef(forged)}), C0 + 1,
+                                   Filled(0x77), fixture.chain.chain,
+                                   fixture.params, fixture.seats,
+                                   fixture.vaults, delta, block_error));
+    BOOST_CHECK_EQUAL(block_error,
+                      "FlowMesh vault proof is not included in its checkpoint");
 }
 
 BOOST_AUTO_TEST_SUITE_END()
