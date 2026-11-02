@@ -40,6 +40,7 @@ add_executable(fuzz
   crypto_poly1305.cpp
   cuckoocache.cpp
   decode_tx.cpp
+  derived_state.cpp
   descriptor_parse.cpp
   deserialize.cpp
   difference_formatter.cpp
