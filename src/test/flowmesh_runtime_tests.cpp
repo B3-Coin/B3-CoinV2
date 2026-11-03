@@ -524,12 +524,55 @@ public:
     flowmesh::ActiveFnBlsSeatSet m_seats;
 };
 
+//! A test clock's time. The test thread moves it while runtime workers read
+//! it, so it is held atomically; it is read, assigned and moved like the
+//! plain time point it replaces. Only the test thread moves it, so += and
+//! -= need no read-modify-write loop.
+class TestTime
+{
+public:
+    using time_point = flowmesh::WireClock::time_point;
+    using duration = flowmesh::WireClock::duration;
+
+    explicit TestTime(const time_point value) : m_value{value} {}
+    TestTime(const TestTime& other) : m_value{other.Get()} {}
+    TestTime& operator=(const TestTime& other)
+    {
+        m_value.store(other.Get());
+        return *this;
+    }
+    TestTime& operator=(const time_point value)
+    {
+        m_value.store(value);
+        return *this;
+    }
+    TestTime& operator+=(const duration delta)
+    {
+        m_value.store(Get() + delta);
+        return *this;
+    }
+    TestTime& operator-=(const duration delta)
+    {
+        m_value.store(Get() - delta);
+        return *this;
+    }
+    operator time_point() const { return Get(); }
+    time_point Get() const { return m_value.load(); }
+
+    friend time_point operator+(const TestTime& t, const duration d) { return t.Get() + d; }
+    friend time_point operator-(const TestTime& t, const duration d) { return t.Get() - d; }
+    friend bool operator==(const TestTime& t, const time_point u) { return t.Get() == u; }
+    friend auto operator<=>(const TestTime& t, const time_point u) { return t.Get() <=> u; }
+
+private:
+    std::atomic<time_point> m_value;
+};
+
 class FixedClock final : public node::FlowMeshRuntimeClock
 {
 public:
     flowmesh::WireClock::time_point Now() const override { return m_now; }
-    flowmesh::WireClock::time_point m_now{
-        flowmesh::WireClock::time_point{std::chrono::seconds{100}}};
+    TestTime m_now{flowmesh::WireClock::time_point{std::chrono::seconds{100}}};
 };
 
 class MapDeposits final : public flowmesh::DepositVerifier
