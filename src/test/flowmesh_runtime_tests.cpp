@@ -538,7 +538,7 @@ public:
     TestTime(const TestTime& other) : m_value{other.Get()} {}
     TestTime& operator=(const TestTime& other)
     {
-        m_value.store(other.Get());
+        if (this != &other) m_value.store(other.Get());
         return *this;
     }
     TestTime& operator=(const time_point value)
