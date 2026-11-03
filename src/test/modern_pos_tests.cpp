@@ -1164,6 +1164,34 @@ BOOST_FIXTURE_TEST_CASE(corridor_pacing_enforced, ModernPosSetup)
     SetMockTime(MOCK_NOW);
 }
 
+//! A corridor coinbase claims its fees and the corridor reward (ratified:
+//! 0, fees only) and not a unit more; while that reward is unset, corridor
+//! blocks are refused rather than read as fees only.
+BOOST_FIXTURE_TEST_CASE(corridor_coinbase_is_capped_and_fails_closed, ModernPosSetup)
+{
+    AdvanceLegacyToH();
+    ConfigureCorridor(Tip()->GetBlockHash());
+    const auto check{[&](const CBlock& block) {
+        LOCK(cs_main);
+        return TestBlockValidity(m_node.chainman->ActiveChainstate(), block,
+                                 /*check_pow=*/true, /*check_merkle_root=*/true);
+    }};
+
+    BlockValidationState state{check(BuildCorridor(Tip(), {}))};
+    BOOST_CHECK_MESSAGE(state.IsValid(), state.ToString());
+    state = check(BuildCorridor(Tip(), {}, 60, EASY_BITS, {CTxOut{1, CScript() << OP_TRUE}}));
+    BOOST_CHECK_EQUAL(state.GetRejectReason(), "bad-cb-amount");
+    BOOST_CHECK_EQUAL(state.GetDebugMessage(), "corridor coinbase pays too much (actual=1 vs limit=0)");
+
+    MutableConsensus().transition_pow_reward.reset();
+    state = check(BuildCorridor(Tip(), {}));
+    BOOST_CHECK_EQUAL(state.GetRejectReason(), "no-transition-pow-rules");
+    BOOST_CHECK_EQUAL(state.GetDebugMessage(), "temporary-PoW corridor reward policy is not configured");
+    MutableConsensus().transition_pow_reward = 0;
+    BOOST_REQUIRE(Submit(BuildCorridor(Tip(), {})));
+    BOOST_CHECK_EQUAL(Tip()->nHeight, SYN_H + 1);
+}
+
 //! The automatic staking loop (release-v1 validator UX): started with
 //! validator A's key it produces signed modern-PoS blocks on its own -- the
 //! fixture's mock clock is far past every forced round time, so the pacing
@@ -1604,6 +1632,67 @@ BOOST_FIXTURE_TEST_CASE(v1_invalid_reward, ModernPosSetup)
     CBlock good{BuildPos(prev, m_val_a, round_a, 0)};
     Sign(good, m_key_a);
     BOOST_REQUIRE(Submit(good));
+}
+
+//! OD-2: the coinbase pays the treasury its share of the subsidy, to the
+//! pinned script exactly and summed over its outputs; the block producer
+//! keeps the rest and the fees, and no more. A coinbase that keeps the
+//! share, pays it short, or pays it to a script that only begins as the
+//! treasury's does is refused.
+BOOST_FIXTURE_TEST_CASE(v1_coinbase_pays_the_treasury_its_share, ModernPosSetup)
+{
+    AdvanceToModernPos();
+    Consensus::Params& mutable_consensus{MutableConsensus()};
+    mutable_consensus.modern_pos->reward = 2'000;
+    mutable_consensus.modern_pos->halving_interval = 0;
+    mutable_consensus.modern_pos->treasury_percent = 10;
+    const CScript treasury{CScript() << OP_2};
+    mutable_consensus.modern_pos->treasury_script.assign(treasury.begin(), treasury.end());
+    const CScript producer{CScript() << OP_TRUE};
+    const CScript lookalike{CScript() << OP_2 << OP_DROP};
+
+    const CAmount W{STAKE_A + STAKE_B};
+    const CBlockIndex* prev{Tip()};
+    const int64_t round_a{FindRound(prev, m_val_a, STAKE_A, W)};
+    const auto build{[&](const std::vector<CTxOut>& outputs) {
+        CBlock block{BuildPos(prev, m_val_a, round_a, /*coinbase_value=*/0)};
+        CMutableTransaction coinbase{*block.vtx[0]};
+        coinbase.vout = outputs;
+        block.vtx[0] = MakeTransactionRef(std::move(coinbase));
+        block.hashMerkleRoot = BlockMerkleRoot(block);
+        Sign(block, m_key_a);
+        return block;
+    }};
+    const auto check{[&](const CBlock& block) {
+        LOCK(cs_main);
+        return TestBlockValidity(m_node.chainman->ActiveChainstate(), block,
+                                 /*check_pow=*/true, /*check_merkle_root=*/true);
+    }};
+
+    // The producer keeps the treasury's share.
+    BlockValidationState state{check(build({CTxOut{2'000, producer}}))};
+    BOOST_CHECK_EQUAL(state.GetRejectReason(), "bad-cb-treasury");
+    BOOST_CHECK_EQUAL(state.GetDebugMessage(), "modern coinbase pays 0 to the treasury script, 200 required");
+    // The share goes to a script that begins as the treasury's.
+    state = check(build({CTxOut{1'800, producer}, CTxOut{200, lookalike}}));
+    BOOST_CHECK_EQUAL(state.GetRejectReason(), "bad-cb-treasury");
+    BOOST_CHECK_EQUAL(state.GetDebugMessage(), "modern coinbase pays 0 to the treasury script, 200 required");
+    // The share falls a unit short.
+    state = check(build({CTxOut{1'801, producer}, CTxOut{199, treasury}}));
+    BOOST_CHECK_EQUAL(state.GetRejectReason(), "bad-cb-treasury");
+    BOOST_CHECK_EQUAL(state.GetDebugMessage(), "modern coinbase pays 199 to the treasury script, 200 required");
+    // The producer claims a unit more than the subsidy.
+    state = check(build({CTxOut{1'801, producer}, CTxOut{200, treasury}}));
+    BOOST_CHECK_EQUAL(state.GetRejectReason(), "bad-cb-amount");
+    // The share split over two outputs counts in full.
+    state = check(build({CTxOut{1'800, producer}, CTxOut{100, treasury}, CTxOut{100, treasury}}));
+    BOOST_CHECK_MESSAGE(state.IsValid(), state.ToString());
+
+    const CBlock good{build({CTxOut{1'800, producer}, CTxOut{200, treasury}})};
+    state = check(good);
+    BOOST_CHECK_MESSAGE(state.IsValid(), state.ToString());
+    BOOST_REQUIRE(Submit(good));
+    BOOST_CHECK_EQUAL(Tip()->nHeight, prev->nHeight + 1);
 }
 
 //! Scenario 6 — restart and reindex: the persisted eligibility digests
