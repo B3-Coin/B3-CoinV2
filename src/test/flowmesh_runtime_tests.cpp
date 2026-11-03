@@ -5109,6 +5109,18 @@ BOOST_AUTO_TEST_CASE(four_node_commit_pause_dynamic_catchup_and_isolated_halt)
         return true;
     }));
 
+    // Pause before deposit 1 exists; admitting it does not wait for the
+    // pause to end. The slot's proposer proposes from any tick once it
+    // holds work, and not every tick is the test's: a HELLO naming a
+    // sequence below a runtime's own wakes it too (HandleHello). Runtime 1's
+    // slot-one HELLO can still wait in runtime 2's queue, as its lane comes
+    // last; taken after deposit 1 arrived and before a pause set
+    // afterwards, it made runtime 2 propose slot two at once. A follower
+    // that took that proposal while paused, or before it held deposit 1,
+    // refused it, and the slot needs all three online votes. After the
+    // resume runtime 2 signs it again but sends it again only once its
+    // clock has moved a second, and this test's clock stands still here.
+    chain.SetTransition(market_a, node::FlowMeshSeatTransitionKind::PAUSED);
     BOOST_REQUIRE(runtimes[1]->SubmitLocalAction(
                       market_a, Deposit(deposit1)) ==
                   flowmesh::QueueResult::ACCEPTED);
@@ -5119,7 +5131,6 @@ BOOST_AUTO_TEST_CASE(four_node_commit_pause_dynamic_catchup_and_isolated_halt)
         }
         return true;
     }));
-    chain.SetTransition(market_a, node::FlowMeshSeatTransitionKind::PAUSED);
     for (size_t i{0}; i < 3; ++i) runtimes[i]->NotifyTick();
     BOOST_REQUIRE(WaitUntil([&] {
         for (size_t i{0}; i < 3; ++i) {
