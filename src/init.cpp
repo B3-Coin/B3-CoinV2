@@ -1629,7 +1629,7 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
     }
 
     if (args.GetBoolArg("-crashreports", DEFAULT_CRASH_REPORTS)) {
-        const fs::path crash_directory{args.GetDataDirNet() / fs::u8path(std::string{crash_report::DIRECTORY_NAME})};
+        const fs::path crash_directory{args.GetDataDirNet() / fs::u8path(crash_report::DIRECTORY_NAME)};
         if (const auto previous{crash_report::Install(crash_directory)}) {
             for (const fs::path& report : *previous) {
                 LogWarning("The previous run ended in a crash; its report is %s", fs::PathToString(report));

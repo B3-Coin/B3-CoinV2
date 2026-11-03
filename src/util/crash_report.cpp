@@ -52,7 +52,6 @@ namespace {
 
 constexpr int MAX_FRAMES{64};
 constexpr size_t REPORT_CAPACITY{16384};
-constexpr size_t STDERR_TAIL_BYTES{2048};
 constexpr std::string_view ANNOUNCED_FILENAME{"announced"};
 
 std::atomic_flag g_reporting;
@@ -151,6 +150,8 @@ void WriteCommon(Writer& w, const char* reason, const char* thread_name)
 }
 
 #ifdef WIN32
+
+constexpr size_t STDERR_TAIL_BYTES{2048};
 
 wchar_t g_directory_path[MAX_PATH * 4];
 wchar_t g_report_path[MAX_PATH * 4];
@@ -546,7 +547,7 @@ bool InstallPlatform(const fs::path& report, const fs::path& directory)
 //! Reports newer than the last announced one; records the newest as announced.
 std::vector<fs::path> TakeNewReports(const fs::path& directory)
 {
-    const fs::path announced_path{directory / fs::u8path(std::string{ANNOUNCED_FILENAME})};
+    const fs::path announced_path{directory / fs::u8path(ANNOUNCED_FILENAME)};
     std::string announced;
     if (FILE* in{fsbridge::fopen(announced_path, "rb")}) {
         char line[256];
@@ -561,7 +562,7 @@ std::vector<fs::path> TakeNewReports(const fs::path& directory)
     for (fs::directory_iterator it{directory, ec}, end; !ec && it != end; it.increment(ec)) {
         const std::string name{fs::PathToString(it->path().filename())};
         if (name.starts_with("crash-") && name.ends_with(".txt") && name > announced) {
-            reports.push_back(it->path());
+            reports.emplace_back(it->path());
         }
     }
     std::sort(reports.begin(), reports.end());
@@ -575,7 +576,9 @@ std::vector<fs::path> TakeNewReports(const fs::path& directory)
     return reports;
 }
 
-int Recurse(volatile int depth)
+//! Recurses until the stack overflows: the "overflow" test crash.
+// NOLINTNEXTLINE(misc-no-recursion)
+int Recurse(int depth)
 {
     volatile char frame[4096];
     frame[depth % sizeof(frame)] = static_cast<char>(depth);
@@ -637,7 +640,10 @@ void TriggerTestCrash(std::string_view kind)
         volatile bool never{false};
         assert(never);
     } else if (kind == "check") {
-        volatile int* volatile null_pointer{nullptr};
+        volatile int* volatile hidden_null{nullptr};
+        // A non-volatile copy, as GCC warns when a volatile value is
+        // discarded; its name is in the message the test expects.
+        volatile int* const null_pointer{hidden_null};
         (void)Assert(null_pointer);
     } else if (kind == "throw") {
         std::thread{[] {
