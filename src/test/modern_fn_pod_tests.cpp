@@ -339,4 +339,72 @@ BOOST_AUTO_TEST_CASE(tier_boundaries_are_priced_by_the_declared_modern_slot)
     }
 }
 
+BOOST_AUTO_TEST_CASE(a_declaration_alone_makes_the_transaction_a_creation)
+{
+    // No asset output at all: the declaration still has to name an
+    // amount-1 FN owner output, or a type-6 record would ride along on a
+    // plain native transfer unchecked.
+    const Consensus::Params params{TestParams()};
+    const CAmount required{modern::RequiredFnPodDisintegration(0)};
+    CMutableTransaction native_only{PodTransaction(params, 0, required, 0)};
+    native_only.vout.pop_back();
+    modern::AssetTransactionEffects effects;
+    std::string error;
+    BOOST_CHECK(!CheckPod(native_only, params, FN_POD_ACTIVATION_HEIGHT, 0,
+                          effects, error));
+    BOOST_CHECK_EQUAL(
+        error, "modern FN PoD declaration does not name an amount-1 FN owner output");
+}
+
+BOOST_AUTO_TEST_CASE(a_creation_carries_exactly_one_declaration)
+{
+    // Two distinct declarations in canonical order, which the payload-area
+    // rules accept; the first alone would be a valid creation.
+    const Consensus::Params params{TestParams()};
+    const CAmount required{modern::RequiredFnPodDisintegration(0)};
+    CMutableTransaction twice{PodTransaction(params, 0, required)};
+    twice.mpa.push_back(modern::MakeModernFnPodRecord(1, 1));
+    BOOST_REQUIRE(modern::MpaRecordLess(twice.mpa[0], twice.mpa[1]));
+    modern::AssetTransactionEffects effects;
+    std::string error;
+    BOOST_CHECK(!CheckPod(twice, params, FN_POD_ACTIVATION_HEIGHT, 0, effects, error));
+    BOOST_CHECK_EQUAL(error,
+                      "modern FN PoD transaction must have exactly one declaration");
+}
+
+BOOST_AUTO_TEST_CASE(a_creation_cannot_carry_a_bridge_mint)
+{
+    // A valid creation, judged with the authorization the bridge state
+    // machine gives a verified deposit: one transaction may not use both.
+    const Consensus::Params params{TestParams()};
+    const CAmount required{modern::RequiredFnPodDisintegration(0)};
+    const CTransaction tx{PodTransaction(params, 0, required)};
+    const std::vector<Coin> coins{NativeCoin()};
+    const modern::AuthorizedAssetMint bridge_mint{
+        uint256{"00000000000000000000000000000000000000000000000000000000000000c3"}, 5};
+    modern::AssetTransactionEffects effects;
+    std::string error;
+    BOOST_CHECK(!modern::CheckAssetTransaction(
+        tx, coins, FN_POD_ACTIVATION_HEIGHT, params,
+        modern::AssetTransactionContext{0, required, bridge_mint}, effects, error));
+    BOOST_CHECK_EQUAL(error, "a transaction cannot combine FN PoD and bridge minting");
+}
+
+BOOST_AUTO_TEST_CASE(the_declared_output_is_an_fn_owner_output)
+{
+    // An amount-1 output of the FN asset under the BURN policy is a valid
+    // output, but not an owner: the declaration may not name it.
+    const Consensus::Params params{TestParams()};
+    const CAmount required{modern::RequiredFnPodDisintegration(0)};
+    const auto burn{modern::MakeAssetBurnOutput(FnAsset(params), 1)};
+    BOOST_REQUIRE(burn.has_value());
+    CMutableTransaction burned{PodTransaction(params, 0, required)};
+    burned.vout[1] = *burn;
+    modern::AssetTransactionEffects effects;
+    std::string error;
+    BOOST_CHECK(!CheckPod(burned, params, FN_POD_ACTIVATION_HEIGHT, 0, effects, error));
+    BOOST_CHECK_EQUAL(
+        error, "modern FN PoD declaration does not name an amount-1 FN owner output");
+}
+
 BOOST_AUTO_TEST_SUITE_END()

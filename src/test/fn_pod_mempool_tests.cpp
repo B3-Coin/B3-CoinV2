@@ -359,6 +359,26 @@ BOOST_AUTO_TEST_CASE(slot_competitors_and_descendants_follow_confirmed_branch)
             result.m_result_type == MempoolAcceptResult::ResultType::VALID,
             result.m_state.ToString());
     }};
+    //! Admission dry run at the tip: "" or the refusal and its result.
+    const auto refusal{[&](const CTransactionRef& tx) {
+        const auto result{WITH_LOCK(
+            cs_main, return chainman.ProcessTransaction(tx, /*test_accept=*/true))};
+        if (result.m_result_type == MempoolAcceptResult::ResultType::VALID) {
+            return std::string{};
+        }
+        return result.m_state.GetRejectReason() +
+               (result.m_state.GetResult() == TxValidationResult::TX_MEMPOOL_POLICY
+                    ? " (policy)"
+                    : " (not policy)");
+    }};
+    //! Full validity of a block on the tip: "" or the state.
+    const auto probe{[&](const CBlock& block) {
+        LOCK(cs_main);
+        const BlockValidationState state{TestBlockValidity(
+            chainman.ActiveChainstate(), block, /*check_pow=*/true,
+            /*check_merkle_root=*/true)};
+        return state.IsValid() ? std::string{} : state.ToString();
+    }};
 
     // Both disjoint transactions can legitimately compete for current slot
     // zero. Confirming one advances the counter and recursively evicts the
@@ -371,6 +391,19 @@ BOOST_AUTO_TEST_CASE(slot_competitors_and_descendants_follow_confirmed_branch)
     admit(loser_child);
     BOOST_REQUIRE_EQUAL(pool.size(), 3U);
 
+    // The destroyed amount is no fee: the mempool counts only the ordinary
+    // fee, and a block producer cannot claim a single unit more (this
+    // chain's modern subsidy is zero, so its coinbase cap is the fees).
+    {
+        LOCK(pool.cs);
+        const CTxMemPoolEntry* entry{pool.GetEntry(winner->GetHash())};
+        BOOST_REQUIRE(entry);
+        BOOST_CHECK_EQUAL(entry->GetFee(), FEE);
+    }
+    BOOST_CHECK_EQUAL(probe(build_modern(tip(), {winner}, FEE + 1)),
+                      "bad-cb-amount, modern coinbase pays too much "
+                      "(actual=1001 vs limit=1000)");
+
     const CBlock winning_block{build_modern(tip(), {winner}, FEE)};
     submit(winning_block);
     BOOST_REQUIRE_EQUAL(tip()->nHeight, A1);
@@ -379,6 +412,31 @@ BOOST_AUTO_TEST_CASE(slot_competitors_and_descendants_follow_confirmed_branch)
     BOOST_CHECK(!pool.exists(loser->GetHash()));
     BOOST_CHECK(!pool.exists(loser_child->GetHash()));
     BOOST_CHECK_EQUAL(pool.size(), 0U);
+
+    // A counter the node cannot read after A1 (a lost block-index sidecar),
+    // or one above the capacity, is local corruption: admission and block
+    // validation fail closed, and the refusal is policy, so no peer that
+    // relayed the declaration is blamed. Read as zero, the counter would
+    // let the evicted slot-zero loser in again.
+    {
+        CBlockIndex* const counted{WITH_LOCK(
+            cs_main, return chainman.ActiveChain().Tip())};
+        WITH_LOCK(cs_main, counted->m_fn_pod_issued_total_known = false);
+        BOOST_CHECK_EQUAL(refusal(loser), "fn-pod-state-unavailable (policy)");
+        BOOST_CHECK_EQUAL(probe(build_modern(tip(), {loser}, FEE)),
+                          "modern FN PoD counter for the parent is unavailable");
+        // Each block counts on from its parent's counter, so one without a
+        // declaration stops there too: the node connects no block on this
+        // tip until the counter is rebuilt.
+        BOOST_CHECK_EQUAL(probe(build_modern(tip(), {}, 0)),
+                          "modern FN PoD counter for the parent is unavailable");
+        WITH_LOCK(cs_main, counted->m_fn_pod_issued_total_known = true);
+        const auto capacity{modern::ModernFnCapacity(consensus)};
+        BOOST_REQUIRE(capacity);
+        WITH_LOCK(cs_main, counted->m_fn_pod_issued_total = *capacity + 1);
+        BOOST_CHECK_EQUAL(refusal(loser), "fn-pod-state-unavailable (policy)");
+        WITH_LOCK(cs_main, counted->m_fn_pod_issued_total = 1);
+    }
 
     // On the count-1 branch, slot one and its child are admissible. Reverting
     // the winning block returns the branch count to zero: the disconnected

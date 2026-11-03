@@ -35,6 +35,22 @@ using node::BlockManager;
 using node::KernelNotifications;
 using node::MAX_BLOCKFILE_SIZE;
 
+namespace {
+//! The modern FN PoD counter's block-index record, as blockstorage.cpp
+//! writes it.
+struct FnPodSidecarKey {
+    uint8_t prefix{0};
+    uint32_t height{0};
+    uint256 block_hash{};
+    SERIALIZE_METHODS(FnPodSidecarKey, obj) { READWRITE(obj.prefix, obj.height, obj.block_hash); }
+};
+struct FnPodSidecarValue {
+    uint8_t version{0};
+    uint32_t issued_total{0};
+    SERIALIZE_METHODS(FnPodSidecarValue, obj) { READWRITE(obj.version, obj.issued_total); }
+};
+} // namespace
+
 // use BasicTestingSetup here for the data directory configuration, setup, and cleanup
 BOOST_FIXTURE_TEST_SUITE(blockmanager_tests, BasicTestingSetup)
 
@@ -171,6 +187,61 @@ BOOST_AUTO_TEST_CASE(fn_pod_issued_total_sidecar_roundtrip)
     BOOST_REQUIRE(old_it != old_loaded.end());
     BOOST_CHECK(!old_it->second.m_fn_pod_issued_total_known);
     BOOST_CHECK_EQUAL(old_it->second.m_fn_pod_issued_total, 0U);
+}
+
+BOOST_AUTO_TEST_CASE(fn_pod_issued_total_sidecar_refuses_unknown_versions)
+{
+    // A sidecar record in a format this binary does not know stops the
+    // load: read as a count, it could set the FN PoD slot a node admits.
+    const CChainParams& params{Params()};
+    const Consensus::Params& consensus{params.GetConsensus()};
+    BlockTreeDB db{DBParams{
+        .path = "",
+        .cache_bytes = 1 << 20,
+        .memory_only = true,
+    }};
+    const uint256 genesis_hash{consensus.hashGenesisBlock};
+    CBlockIndex stored{params.GenesisBlock()};
+    stored.phashBlock = &genesis_hash;
+    stored.nHeight = 0;
+    stored.m_fn_pod_issued_total = 37;
+    stored.m_fn_pod_issued_total_known = true;
+    db.WriteBatchSync({}, /*nLastFile=*/0, {&stored});
+
+    const auto load{[&] {
+        node::BlockMap loaded;
+        const auto insert{[&](const uint256& hash) -> CBlockIndex* {
+            if (hash.IsNull()) return nullptr;
+            const auto [it, inserted]{loaded.try_emplace(hash)};
+            if (inserted) it->second.phashBlock = &it->first;
+            return &it->second;
+        }};
+        return WITH_LOCK(cs_main, return db.LoadBlockIndexGuts(consensus, insert, m_interrupt));
+    }};
+    BOOST_REQUIRE(load());
+
+    // The record as written: key 'N', height, block hash; value format
+    // version 1, count.
+    const FnPodSidecarKey key{'N', 0, genesis_hash};
+    FnPodSidecarValue value;
+    BOOST_REQUIRE(db.Read(key, value));
+    BOOST_CHECK_EQUAL(int{value.version}, 1);
+    BOOST_CHECK_EQUAL(value.issued_total, 37U);
+
+    value.version = 2;
+    db.Write(key, value);
+    // A missing log line fails the check below instead of aborting, so the
+    // suite's other cases still report.
+    bool logged{false};
+    {
+        DebugLogHelper watch{"unsupported modern FN issuance sidecar version 2",
+                             [&](const std::string* line) {
+                                 if (line) logged = true;
+                                 return line != nullptr;
+                             }};
+        BOOST_CHECK(!load());
+    }
+    BOOST_CHECK(logged);
 }
 
 BOOST_FIXTURE_TEST_CASE(block_index_restart_rejects_invalid_non_b3_pow,

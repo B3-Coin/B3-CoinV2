@@ -168,6 +168,7 @@ add_executable(test_bitcoin
   modern_stake_tests.cpp
   finality_types_tests.cpp
   fn_pod_mempool_tests.cpp
+  fn_pod_template_tests.cpp
   bls_tests.cpp
   metadata_cell_tests.cpp
   finality_key_tests.cpp
