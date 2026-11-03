@@ -1021,7 +1021,7 @@ public:
                 if (relay.message.kind == flowmesh::WireMessageKind::HELLO || !Observe(relay.message)) return LegacyRelayResult();
                 return links.Offer(i, relay, clocks[i].Now());
             }
-            network.Relay(i, std::move(relay));
+            if (!HeldForRound(i, relay)) network.Relay(i, std::move(relay));
             // This transport admits an in-memory legacy delivery, not a claim
             // of peer verification. No socket-completion scheduler is used.
             node::FlowMeshRelayResult result;
@@ -1080,6 +1080,43 @@ public:
         BOOST_REQUIRE(AllAt(sequence));
     }
 
+    // With the clocks still, a follower that takes a proposal before its
+    // actions parks it, and only another agreement frame runs it again. A
+    // follower that falls behind takes the whole round first (its lane
+    // comes first); with two such followers the round never completes.
+    // Between HoldRound() and ReleaseRound(), agreement frames wait here
+    // until every runtime holds at least `pending` actions.
+    void HoldRound()
+    {
+        std::lock_guard lock{round_mutex};
+        round_hold = true;
+    }
+
+    void ReleaseRound(const size_t pending)
+    {
+        BOOST_REQUIRE(WaitUntil([&] {
+            return std::all_of(runtimes.begin(), runtimes.end(), [&](const auto& runtime) {
+                return !runtime || runtime->MarketStatus(market)->pending_actions >= pending;
+            });
+        }));
+        std::vector<std::pair<size_t, node::FlowMeshRuntimeRelay>> held;
+        {
+            std::lock_guard lock{round_mutex};
+            round_hold = false;
+            held.swap(round_held);
+        }
+        for (auto& [from, relay] : held) network.Relay(from, std::move(relay));
+    }
+
+    bool HeldForRound(const size_t from, node::FlowMeshRuntimeRelay& relay)
+    {
+        if (relay.message.kind != flowmesh::WireMessageKind::AGREEMENT) return false;
+        std::lock_guard lock{round_mutex};
+        if (!round_hold) return false;
+        round_held.emplace_back(from, std::move(relay));
+        return true;
+    }
+
     // FMN2-link mode: advance every clock together, let each blocked channel
     // retry, and schedule the production 250 ms runtime tick.
     void Step(const std::chrono::milliseconds advance = std::chrono::milliseconds{50})
@@ -1131,6 +1168,9 @@ public:
     std::array<std::unique_ptr<node::FlowMeshProductionStore>, Count> stores;
     std::atomic<bool> block_commits{true};
     std::atomic<size_t> prepares{0}, commits{0}, decisions{0}, view_changes{0}, premature_v1{0};
+    std::mutex round_mutex;
+    bool round_hold{false};
+    std::vector<std::pair<size_t, node::FlowMeshRuntimeRelay>> round_held;
     RuntimeNetwork network{Count};
     std::array<std::unique_ptr<node::FlowMeshRuntime>, Count> runtimes;
 };
@@ -4373,6 +4413,19 @@ BOOST_AUTO_TEST_CASE(dropped_action_evidence_retries_exact_locked_candidate)
     deposits.required_anchor = chain.m_current;
     const COutPoint outpoint{Txid::FromUint256(Filled(0x8d)), 0};
     deposits.entries.emplace(outpoint, flowmesh::DepositInfo{asset, 100, account});
+    // Proposals of the deposit's round, held below until every runtime
+    // holds the deposit. Declared before the network and the runtimes, so it
+    // outlives every worker.
+    struct HeldFrame {
+        size_t from;
+        size_t to;
+        flowmesh::WireMessage message;
+    };
+    struct {
+        std::mutex mutex;
+        bool hold{true};
+        std::vector<HeldFrame> held;
+    } deposit_round;
     const flowmesh::FlowMeshState initial{vault, asset, modern::NativeAsset(),
                                         flowmesh::FLOWMESH_V1_MAX_CURVE_POINTS};
     std::array<RuntimeKeys, 3> keys;
@@ -4407,8 +4460,36 @@ BOOST_AUTO_TEST_CASE(dropped_action_evidence_retries_exact_locked_candidate)
     };
     runtimes[0]->NotifyTick();
     BOOST_REQUIRE(WaitUntil([&] { return all_at(1); }));
+    // Every runtime needs the deposit before the proposal: a worker that
+    // falls behind takes the proposal first (its lane comes first) and
+    // drops it for missing evidence, and with the clock still nothing
+    // resends it. Runtime 1 can propose before the tick below (a peer's
+    // HELLO for sequence zero can wait in its last lane until after the
+    // deposit, and wakes it), so its proposals wait until every runtime
+    // holds the deposit.
+    network.SetFilter([&](size_t from, size_t to, const flowmesh::WireMessage& message) {
+        if (message.kind != flowmesh::WireMessageKind::PROPOSAL || message.header.sequence != 1) return true;
+        std::lock_guard<std::mutex> lock{deposit_round.mutex};
+        if (!deposit_round.hold) return true;
+        deposit_round.held.push_back({from, to, message});
+        return false;
+    });
     BOOST_REQUIRE(runtimes[1]->SubmitLocalAction(market, Deposit(outpoint)) == flowmesh::QueueResult::ACCEPTED);
-    BOOST_REQUIRE(runtimes[1]->WaitForIdle(std::chrono::seconds{2}));
+    BOOST_REQUIRE(WaitUntil([&] {
+        return std::all_of(runtimes.begin(), runtimes.end(), [&](const auto& runtime) {
+            return runtime->MarketStatus(market)->pending_actions == 1;
+        });
+    }));
+    std::vector<HeldFrame> held_round;
+    {
+        std::lock_guard<std::mutex> lock{deposit_round.mutex};
+        deposit_round.hold = false;
+        held_round.swap(deposit_round.held);
+    }
+    for (auto& [from, to, message] : held_round) {
+        BOOST_REQUIRE(runtimes[to]->EnqueueWireMessage(static_cast<int64_t>(from), std::move(message)) ==
+                      flowmesh::QueueResult::ACCEPTED);
+    }
     runtimes[1]->NotifyTick();
     BOOST_REQUIRE(WaitUntil([&] { return all_at(2); }));
     for (const auto& runtime : runtimes) BOOST_REQUIRE(runtime->WaitForIdle(std::chrono::seconds{2}));
@@ -4431,6 +4512,8 @@ BOOST_AUTO_TEST_CASE(dropped_action_evidence_retries_exact_locked_candidate)
     size_t voter_replays{0};
     std::optional<std::vector<unsigned char>> candidate_bytes;
     std::optional<std::vector<unsigned char>> voter_bytes;
+    bool hold_proposals_to_zero{false};
+    std::vector<std::pair<size_t, flowmesh::WireMessage>> held_proposals;
     struct StopBeforeCapturedState {
         std::array<std::unique_ptr<node::FlowMeshRuntime>, 3>& runtimes;
         ~StopBeforeCapturedState() { for (auto& runtime : runtimes) runtime->Stop(); }
@@ -4462,6 +4545,10 @@ BOOST_AUTO_TEST_CASE(dropped_action_evidence_retries_exact_locked_candidate)
                     ++voter_replays;
                 }
             }
+        }
+        if (message.kind == flowmesh::WireMessageKind::PROPOSAL && to == 0 && hold_proposals_to_zero) {
+            held_proposals.emplace_back(from, message);
+            return false;
         }
         return true;
     });
@@ -4505,7 +4592,30 @@ BOOST_AUTO_TEST_CASE(dropped_action_evidence_retries_exact_locked_candidate)
     }));
     for (const auto& runtime : runtimes) BOOST_REQUIRE(runtime->WaitForIdle(std::chrono::seconds{2}));
     clock.m_now += node::FlowMeshCommitteeRelayBudget::REPEAT_DELAY;
+    // Runtime 1 voted in the first round, so it answers the retry with its
+    // cached vote, unless runtime 0's vote or the certificate reaches it
+    // first: those pop before a proposal (their lane comes first), and
+    // runtime 1 has then left sequence two and ignores the retry. Keep the
+    // retry from runtime 0 until runtime 1 has answered it.
+    {
+        std::lock_guard<std::mutex> lock{filter_mutex};
+        hold_proposals_to_zero = true;
+    }
     runtimes[2]->NotifyTick(); // normal proposal retry after queued evidence
+    BOOST_REQUIRE(WaitUntil([&] {
+        std::lock_guard<std::mutex> lock{filter_mutex};
+        return voter_replays > 0;
+    }));
+    std::vector<std::pair<size_t, flowmesh::WireMessage>> held;
+    {
+        std::lock_guard<std::mutex> lock{filter_mutex};
+        hold_proposals_to_zero = false;
+        held.swap(held_proposals);
+    }
+    for (auto& [from, message] : held) {
+        BOOST_REQUIRE(runtimes[0]->EnqueueWireMessage(static_cast<int64_t>(from), std::move(message)) ==
+                      flowmesh::QueueResult::ACCEPTED);
+    }
     BOOST_REQUIRE(WaitUntil([&] { return all_at(3); }));
     for (const auto& runtime : runtimes) BOOST_REQUIRE(runtime->WaitForIdle(std::chrono::seconds{2}));
     std::optional<node::StoredProductionEntry> committed;
@@ -4795,6 +4905,14 @@ BOOST_AUTO_TEST_CASE(repeated_proposal_replays_cached_attestation)
     runtimes[0]->NotifyTick();
     BOOST_REQUIRE(WaitUntil([&] {
         return network.DroppedFirstAttestation();
+    }));
+    // Runtimes found idle one after another are no barrier: node 1's vote
+    // can reach node 0 after node 0 was found idle. Wait for node 0 to hold
+    // it.
+    BOOST_REQUIRE(WaitUntil([&] {
+        std::string ignored;
+        const auto data{runtimes[0]->MarketData(market, std::nullopt, {}, ignored)};
+        return data && data->snapshot.runtime.max_verified_attestations == 2;
     }));
     for (const auto& runtime : runtimes) {
         BOOST_REQUIRE(runtime->WaitForIdle(std::chrono::seconds{2}));
@@ -10047,7 +10165,9 @@ BOOST_AUTO_TEST_CASE(preagreement_action_admission_wakes_proposal_without_period
     // Seat zero is not sequence one's proposer. Its fresh ACTION must wake
     // the remote proposer too; there is no ticker in this harness and no
     // NotifyTick/clock advance between submission and durable certification.
+    f.HoldRound(); // until every runtime holds the deposit
     BOOST_REQUIRE(f.runtimes[0]->SubmitLocalAction(f.market, Deposit(f.outpoint)) == flowmesh::QueueResult::ACCEPTED);
+    f.ReleaseRound(1);
     BOOST_REQUIRE(WaitUntil([&] { return f.AllAt(2); }));
     f.Drain();
     BOOST_CHECK_GT(f.decisions.load(), decisions_before);
@@ -12013,7 +12133,9 @@ BOOST_AUTO_TEST_CASE(accepted_local_original_certificate_loss_recovers_on_period
     for (size_t n{0}; n < 4; ++n) f.Tick();
     BOOST_CHECK(f.clocks[0].Now() == clock);
     BOOST_REQUIRE_EQUAL(runtime.DeliverySnapshots(f.market).front().deferred_objects, 1U);
+    f.HoldRound(); // until every runtime holds the original action
     f.chains[0].SetReconciled(true); f.Tick();
+    f.ReleaseRound(1);
     BOOST_REQUIRE(WaitUntil([&] {
         for (size_t i{0}; i < 3; ++i) {
             const auto status{f.runtimes[i]->MarketStatus(f.market)};
@@ -12150,7 +12272,9 @@ BOOST_AUTO_TEST_CASE(local_source_survives_queue_drop_and_cannot_be_claimed_by_r
     f.Drain();
     BOOST_CHECK_EQUAL(node::FlowMeshRuntimeTestAccess::Sources(runtime).first, 1U);
     node::FlowMeshRuntimeTestAccess::DropQueueCopy(runtime, id);
+    f.HoldRound(); // until every runtime holds the original
     f.Tick(std::chrono::milliseconds{250});
+    f.ReleaseRound(1);
     BOOST_REQUIRE(WaitUntil([&] { return f.AllAt(2); }));
     f.Drain();
     BOOST_CHECK_EQUAL(runtime.StateSnapshot(f.market)->NextSequence(action.signer), 1U);
@@ -12229,8 +12353,10 @@ BOOST_AUTO_TEST_CASE(local_source_open_chain_seat_pause_preserves_retry_pacing_a
     f.Tick(std::chrono::milliseconds{250}); sample();
     BOOST_CHECK_EQUAL(action_processing, first_pass + 1);
     BOOST_CHECK(node::FlowMeshRuntimeTestAccess::Deadline(runtime, id) == deadline);
+    f.HoldRound(); // until every runtime holds the original
     f.chains[0].SetTransition(f.market, node::FlowMeshSeatTransitionKind::CONTINUE);
     f.Tick(std::chrono::milliseconds{250});
+    f.ReleaseRound(1);
     BOOST_REQUIRE(WaitUntil([&] { return f.AllAt(3); }));
     f.Drain();
     BOOST_CHECK_EQUAL(runtime.StateSnapshot(f.market)->NextSequence(action.signer), 1U);
