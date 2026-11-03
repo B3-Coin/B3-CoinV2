@@ -10,10 +10,14 @@
 #include <consensus/params.h>
 #include <crypto/common.h>
 #include <kernel/chainparams.h>
+#include <modern/asset_output.h>
+#include <modern/asset_validation.h>
+#include <modern/creation_action.h>
 #include <modern/fn.h>
 #include <modern/fn_genesis.h>
 #include <modern/fn_genesis_validation.h>
 #include <modern/chain_domain.h>
+#include <modern/policy.h>
 #include <primitives/block.h>
 #include <primitives/transaction.h>
 #include <script/script.h>
@@ -30,6 +34,7 @@
 #include <numeric>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -563,6 +568,100 @@ BOOST_AUTO_TEST_CASE(mandatory_configuration_fails_closed_and_enforces_bounds)
     missing.fn_genesis_required = false;
     BOOST_CHECK(modern::CheckFnGenesisBlock(
         CoinbaseBlock(), *missing.hard_fork_height, missing, error));
+}
+
+//! No coinbase but FN Genesis's may carry an asset output. An asset output
+//! carries no native value, so the coinbase amount cap cannot see it: this
+//! rule alone keeps a block producer from minting FN, or any colored asset,
+//! in its coinbase.
+BOOST_AUTO_TEST_CASE(no_other_coinbase_carries_an_asset_output)
+{
+    std::string error;
+    const Consensus::Params params{
+        ConfiguredParams(Consensus::HISTORICAL_FN_PROVEN_FLOOR)};
+    const auto expected{modern::ExpectedFnGenesisOutputs(params, error)};
+    BOOST_REQUIRE_MESSAGE(expected.has_value(), error);
+    const int genesis_height{*params.hard_fork_height};
+
+    BOOST_CHECK(modern::CheckFnGenesisBlock(
+        CoinbaseBlock(), genesis_height + 1, params, error));
+    // One manifest unit again, before and after its genesis.
+    for (const int height : {genesis_height - 1, genesis_height + 1}) {
+        BOOST_CHECK(!modern::CheckFnGenesisBlock(
+            CoinbaseBlock({expected->front()}), height, params, error));
+        BOOST_CHECK_EQUAL(error, "asset output outside the FN Genesis coinbase");
+    }
+}
+
+//! No coinbase declares an asset genesis or an FN proof of disintegration,
+//! FN Genesis's included: either would create assets no transaction paid
+//! for.
+BOOST_AUTO_TEST_CASE(a_coinbase_carries_no_creation_declaration)
+{
+    std::string error;
+    const Consensus::Params params{
+        ConfiguredParams(Consensus::HISTORICAL_FN_PROVEN_FLOOR)};
+    const auto expected{modern::ExpectedFnGenesisOutputs(params, error)};
+    BOOST_REQUIRE_MESSAGE(expected.has_value(), error);
+    const int genesis_height{*params.hard_fork_height};
+
+    for (const uint16_t type : {modern::CREATION_ACTION_ASSET_ISSUANCE,
+                                modern::CREATION_ACTION_MODERN_FN_POD}) {
+        for (const int height : {genesis_height, genesis_height + 1}) {
+            CBlock block{CoinbaseBlock(height == genesis_height ? *expected
+                                                                : std::vector<CTxOut>{})};
+            BOOST_CHECK(modern::CheckFnGenesisBlock(block, height, params, error));
+            CMutableTransaction coinbase{*block.vtx.front()};
+            coinbase.mpa.push_back(CMpaRecord{type, 1, {}});
+            block.vtx.front() = MakeTransactionRef(std::move(coinbase));
+            BOOST_CHECK(!modern::CheckFnGenesisBlock(block, height, params, error));
+            BOOST_CHECK_EQUAL(error, "user asset/FN creation declaration is forbidden in coinbase");
+        }
+    }
+}
+
+//! FN Genesis's coinbase carries one unit per manifest row, in manifest
+//! order, and nothing more: a unit paid to another script, two units
+//! swapped, a unit missing or a unit more each leave it invalid.
+BOOST_AUTO_TEST_CASE(the_genesis_coinbase_carries_the_manifest_exactly)
+{
+    std::string error;
+    const Consensus::Params params{
+        ConfiguredParams(Consensus::HISTORICAL_FN_PROVEN_FLOOR)};
+    const auto expected{modern::ExpectedFnGenesisOutputs(params, error)};
+    BOOST_REQUIRE_MESSAGE(expected.has_value(), error);
+    BOOST_REQUIRE_GE(expected->size(), 2U);
+    const int genesis_height{*params.hard_fork_height};
+    BOOST_CHECK(modern::CheckFnGenesisBlock(
+        CoinbaseBlock(*expected), genesis_height, params, error));
+
+    const auto fn_asset{modern::ConfiguredFnAssetId(params)};
+    BOOST_REQUIRE(fn_asset.has_value());
+    const auto elsewhere{modern::MakeAssetOwnerOutput(
+        *fn_asset, 1, modern::PolicyType::FN, CScript() << OP_TRUE)};
+    BOOST_REQUIRE(elsewhere.has_value());
+    std::vector<CTxOut> redirected{*expected};
+    redirected.front() = *elsewhere;
+    std::vector<CTxOut> swapped{*expected};
+    std::swap(swapped[0], swapped[1]);
+    std::vector<CTxOut> one_missing{*expected};
+    one_missing.pop_back();
+    std::vector<CTxOut> one_more{*expected};
+    one_more.push_back(expected->back());
+
+    const std::string mismatch{"FN Genesis coinbase outputs do not match the pinned manifest"};
+    BOOST_CHECK(!modern::CheckFnGenesisBlock(
+        CoinbaseBlock(redirected), genesis_height, params, error));
+    BOOST_CHECK_EQUAL(error, mismatch);
+    BOOST_CHECK(!modern::CheckFnGenesisBlock(
+        CoinbaseBlock(swapped), genesis_height, params, error));
+    BOOST_CHECK_EQUAL(error, mismatch);
+    BOOST_CHECK(!modern::CheckFnGenesisBlock(
+        CoinbaseBlock(one_missing), genesis_height, params, error));
+    BOOST_CHECK_EQUAL(error, mismatch);
+    BOOST_CHECK(!modern::CheckFnGenesisBlock(
+        CoinbaseBlock(one_more), genesis_height, params, error));
+    BOOST_CHECK_EQUAL(error, mismatch);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

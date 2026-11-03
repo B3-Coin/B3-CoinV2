@@ -31,8 +31,10 @@
 #include <node/utxo_rows.h>
 #include <kernel/mempool_removal_reason.h>
 #include <modern/pos.h>
+#include <modern/asset_output.h>
 #include <modern/chain_domain.h>
 #include <modern/fn_genesis_validation.h>
+#include <modern/policy.h>
 #include <modern/stake.h>
 #include <node/mempool_persist.h>
 #include <node/miner.h>
@@ -2685,6 +2687,134 @@ BOOST_AUTO_TEST_CASE(stake_policy_in_corridor)
         LOCK(cs_main);
         BOOST_CHECK(!chainman.ActiveChainstate().CoinsTip().HaveCoin(COutPoint{stake_txid, 0}));
     }
+}
+
+//! No coinbase but FN Genesis's may carry an asset output; here a corridor
+//! block's coinbase carries a colored-asset owner output. An asset output
+//! carries no native value, so the coinbase amount cap cannot see it: this
+//! rule alone keeps a block producer from minting FN or a colored asset.
+//! Both places that apply it refuse the block on their own:
+//! ContextualCheckBlock, before the block is stored, and ConnectBlock, which
+//! -reindex-chainstate runs without the former.
+BOOST_AUTO_TEST_CASE(corridor_coinbase_carries_no_asset_output)
+{
+    ChainstateManager& chainman{*m_node.chainman};
+    const Consensus::Params& consensus{chainman.GetConsensus()};
+    auto& mutable_consensus{const_cast<Consensus::Params&>(consensus)};
+
+    constexpr int H{3};
+    constexpr uint32_t EASY_BITS{0x207fffff};
+    const auto tip{[&] { return WITH_LOCK(cs_main, return chainman.ActiveChain().Tip()); }};
+
+    const auto build_legacy{[&](const CBlockIndex* prev) {
+        CMutableTransaction coinbase;
+        coinbase.version = 1;
+        coinbase.nTime = static_cast<uint32_t>(prev->GetBlockTime() + 17);
+        coinbase.m_legacy_encoding = true;
+        coinbase.vin.resize(1);
+        coinbase.vin[0].prevout.SetNull();
+        coinbase.vin[0].scriptSig = CScript() << (prev->nHeight + 1) << CScriptNum{99};
+        coinbase.vout.emplace_back(legacy::GetProofOfWorkReward(0, prev->nHeight + 1, consensus),
+                                   CScript() << OP_TRUE);
+        CBlock block;
+        block.nVersion = 4;
+        block.hashPrevBlock = prev->GetBlockHash();
+        block.nTime = static_cast<uint32_t>(prev->GetBlockTime() + 17);
+        block.nBits = legacy::GetNextTargetRequired(prev, /*proof_of_stake=*/false, consensus);
+        block.vtx.push_back(MakeTransactionRef(std::move(coinbase)));
+        block.hashMerkleRoot = BlockMerkleRoot(block);
+        const arith_uint256 target{arith_uint256().SetCompact(block.nBits)};
+        block.nNonce = 0;
+        while (UintToArith256(block.GetLegacyB3Hash()) > target) ++block.nNonce;
+        return block;
+    }};
+    for (int height{1}; height <= H; ++height) {
+        bool new_block{false};
+        BOOST_REQUIRE(chainman.ProcessNewBlock(CodecRoundTrip(build_legacy(tip())), true, true, &new_block));
+        BOOST_REQUIRE(new_block);
+    }
+    mutable_consensus.hard_fork_height = H + 1;
+    mutable_consensus.legacy_final_hash = tip()->GetBlockHash();
+    mutable_consensus.transition_pow_length = 6;
+    mutable_consensus.transition_pow_bits = EASY_BITS;
+    mutable_consensus.transition_pow_reward = 0; // ratified fees-only, stated explicitly
+
+    const auto build_corridor{[&](const CBlockIndex* prev, const std::vector<CTxOut>& extra_outputs) {
+        CMutableTransaction coinbase;
+        coinbase.version = 2;
+        coinbase.vin.resize(1);
+        coinbase.vin[0].prevout.SetNull();
+        coinbase.vin[0].scriptSig = CScript() << CScriptNum{prev->nHeight + 1} << CScriptNum{7};
+        coinbase.vout.emplace_back(0, CScript() << OP_TRUE);
+        coinbase.vout.insert(coinbase.vout.end(), extra_outputs.begin(), extra_outputs.end());
+        CBlock block;
+        block.nVersion = static_cast<int32_t>(Consensus::B3_BLOCK_CODEC_V2_VERSION);
+        block.hashPrevBlock = prev->GetBlockHash();
+        block.nTime = static_cast<uint32_t>(prev->GetBlockTime() + 60);
+        block.nBits = EASY_BITS;
+        block.vtx.push_back(MakeTransactionRef(std::move(coinbase)));
+        block.hashMerkleRoot = BlockMerkleRoot(block);
+        block.nNonce = 0;
+        while (!CheckTransitionPowEligibility(block)) ++block.nNonce;
+        return block;
+    }};
+    {
+        bool new_block{false};
+        BOOST_REQUIRE(chainman.ProcessNewBlock(std::make_shared<const CBlock>(build_corridor(tip(), {})),
+                                               true, true, &new_block));
+        BOOST_REQUIRE_EQUAL(tip()->nHeight, H + 1);
+    }
+
+    modern::AssetId asset;
+    asset.begin()[0] = 0x55;
+    const auto minted{modern::MakeAssetOwnerOutput(asset, 1'000'000, modern::PolicyType::OWNER,
+                                                   CScript() << OP_TRUE)};
+    BOOST_REQUIRE(minted.has_value());
+    BOOST_CHECK_EQUAL(minted->nValue, 0);
+    const CBlock ordinary{build_corridor(tip(), {})};
+    const CBlock minting{build_corridor(tip(), {*minted})};
+
+    {
+        LOCK(cs_main);
+        Chainstate& chainstate{chainman.ActiveChainstate()};
+        const BlockValidationState ordinary_state{TestBlockValidity(
+            chainstate, ordinary, /*check_pow=*/true, /*check_merkle_root=*/true)};
+        BOOST_CHECK_MESSAGE(ordinary_state.IsValid(), ordinary_state.ToString());
+        const BlockValidationState state{TestBlockValidity(
+            chainstate, minting, /*check_pow=*/true, /*check_merkle_root=*/true)};
+        BOOST_CHECK(state.IsInvalid());
+        BOOST_CHECK_EQUAL(state.GetRejectReason(), "bad-fn-genesis");
+        BOOST_CHECK_EQUAL(state.GetDebugMessage(), "asset output outside the FN Genesis coinbase");
+
+        // ConnectBlock alone, on a dummy index as TestBlockValidity builds.
+        const auto connect_only{[&](const CBlock& block) EXCLUSIVE_LOCKS_REQUIRED(cs_main) {
+            const uint256 hash{block.GetMarkerHash(consensus)};
+            CBlockIndex index{block};
+            index.pprev = chainstate.m_chain.Tip();
+            index.nHeight = index.pprev->nHeight + 1;
+            index.phashBlock = &hash;
+            CCoinsViewCache view{&chainstate.CoinsTip()};
+            BlockValidationState connect_state;
+            const bool connected{chainstate.ConnectBlock(block, connect_state, &index, view, /*fJustCheck=*/true)};
+            BOOST_CHECK_EQUAL(connected, connect_state.IsValid());
+            return connect_state;
+        }};
+        const BlockValidationState ordinary_connect{connect_only(ordinary)};
+        BOOST_CHECK_MESSAGE(ordinary_connect.IsValid(), ordinary_connect.ToString());
+        const BlockValidationState connect_state{connect_only(minting)};
+        BOOST_CHECK(connect_state.IsInvalid());
+        BOOST_CHECK_EQUAL(connect_state.GetRejectReason(), "bad-fn-genesis");
+    }
+
+    // Received, the block is refused before it is stored; the ordinary one
+    // extends the chain.
+    bool new_block{true};
+    BOOST_CHECK(!chainman.ProcessNewBlock(std::make_shared<const CBlock>(minting), true, true, &new_block));
+    BOOST_CHECK(!new_block);
+    BOOST_CHECK_EQUAL(tip()->nHeight, H + 1);
+    BOOST_REQUIRE(chainman.ProcessNewBlock(std::make_shared<const CBlock>(ordinary), true, true, &new_block));
+    BOOST_CHECK(new_block);
+    BOOST_CHECK_EQUAL(tip()->nHeight, H + 2);
 }
 
 //! The complete transition corridor end to end (stage 8): a live legacy
