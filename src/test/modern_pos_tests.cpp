@@ -1202,7 +1202,10 @@ BOOST_FIXTURE_TEST_CASE(staking_loop_produces_blocks, ModernPosStakingSetup)
     BOOST_REQUIRE_MESSAGE(loop.Start(m_key_a, CScript() << OP_TRUE, error), error);
     BOOST_CHECK(!loop.Start(m_key_a, CScript() << OP_TRUE, error)); // already running
 
-    for (int i{0}; i < 600 && Tip()->nHeight < start_height + 3; ++i) {
+    // The loop makes each block the tip a moment before it counts it, so
+    // wait for both: the tip alone can be a block ahead of the count.
+    const auto produced{[&] { return loop.Status(std::nullopt).blocks_produced; }};
+    for (int i{0}; i < 600 && (Tip()->nHeight < start_height + 3 || produced() < 3); ++i) {
         UninterruptibleSleep(std::chrono::milliseconds{50});
         SetMockTime(GetTime() + 60);
     }
