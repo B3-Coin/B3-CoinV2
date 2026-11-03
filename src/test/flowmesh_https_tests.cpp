@@ -4520,6 +4520,19 @@ std::pair<int, UniValue> ApiCall(const node::HttpsEndpoint& endpoint, const std:
     return {reply.status, value};
 }
 
+//! ApiCall for another thread. Boost.Test's checks belong to the test's own
+//! thread, so a reply that is missing or not JSON throws instead, and the
+//! test sees it through the future that ran the call.
+std::pair<int, UniValue> ApiCallOffThread(const node::HttpsEndpoint& endpoint, const std::string& method, const std::string& params)
+{
+    const auto reply{node::FlowMeshHttpsRequest(endpoint, "/flowmesh/v1",
+        "{\"method\":\"" + method + "\",\"params\":" + params + "}", std::chrono::seconds{5}, 1 << 24)};
+    if (!reply.response_received) throw std::runtime_error{"no reply: " + reply.error};
+    UniValue value;
+    if (!value.read(reply.body)) throw std::runtime_error{"the reply is not JSON"};
+    return {reply.status, value};
+}
+
 /** Runs `burst` at the start of a fresh one-second budget window of this
  * identity, up to five times, until one run finishes within 900 ms; its
  * result, or nullopt when none fitted (the caller fails). */
@@ -6399,11 +6412,12 @@ BOOST_AUTO_TEST_CASE(trading_api_updates_watchers_are_bounded_and_hold_no_permit
     BOOST_REQUIRE_MESSAGE(api->Start(error), error);
     const auto endpoint{Endpoint(api->Port())};
     const auto cursor{ApiCall(endpoint, "updates", UpdatesParams(market)).second["result"]["cursor"]};
+    // Also runs on other threads, so it checks nothing itself: an HTTP error
+    // comes back as the label, which the test's thread compares.
     const auto watch = [&] {
         const auto start{std::chrono::steady_clock::now()};
-        const auto [status, reply]{ApiCall(endpoint, "updates", UpdatesParams(market, CursorParam(cursor) + ",\"watch_ms\":1500"))};
-        BOOST_REQUIRE_EQUAL(status, 200);
-        return std::pair{reply["result"]["watch_status"].get_str(), Elapsed(start)};
+        const auto [status, reply]{ApiCallOffThread(endpoint, "updates", UpdatesParams(market, CursorParam(cursor) + ",\"watch_ms\":1500"))};
+        return std::pair{status == 200 ? reply["result"]["watch_status"].get_str() : "HTTP " + std::to_string(status), Elapsed(start)};
     };
     auto first{std::async(std::launch::async, watch)};
     auto second{std::async(std::launch::async, watch)};
@@ -6431,7 +6445,7 @@ BOOST_AUTO_TEST_CASE(trading_api_updates_watchers_are_bounded_and_hold_no_permit
     BOOST_REQUIRE_MESSAGE(single->Start(error), error);
     const auto single_endpoint{Endpoint(single->Port())};
     auto sleeping{std::async(std::launch::async, [&] {
-        return ApiCall(single_endpoint, "updates", UpdatesParams(market, CursorParam(cursor) + ",\"watch_ms\":1500")).second;
+        return ApiCallOffThread(single_endpoint, "updates", UpdatesParams(market, CursorParam(cursor) + ",\"watch_ms\":1500")).second;
     })};
     std::this_thread::sleep_for(std::chrono::milliseconds{300});
     const auto [status, refused]{ApiCall(single_endpoint, "updates", UpdatesParams(market, CursorParam(cursor) + ",\"watch_ms\":1500"))};
@@ -6456,7 +6470,7 @@ BOOST_AUTO_TEST_CASE(trading_api_updates_watch_wakes_on_commit_and_ends_on_stop)
     const std::string watch_params{UpdatesParams(market, CursorParam(plain["cursor"]) + ",\"known_head\":\"" +
                                                  plain["status"]["last_microblock_hash"].get_str() + "\",\"watch_ms\":2500")};
     const auto start{std::chrono::steady_clock::now()};
-    auto watcher{std::async(std::launch::async, [&] { return ApiCall(endpoint, "updates", watch_params).second["result"]; })};
+    auto watcher{std::async(std::launch::async, [&] { return ApiCallOffThread(endpoint, "updates", watch_params).second["result"]; })};
     std::this_thread::sleep_for(std::chrono::milliseconds{200});
     // Arming the seats certifies the market genesis: the commit's head event
     // ends the watch early.
@@ -8869,17 +8883,17 @@ BOOST_AUTO_TEST_CASE(watch_applies_a_commit_through_the_verified_snapshot)
     BOOST_REQUIRE_MESSAGE(client->Data(market, std::nullopt, Page(), error), error);
     BOOST_CHECK_EQUAL(client->Status().endpoints.at(0).live_updates_ms, 2000U);
     const auto start{std::chrono::steady_clock::now()};
+    // The watch's error is checked on this thread once the watch is back.
+    std::string watch_error;
     auto pending{std::async(std::launch::async, [&] {
-        std::string watch_error;
-        auto result{WatchRead(*client, market, std::chrono::milliseconds{1500}, watch_error)};
-        BOOST_CHECK_MESSAGE(result.first, watch_error);
-        return result;
+        return WatchRead(*client, market, std::chrono::milliseconds{1500}, watch_error);
     })};
     std::this_thread::sleep_for(std::chrono::milliseconds{200});
     live.Deposit();
     // The deposit's admission events wake the (unfiltered) watch first; the
     // caller watches again at once until the commit's head arrives.
     auto [data, watch]{pending.get()};
+    BOOST_CHECK_MESSAGE(data, watch_error);
     for (int follow{0}; data && watch.waited && data->snapshot.next_microblock_sequence < 2 && follow < 5; ++follow) {
         std::tie(data, watch) = WatchRead(*client, market, std::chrono::milliseconds{1500}, error);
     }
@@ -9152,8 +9166,8 @@ BOOST_AUTO_TEST_CASE(watch_lane_connection_released_after_busy)
     // its connection go.
     const auto cursor{ApiCall(live.Endpoint(), "updates", UpdatesParams(market)).second["result"]["cursor"]};
     const std::string held{UpdatesParams(market, CursorParam(cursor) + ",\"known_head\":\"" + data->snapshot.last_microblock_hash.GetHex() + "\",\"watch_ms\":1500")};
-    auto first{std::async(std::launch::async, [&] { return ApiCall(live.Endpoint(), "updates", held); })};
-    auto second{std::async(std::launch::async, [&] { return ApiCall(live.Endpoint(), "updates", held); })};
+    auto first{std::async(std::launch::async, [&] { return ApiCallOffThread(live.Endpoint(), "updates", held); })};
+    auto second{std::async(std::launch::async, [&] { return ApiCallOffThread(live.Endpoint(), "updates", held); })};
     std::this_thread::sleep_for(std::chrono::milliseconds{300});
     const auto [busy_data, busy]{WatchRead(*client, market, std::chrono::milliseconds{300}, error)};
     BOOST_CHECK(busy_data);
