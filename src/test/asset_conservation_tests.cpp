@@ -431,4 +431,89 @@ BOOST_AUTO_TEST_CASE(arithmetic_is_overflow_safe)
                 modern::AssetCheck::AMOUNT_OVERFLOW);
 }
 
+//! A genesis creates its whole supply: an input that already carries the
+//! new id leaves the issuance invalid, even when the outputs hold exactly
+//! the declared supply. No chain can reach this, as the id commits to the
+//! first input's outpoint, which is spent once; the rule is a backstop.
+BOOST_AUTO_TEST_CASE(a_genesis_creates_its_whole_supply)
+{
+    const Consensus::Params params{B3ParamsActive()};
+    const modern::AssetId asset{Asset()};
+    modern::ModernTransitionV2 issue{Issue(DefiningPrevout(), Genesis())};
+    issue.inputs.resize(2);
+    issue.inputs[1].prevout = COutPoint{DefiningPrevout().hash, 2};
+    issue.inputs[1].proof_index = 1;
+    issue.outputs.push_back(Out(asset, 1000));
+
+    BOOST_CHECK(modern::CheckAssetConservation({Out(modern::NativeAsset(), 100),
+                                                Out(modern::NativeAsset(), 1)},
+                                               issue, MODERN_HEIGHT, params) ==
+                modern::AssetCheck::OK);
+    BOOST_CHECK(modern::CheckAssetConservation({Out(modern::NativeAsset(), 100), Out(asset, 1)},
+                                               issue, MODERN_HEIGHT, params) ==
+                modern::AssetCheck::ISSUANCE_INVALID);
+}
+
+//! Spent outputs are held to the output policy too. On chain, the
+//! transaction checker's input view refuses such a coin first, so this is
+//! a backstop.
+BOOST_AUTO_TEST_CASE(spent_outputs_are_held_to_the_output_policy)
+{
+    const Consensus::Params params{B3ParamsActive()};
+    const modern::AssetId asset{Asset()};
+    modern::ModernTransition t{Spend(COutPoint{DefiningPrevout().hash, 19})};
+    t.outputs.push_back(Out(asset, 1000));
+    BOOST_CHECK(modern::CheckAssetConservation({Out(asset, 1000)}, t, MODERN_HEIGHT, params) ==
+                modern::AssetCheck::OK);
+
+    // An owner output carries no parameters.
+    modern::ModernOutput with_params{Out(asset, 1000)};
+    with_params.policy_params = {0x01};
+    BOOST_CHECK(modern::CheckAssetConservation({with_params}, t, MODERN_HEIGHT, params) ==
+                modern::AssetCheck::POLICY_INVALID);
+}
+
+//! An issuance record is version 1 only: the same bytes under another
+//! version neither decode nor issue. On chain the record layer refuses
+//! that version first (GetPayloadTypeStatus), so this is a backstop.
+BOOST_AUTO_TEST_CASE(an_issuance_action_is_version_one_only)
+{
+    const Consensus::Params params{B3ParamsActive()};
+    modern::ModernTransitionV2 issue{Issue(DefiningPrevout(), Genesis())};
+    issue.outputs.push_back(Out(Asset(), 1000));
+    BOOST_CHECK(modern::CheckAssetConservation({Out(modern::NativeAsset(), 100)}, issue,
+                                               MODERN_HEIGHT, params) ==
+                modern::AssetCheck::OK);
+
+    issue.creation_actions[0].action_version = modern::ASSET_ISSUANCE_ACTION_VERSION_V1 + 1;
+    modern::AssetGenesisV1 decoded;
+    std::string error;
+    BOOST_CHECK(!modern::DecodeAssetIssuanceAction(issue.creation_actions[0], decoded, error));
+    BOOST_CHECK_EQUAL(error, "not an asset issuance action");
+    BOOST_CHECK(modern::CheckAssetConservation({Out(modern::NativeAsset(), 100)}, issue,
+                                               MODERN_HEIGHT, params) ==
+                modern::AssetCheck::ISSUANCE_INVALID);
+}
+
+//! FN Coin moves from its H+1 genesis, but no colored asset may be issued
+//! until colored assets activate. On chain the transaction checker
+//! refuses such an issuance first, so this is a backstop.
+BOOST_AUTO_TEST_CASE(no_genesis_while_only_fn_is_active)
+{
+    Consensus::Params fn_only{B3Params()};
+    fn_only.fn_genesis_rights_root = uint256::ONE;
+    fn_only.fn_genesis_manifest.emplace_back();
+    BOOST_REQUIRE(Consensus::FnRulesActive(MODERN_HEIGHT, fn_only));
+    BOOST_REQUIRE(!Consensus::AssetRulesActive(MODERN_HEIGHT, fn_only));
+
+    modern::ModernTransitionV2 issue{Issue(DefiningPrevout(), Genesis())};
+    issue.outputs.push_back(Out(Asset(), 1000));
+    BOOST_CHECK(modern::CheckAssetConservation({Out(modern::NativeAsset(), 100)}, issue,
+                                               MODERN_HEIGHT, fn_only) ==
+                modern::AssetCheck::NOT_ACTIVE);
+    BOOST_CHECK(modern::CheckAssetConservation({Out(modern::NativeAsset(), 100)}, issue,
+                                               MODERN_HEIGHT, B3ParamsActive()) ==
+                modern::AssetCheck::OK);
+}
+
 BOOST_AUTO_TEST_SUITE_END()

@@ -413,4 +413,90 @@ BOOST_AUTO_TEST_CASE(issuance_requires_at_least_one_thousand_b3_to_treasury)
     BOOST_CHECK_EQUAL(error, "asset issuance does not pay 1,000 B3 to the treasury");
 }
 
+//! An authorized mint (here a bridge deposit's) opens one exact surplus of
+//! its asset: a transaction that mints less than it, or nothing, is refused
+//! like one that mints more.
+BOOST_AUTO_TEST_CASE(an_authorized_mint_creates_exactly_its_amount)
+{
+    const Consensus::Params params{TestParams()};
+    const modern::AssetId asset{TestAsset()};
+    const std::vector<Coin> coins{NativeCoin()};
+    std::string error;
+    modern::AssetTransactionEffects effects;
+    const auto check{[&](const CMutableTransaction& tx, const CAmount authorized) {
+        error.clear();
+        return modern::CheckAssetTransaction(
+            CTransaction{tx}, coins, ASSET_ACTIVATION_HEIGHT, params,
+            modern::AssetTransactionContext{
+                std::nullopt, NATIVE_INPUT_VALUE,
+                modern::AuthorizedAssetMint{asset, authorized}},
+            effects, error);
+    }};
+
+    CMutableTransaction mint{Spend({Prevout(52)})};
+    mint.vout.push_back(AssetOwnerOutput(asset, 25));
+    BOOST_CHECK(check(mint, 25));
+    BOOST_CHECK(!check(mint, 24));
+    BOOST_CHECK_EQUAL(error, ConservationError(modern::AssetCheck::UNAUTHORIZED_MINT));
+    BOOST_CHECK(!check(mint, 26));
+    BOOST_CHECK_EQUAL(error, ConservationError(modern::AssetCheck::UNAUTHORIZED_MINT));
+
+    // The authorization alone makes this an asset transaction.
+    CMutableTransaction none{Spend({Prevout(52)})};
+    none.vout.emplace_back(NATIVE_CHANGE_VALUE, CScript() << OP_TRUE);
+    BOOST_CHECK(!check(none, 25));
+    BOOST_CHECK_EQUAL(error, ConservationError(modern::AssetCheck::ISSUANCE_INVALID));
+}
+
+//! A spent asset coin makes its transaction an asset transaction even when
+//! every output is native B3: the units may leave only through an explicit
+//! burn, never by vanishing.
+BOOST_AUTO_TEST_CASE(an_asset_input_alone_makes_an_asset_transaction)
+{
+    const Consensus::Params params{TestParams()};
+    const modern::AssetId asset{TestAsset()};
+    const std::vector<Coin> coins{PreviousCoin(AssetOwnerOutput(asset, 25)), NativeCoin()};
+    std::string error;
+
+    CMutableTransaction native_only{Spend({Prevout(53), Prevout(54)})};
+    native_only.vout.emplace_back(NATIVE_CHANGE_VALUE, CScript() << OP_TRUE);
+    BOOST_CHECK(!Check(native_only, coins, ASSET_ACTIVATION_HEIGHT, params, error));
+    BOOST_CHECK_EQUAL(error, ConservationError(modern::AssetCheck::CONSERVATION_MISMATCH));
+
+    CMutableTransaction burned{native_only};
+    burned.vout.push_back(AssetBurnOutput(asset, 25));
+    BOOST_CHECK(Check(burned, coins, ASSET_ACTIVATION_HEIGHT, params, error));
+}
+
+//! The coin view matches the inputs one to one: a view with a coin more
+//! than the transaction spends is refused, not read in part.
+BOOST_AUTO_TEST_CASE(the_coin_view_matches_the_inputs_one_to_one)
+{
+    const Consensus::Params params{TestParams()};
+    CMutableTransaction tx{Spend({Prevout(55)})};
+    tx.vout.emplace_back(NATIVE_CHANGE_VALUE, CScript() << OP_TRUE);
+    std::string error;
+    BOOST_CHECK(Check(tx, {NativeCoin()}, ASSET_ACTIVATION_HEIGHT, params, error));
+    BOOST_CHECK(!Check(tx, {NativeCoin(), NativeCoin()}, ASSET_ACTIVATION_HEIGHT, params, error));
+    BOOST_CHECK_EQUAL(error, "asset previous-output view does not match inputs");
+}
+
+//! The output view holds an output to its policy's contextual rules: an
+//! FN output above the lifetime cap parses, but is refused. On chain the
+//! conservation check refuses it too, so this is a backstop.
+BOOST_AUTO_TEST_CASE(the_output_view_applies_the_policy_rules)
+{
+    const Consensus::Params params{TestParams()};
+    const modern::AssetId fn{FnAsset(params)};
+    std::string error;
+    BOOST_CHECK(modern::ViewAssetAwareOutput(
+        AssetOwnerOutput(fn, Consensus::MAX_FN_EVER_ISSUED, modern::PolicyType::FN),
+        ASSET_ACTIVATION_HEIGHT, params, error));
+    const CTxOut over{
+        AssetOwnerOutput(fn, Consensus::MAX_FN_EVER_ISSUED + 1, modern::PolicyType::FN)};
+    BOOST_CHECK(modern::ParseAssetOutput(over, error));
+    BOOST_CHECK(!modern::ViewAssetAwareOutput(over, ASSET_ACTIVATION_HEIGHT, params, error));
+    BOOST_CHECK_EQUAL(error, "asset policy output failed contextual validation");
+}
+
 BOOST_AUTO_TEST_SUITE_END()

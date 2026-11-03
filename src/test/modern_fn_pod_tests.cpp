@@ -407,4 +407,23 @@ BOOST_AUTO_TEST_CASE(the_declared_output_is_an_fn_owner_output)
         error, "modern FN PoD declaration does not name an amount-1 FN owner output");
 }
 
+BOOST_AUTO_TEST_CASE(a_creation_mints_a_new_unit_not_a_spent_one)
+{
+    // The declared amount-1 FN owner output only carries an FN unit the
+    // transaction spends: nothing is minted, so the creation is refused and
+    // no slot is used up without a new unit.
+    const Consensus::Params params{TestParams()};
+    const CAmount required{modern::RequiredFnPodDisintegration(0)};
+    CMutableTransaction moved{PodTransaction(params, 0, required)};
+    moved.vin.emplace_back(Prevout(77));
+    const std::vector<Coin> coins{
+        NativeCoin(), Coin{FnOutput(params, 1, 0x43), FN_GENESIS_HEIGHT, /*fCoinBaseIn=*/false}};
+    modern::AssetTransactionEffects effects;
+    std::string error;
+    BOOST_CHECK(!modern::CheckAssetTransaction(
+        CTransaction{moved}, coins, FN_POD_ACTIVATION_HEIGHT, params,
+        modern::AssetTransactionContext{0, required}, effects, error));
+    BOOST_CHECK_EQUAL(error, ConservationError(modern::AssetCheck::ISSUANCE_INVALID));
+}
+
 BOOST_AUTO_TEST_SUITE_END()

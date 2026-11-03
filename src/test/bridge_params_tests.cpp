@@ -598,4 +598,41 @@ BOOST_AUTO_TEST_CASE(bridge_asset_outputs_activate_at_m_without_colored_assets)
                     .has_value());
 }
 
+//! The bridge asset's exception starts with its bridge: one block before the
+//! bridge activates, its outputs wait for colored assets like any other. On
+//! chain none can exist before the bridge mints, so this is a backstop.
+BOOST_AUTO_TEST_CASE(bridge_asset_outputs_wait_for_the_bridge_itself)
+{
+    CChainParams::RegTestOptions options;
+    CChainParams::B3ModernRegTestOptions b3;
+    b3.flowmesh_test = true;
+    options.b3_modern = b3;
+    auto chain{CChainParams::RegTest(options)};
+    auto& params{const_cast<Consensus::Params&>(chain->GetConsensus())};
+
+    const int modern_start{*Consensus::ModernPosStartHeight(params)};
+    BOOST_REQUIRE(params.busd_bridge);
+    params.busd_bridge->activation_height = modern_start + 1;
+    BOOST_REQUIRE_LT(modern_start + 1, *params.asset_activation_height);
+    BOOST_REQUIRE(!Consensus::BridgeRulesActive(modern_start, params));
+    BOOST_REQUIRE(Consensus::BridgeRulesActive(modern_start + 1, params));
+
+    const auto bridge_asset{modern::ConfiguredBridgeAssetId(params)};
+    BOOST_REQUIRE(bridge_asset);
+    const auto owner{
+        modern::MakeAssetOwnerOutput(*bridge_asset, 1'000'000, CScript() << OP_TRUE)};
+    const auto burn{modern::MakeAssetBurnOutput(*bridge_asset, 1'000'000)};
+    BOOST_REQUIRE(owner);
+    BOOST_REQUIRE(burn);
+
+    std::string error;
+    BOOST_CHECK(!modern::ViewAssetAwareOutput(*owner, modern_start, params, error).has_value());
+    BOOST_CHECK_EQUAL(error, "colored-asset owner output is not active");
+    error.clear();
+    BOOST_CHECK(!modern::ViewAssetAwareOutput(*burn, modern_start, params, error).has_value());
+    BOOST_CHECK_EQUAL(error, "colored-asset burn is not active");
+    BOOST_CHECK(modern::ViewAssetAwareOutput(*owner, modern_start + 1, params, error).has_value());
+    BOOST_CHECK(modern::ViewAssetAwareOutput(*burn, modern_start + 1, params, error).has_value());
+}
+
 BOOST_AUTO_TEST_SUITE_END()
