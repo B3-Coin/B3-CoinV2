@@ -14,6 +14,12 @@ namespace util {
 //! UNIX utilities such as top and killall. Use ThreadSetInternalName instead.
 void ThreadRename(const std::string&);
 
+//! Set a function ThreadRename() calls on each thread it names, once the
+//! name is set (the crash reporter gives each named thread its own signal
+//! stack). It is read atomically; threads named before it is set are not
+//! called back. nullptr removes it.
+void ThreadSetRenameHook(void (*hook)());
+
 //! Set the internal (in-memory) name of the current thread only.
 void ThreadSetInternalName(const std::string&);
 

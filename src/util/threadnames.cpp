@@ -2,6 +2,7 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
+#include <atomic>
 #include <cstring>
 #include <string>
 #include <thread>
@@ -53,10 +54,18 @@ static void SetInternalName(const std::string& name)
     g_thread_name[copy_bytes] = '\0';
 }
 
+static std::atomic<void (*)()> g_rename_hook{nullptr};
+
 void util::ThreadRename(const std::string& name)
 {
     SetThreadName(("b-" + name).c_str());
     SetInternalName(name);
+    if (const auto hook{g_rename_hook.load()}) hook();
+}
+
+void util::ThreadSetRenameHook(void (*hook)())
+{
+    g_rename_hook.store(hook);
 }
 
 void util::ThreadSetInternalName(const std::string& name)

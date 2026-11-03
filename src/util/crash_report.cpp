@@ -33,6 +33,7 @@
 #include <compat/compat.h>
 #else
 #include <fcntl.h>
+#include <pthread.h>
 #include <sys/stat.h>
 #include <sys/utsname.h>
 #include <unistd.h>
@@ -45,8 +46,10 @@
 #endif
 #endif
 
-// Everything a handler touches is prepared by Install() in static storage,
-// so writing a report needs no allocation, no locks and no C++ runtime.
+// Everything a handler touches is prepared in advance, by Install() in
+// static storage and, for a named thread's signal stack, when the thread is
+// named, so writing a report needs no allocation, no locks and no C++
+// runtime.
 namespace crash_report {
 namespace {
 
@@ -415,7 +418,11 @@ bool InstallPlatform(const fs::path& report, const fs::path& directory)
 
 char g_directory_path[4096];
 char g_report_path[4096];
-alignas(16) char g_alt_stack[64 * 1024];
+//! A signal stack's size: room for the handler, backtrace() and dladdr().
+constexpr size_t SIGNAL_STACK_SIZE{64 * 1024};
+alignas(16) char g_alt_stack[SIGNAL_STACK_SIZE];
+//! Holds each named thread's signal stack, freed when the thread ends.
+pthread_key_t g_signal_stack_key;
 
 const char* SignalName(int sig)
 {
@@ -490,6 +497,35 @@ std::string OsDescription()
     return strprintf("%s %s %s", name.sysname, name.release, name.machine);
 }
 
+//! When a named thread ends: stop using its signal stack, then free it.
+void ReleaseSignalStack(void* memory)
+{
+    stack_t off{};
+    off.ss_flags = SS_DISABLE;
+    sigaltstack(&off, nullptr);
+    std::free(memory);
+}
+
+//! The rename hook: give the calling thread a signal stack of its own, so
+//! the handler can run after a stack overflow on it, as a thread does not
+//! inherit one. A thread that has one keeps it (Install()'s own thread, or
+//! a sanitizer's).
+void PrepareThread()
+{
+    stack_t current{};
+    if (sigaltstack(nullptr, &current) != 0 || !(current.ss_flags & SS_DISABLE)) return;
+    void* memory{std::malloc(SIGNAL_STACK_SIZE)};
+    if (memory == nullptr) return;
+    stack_t alt{};
+    alt.ss_sp = memory;
+    alt.ss_size = SIGNAL_STACK_SIZE;
+    if (sigaltstack(&alt, nullptr) != 0) {
+        std::free(memory);
+    } else if (pthread_setspecific(g_signal_stack_key, memory) != 0) {
+        ReleaseSignalStack(memory);
+    }
+}
+
 bool InstallPlatform(const fs::path& report, const fs::path& directory)
 {
     const std::string narrow{fs::PathToString(report)};
@@ -503,6 +539,8 @@ bool InstallPlatform(const fs::path& report, const fs::path& directory)
     void* warmup[1];
     backtrace(warmup, 1);
 #endif
+    if (pthread_key_create(&g_signal_stack_key, ReleaseSignalStack) != 0) return false;
+    // This thread's signal stack; threads named later get their own.
     stack_t alt{};
     alt.ss_sp = g_alt_stack;
     alt.ss_size = sizeof(g_alt_stack);
@@ -515,6 +553,7 @@ bool InstallPlatform(const fs::path& report, const fs::path& directory)
     for (const int sig : {SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT}) {
         if (sigaction(sig, &action, nullptr) != 0) return false;
     }
+    util::ThreadSetRenameHook(PrepareThread);
     return true;
 }
 

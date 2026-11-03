@@ -54,6 +54,9 @@ class CrashReportTest(BitcoinTestFramework):
              ["reason: abort", "thread: init", "message: ", "Assertion `null_pointer' failed."]),
             ("throw", signal.SIGABRT, "uncaught exception: crash report test exception",
              ["reason: abort", "thread: crashtest", "message: uncaught exception: crash report test exception"]),
+            # A stack overflow on a thread other than the one that installed
+            # the reporter: the handler runs on that thread's own signal stack.
+            ("overflow", signal.SIGSEGV, "", ["reason: fatal signal", "signal: 11 (SIGSEGV)", "thread: crashtest"]),
         ]
         for kind, sig, stderr, expected in cases:
             self.log.info(f"A {kind} crash leaves one report with its reason")
