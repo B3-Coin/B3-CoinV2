@@ -144,8 +144,12 @@ BOOST_AUTO_TEST_CASE(append_barrier_and_scan_reproduce_records)
     }
     BOOST_CHECK(std::equal(expected.begin(), expected.end(), image.begin()));
     BOOST_CHECK_EQUAL(observer.events.size(), 7U);
-    // Reading back from disk is M4-STO-01.
-    RequireStub(journal.ReadAll(), "M4-STO-01");
+    // Reading back from disk (landed with M4-STO-06): the durable records only.
+    BOOST_CHECK_EQUAL(journal.Append(RecordType::INTENT, Bytes("not yet durable")).value(), 4U);
+    const Result<std::vector<JournalRecord>> all{journal.ReadAll()};
+    RequireStorageOk(all, "ReadAll");
+    BOOST_REQUIRE_EQUAL(all->size(), 3U);
+    BOOST_CHECK(all->at(0) == scan->records[0] && all->at(2) == scan->records[2]);
 }
 
 BOOST_AUTO_TEST_CASE(commit_failure_on_closed_fd_is_sticky)
@@ -189,26 +193,167 @@ BOOST_AUTO_TEST_CASE(commit_failure_on_closed_fd_is_sticky)
     BOOST_CHECK(journal->Status() == (JournalStatus{1, 0, true}));
 }
 
-BOOST_AUTO_TEST_CASE(full_segment_is_refused_without_fencing)
+//! Every record of every segment file in `dir`, scanned the way a reopen will (chain continued across segments).
+std::vector<JournalRecord> ScanSegments(const fs::path& dir, JournalRole role, uint64_t instance, size_t segments)
 {
-    const TestDir root{"full_segment"};
+    std::vector<JournalRecord> out;
+    uint256 prev{JournalGenesisChain(role, instance)};
+    for (size_t index{0}; index < segments; ++index) {
+        const Result<ScanResult> scan{ScanRecordsFrom(ReadFile(dir / fs::u8path(SegmentFileName(index))), role, prev, out.size())};
+        RequireStorageOk(scan, "scan of segment " + std::to_string(index));
+        out.insert(out.end(), scan->records.begin(), scan->records.end());
+        prev = scan->last_chain;
+    }
+    return out;
+}
+
+BOOST_AUTO_TEST_CASE(append_past_the_segment_end_moves_to_the_next_segment)
+{
+    // M4-STO-06. One-page segments: the first record fills page 0 exactly.
+    const TestDir root{"rollover_append"};
     auto journal{MustCreate(root.path, JournalRole::COMMIT, 6, SEGMENT_PAGE_BYTES)};
-    // One record that fills the page exactly, then any record is refused (rollover is M4-STO-06).
     const std::vector<unsigned char> fill(SEGMENT_PAGE_BYTES - RECORD_OVERHEAD_BYTES, 0xAB);
+    // A record that fits in no segment is OVERSIZE, consumes nothing and fences nothing.
     const std::vector<unsigned char> too_big(SEGMENT_PAGE_BYTES - RECORD_OVERHEAD_BYTES + 1, 0xAB);
-    RequireStub(journal->Append(RecordType::DECISION, too_big), "M4-STO-06");
+    RequireRefusal(journal->Append(RecordType::DECISION, too_big), ErrorCode::OVERSIZE, JOURNAL_RECORD_EXCEEDS_SEGMENT, "record above a segment");
     BOOST_CHECK(journal->Status() == (JournalStatus{0, 0, false}));
+    BOOST_CHECK_EQUAL(journal->SegmentCount(), 1U);
     BOOST_CHECK_EQUAL(journal->Append(RecordType::DECISION, fill).value(), 1U);
-    RequireStub(journal->Append(RecordType::APPLIED, {}), "M4-STO-06");
+    // Before the first barrier only segment 0 exists, so a record that does
+    // not fit is BUSY (nothing queued, nothing fenced): the owner barriers first.
+    RequireRefusal(journal->Append(RecordType::APPLIED, {}), ErrorCode::BUSY, JOURNAL_SEGMENT_FULL, "no next segment yet");
     BOOST_CHECK(journal->Status() == (JournalStatus{1, 0, false}));
     BOOST_CHECK_EQUAL(journal->Barrier().value(), 1U);
-    const std::vector<unsigned char> image{ReadFile(journal->SegmentPath())};
-    BOOST_CHECK_EQUAL(image.size(), SEGMENT_PAGE_BYTES);
-    const Result<ScanResult> scan{ScanRecords(image, JournalRole::COMMIT, 6)};
-    RequireStorageOk(scan, "scan of a full segment");
-    BOOST_CHECK_EQUAL(scan->records.size(), 1U);
-    BOOST_CHECK_EQUAL(scan->end_offset, SEGMENT_PAGE_BYTES);
-    RequireStub(journal->Rollover(), "M4-STO-06");
+    // The barrier created the spare segment 00000001.seg, zero-filled and committed.
+    BOOST_CHECK_EQUAL(journal->SegmentCount(), 2U);
+    BOOST_CHECK(fs::exists(journal->SegmentPathOf(1)));
+    BOOST_CHECK_EQUAL(ReadFile(journal->SegmentPathOf(1)).size(), SEGMENT_PAGE_BYTES);
+    BOOST_CHECK_EQUAL(std::distance(fs::directory_iterator{root.path}, fs::directory_iterator{}), 2);
+    // Now the append goes to byte 0 of segment 1.
+    BOOST_CHECK_EQUAL(journal->Append(RecordType::APPLIED, Bytes("applied")).value(), 2U);
+    BOOST_CHECK_EQUAL(journal->CurrentSegment(), 1U);
+    BOOST_CHECK_EQUAL(journal->Barrier().value(), 2U);
+    BOOST_CHECK_EQUAL(journal->SegmentCount(), 3U); // the invariant: a spare after every barrier
+
+    const std::vector<unsigned char> image0{ReadFile(journal->SegmentPathOf(0))};
+    const Result<ScanResult> scan0{ScanRecords(image0, JournalRole::COMMIT, 6)};
+    RequireStorageOk(scan0, "scan of the full segment 0");
+    BOOST_CHECK_EQUAL(scan0->records.size(), 1U);
+    BOOST_CHECK_EQUAL(scan0->end_offset, SEGMENT_PAGE_BYTES);
+    const std::vector<unsigned char> image1{ReadFile(journal->SegmentPathOf(1))};
+    const Result<ScanResult> scan1{ScanRecordsFrom(image1, JournalRole::COMMIT, scan0->last_chain, 1)};
+    RequireStorageOk(scan1, "scan of segment 1 continued from segment 0");
+    BOOST_REQUIRE_EQUAL(scan1->records.size(), 1U);
+    BOOST_CHECK_EQUAL(scan1->records[0].seq, 2U);
+    BOOST_CHECK(scan1->records[0].payload == Bytes("applied"));
+    // Segment 1 alone does not continue the genesis chain.
+    RequireRefusal(ScanRecords(image1, JournalRole::COMMIT, 6), ErrorCode::VERIFY_FAILED, RECORD_CHAIN, "segment 1 from genesis");
+    // ReadAll returns both, across the segments, from disk.
+    const Result<std::vector<JournalRecord>> all{journal->ReadAll()};
+    RequireStorageOk(all, "ReadAll across two segments");
+    BOOST_REQUIRE_EQUAL(all->size(), 2U);
+    BOOST_CHECK(all->at(0).payload == fill && all->at(1).payload == Bytes("applied"));
+    BOOST_CHECK(*all == ScanSegments(root.path, JournalRole::COMMIT, 6, journal->SegmentCount()));
+}
+
+BOOST_AUTO_TEST_CASE(rollover_pads_the_segment_and_group_commits_across_it)
+{
+    // M4-STO-06. Rollover() starts the next segment early: the rest of the
+    // current one stays its zero tail and the next record lands at byte 0 of
+    // the next segment, all in one barrier.
+    const TestDir root{"rollover_explicit"};
+    RecordingObserver observer;
+    Result<std::unique_ptr<FileJournal>> created{FileJournal::CreateNew(root.path, JournalRole::SIGNER, 9, 4 * SEGMENT_PAGE_BYTES, &observer)};
+    RequireStorageOk(created, "CreateNew");
+    FileJournal& journal{**created};
+    // At a segment start a rollover has nothing to pad: a no-op that creates no file.
+    RequireStorageOk(journal.Rollover(), "Rollover of a fresh journal");
+    BOOST_CHECK_EQUAL(journal.CurrentSegment(), 0U);
+    BOOST_CHECK_EQUAL(journal.SegmentCount(), 1U);
+    BOOST_CHECK_EQUAL(journal.Append(RecordType::INTENT, Bytes("one")).value(), 1U);
+    BOOST_CHECK_EQUAL(journal.Barrier().value(), 1U);
+    BOOST_CHECK_EQUAL(journal.SegmentCount(), 2U);
+    // Rollover with record 2 still unwritten in segment 0: the next record
+    // lands at byte 0 of segment 1 (the spare the barrier created); a second
+    // Rollover is idempotent.
+    BOOST_CHECK_EQUAL(journal.Append(RecordType::INTENT, Bytes("two")).value(), 2U);
+    RequireStorageOk(journal.Rollover(), "Rollover");
+    RequireStorageOk(journal.Rollover(), "Rollover twice");
+    BOOST_CHECK_EQUAL(journal.CurrentSegment(), 1U);
+    BOOST_CHECK_EQUAL(journal.Append(RecordType::SIGNED_VOTE, Bytes("three")).value(), 3U);
+    BOOST_CHECK_EQUAL(journal.CurrentSegment(), 1U);
+    BOOST_CHECK_EQUAL(journal.Barrier().value(), 3U); // records 2 (segment 0) and 3 (segment 1) in one barrier
+    BOOST_CHECK_EQUAL(journal.SegmentCount(), 3U);
+    BOOST_CHECK(journal.Status() == (JournalStatus{3, 3, false}));
+
+    const std::vector<unsigned char> image0{ReadFile(journal.SegmentPathOf(0))};
+    const Result<ScanResult> scan0{ScanRecords(image0, JournalRole::SIGNER, 9)};
+    RequireStorageOk(scan0, "segment 0");
+    BOOST_REQUIRE_EQUAL(scan0->records.size(), 2U);
+    BOOST_CHECK(std::all_of(image0.begin() + static_cast<std::ptrdiff_t>(scan0->end_offset), image0.end(), [](unsigned char b) { return b == 0; }));
+    const Result<ScanResult> scan1{ScanRecordsFrom(ReadFile(journal.SegmentPathOf(1)), JournalRole::SIGNER, scan0->last_chain, 2)};
+    RequireStorageOk(scan1, "segment 1");
+    BOOST_REQUIRE_EQUAL(scan1->records.size(), 1U);
+    BOOST_CHECK_EQUAL(scan1->records[0].seq, 3U);
+    BOOST_CHECK_EQUAL(scan1->end_offset, RECORD_OVERHEAD_BYTES + 5);
+    const Result<std::vector<JournalRecord>> all{journal.ReadAll()};
+    RequireStorageOk(all, "ReadAll");
+    BOOST_CHECK_EQUAL(all->size(), 3U);
+    // Observer: 3 appends, 2 barriers with start and end.
+    BOOST_CHECK_EQUAL(observer.events.size(), 7U);
+
+    // Rollover on a fatal journal is refused like an append.
+    {
+        const TestDir fatal_root{"rollover_fatal"};
+        auto fatal{MustCreate(fatal_root.path, JournalRole::COMMIT, 1, SEGMENT_PAGE_BYTES, &CommitOnClosedFd)};
+        BOOST_CHECK_EQUAL(fatal->Append(RecordType::DECISION, Bytes("d")).value(), 1U);
+        RequireCode(fatal->Barrier(), ErrorCode::STORAGE_FATAL, "failed commit");
+        RequireRefusal(fatal->Rollover(), ErrorCode::FENCED, JOURNAL_FENCED, "rollover of a fatal journal");
+    }
+}
+
+BOOST_AUTO_TEST_CASE(many_segments_read_back_after_a_crash)
+{
+    // M4-STO-06 crash test: records across five one-page segments, the
+    // journal object dropped after every barrier (what a crash leaves), the
+    // files scanned afresh and compared with what the journal appended.
+    const TestDir root{"rollover_crash"};
+    std::vector<std::vector<unsigned char>> appended;
+    size_t segments{0};
+    {
+        auto journal{MustCreate(root.path, JournalRole::COMMIT, 5, SEGMENT_PAGE_BYTES)};
+        for (unsigned round{0}; round < 12; ++round) {
+            // Three records of about a third of a page: every third append crosses a boundary.
+            std::vector<unsigned char> payload(SEGMENT_PAGE_BYTES / 3, static_cast<unsigned char>(round));
+            Result<uint64_t> seq{journal->Append(RecordType::DECISION, payload)};
+            if (!seq.has_value()) {
+                // The spare does not exist before the first barrier of the journal: barrier, then retry once.
+                RequireRefusal(seq, ErrorCode::BUSY, JOURNAL_SEGMENT_FULL, "append before the spare exists");
+                BOOST_CHECK_EQUAL(journal->Barrier().value(), journal->Status().appended_seq);
+                seq = journal->Append(RecordType::DECISION, payload);
+            }
+            RequireStorageOk(seq, "append");
+            appended.push_back(payload);
+            BOOST_CHECK_EQUAL(journal->Barrier().value(), appended.size());
+            // The invariant after every barrier: the segment after the current one exists.
+            BOOST_CHECK(fs::exists(journal->SegmentPathOf(journal->CurrentSegment() + 1)));
+        }
+        segments = journal->SegmentCount();
+        const Result<std::vector<JournalRecord>> all{journal->ReadAll()};
+        RequireStorageOk(all, "ReadAll");
+        BOOST_CHECK_EQUAL(all->size(), appended.size());
+    }
+    BOOST_CHECK_GE(segments, 5U);
+    const std::vector<JournalRecord> records{ScanSegments(root.path, JournalRole::COMMIT, 5, segments)};
+    BOOST_REQUIRE_EQUAL(records.size(), appended.size());
+    for (size_t i{0}; i < records.size(); ++i) {
+        BOOST_CHECK_EQUAL(records[i].seq, i + 1);
+        BOOST_CHECK(records[i].payload == appended[i]);
+    }
+    // A record never straddles two segments: every segment alone scans clean from its predecessor's chain.
+    for (size_t index{0}; index < segments; ++index) {
+        BOOST_CHECK_EQUAL(ReadFile(root.path / fs::u8path(SegmentFileName(index))).size(), SEGMENT_PAGE_BYTES);
+    }
 }
 
 BOOST_AUTO_TEST_CASE(open_existing_is_not_implemented)

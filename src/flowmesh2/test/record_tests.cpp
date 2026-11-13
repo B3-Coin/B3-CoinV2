@@ -279,4 +279,34 @@ BOOST_AUTO_TEST_CASE(scan_detects_length_type_and_tail_errors)
     }
 }
 
+BOOST_AUTO_TEST_CASE(scan_from_a_chain_continues_a_previous_segment)
+{
+    // ScanRecordsFrom (M4-STO-06): the chain and the sequence numbers continue
+    // from a previous segment's last record; from the genesis chain and 0 it is ScanRecords.
+    std::vector<unsigned char> first;
+    std::vector<unsigned char> second;
+    uint256 prev{JournalGenesisChain(JournalRole::SIGNER, 3)};
+    const std::vector<unsigned char> payload_a{0x01};
+    const std::vector<unsigned char> payload_b{0x02};
+    const EncodedRecord a{EncodeRecord(prev, RecordType::INTENT, payload_a).value()};
+    first.insert(first.end(), a.bytes.begin(), a.bytes.end());
+    const EncodedRecord b{EncodeRecord(a.chain, RecordType::SIGNED_VOTE, payload_b).value()};
+    second.insert(second.end(), b.bytes.begin(), b.bytes.end());
+    second.resize(second.size() + 7, 0); // a zero tail
+    const Result<ScanResult> one{ScanRecordsFrom(first, JournalRole::SIGNER, prev, 0)};
+    BOOST_REQUIRE(one.has_value());
+    const ScanResult from_genesis{ScanRecords(first, JournalRole::SIGNER, 3).value()};
+    BOOST_CHECK(one->records == from_genesis.records && one->last_chain == from_genesis.last_chain && one->end_offset == from_genesis.end_offset);
+    const Result<ScanResult> two{ScanRecordsFrom(second, JournalRole::SIGNER, one->last_chain, one->records.size())};
+    BOOST_REQUIRE(two.has_value());
+    BOOST_REQUIRE_EQUAL(two->records.size(), 1U);
+    BOOST_CHECK_EQUAL(two->records[0].seq, 2U);
+    BOOST_CHECK(two->records[0].type == RecordType::SIGNED_VOTE);
+    BOOST_CHECK(two->last_chain == b.chain);
+    BOOST_CHECK_EQUAL(two->end_offset, b.bytes.size());
+    // The wrong starting chain is a chain break; an unknown role is refused.
+    BOOST_CHECK(ScanRecordsFrom(second, JournalRole::SIGNER, prev, 1).error().detail == RECORD_CHAIN);
+    BOOST_CHECK(ScanRecordsFrom(second, JournalRole{0}, prev, 1).error().code == ErrorCode::INVALID_INPUT);
+}
+
 BOOST_AUTO_TEST_SUITE_END()

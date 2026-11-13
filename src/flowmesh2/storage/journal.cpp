@@ -25,10 +25,17 @@ Result<uint64_t> Journal::Append(RecordType type, std::span<const unsigned char>
         if (!encoded.has_value()) return encoded.error();
         ++m_append_calls;
         const uint64_t offset{m_unwritten_offset + m_unwritten.size()};
-        if (Result<void> admitted{AdmitAppend(m_append_calls, offset, encoded->bytes.size())}; !admitted.has_value()) {
-            if (admitted.error().code == ErrorCode::STORAGE_FATAL) m_fatal = true;
-            return admitted.error();
+        const Result<uint64_t> placed{AdmitAppend(m_append_calls, offset, encoded->bytes.size())};
+        if (!placed.has_value()) {
+            if (placed.error().code == ErrorCode::STORAGE_FATAL) m_fatal = true;
+            return placed.error();
         }
+        if (*placed < offset) {
+            m_fatal = true;
+            return Error{ErrorCode::STORAGE_FATAL, "record placed before the image end"};
+        }
+        // The skipped bytes (a segment's unused tail, M4-STO-06) are zeros.
+        m_unwritten.resize(m_unwritten.size() + static_cast<size_t>(*placed - offset), 0);
         m_unwritten.insert(m_unwritten.end(), encoded->bytes.begin(), encoded->bytes.end());
         m_chain = encoded->chain;
         seq = ++m_appended_seq;
@@ -75,6 +82,18 @@ JournalStatus Journal::Status() const
 {
     LOCK(m_mutex);
     return JournalStatus{m_appended_seq, m_durable_seq, m_fatal};
+}
+
+void Journal::SetFatal()
+{
+    LOCK(m_mutex);
+    m_fatal = true;
+}
+
+uint64_t Journal::ImageEnd() const
+{
+    LOCK(m_mutex);
+    return m_unwritten_offset + m_unwritten.size();
 }
 
 } // namespace flowmesh2::storage

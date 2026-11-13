@@ -51,6 +51,42 @@ Result<void> WriteAllAt(int fd, std::span<const unsigned char> bytes, uint64_t o
     return Ok();
 }
 
+//! Read the whole file at `path` (at most `max_bytes`); STORAGE_FATAL if it cannot be opened or read.
+Result<std::vector<unsigned char>> ReadWholeFile(const fs::path& path, uint64_t max_bytes)
+{
+#ifdef WIN32
+    const int fd{_wopen(path.c_str(), _O_RDONLY | _O_BINARY)};
+#else
+    const int fd{open(path.c_str(), O_RDONLY | O_CLOEXEC)};
+#endif
+    if (fd < 0) return Error{ErrorCode::STORAGE_FATAL, JOURNAL_SEGMENT_READ};
+    std::vector<unsigned char> out;
+    std::array<unsigned char, 64 * 1024> buffer{};
+    while (out.size() < max_bytes) {
+#ifdef WIN32
+        const int got{_read(fd, buffer.data(), static_cast<unsigned int>(std::min<uint64_t>(buffer.size(), max_bytes - out.size())))};
+#else
+        const ssize_t got{read(fd, buffer.data(), static_cast<size_t>(std::min<uint64_t>(buffer.size(), max_bytes - out.size())))};
+#endif
+        if (got < 0) {
+#ifdef WIN32
+            _close(fd);
+#else
+            close(fd);
+#endif
+            return Error{ErrorCode::STORAGE_FATAL, JOURNAL_SEGMENT_READ};
+        }
+        if (got == 0) break;
+        out.insert(out.end(), buffer.begin(), buffer.begin() + got);
+    }
+#ifdef WIN32
+    _close(fd);
+#else
+    close(fd);
+#endif
+    return Ok(std::move(out));
+}
+
 int OpenNewSegment(const fs::path& path)
 {
 #ifdef WIN32
@@ -62,6 +98,7 @@ int OpenNewSegment(const fs::path& path)
 
 void CloseFd(int fd)
 {
+    if (fd < 0) return;
 #ifdef WIN32
     _close(fd);
 #else
@@ -71,17 +108,78 @@ void CloseFd(int fd)
 
 } // namespace
 
-FileJournal::FileJournal(JournalRole role, uint64_t instance_id, BarrierObserver* observer, fs::path segment_path, int fd,
+std::string SegmentFileName(uint64_t index)
+{
+    static constexpr char DIGITS[]{"0123456789abcdef"};
+    std::string name(8, '0');
+    for (size_t i{0}; i < 8; ++i) {
+        name[7 - i] = DIGITS[index & 0xf];
+        index >>= 4;
+    }
+    return name + ".seg";
+}
+
+FileJournal::FileJournal(JournalRole role, uint64_t instance_id, BarrierObserver* observer, fs::path dir, int first_fd,
                          uint64_t segment_bytes, SegmentCommitHook commit)
     : Journal(ImplKey{}, role, instance_id, observer),
-      m_segment_path{std::move(segment_path)},
-      m_fd{fd},
+      m_dir{std::move(dir)},
+      m_first_segment_path{m_dir / fs::u8path(FIRST_SEGMENT_NAME)},
       m_segment_bytes{segment_bytes},
-      m_commit{commit}
+      m_commit{commit},
+      m_fds{first_fd}
 {
 }
 
-FileJournal::~FileJournal() { CloseFd(m_fd); }
+FileJournal::~FileJournal()
+{
+    for (const int fd : m_fds) CloseFd(fd);
+}
+
+fs::path FileJournal::SegmentPathOf(uint64_t index) const { return m_dir / fs::u8path(SegmentFileName(index)); }
+
+uint64_t FileJournal::SegmentCount() const
+{
+    LOCK(m_segments_mutex);
+    return m_fds.size();
+}
+
+uint64_t FileJournal::CurrentSegment() const
+{
+    const uint64_t end{ImageEnd()};
+    LOCK(m_segments_mutex);
+    uint64_t segment{end / m_segment_bytes};
+    if (m_rollover_requested && end % m_segment_bytes != 0) ++segment;
+    return segment;
+}
+
+Result<int> FileJournal::CreateSegment(const fs::path& dir, uint64_t index, uint64_t segment_bytes)
+{
+    const fs::path segment_path{dir / fs::u8path(SegmentFileName(index))};
+    const int fd{OpenNewSegment(segment_path)};
+    if (fd < 0) return Error{ErrorCode::STORAGE_FATAL, JOURNAL_SEGMENT_CREATE};
+
+    // Explicit zero pages for the whole segment (plan section 3.7, S-9): the
+    // blocks are allocated now, not on the first barrier, and the unused tail
+    // reads back as zeros.
+    static constexpr std::array<unsigned char, 64 * 1024> ZEROS{};
+    for (uint64_t offset{0}; offset < segment_bytes; offset += ZEROS.size()) {
+        const size_t chunk{static_cast<size_t>(std::min<uint64_t>(ZEROS.size(), segment_bytes - offset))};
+        if (const Result<void> written{WriteAllAt(fd, std::span{ZEROS}.first(chunk), offset)}; !written.has_value()) {
+            CloseFd(fd);
+            return written.error();
+        }
+    }
+    // Creation always uses the real strict commit; a hook only replaces the barriers' commit.
+    if (const Result<void> committed{JournalCommit(fd)}; !committed.has_value()) {
+        CloseFd(fd);
+        return committed.error();
+    }
+    if (const Result<void> dir_committed{CommitDirectory(dir)}; !dir_committed.has_value()) {
+        CloseFd(fd);
+        return dir_committed.error();
+    }
+    return Ok(fd);
+}
 
 Result<std::unique_ptr<FileJournal>> FileJournal::CreateNew(const fs::path& empty_dir, JournalRole role, uint64_t instance_id,
                                                             uint64_t segment_bytes, BarrierObserver* observer)
@@ -104,32 +202,9 @@ Result<std::unique_ptr<FileJournal>> FileJournal::CreateNewWithCommitHook(const 
     if (ec) return Error{ErrorCode::INVALID_INPUT, JOURNAL_DIR_MISSING};
     if (first != fs::directory_iterator{}) return Error{ErrorCode::INVALID_INPUT, JOURNAL_DIR_NOT_EMPTY};
 
-    fs::path segment_path{empty_dir / fs::u8path(FIRST_SEGMENT_NAME)};
-    const int fd{OpenNewSegment(segment_path)};
-    if (fd < 0) return Error{ErrorCode::STORAGE_FATAL, JOURNAL_SEGMENT_CREATE};
-
-    // Explicit zero pages for the whole segment (plan section 3.7, S-9): the
-    // blocks are allocated now, not on the first barrier, and the unused tail
-    // reads back as zeros.
-    static constexpr std::array<unsigned char, 64 * 1024> ZEROS{};
-    for (uint64_t offset{0}; offset < segment_bytes; offset += ZEROS.size()) {
-        const size_t chunk{static_cast<size_t>(std::min<uint64_t>(ZEROS.size(), segment_bytes - offset))};
-        if (const Result<void> written{WriteAllAt(fd, std::span{ZEROS}.first(chunk), offset)}; !written.has_value()) {
-            CloseFd(fd);
-            return written.error();
-        }
-    }
-    // Creation always uses the real strict commit; a hook only replaces the barriers' commit.
-    if (const Result<void> committed{JournalCommit(fd)}; !committed.has_value()) {
-        CloseFd(fd);
-        return committed.error();
-    }
-    if (const Result<void> dir_committed{CommitDirectory(empty_dir)}; !dir_committed.has_value()) {
-        CloseFd(fd);
-        return dir_committed.error();
-    }
-    return Ok(std::unique_ptr<FileJournal>{
-        new FileJournal{role, instance_id, observer, std::move(segment_path), fd, segment_bytes, commit}});
+    const Result<int> fd{CreateSegment(empty_dir, 0, segment_bytes)};
+    if (!fd.has_value()) return fd.error();
+    return Ok(std::unique_ptr<FileJournal>{new FileJournal{role, instance_id, observer, empty_dir, *fd, segment_bytes, commit}});
 }
 
 Result<std::unique_ptr<FileJournal>> FileJournal::OpenExisting(const fs::path& /*dir*/, JournalRole /*role*/,
@@ -140,27 +215,117 @@ Result<std::unique_ptr<FileJournal>> FileJournal::OpenExisting(const fs::path& /
 
 Result<std::vector<JournalRecord>> FileJournal::ReadAll() const
 {
-    return NotImplemented("M4-STO-01"); // TODO(rebirth:M4-STO-01)
+    const uint64_t durable{DurableSeq()};
+    uint64_t segments{0};
+    {
+        LOCK(m_segments_mutex);
+        segments = m_fds.size();
+    }
+    std::vector<JournalRecord> out;
+    uint256 prev{JournalGenesisChain(Role(), InstanceId())};
+    for (uint64_t index{0}; index < segments && out.size() < durable; ++index) {
+        const Result<std::vector<unsigned char>> image{ReadWholeFile(SegmentPathOf(index), m_segment_bytes)};
+        if (!image.has_value()) return image.error();
+        Result<ScanResult> scan{ScanRecordsFrom(*image, Role(), prev, out.size())};
+        if (!scan.has_value()) return scan.error();
+        out.insert(out.end(), std::make_move_iterator(scan->records.begin()), std::make_move_iterator(scan->records.end()));
+        prev = scan->last_chain;
+    }
+    // A barrier in flight may have written records that are not durable yet.
+    if (out.size() > durable) out.resize(static_cast<size_t>(durable));
+    return Ok(std::move(out));
+}
+
+Result<void> FileJournal::EnsureSegments(uint64_t index)
+{
+    for (;;) {
+        uint64_t next{0};
+        {
+            LOCK(m_segments_mutex);
+            if (m_fds.size() > index) return Ok();
+            next = m_fds.size();
+        }
+        // I/O without any fm2 lock: creation is the owner thread's (Barrier, Rollover).
+        const Result<int> fd{CreateSegment(m_dir, next, m_segment_bytes)};
+        if (!fd.has_value()) return fd.error();
+        LOCK(m_segments_mutex);
+        if (m_fds.size() != next) {
+            CloseFd(*fd);
+            return Error{ErrorCode::STORAGE_FATAL, JOURNAL_SEGMENT_CREATE}; // two creators: not the contract
+        }
+        m_fds.push_back(*fd);
+    }
 }
 
 Result<void> FileJournal::Rollover()
 {
-    return NotImplemented("M4-STO-06"); // TODO(rebirth:M4-STO-06)
+    if (IsFatal()) return Error{ErrorCode::FENCED, JOURNAL_FENCED};
+    const uint64_t end{ImageEnd()};
+    if (end % m_segment_bytes == 0) return Ok(); // at a segment start already: nothing to pad
+    if (const Result<void> created{EnsureSegments(end / m_segment_bytes + 1)}; !created.has_value()) {
+        SetFatal();
+        return Error{ErrorCode::STORAGE_FATAL, created.error().detail};
+    }
+    LOCK(m_segments_mutex);
+    m_rollover_requested = true;
+    return Ok();
 }
 
-Result<void> FileJournal::AdmitAppend(uint64_t /*append_number*/, uint64_t offset, size_t size) const
+Result<uint64_t> FileJournal::AdmitAppend(uint64_t /*append_number*/, uint64_t offset, size_t size)
 {
-    // The record must fit in the rest of the segment; the next segment is M4-STO-06.
-    if (offset > m_segment_bytes || size > m_segment_bytes - offset) {
-        return NotImplemented("M4-STO-06"); // TODO(rebirth:M4-STO-06)
+    if (size > m_segment_bytes) return Error{ErrorCode::OVERSIZE, JOURNAL_RECORD_EXCEEDS_SEGMENT};
+    LOCK(m_segments_mutex);
+    const uint64_t in_segment{offset % m_segment_bytes};
+    uint64_t place{offset};
+    if ((m_rollover_requested && in_segment != 0) || size > m_segment_bytes - in_segment) {
+        place = (offset / m_segment_bytes + 1) * m_segment_bytes; // byte 0 of the next segment
     }
-    return Ok();
+    if (place / m_segment_bytes >= m_fds.size()) return Error{ErrorCode::BUSY, JOURNAL_SEGMENT_FULL};
+    m_rollover_requested = false;
+    return Ok(place);
 }
 
 Result<void> FileJournal::Persist(uint64_t /*barrier_number*/, uint64_t offset, std::span<const unsigned char> bytes)
 {
-    if (const Result<void> written{WriteAllAt(m_fd, bytes, offset)}; !written.has_value()) return written.error();
-    return m_commit(m_fd);
+    std::vector<int> fds;
+    {
+        LOCK(m_segments_mutex);
+        fds = m_fds;
+    }
+    // Write, split by segment; a record never straddles one, but the batch may.
+    std::vector<uint64_t> touched;
+    uint64_t pos{offset};
+    std::span<const unsigned char> rest{bytes};
+    while (!rest.empty()) {
+        const uint64_t segment{pos / m_segment_bytes};
+        const uint64_t in_segment{pos % m_segment_bytes};
+        const size_t chunk{static_cast<size_t>(std::min<uint64_t>(rest.size(), m_segment_bytes - in_segment))};
+        if (segment >= fds.size() || fds[segment] < 0) return Error{ErrorCode::STORAGE_FATAL, JOURNAL_SEGMENT_WRITE};
+        if (const Result<void> written{WriteAllAt(fds[segment], rest.first(chunk), in_segment)}; !written.has_value()) {
+            return written.error();
+        }
+        if (touched.empty() || touched.back() != segment) touched.push_back(segment);
+        pos += chunk;
+        rest = rest.subspan(chunk);
+    }
+    // Every barrier commits, also with nothing new: then the segment the next byte goes to.
+    if (touched.empty()) touched.push_back(std::min<uint64_t>(offset / m_segment_bytes, fds.size() - 1));
+    for (const uint64_t segment : touched) {
+        if (const Result<void> committed{m_commit(fds[segment])}; !committed.has_value()) return committed.error();
+    }
+    // The spare: after every barrier the segment the next record can go to
+    // exists. At a segment start that is the segment itself (any record fits
+    // a fresh segment); elsewhere also the one after it.
+    const uint64_t end{offset + bytes.size()};
+    const uint64_t needed{end / m_segment_bytes + (end % m_segment_bytes == 0 ? 0 : 1)};
+    if (const Result<void> created{EnsureSegments(needed)}; !created.has_value()) return created.error();
+    // Segments entirely before the next write are never written again.
+    LOCK(m_segments_mutex);
+    for (uint64_t segment{0}; segment < end / m_segment_bytes && segment < m_fds.size(); ++segment) {
+        CloseFd(m_fds[segment]);
+        m_fds[segment] = -1;
+    }
+    return Ok();
 }
 
 } // namespace flowmesh2::storage

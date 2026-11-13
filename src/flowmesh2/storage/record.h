@@ -159,6 +159,14 @@ struct ScanResult {
  */
 Result<ScanResult> ScanRecords(std::span<const unsigned char> bytes, JournalRole role, uint64_t instance_id);
 
+/** ScanRecords for a later segment of a journal (M4-STO-06): the chain
+ * continues from `prev_chain` (the previous segment's `last_chain`) and the
+ * records are numbered from `first_seq` + 1. With the genesis chain and 0 it
+ * is ScanRecords. Same refusals; `RECORD_CHAIN` also when `prev_chain` is
+ * not the chain the segment continues.
+ */
+Result<ScanResult> ScanRecordsFrom(std::span<const unsigned char> bytes, JournalRole role, const uint256& prev_chain, uint64_t first_seq);
+
 } // namespace flowmesh2::storage
 
 #endif // B3_FLOWMESH2_STORAGE_RECORD_H

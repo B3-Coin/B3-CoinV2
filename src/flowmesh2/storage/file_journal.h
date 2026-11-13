@@ -8,16 +8,19 @@
 #include <flowmesh2/core/result.h>
 #include <flowmesh2/storage/journal.h>
 #include <flowmesh2/storage/record.h>
+#include <sync.h>
 #include <util/fs.h>
 
 #include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <span>
+#include <string>
 #include <string_view>
 #include <vector>
 
-/** A journal on disk: one pre-zeroed segment file (slice R8; ARCHITECTURE.md 7.1).
+/** A journal on disk: pre-zeroed segment files (slice R8; ARCHITECTURE.md 7.1;
+ * segment rollover since M4-STO-06).
  *
  * CreateNew(empty_dir, role, instance_id, segment_bytes):
  * - refuses a directory that is missing, not a directory or not empty
@@ -30,21 +33,46 @@
  * - then JournalCommit(segment) and CommitDirectory(dir). Any I/O error on
  *   the way is STORAGE_FATAL and no journal is returned.
  *
+ * Segments. The journal image is the concatenation of its segments
+ * `00000000.seg`, `00000001.seg`, ... (SegmentFileName), each exactly
+ * `segment_bytes` long: image byte b lives in segment b / segment_bytes at
+ * b % segment_bytes. A record never straddles two segments: when it would
+ * not fit in the rest of the current segment, AdmitAppend places it at byte
+ * 0 of the next one and the rest of the current segment stays its zero
+ * tail (the base journal writes those bytes as zeros). A record longer than
+ * a segment is refused with OVERSIZE (JOURNAL_RECORD_EXCEEDS_SEGMENT),
+ * consuming nothing. AdmitAppend never does I/O, so it can only place a
+ * record into a segment that already exists on disk; every Barrier leaves
+ * the segment after the one holding the next write created, zero-filled and
+ * committed (the spare), and an append that needs a segment that does not
+ * exist yet (only before the journal's first barrier, or when one group
+ * commit spans two boundaries) is refused with BUSY (JOURNAL_SEGMENT_FULL):
+ * nothing queued, nothing fenced; the owner barriers (or calls Rollover) and
+ * appends again. Rollover() ends the current segment early: the next record
+ * goes to byte 0 of the next segment, which Rollover creates if it does not
+ * exist. At a segment start it is a no-op. It is the owner thread's call,
+ * like Barrier (section 4); a creation failure makes the journal fatal.
+ *
  * Append frames a record into memory (the journal lock is never held across
- * disk work). Barrier writes the queued bytes at their offsets with pwrite
- * and runs JournalCommit; any write or commit error makes the journal fatal
- * (journal.h). A record that would not fit in the rest of the segment is
- * refused with NotImplemented(M4-STO-06) (segment rollover) without making
- * the journal fatal; Rollover() itself is that stub.
+ * disk work). Barrier writes the queued bytes at their offsets with pwrite,
+ * split by segment, and runs the commit on every segment it touched; then
+ * it creates the spare if needed and closes the descriptors of segments
+ * that lie entirely before the next write. Any write, commit or creation
+ * error makes the journal fatal (journal.h).
  *
- * The segment carries no header: role and instance are bound by the chain
- * (record.h), so whoever reopens a segment must know them.
+ * ReadAll reads every segment file from disk, scans them in order with the
+ * chain continued across segments (ScanRecordsFrom) and returns the records
+ * up to DurableSeq(). It is the owner thread's call too: concurrently with
+ * a Barrier it could read a half-written record. A torn or corrupt image is
+ * a refusal (what recovery makes of it is M4-STO-01).
  *
- * Stubs: OpenExisting and ReadAll (M4-STO-01: reopen, torn-tail handling,
- * key retirement on a gap or CRC break); Rollover (M4-STO-06). Until
- * M4-STO-01 lands the outline makes no crash-recovery claim for real files.
- * POSIX only in practice: the Windows branches are not compiled on this host
- * (O-24 pattern).
+ * The segments carry no header: role and instance are bound by the chain
+ * (record.h), so whoever reopens a journal must know them.
+ *
+ * Stubs: OpenExisting (M4-STO-01: reopen, torn-tail handling, key
+ * retirement on a gap or CRC break). Until M4-STO-01 lands the outline makes
+ * no crash-recovery claim for real files. POSIX only in practice: the
+ * Windows branches are not compiled on this host (O-24 pattern).
  */
 namespace flowmesh2::storage {
 
@@ -59,12 +87,19 @@ inline constexpr std::string_view JOURNAL_DIR_MISSING{"JOURNAL_DIR_MISSING"};
 inline constexpr std::string_view JOURNAL_SEGMENT_SIZE{"JOURNAL_SEGMENT_SIZE"};
 inline constexpr std::string_view JOURNAL_SEGMENT_CREATE{"JOURNAL_SEGMENT_CREATE"};
 inline constexpr std::string_view JOURNAL_SEGMENT_WRITE{"JOURNAL_SEGMENT_WRITE"};
+inline constexpr std::string_view JOURNAL_SEGMENT_READ{"JOURNAL_SEGMENT_READ"};                     //!< (STORAGE_FATAL) ReadAll could not read a segment file
+inline constexpr std::string_view JOURNAL_SEGMENT_FULL{"JOURNAL_SEGMENT_FULL"};                     //!< (BUSY) the next segment does not exist yet: Barrier or Rollover first
+inline constexpr std::string_view JOURNAL_RECORD_EXCEEDS_SEGMENT{"JOURNAL_RECORD_EXCEEDS_SEGMENT"}; //!< (OVERSIZE) a record longer than a segment
+
+//! `<index as 8 hex digits>.seg`; index 0 is FIRST_SEGMENT_NAME.
+std::string SegmentFileName(uint64_t index);
 
 /** Replaces the JournalCommit call of Barrier. Production code never passes
  * one (CreateNew uses JournalCommit). It exists for fault injection in tests
  * and the simulator: a hook receives the segment's real descriptor and must
  * end in JournalCommit or a failure, for example by closing the descriptor
- * first so the real JournalCommit fails.
+ * first so the real JournalCommit fails. Segment creation (CreateNew, the
+ * spare, Rollover) always uses the real JournalCommit.
  */
 using SegmentCommitHook = Result<void> (*)(int fd);
 
@@ -83,25 +118,47 @@ public:
 
     //! Reopen a journal after a restart. Stub: M4-STO-01.
     static Result<std::unique_ptr<FileJournal>> OpenExisting(const fs::path& dir, JournalRole role, uint64_t instance_id);
-    //! Read the durable records back from disk. Stub: M4-STO-01.
-    Result<std::vector<JournalRecord>> ReadAll() const override;
-    //! Start the next segment. Stub: M4-STO-06.
-    Result<void> Rollover();
+    //! The durable records, read back from every segment file (see the file comment).
+    Result<std::vector<JournalRecord>> ReadAll() const override EXCLUSIVE_LOCKS_REQUIRED(!m_segments_mutex);
+    //! End the current segment early (see the file comment). FENCED on a fatal journal.
+    Result<void> Rollover() EXCLUSIVE_LOCKS_REQUIRED(!m_segments_mutex);
 
-    const fs::path& SegmentPath() const { return m_segment_path; }
+    //! The first segment's path (`<dir>/00000000.seg`).
+    const fs::path& SegmentPath() const { return m_first_segment_path; }
+    //! `<dir>/<SegmentFileName(index)>`, whether or not that segment exists.
+    fs::path SegmentPathOf(uint64_t index) const;
     uint64_t SegmentBytes() const { return m_segment_bytes; }
+    //! Segments created on disk so far (the current one and the spare included).
+    uint64_t SegmentCount() const EXCLUSIVE_LOCKS_REQUIRED(!m_segments_mutex);
+    //! The segment the next record goes to (a requested rollover applied).
+    uint64_t CurrentSegment() const EXCLUSIVE_LOCKS_REQUIRED(!m_segments_mutex);
 
 private:
-    FileJournal(JournalRole role, uint64_t instance_id, BarrierObserver* observer, fs::path segment_path, int fd,
+    FileJournal(JournalRole role, uint64_t instance_id, BarrierObserver* observer, fs::path dir, int first_fd,
                 uint64_t segment_bytes, SegmentCommitHook commit);
 
-    Result<void> AdmitAppend(uint64_t append_number, uint64_t offset, size_t size) const override;
-    Result<void> Persist(uint64_t barrier_number, uint64_t offset, std::span<const unsigned char> bytes) override;
+    Result<uint64_t> AdmitAppend(uint64_t append_number, uint64_t offset, size_t size) override
+        EXCLUSIVE_LOCKS_REQUIRED(!m_segments_mutex);
+    Result<void> Persist(uint64_t barrier_number, uint64_t offset, std::span<const unsigned char> bytes) override
+        EXCLUSIVE_LOCKS_REQUIRED(!m_segments_mutex);
 
-    const fs::path m_segment_path;
-    const int m_fd;
+    //! Create `<dir>/<SegmentFileName(index)>` zero-filled and committed, and commit the directory; the open descriptor.
+    static Result<int> CreateSegment(const fs::path& dir, uint64_t index, uint64_t segment_bytes);
+    //! Create every missing segment up to `index` (no lock during the I/O).
+    Result<void> EnsureSegments(uint64_t index) EXCLUSIVE_LOCKS_REQUIRED(!m_segments_mutex);
+
+    const fs::path m_dir;
+    const fs::path m_first_segment_path;
     const uint64_t m_segment_bytes;
     const SegmentCommitHook m_commit;
+
+    //! Never held together with the base journal's lock across I/O: AdmitAppend
+    //! takes it under the base lock without I/O; Persist, Rollover and ReadAll
+    //! take it only to copy or update the table.
+    mutable Mutex m_segments_mutex;
+    //! Descriptor per created segment, by index; -1 once a segment lies entirely before the next write.
+    std::vector<int> m_fds GUARDED_BY(m_segments_mutex);
+    bool m_rollover_requested GUARDED_BY(m_segments_mutex){false};
 };
 
 } // namespace flowmesh2::storage

@@ -135,7 +135,7 @@ public:
     uint64_t DurableSeq() const EXCLUSIVE_LOCKS_REQUIRED(!m_mutex) { return Status().durable_seq; }
     bool IsFatal() const EXCLUSIVE_LOCKS_REQUIRED(!m_mutex) { return Status().fatal; }
 
-    //! The durable records, in order (FileJournal: stub M4-STO-01).
+    //! The durable records, in order.
     virtual Result<std::vector<JournalRecord>> ReadAll() const = 0;
 
     //! Mint the durability token of a pending record; see the file comment.
@@ -168,11 +168,21 @@ protected:
     /** Called with the journal lock held, before a framed record of `size`
      * bytes is queued at byte `offset` of the journal image; `append_number`
      * counts the Append calls that got this far (1-based). A pure check of
-     * the implementation's limits: no I/O, no lock, no callback. Any error
-     * refuses the append and consumes nothing; STORAGE_FATAL also makes the
-     * journal fatal.
+     * the implementation's limits: no I/O, no lock, no callback. Ok carries
+     * the image offset the record is placed at: `offset` itself, or a later
+     * one when the implementation cannot hold the record at `offset` (the
+     * file journal moves a record that would not fit in the rest of its
+     * segment to the start of the next one, M4-STO-06); the bytes skipped
+     * are written as zeros, which is what a pre-zeroed segment's tail reads
+     * as. Any error refuses the append and consumes nothing; STORAGE_FATAL
+     * also makes the journal fatal.
      */
-    virtual Result<void> AdmitAppend(uint64_t append_number, uint64_t offset, size_t size) const = 0;
+    virtual Result<uint64_t> AdmitAppend(uint64_t append_number, uint64_t offset, size_t size) = 0;
+
+    //! Make the journal fatal from an implementation's own operation (FileJournal::Rollover).
+    void SetFatal() EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+    //! Image offset just past everything appended so far (the next record's offset, before placement).
+    uint64_t ImageEnd() const EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
 
     /** Called by Barrier WITHOUT the journal lock: write `bytes` at byte
      * `offset` of the journal image and make the image durable up to
