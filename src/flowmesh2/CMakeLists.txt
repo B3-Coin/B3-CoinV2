@@ -293,6 +293,7 @@ if(BUILD_FLOWMESH2)
     test/replay_tests.cpp
     test/result_tests.cpp
     test/seat_mesh_tests.cpp
+    test/short_id_tests.cpp
     test/seat_set_tests.cpp
     test/seat_signer_tests.cpp
     test/signer_log_tests.cpp

@@ -153,9 +153,9 @@ BUSY that always means "not queued"), the client API contract and the
 in-process API (exactly one reply per request, admission through the
 lane, and `GetAction` from one read lease that answers EXPIRED only with
 a proof), and the seat mesh interface whose only vote path takes a
-durable vote; HTTPS + SSE, streams, the real meshes, short IDs, sentry
+durable vote; HTTPS + SSE, streams, the real meshes, sentry
 fan-out and the `bridge/`, `futures/` and `governance/` boundaries are
-typed stubs; and **R14**, the deterministic simulator in `sim/` (library
+typed stubs (the short-ID codec landed with M4-NET-02); and **R14**, the deterministic simulator in `sim/` (library
 `fm2_simlib`, CLI `fm2-sim`): a fake clock and a scheduler seeded from
 the run's seed, a fault plan (withhold an action, fail the commit barrier
 after a slot's DECISION, bump the authority between Preview and Propose),
@@ -180,7 +180,7 @@ build-rebirth/bin/fm2-sim --scenario all --seeds 1-32   # JSON on stdout; exit 0
 
 Expected after R14 and the review fixes (O-89 to O-92): 10 CTests pass
 (`flowmesh2_foundations` with its 19 C1 cases, `flowmesh2_sim`,
-`flowmesh2_sim_cli_determinism`, `flowmesh2_unit` with 513 cases,
+`flowmesh2_sim_cli_determinism`, `flowmesh2_unit` with 515 cases,
 `flowmesh2_inventory`, `flowmesh2_todo_lint`, `flowmesh2_guards`,
 `flowmesh2_guards_selftest`, `flowmesh2_evidence_selftest` and, with Clang,
 `flowmesh2_negative_compile` with six negative controls and a positive one).
