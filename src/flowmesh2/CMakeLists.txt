@@ -32,10 +32,12 @@ if(BUILD_FLOWMESH2)
   endif()
 
   # Linked PRIVATE by every fm2 target: lock annotations are errors on Clang,
-  # and an ignored [[nodiscard]] Result is an error on every compiler.
+  # and an ignored [[nodiscard]] Result is an error on every compiler. Clang
+  # up to 20 reports a discarded [[nodiscard]] type under -Wunused-result;
+  # Apple clang 21 reports it under -Wunused-value, so both are errors.
   add_library(fm2_warnings INTERFACE)
   target_compile_options(fm2_warnings INTERFACE
-    $<$<COMPILE_LANG_AND_ID:CXX,Clang,AppleClang>:-Wthread-safety;-Werror=thread-safety>
+    $<$<COMPILE_LANG_AND_ID:CXX,Clang,AppleClang>:-Wthread-safety;-Werror=thread-safety;-Werror=unused-value>
     $<$<COMPILE_LANG_AND_ID:CXX,Clang,AppleClang,GNU>:-Werror=unused-result>
     $<$<COMPILE_LANG_AND_ID:CXX,MSVC>:/we4834>
   )
