@@ -90,7 +90,7 @@ it; none of them is closed by the outline itself.
 | **G-1** (O-1) | The tracked `CLAUDE.md` (`55c034ea`) locks Claude to `/Users/josh/development/ON/B3-FlowMesh` on branch `FlowMesh`. It also says that when an owner decision conflicts with tracked governing documentation, implementation stops until the documentation is reconciled in a reviewed commit. [CC] says "No new branch or PR", and plan §10.1 names `flowmeshV2-dev` as the implementation branch. The owner's 2026-10-16 instruction names branch `rebirth`. | The documentation commit followed the owner's direct instruction. The R1 implementation run received that instruction again, verbatim ("make branch rebirth and implement there the outline ..."), and treats it as the owner's explicit direction to implement the outline on `rebirth`. The slices therefore proceed, as isolated, default-OFF, unpushed code on `rebirth` only. **Still open:** the reconciliation of `CLAUDE.md`, [CC] and plan §10.1 has not landed. Nothing from `rebirth` may be merged into another branch, pushed or released until it lands or the owner rules otherwise. Claude does not edit `CLAUDE.md`. |
 | **G-2** (O-14) | Decision D3 (the C-1 reconciliation: stable quote and fees in Q) has not landed. Plan §12.1 requires it before implementation. | The fee code in R4, R6 and R7 stays inside the REGTEST provisional profile. The owner acknowledges this or lands D3 first. |
 | **G-3** (O-13) | A harness reminder asks for attribution trailers. `CLAUDE.md` forbids them. | No attribution trailers. Repository Git identity only. Never push. |
-| **G-4** | Branch drift. | Before every edit and commit, `git -C /Users/josh/development/ON/B3-FlowMesh-hl branch --show-current` must print `rebirth`. Otherwise stop. |
+| **G-4** | Branch drift. | Before every edit and commit, `git -C /Users/joshesteve/development/on/B3-FlowMesh-hl branch --show-current` must print `rebirth`. Otherwise stop. |
 
 ---
 
@@ -1222,7 +1222,7 @@ run ten CTests: `flowmesh2_foundations` (C1, 19 cases), `flowmesh2_sim`,
 ### 13.2 Commands (growing with each slice)
 
 ```sh
-git -C /Users/josh/development/ON/B3-FlowMesh-hl branch --show-current   # must print: rebirth
+git -C /Users/joshesteve/development/on/B3-FlowMesh-hl branch --show-current   # must print: rebirth
 # An array, so the options split the same way in bash and zsh (zsh does not
 # split an unquoted "$COMMON" string; R1's string form broke there).
 COMMON=(-DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_EXPORT_COMPILE_COMMANDS=ON

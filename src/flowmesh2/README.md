@@ -168,7 +168,7 @@ Twins are typed stubs. Every outline slice has landed; Codex's first task
 is the audit M0-AUD-01. Nothing is linked into the node, wallet or Qt.
 
 ```sh
-git -C /Users/josh/development/ON/B3-FlowMesh-hl branch --show-current   # must print: rebirth
+git -C /Users/joshesteve/development/on/B3-FlowMesh-hl branch --show-current   # must print: rebirth
 cmake -S . -B build-rebirth -DCMAKE_BUILD_TYPE=RelWithDebInfo \
   -DBUILD_TESTS=ON -DBUILD_FLOWMESH2_FOUNDATION_TESTS=ON -DBUILD_FLOWMESH2=ON \
   -DBUILD_GUI=OFF -DBUILD_DAEMON=OFF -DBUILD_CLI=OFF -DBUILD_TX=OFF -DBUILD_UTIL=OFF \

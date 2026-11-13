@@ -77,7 +77,7 @@ Every other row is `todo`, except the C1 baseline, which is `done`.
 | Slice | The outline slice that adds the tag (`—` if none). |
 | Replaces / location | Where the stub or skeleton lives, or where new work goes. |
 | Acceptance | The test that must fail first and then pass. |
-| Evidence | Path under the evidence root `$EV = /Users/josh/development/ON/B3-FlowMesh-200ms-evidence/`, one directory per run: `$EV/<Ms>/<ID>/<run-id>/` with `run.json`, logs and `MANIFEST.sha256` (plan §10.2). For outline slices, `scratch:R<n>/` means the provisional session scratch directory `.../scratchpad/rebirth/evidence/R<n>/`; it is not durable, and M0-AUD-01 re-creates the evidence under `$EV`. |
+| Evidence | Path under the evidence root `$EV = /Users/joshesteve/development/on/B3-FlowMesh-200ms-evidence/`, one directory per run: `$EV/<Ms>/<ID>/<run-id>/` with `run.json`, logs and `MANIFEST.sha256` (plan §10.2). For outline slices, `scratch:R<n>/` means the provisional session scratch directory `.../scratchpad/rebirth/evidence/R<n>/`; it is not durable, and M0-AUD-01 re-creates the evidence under `$EV`. |
 | Refs | Requirement IDs, plan IDs, decisions (D1..D30), reported contradictions (O-n), gates. |
 
 **Status transitions.** When a slice lands, the same commit moves its own R row
