@@ -127,6 +127,10 @@ struct SlotFixture {
     {
         return Sign(Unsigned(name, nonce, ActionKind::CANCEL, EncodePayload(CancelPayload{order}).value()), name);
     }
+    std::vector<unsigned char> CancelAll(std::string_view name, uint64_t nonce)
+    {
+        return Sign(Unsigned(name, nonce, ActionKind::CANCEL_ALL, EncodePayload(CancelAllPayload{}).value()), name);
+    }
     std::vector<unsigned char> Transfer(std::string_view name, uint64_t nonce, const AccountId& to, const AssetId& asset,
                                         Atoms amount)
     {

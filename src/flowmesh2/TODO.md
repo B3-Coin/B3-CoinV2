@@ -43,7 +43,7 @@ M8-BRG-02, M8-EXIT-01 and the REAL-REPLACE M2-ADM-01 (R4); M2-LED-02,
 M2-LED-03, M2-LED-04, M2-LED-05, M2-LED-06 and the REAL-REPLACE M2-LED-07 and
 M7-FEE-01 (R5); M3-ENG-02 and the REAL-REPLACE M3-ENG-01, M3-ENG-04,
 M3-ENG-13 and M3-ENG-14 (R6; M3-ENG-03 gains its second stub site there);
-M3-ENG-09, M9-FUT-04 and the REAL-REPLACE M3-ENG-12 and M4-AGR-11 (R7;
+M9-FUT-04 and the REAL-REPLACE M3-ENG-12 and M4-AGR-11 (R7; M3-ENG-09 did too, until it landed;
 M2-LED-05, M2-LED-06, M3-ENG-02 and M3-ENG-04 gain R7 sites there);
 M4-STO-01, M4-STO-02, M4-STO-03, M4-STO-06 and M4-STO-07 (R8; M4-STO-05
 gains its second stub site there); M4-AGR-10 and the REAL-REPLACE
@@ -51,14 +51,15 @@ M2-LED-10 (R9; M4-STO-03 and M4-STO-07 gain R9 sites there); M4-AGR-01,
 M4-AGR-02, M4-AGR-03, M4-AGR-04, M4-AGR-06, M4-AGR-07, MB1-ADP-06 and
 M7-ADP-01 (R10); M5-VFY-03, M7-ADP-02, M8-CKP-01 and the REAL-REPLACE
 M5-RD-01 (R11; M2-LED-02 gains its R11 site there); M4-ADM-02 (R12;
-M4-ADM-01, M2-LED-05, M2-LED-06, M3-ENG-09 and the REAL-REPLACE M2-ADM-01
+M4-ADM-01, M2-LED-05, M2-LED-06 and the REAL-REPLACE M2-ADM-01
 gain R12 sites there); M5-API-01, M5-API-02, M4-SIM-01, M4-NET-01,
 M4-NET-02, M4-NET-03, M8-BRG-01, M8-BRG-03, M9-FUT-02, M9-FUT-03, M7-GOV-02
 and M7-GOV-03 (R13; M7-GOV-01, M8-BRG-02, M8-CKP-01, M8-EXIT-01, M9-FUT-01
 and M9-FUT-04 gain R13 sites there); M4-SIM-02, M4-SIM-03 and the
 REAL-REPLACE M0-SIM-01 (R14; M4-SIM-01 gains its R14 site there, and the
 walking skeleton's check N9 tags M2-LED-05).
-Every other row is `todo`, except the C1 baseline, which is `done`.
+Every other row is `todo`, except the C1 baseline and the tasks completed
+since (M3-ENG-09, 2026-11-14), which are `done`.
 
 ---
 
@@ -234,7 +235,7 @@ for M10. ARCHITECTURE.md §0 and §15 describe each.
 | M3-ENG-06 | M3 | todo | NONE | — | x86 gate: apply + roots p99 ≤ 5 ms at 1,024 actions on an adversarial 131k-tick book; parallel subtree hashing | new | perf evidence with PERF-7 metadata | M3/M3-ENG-06/ | plan §3.5 |
 | M3-ENG-07 | M3 | todo | NONE | — | MEV analysis: A versus A2 | new | report accepted by the owner | M3/M3-ENG-07/ | D4, OWNER-GATED |
 | M3-ENG-08 | M3 | outline | STUB | R3, R4 | `PER_SIDE` fee incidence plus D6 dust vectors | `core/params` `Validate` (`PER_SIDE`, R3); `core/fee_math` extension point (R4) | both incidences pass | M3/M3-ENG-08/ | D3, D5, D6, BLOCKED-ON-RULING |
-| M3-ENG-09 | M3 | outline | STUB | R7, R12 | `CANCEL_ALL` | engine branch `PhaseOf` CANCEL_ALL (`engine/engine`, R7; `ValidateSlotInputs` refuses the kind first); admission `KindAdmissible` → `UNSUPPORTED_KIND` with reason M3-ENG-09 (`admission/admission`, R12) | releases all; conservation | M3/M3-ENG-09/ | plan §3.6 |
+| M3-ENG-09 | M3 | done | STUB | R7, R12 | `CANCEL_ALL` (landed 2026-11-14: empty payload, phase 3, every market, always `CANCELLED`; O-93; acceptance by the owner or auditor pending) | `CancelAllPayload`, `ActionV2::CancelAll` (`core/action`); `PhaseOf`, `SlotRun::CancelAll` (`engine/engine`); `KindAdmissible`, `PayloadAdmissible` (`admission/admission`) | `engine_tests/cancel_all_releases_every_order_of_the_account` (every order of the account in two markets released, deltas per asset, bob's order and a same-slot PLACE untouched, conservation in phase 9, empty CANCEL_ALL still CANCELLED), `admission_tests/cancel_all_is_admitted`, `validate_slot_tests`, `canonical_order_tests/phase_of_every_kind`, `action_tests` codec; failed first (the API did not exist) | M3/M3-ENG-09/20261114-newmac-01/ | plan §3.6, O-93 |
 | M3-ENG-10 | M3 | todo | NONE | — | Replace/amend revisions | new | atomic replace tests | M3/M3-ENG-10/ | BLOCKED-ON-RULING |
 | M3-ENG-11 | M3 | outline | REAL-REPLACE | R3 | Per-market tick, lot and minimum size at listing | `core/market` `MarketDescriptor` | vectors | M3/M3-ENG-11/ | D6, OD-7 |
 | M3-ENG-12 | M3 | outline | REAL-REPLACE | R7 | Seed hardening: parent-header seed, grinding tests; consider a VRF or a unique threshold signature | `OrderKey`, `CanonicalOrder` (`engine/engine`) | no measured proposer or client advantage | M3/M3-ENG-12/ | PLAN-7, D4, O-4, O-4b, BLOCKED-ON-RULING |

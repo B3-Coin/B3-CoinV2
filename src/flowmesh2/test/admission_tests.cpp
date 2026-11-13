@@ -433,7 +433,6 @@ BOOST_AUTO_TEST_CASE(unsupported_kinds_name_their_task)
     SlotFixture& a{r.Actions()};
     const std::vector<std::pair<Frame, std::string_view>> cases{
         {KindAction(a, "alice", 1, ActionKind::WITHDRAW, WithdrawPayloadBytes()), "M2-LED-05"},
-        {KindAction(a, "alice", 2, ActionKind::CANCEL_ALL), "M3-ENG-09"},
         {KindAction(a, "alice", 3, ActionKind::SPOT_TO_FUTURES), "M2-LED-06"},
         {KindAction(a, "alice", 4, ActionKind::FUTURES_TO_SPOT), "M2-LED-06"},
     };
@@ -448,6 +447,18 @@ BOOST_AUTO_TEST_CASE(unsupported_kinds_name_their_task)
     BOOST_CHECK_EQUAL(r.pool->Size(), 0U);
     // The nonces were not consumed: nonce 1 is still admissible as a PLACE.
     Step(r, PlaceAt(a, "alice", 1, 1, 16), AdmissionCode::ADMITTED, 1, "nonce 1 afterwards");
+}
+
+BOOST_AUTO_TEST_CASE(cancel_all_is_admitted)
+{
+    // M3-ENG-09: CANCEL_ALL passes A2 like CANCEL (empty payload, one signature
+    // check); a payload byte is MALFORMED before any signature check.
+    AdmissionRig r;
+    r.Fund();
+    SlotFixture& a{r.Actions()};
+    Step(r, KindAction(a, "alice", 1, ActionKind::CANCEL_ALL), AdmissionCode::ADMITTED, 1, "CANCEL_ALL");
+    Step(r, KindAction(a, "alice", 2, ActionKind::CANCEL_ALL, {0x00}), AdmissionCode::MALFORMED, 0, "CANCEL_ALL with a byte");
+    BOOST_CHECK_EQUAL(r.pool->Size(), 1U);
 }
 
 BOOST_AUTO_TEST_CASE(payload_rule_matches_the_validity_predicate)
@@ -482,6 +493,8 @@ BOOST_AUTO_TEST_CASE(payload_rule_matches_the_validity_predicate)
         {ActionKind::CANCEL, cancel, true},
         {ActionKind::CANCEL, plus(cancel), false},
         {ActionKind::CANCEL, {}, false},
+        {ActionKind::CANCEL_ALL, {}, true},
+        {ActionKind::CANCEL_ALL, {0x00}, false},
         {ActionKind::TRANSFER, transfer, true},
         {ActionKind::TRANSFER, negative, false},
         {ActionKind::TRANSFER, minus(transfer), false},
@@ -504,7 +517,7 @@ BOOST_AUTO_TEST_CASE(payload_rule_matches_the_validity_predicate)
         RequireCode(reply, admissible ? AdmissionCode::ADMITTED : AdmissionCode::MALFORMED, "admission of the payload");
         if (!admissible) BOOST_CHECK_EQUAL(reply.reason, admission::REASON_PAYLOAD_MALFORMED);
     }
-    for (const ActionKind kind : {ActionKind::CANCEL_ALL, ActionKind::WITHDRAW, ActionKind::SPOT_TO_FUTURES, ActionKind::FUTURES_TO_SPOT}) {
+    for (const ActionKind kind : {ActionKind::WITHDRAW, ActionKind::SPOT_TO_FUTURES, ActionKind::FUTURES_TO_SPOT}) {
         BOOST_CHECK(!admission::PayloadAdmissible(DecodeAction(KindAction(a, "alice", nonce++, kind))));
     }
 }

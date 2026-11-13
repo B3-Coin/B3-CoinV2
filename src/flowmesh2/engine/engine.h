@@ -89,7 +89,7 @@ Result<std::vector<size_t>> CanonicalOrder(std::span<const VerifiedAction> origi
 enum class SlotPhase : uint8_t {
     DEPOSITS = 1,     //!< chain facts: deposits credit accounts
     ACCOUNT = 2,      //!< TRANSFER (later WITHDRAW, M2-LED-05)
-    CANCELS = 3,      //!< CANCEL by OrderId (later CANCEL_ALL, M3-ENG-09)
+    CANCELS = 3,      //!< CANCEL by OrderId and CANCEL_ALL
     POST_ONLY = 4,    //!< PLACE POST_ONLY: rest, or REJ_WOULD_CROSS
     TAKERS = 5,       //!< PLACE GTC/IOC: reserve all, then one A2 sweep per market
     REST = 6,         //!< GTC remainders rest; IOC and refused remainders are released
@@ -101,13 +101,12 @@ bool IsKnown(SlotPhase phase);
 //! Registry name; "UNKNOWN" for an unregistered value.
 std::string_view ToString(SlotPhase phase);
 
-/** The phase in which `action` executes: TRANSFER in ACCOUNT, CANCEL in
- * CANCELS, a POST_ONLY PLACE in POST_ONLY, a GTC or IOC PLACE in TAKERS. A
- * PLACE whose payload does not decode returns the decoder's error. The
- * other kinds are the engine branches the outline leaves as stubs; the
- * validity predicate refuses them first (KindSupported), so a validated
- * slot never reaches them:
- * - CANCEL_ALL: NotImplemented(M3-ENG-09) (phase CANCELS once done);
+/** The phase in which `action` executes: TRANSFER in ACCOUNT, CANCEL and
+ * CANCEL_ALL in CANCELS, a POST_ONLY PLACE in POST_ONLY, a GTC or IOC PLACE
+ * in TAKERS. A PLACE or CANCEL_ALL whose payload does not decode returns the
+ * decoder's error. The other kinds are the engine branches the outline
+ * leaves as stubs; the validity predicate refuses them first
+ * (KindSupported), so a validated slot never reaches them:
  * - WITHDRAW: NotImplemented(M2-LED-05) (phase ACCOUNT once done);
  * - SPOT_TO_FUTURES, FUTURES_TO_SPOT: NotImplemented(M2-LED-06).
  * INVALID_INPUT for an unregistered kind.
@@ -210,8 +209,8 @@ struct SlotInputs {
     friend bool operator==(const SlotInputs&, const SlotInputs&) = default;
 };
 
-//! The decoded payload of an action kind the outline executes.
-using ActionPayload = std::variant<PlacePayload, CancelPayload, TransferPayload>;
+//! The decoded payload of an action kind the engine executes.
+using ActionPayload = std::variant<PlacePayload, CancelPayload, CancelAllPayload, TransferPayload>;
 
 //! One validated original: the verified action, its decoded payload and its phase.
 struct SlotAction {
@@ -380,7 +379,12 @@ Result<void> RunFuturesPhase(EngineState& state, const ProfileParams& profile);
  *    REJ_UNKNOWN_ORDER (not resting: never placed, already closed, or
  *    placed in this slot, whose PLACE runs later) or REJ_NOT_OWN_ORDER.
  *    REJ_ORDER_CLOSED needs an index of closed orders; the outline does
- *    not keep one and answers REJ_UNKNOWN_ORDER.
+ *    not keep one and answers REJ_UNKNOWN_ORDER. CANCEL_ALL (M3-ENG-09)
+ *    removes every resting order of the signer's account in every market
+ *    (books in ascending MarketId, each book in its Orders() order) the
+ *    same way and is always CANCELLED, with one delta per reserved asset
+ *    (none when nothing rested), never a fill; it cannot reach a PLACE of
+ *    its own slot either.
  * 4. POST_ONLY: RESTING at its own price with
  *    ArrivalRank(height, POST_ONLY, rank), or REJ_WOULD_CROSS if it would
  *    execute against the book as it stands after the earlier post-only

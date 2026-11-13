@@ -34,8 +34,8 @@
  * v1 (M2-LED-02), the liability sum root (M2-LED-03) and exit_value
  * (M2-LED-04). Slice R6 adds the residual-cross call (M3-ENG-02) and
  * extends M3-ENG-03 to probe the engine's PriceBandCheck as well. Slice R7
- * adds the engine's CANCEL_ALL branch (M3-ENG-09) and futures phase 7
- * (M9-FUT-04), and extends M2-LED-05 and M2-LED-06 to probe the engine
+ * adds the engine's CANCEL_ALL branch (M3-ENG-09, done since: its case is
+ * gone) and futures phase 7 (M9-FUT-04), and extends M2-LED-05 and M2-LED-06 to probe the engine
  * branches of WITHDRAW and the spot/futures transfers (engine PhaseOf) as
  * well. Slice R8 adds the file journal's reopen and read-back and the logs'
  * recovery over a journal with history (M4-STO-01), segment rollover
@@ -56,7 +56,7 @@
  * liability paths (M5-VFY-03), checkpoints (M8-CKP-01) and anchor proofs
  * (M7-ADP-02). Slice R12 adds the credit budget (M4-ADM-02), and extends
  * M4-ADM-01 to probe admission's batch path (Admission::AdmitBatch) and
- * M2-LED-05, M2-LED-06 and M3-ENG-09 to probe admission's kind rule
+ * M2-LED-05 and M2-LED-06 (and M3-ENG-09 until it landed) to probe admission's kind rule
  * (KindAdmissible, whose Unsupported refusals become UNSUPPORTED_KIND).
  * Slice R13 adds the client API's HTTPS + SSE transport (M5-API-01) and
  * streams (M5-API-02, InProcessApi::Subscribe); the in-process (M4-SIM-01)
@@ -487,13 +487,6 @@ FM2_STUB_CASE(M3_ENG_02, "M3-ENG-02")
 }
 
 // ---- Slice R7: engine/engine ----
-
-FM2_STUB_CASE(M3_ENG_09, "M3-ENG-09")
-{
-    // The engine branch (R7) and admission's kind rule (R12).
-    return FirstDeviation("M3-ENG-09", {Observe(engine::PhaseOf(ActionOfKind(ActionKind::CANCEL_ALL))),
-                                        Observe(admission::KindAdmissible(ActionKind::CANCEL_ALL))});
-}
 
 FM2_STUB_CASE(M9_FUT_04, "M9-FUT-04")
 {

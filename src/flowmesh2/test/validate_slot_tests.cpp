@@ -279,8 +279,7 @@ BOOST_AUTO_TEST_CASE(action_domain_kind_and_payload)
     foreign.domain = LabelHash("fm2/test/other-domain");
     RequireRefusal(fx.Validate(fx.Inputs({}, {fx.Sign(foreign, "alice")})), SLOT_ACTION_DOMAIN, "another domain");
 
-    for (const ActionKind kind : {ActionKind::CANCEL_ALL, ActionKind::WITHDRAW, ActionKind::SPOT_TO_FUTURES,
-                                  ActionKind::FUTURES_TO_SPOT}) {
+    for (const ActionKind kind : {ActionKind::WITHDRAW, ActionKind::SPOT_TO_FUTURES, ActionKind::FUTURES_TO_SPOT}) {
         const std::vector<unsigned char> payload{kind == ActionKind::WITHDRAW
                                                      ? EncodePayload(WithdrawPayload{RUSD, 1, {0x51}}).value()
                                                      : std::vector<unsigned char>{}};
@@ -290,6 +289,10 @@ BOOST_AUTO_TEST_CASE(action_domain_kind_and_payload)
 
     RequireRefusal(fx.Validate(fx.Inputs({}, {fx.Sign(fx.Unsigned("alice", 1, ActionKind::PLACE, {0x01}), "alice")})),
                    SLOT_ACTION_PAYLOAD, "truncated PLACE payload");
+    // CANCEL_ALL executes (M3-ENG-09); its payload must be exactly empty.
+    RequireOk(fx.Validate(fx.Inputs({}, {fx.CancelAll("alice", 1)})), "CANCEL_ALL validates");
+    RequireRefusal(fx.Validate(fx.Inputs({}, {fx.Sign(fx.Unsigned("alice", 1, ActionKind::CANCEL_ALL, {0x00}), "alice")})),
+                   SLOT_ACTION_PAYLOAD, "CANCEL_ALL payload with a byte");
     std::vector<unsigned char> bad_side{EncodePayload(PlacePayload{MarketM1().Id(), Side::BUY, TimeInForce::GTC, 1, 1}).value()};
     bad_side[32] = 7;
     RequireRefusal(fx.Validate(fx.Inputs({}, {fx.Sign(fx.Unsigned("alice", 1, ActionKind::PLACE, bad_side), "alice")})),

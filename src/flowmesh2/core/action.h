@@ -83,9 +83,9 @@ inline constexpr std::string_view ACTION_UNKNOWN_KIND{"unknown ActionV2 kind"};
 
 /** Action kinds. APPEND-ONLY registry, owner-protected; zero is never a
  * value. The order follows plan section 3.6 (PLACE, CANCEL, CANCEL_ALL,
- * WITHDRAW, TRANSFER, ...). Only PLACE, CANCEL and TRANSFER execute in the
- * outline (KindSupported); the others are refused before execution
- * (CANCEL_ALL: M3-ENG-09, WITHDRAW: M2-LED-05, futures transfers: M2-LED-06).
+ * WITHDRAW, TRANSFER, ...). PLACE, CANCEL, CANCEL_ALL and TRANSFER execute
+ * (KindSupported); the others are refused before execution (WITHDRAW:
+ * M2-LED-05, futures transfers: M2-LED-06).
  */
 enum class ActionKind : uint8_t {
     PLACE = 1,
@@ -118,7 +118,7 @@ std::string_view ToString(ActionKind kind);
 std::string_view ToString(Side side);
 std::string_view ToString(TimeInForce tif);
 
-//! True for the kinds the outline executes: PLACE, CANCEL and TRANSFER.
+//! True for the kinds the engine executes: PLACE, CANCEL, CANCEL_ALL and TRANSFER.
 bool KindSupported(ActionKind kind);
 
 namespace detail {
@@ -170,6 +170,25 @@ struct CancelPayload {
     SERIALIZE_METHODS(CancelPayload, obj) { READWRITE(obj.order); }
 };
 
+/** CANCEL_ALL payload, 0 bytes (M3-ENG-09): the signer cancels every order of
+ * its account that rests in any market. PROVISIONAL: plan section 3.6 names
+ * only the kind, so there is no market filter; a filtered form would be a new
+ * kind. Any payload byte is above the encoding's size (OVERSIZE at decode).
+ */
+struct CancelAllPayload {
+    static constexpr size_t ENCODED_BYTES{0};
+    friend bool operator==(const CancelAllPayload&, const CancelAllPayload&) = default;
+
+    template <typename Stream>
+    void Serialize(Stream&) const
+    {
+    }
+    template <typename Stream>
+    void Unserialize(Stream&)
+    {
+    }
+};
+
 /** TRANSFER payload, 72 bytes: to | asset | i64 amount. The amount must be in
  * [0, MAX_ATOMS] on the wire (DECODE otherwise). Zero, self-transfer and an
  * unknown recipient are certified engine rejections (O-7, R7).
@@ -219,6 +238,7 @@ struct WithdrawPayload {
  */
 Result<std::vector<unsigned char>> EncodePayload(const PlacePayload& payload);
 Result<std::vector<unsigned char>> EncodePayload(const CancelPayload& payload);
+Result<std::vector<unsigned char>> EncodePayload(const CancelAllPayload& payload);
 Result<std::vector<unsigned char>> EncodePayload(const TransferPayload& payload);
 Result<std::vector<unsigned char>> EncodePayload(const WithdrawPayload& payload);
 
@@ -260,6 +280,7 @@ struct ActionV2 {
     //! of `payload` (DECODE, or OVERSIZE above the payload's size).
     Result<PlacePayload> Place() const;
     Result<CancelPayload> Cancel() const;
+    Result<CancelAllPayload> CancelAll() const;
     Result<TransferPayload> Transfer() const;
     Result<WithdrawPayload> Withdraw() const;
 

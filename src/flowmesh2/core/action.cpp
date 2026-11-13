@@ -76,7 +76,8 @@ std::string_view ToString(TimeInForce tif)
 
 bool KindSupported(ActionKind kind)
 {
-    return kind == ActionKind::PLACE || kind == ActionKind::CANCEL || kind == ActionKind::TRANSFER;
+    return kind == ActionKind::PLACE || kind == ActionKind::CANCEL || kind == ActionKind::CANCEL_ALL ||
+           kind == ActionKind::TRANSFER;
 }
 
 namespace {
@@ -100,6 +101,8 @@ Result<std::vector<unsigned char>> EncodePayload(const PlacePayload& payload)
 }
 
 Result<std::vector<unsigned char>> EncodePayload(const CancelPayload& payload) { return Ok(EncodeBytes(payload)); }
+
+Result<std::vector<unsigned char>> EncodePayload(const CancelAllPayload& /*payload*/) { return Ok(std::vector<unsigned char>{}); }
 
 Result<std::vector<unsigned char>> EncodePayload(const TransferPayload& payload)
 {
@@ -180,6 +183,11 @@ Result<PlacePayload> ActionV2::Place() const
 Result<CancelPayload> ActionV2::Cancel() const
 {
     return DecodePayload<CancelPayload>(*this, ActionKind::CANCEL, CancelPayload::ENCODED_BYTES);
+}
+
+Result<CancelAllPayload> ActionV2::CancelAll() const
+{
+    return DecodePayload<CancelAllPayload>(*this, ActionKind::CANCEL_ALL, CancelAllPayload::ENCODED_BYTES);
 }
 
 Result<TransferPayload> ActionV2::Transfer() const

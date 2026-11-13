@@ -614,6 +614,56 @@ BOOST_AUTO_TEST_CASE(stale_parent_and_profile_checks)
     RequireError(engine.ApplySlot(held_head, *held_slot), ErrorCode::INVARIANT, "fees held by the parent");
 }
 
+BOOST_AUTO_TEST_CASE(cancel_all_releases_every_order_of_the_account)
+{
+    // M3-ENG-09. Alice rests on both sides of M1 and on M2; bob rests on M1.
+    SlotFixture fx;
+    FundAll(fx);
+    const auto a_bid{fx.Place("alice", 1, MarketM1(), Side::BUY, TimeInForce::GTC, 100, 7)};        // 700 rUSD
+    const auto a_ask{fx.Place("alice", 2, MarketM1(), Side::SELL, TimeInForce::GTC, 300, 2)};       // 2 lots = 2e6 B3
+    const auto a_m2{fx.Place("alice", 3, MarketM2(), Side::BUY, TimeInForce::POST_ONLY, 5, 4)};     // 5 * 4 * 10 = 200 rUSD
+    const auto b_ask{fx.Place("bob", 1, MarketM1(), Side::SELL, TimeInForce::GTC, 200, 3)};         // 3e6 B3
+    fx.Apply(fx.Inputs({}, {a_bid, a_ask, a_m2, b_ask}));
+    BOOST_CHECK(fx.BalanceOf("alice", RUSD).reserved == 900);
+    BOOST_CHECK(fx.BalanceOf("alice", B3).reserved == 2'000'000);
+    BOOST_CHECK_EQUAL(fx.state.ledger.Find(KeyAccount("alice"))->open_orders, 3U);
+    BOOST_CHECK_EQUAL(fx.state.books.OrderCount(), 4U);
+
+    // One CANCELLED outcome releases every resting order of alice in every
+    // market, one delta per reserved asset. Bob's order survives; so does a
+    // same-slot post-only PLACE of alice (phase 4 runs after phase 3). A CANCEL
+    // by alice with a higher nonce runs after her CANCEL_ALL and finds nothing.
+    const auto all{fx.CancelAll("alice", 4)};
+    const auto later{fx.Place("alice", 5, MarketM1(), Side::BUY, TimeInForce::POST_ONLY, 90, 1)};
+    const auto stale{fx.Cancel("alice", 6, fx.IdOf(a_bid))};
+    const SlotResult s{fx.Apply(fx.Inputs({}, {stale, later, all}))};
+    BOOST_CHECK(Outcome(s, all, fx).code == OutcomeCode::CANCELLED);
+    BOOST_CHECK(DeltasOf(Outcome(s, all, fx)) ==
+                (Deltas{{{KeyAccount("alice"), B3}, {2'000'000, -2'000'000}}, {{KeyAccount("alice"), RUSD}, {900, -900}}}));
+    BOOST_CHECK(Outcome(s, all, fx).fills.empty());
+    CheckRejected(Outcome(s, stale, fx), OutcomeCode::REJ_UNKNOWN_ORDER, "a cancel after the account's CANCEL_ALL");
+    BOOST_CHECK(Outcome(s, later, fx).code == OutcomeCode::RESTING);
+    BOOST_CHECK(fx.BalanceOf("alice", B3).reserved == 0);
+    BOOST_CHECK(fx.BalanceOf("alice", RUSD).reserved == 90); // only the new post-only bid
+    BOOST_CHECK_EQUAL(fx.state.ledger.Find(KeyAccount("alice"))->open_orders, 1U);
+    BOOST_CHECK(fx.state.books.FindOrder(fx.IdOf(a_bid)) == nullptr);
+    BOOST_CHECK(fx.state.books.FindOrder(fx.IdOf(a_ask)) == nullptr);
+    BOOST_CHECK(fx.state.books.FindOrder(fx.IdOf(a_m2)) == nullptr);
+    BOOST_CHECK(fx.state.books.FindOrder(fx.IdOf(b_ask)) != nullptr);
+    BOOST_CHECK(fx.state.books.FindOrder(fx.IdOf(later)) != nullptr);
+    BOOST_CHECK(fx.BalanceOf("bob", B3).reserved == 3'000'000);
+    BOOST_CHECK_EQUAL(fx.state.books.OrderCount(), 2U);
+
+    // With nothing resting, CANCEL_ALL is still CANCELLED, with no deltas: a
+    // definite, idempotent answer that consumes the nonce (DUR-5).
+    const auto nothing{fx.CancelAll("carol", 1)};
+    const SlotResult s2{fx.Apply(fx.Inputs({}, {nothing}))};
+    const OutcomeV2& o{Outcome(s2, nothing, fx)};
+    BOOST_CHECK(o.code == OutcomeCode::CANCELLED);
+    BOOST_CHECK(o.deltas.empty() && o.fills.empty());
+    BOOST_CHECK(HasNonce(fx.UsedNonces("carol"), 1));
+}
+
 BOOST_AUTO_TEST_CASE(futures_phase_is_a_no_op_while_disabled)
 {
     SlotFixture fx;

@@ -413,7 +413,7 @@ BOOST_AUTO_TEST_CASE(each_leader_fault_input_gives_invalid_input_and_no_candidat
     };
     ActionV2 expired{a.Unsigned("bob", 2, ActionKind::PLACE,
                                 EncodePayload(PlacePayload{MarketM1().Id(), Side::SELL, TimeInForce::GTC, 300, 1}).value(), 0, 1)};
-    ActionV2 cancel_all{a.Unsigned("bob", 3, ActionKind::CANCEL_ALL, {})};
+    ActionV2 withdraw{a.Unsigned("bob", 3, ActionKind::WITHDRAW, EncodePayload(WithdrawPayload{AssetId::Native(), 1, {0x51}}).value())};
     std::vector<unsigned char> bad_sig{a.Place("carol", 1, MarketM1(), Side::BUY, TimeInForce::GTC, 1, 1)};
     bad_sig.back() ^= 0x01;
     const std::vector<Fault> faults{
@@ -432,7 +432,7 @@ BOOST_AUTO_TEST_CASE(each_leader_fault_input_gives_invalid_input_and_no_candidat
         {"too many originals", [&](state::SlotInputs& in) { in.body.originals.assign(RegtestProfile().max_actions_per_slot + 1, good); },
          engine::SLOT_ACTION_COUNT_CAP},
         {"malformed original", [](state::SlotInputs& in) { in.body.originals = {{0x00, 0x01}}; }, engine::SLOT_ACTION_MALFORMED},
-        {"unsupported kind", [&](state::SlotInputs& in) { in.body.originals = {a.Sign(cancel_all, "bob")}; }, engine::SLOT_ACTION_KIND},
+        {"unsupported kind", [&](state::SlotInputs& in) { in.body.originals = {a.Sign(withdraw, "bob")}; }, engine::SLOT_ACTION_KIND},
         {"outside its window", [&](state::SlotInputs& in) { in.body.originals = {a.Sign(expired, "bob")}; }, engine::SLOT_ACTION_WINDOW},
         {"duplicate original", [&](state::SlotInputs& in) { in.body.originals = {good, good}; }, engine::SLOT_DUPLICATE_ACTION},
         {"duplicate nonce",

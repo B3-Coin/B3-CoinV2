@@ -143,8 +143,11 @@ Result<SlotPhase> PhaseOf(const ActionV2& action)
         return Ok(SlotPhase::CANCELS);
     case ActionKind::TRANSFER:
         return Ok(SlotPhase::ACCOUNT);
-    case ActionKind::CANCEL_ALL:
-        return NotImplemented("M3-ENG-09"); // TODO(rebirth:M3-ENG-09) CANCEL_ALL in phase 3: release every order of the account
+    case ActionKind::CANCEL_ALL: {
+        const Result<CancelAllPayload> all{action.CancelAll()};
+        if (!all.has_value()) return all.error();
+        return Ok(SlotPhase::CANCELS);
+    }
     case ActionKind::WITHDRAW:
         return NotImplemented("M2-LED-05"); // TODO(rebirth:M2-LED-05) WITHDRAW in phase 2 through LedgerState::RequestWithdrawal
     case ActionKind::SPOT_TO_FUTURES:
@@ -285,12 +288,16 @@ std::optional<ActionPayload> DecodePayload(const ActionV2& action)
         if (!cancel.has_value()) return std::nullopt;
         return ActionPayload{std::move(cancel).value()};
     }
+    case ActionKind::CANCEL_ALL: {
+        Result<CancelAllPayload> all{action.CancelAll()};
+        if (!all.has_value()) return std::nullopt;
+        return ActionPayload{std::move(all).value()};
+    }
     case ActionKind::TRANSFER: {
         Result<TransferPayload> transfer{action.Transfer()};
         if (!transfer.has_value()) return std::nullopt;
         return ActionPayload{std::move(transfer).value()};
     }
-    case ActionKind::CANCEL_ALL:
     case ActionKind::WITHDRAW:
     case ActionKind::SPOT_TO_FUTURES:
     case ActionKind::FUTURES_TO_SPOT:
@@ -588,14 +595,19 @@ private:
         return Ok();
     }
 
-    // Phase 3.
+    // Phase 3: CANCEL by OrderId and CANCEL_ALL, in canonical order.
     Result<void> Cancels()
     {
         for (size_t rank{0}; rank < Count(); ++rank) {
             const SlotAction& a{At(rank)};
             if (a.phase != SlotPhase::CANCELS) continue;
-            const OrderId& id{std::get<CancelPayload>(a.payload).order};
             const AccountId& owner{a.action.Account()};
+            if (std::holds_alternative<CancelAllPayload>(a.payload)) {
+                const Result<void> all{CancelAll(rank, owner)};
+                if (!all.has_value()) return all.error();
+                continue;
+            }
+            const OrderId& id{std::get<CancelPayload>(a.payload).order};
             OrderBook* book{m_state.books.FindOrderMutable(id)};
             if (book == nullptr) {
                 Reject(rank, OutcomeCode::REJ_UNKNOWN_ORDER);
@@ -617,6 +629,40 @@ private:
             const Result<void> added{record.deltas.Add(owner, asset, removed->reserved_left, -removed->reserved_left)};
             if (!added.has_value()) return added.error();
         }
+        return Ok();
+    }
+
+    /** CANCEL_ALL (M3-ENG-09): every resting order of `owner`, in every
+     * market (ascending MarketId; inside a book in its Orders() order), the
+     * same way as a CANCEL: the order leaves its book, its reservation is
+     * released and one open-order slot is given back. Always CANCELLED; the
+     * deltas sum per reserved asset, so an account with nothing resting gets
+     * CANCELLED with no delta.
+     */
+    Result<void> CancelAll(size_t rank, const AccountId& owner)
+    {
+        ActionRecord& record{m_records[rank]};
+        std::vector<MarketId> markets;
+        markets.reserve(m_state.books.MarketCount());
+        for (const auto& [market, book] : m_state.books.Books()) markets.push_back(market);
+        for (const MarketId& market : markets) {
+            OrderBook* book{m_state.books.FindMutable(market)};
+            if (book == nullptr) return Broken("market vanished during CANCEL_ALL");
+            const std::vector<RestingOrder> resting{book->Orders()}; // a copy: the loop mutates the book
+            for (const RestingOrder& order : resting) {
+                if (!(order.owner == owner)) continue;
+                const Result<RestingOrder> removed{book->Remove(order.id)};
+                if (!removed.has_value()) return removed.error();
+                const AssetId& asset{ReservedAsset(book->Market(), removed->side)};
+                const Result<void> released{Ledger().Release(owner, asset, removed->reserved_left)};
+                if (!released.has_value()) return released.error();
+                const Result<void> closed{Ledger().RemoveOpenOrder(owner)};
+                if (!closed.has_value()) return closed.error();
+                const Result<void> added{record.deltas.Add(owner, asset, removed->reserved_left, -removed->reserved_left)};
+                if (!added.has_value()) return added.error();
+            }
+        }
+        record.code = OutcomeCode::CANCELLED;
         return Ok();
     }
 
