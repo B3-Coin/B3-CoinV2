@@ -141,7 +141,6 @@ if(BUILD_FLOWMESH2)
     net/sentry.cpp
     net/short_id.cpp
     net/sync.cpp
-    net/tcp_mesh.cpp
     read/read_service.cpp
     read/views.cpp
     seat/seat_node.cpp
@@ -183,6 +182,27 @@ if(BUILD_FLOWMESH2)
       fm2_warnings
     PUBLIC
       fm2_types
+      bitcoin_crypto
+  )
+
+  # netio/ (stage 2, M4-NET-01): the TCP seat mesh, in namespaces
+  # flowmesh2::netio (channel, handshake) and flowmesh2::net (the
+  # TcpSeatMesh declared in net/tcp_mesh.h). It links bitcoin_common for the
+  # ElligatorSwift ECDH, the BIP340 transport signatures and the socket
+  # helpers, which fm2_core may not link (guard rule 4); only executables
+  # and the tests link fm2_netio, never fm2_core, fm2_verify or fm2_types.
+  add_library(fm2_netio STATIC
+    netio/bip324_session.cpp
+    netio/mesh_handshake.cpp
+    netio/tcp_mesh.cpp
+  )
+  target_link_libraries(fm2_netio
+    PRIVATE
+      core_interface
+      fm2_warnings
+    PUBLIC
+      fm2_core
+      bitcoin_common
       bitcoin_crypto
   )
 
@@ -313,6 +333,7 @@ if(BUILD_FLOWMESH2)
     test/state_root_tests.cpp
     test/stub_inventory_tests.cpp
     test/sync_tests.cpp
+    test/tcp_mesh_tests.cpp
     test/validate_slot_tests.cpp
     test/verify_tests.cpp
   )
@@ -321,6 +342,7 @@ if(BUILD_FLOWMESH2)
   target_link_libraries(test_flowmesh2 PRIVATE
     core_interface
     fm2_warnings
+    fm2_netio
     fm2_simlib
     fm2_dev
     fm2_core

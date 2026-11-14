@@ -617,11 +617,6 @@ FM2_STUB_CASE(M5_API_02, "M5-API-02")
 
 // ---- Slice R13: net/ seat mesh ----
 
-FM2_STUB_CASE(M4_NET_01, "M4-NET-01")
-{
-    return Observe(net::TcpSeatMesh::Create(net::TcpMeshConfig{TestMeshConfig(0, 4), net::DEFAULT_SEAT_MESH_PORT, {}}));
-}
-
 FM2_STUB_CASE(M4_NET_03, "M4-NET-03")
 {
     auto mesh{RecordingMesh::Make(TestMeshConfig(0, 4))};

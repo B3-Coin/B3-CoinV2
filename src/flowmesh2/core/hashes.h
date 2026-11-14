@@ -62,6 +62,8 @@ enum class HashTag : uint8_t {
     JOURNAL = 28,          //!< first chain value of a journal (R8)
     TEST_ASSET = 29,       //!< synthetic test and simulator assets only
     AGREEMENT = 30,        //!< agreement statements and seeds: u8 kind first (agreement/digests.h; M4-AGR-02)
+    MESH_SESSION = 31,     //!< seat-mesh HELLO: the session id and the connection's fields (netio/mesh_handshake.h; M4-NET-01)
+    MESH_ENDPOINT = 32,    //!< seat endpoint record signed by the seat key (net/tcp_mesh.h; M4-NET-01)
 };
 
 //! The prefix of every tag text.
