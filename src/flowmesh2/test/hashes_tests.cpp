@@ -80,6 +80,7 @@ const PinnedTag PINNED_TAGS[]{
     {HashTag::PROTOCOL_ACCOUNT, 27, "B3/FM2/PROTOCOL_ACCOUNT", "dd170734e9886cefee4be813658ec7f08523ea1fe1df78aec279c0d43f84f3a9"},
     {HashTag::JOURNAL, 28, "B3/FM2/JOURNAL", "61a775b2eac97901da6842c51654a3fce27ca42f621dedb21b0641a766ced621"},
     {HashTag::TEST_ASSET, 29, "B3/FM2/TEST_ASSET", "bcbd107c316a7ee9193d8f593a2a1b8345f42cbfe8cc637032b76c12fef26c05"},
+    {HashTag::AGREEMENT, 30, "B3/FM2/AGREEMENT", "8341e1670c965b3482fbdfe1cad9c2df61706f6b350a6f41d44791c63bde1fd4"},
 };
 
 bool ScannedSuffix(const std::filesystem::path& path)
@@ -160,10 +161,10 @@ BOOST_AUTO_TEST_CASE(tags_unique_prefixed_and_distinct)
 BOOST_AUTO_TEST_CASE(unknown_tags_are_refused)
 {
     BOOST_CHECK(!IsKnown(static_cast<HashTag>(0)));
-    BOOST_CHECK(!IsKnown(static_cast<HashTag>(30)));
+    BOOST_CHECK(!IsKnown(static_cast<HashTag>(31)));
     BOOST_CHECK(!IsKnown(static_cast<HashTag>(255)));
     BOOST_CHECK(TagText(static_cast<HashTag>(0)).empty());
-    BOOST_CHECK(TagText(static_cast<HashTag>(30)).empty());
+    BOOST_CHECK(TagText(static_cast<HashTag>(31)).empty());
 }
 
 BOOST_AUTO_TEST_CASE(tagged_matches_the_bip340_definition)

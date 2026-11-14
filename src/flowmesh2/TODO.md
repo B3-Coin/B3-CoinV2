@@ -66,8 +66,8 @@ M2-LED-05, M2-LED-06, M3-ENG-02 and M3-ENG-04 gain R7 sites there);
 M4-STO-02 and M4-STO-03 (R8; M4-STO-01, M4-STO-06 and M4-STO-07 did too,
 until they landed; M4-STO-05 gains its second stub site there); M4-AGR-10 and the REAL-REPLACE
 M2-LED-10 (R9; M4-STO-03 gains an R9 site there, as M4-STO-07 did); M4-AGR-01,
-M4-AGR-02, M4-AGR-03, M4-AGR-04, M4-AGR-06, M4-AGR-07, MB1-ADP-06 and
-M7-ADP-01 (R10); M5-VFY-03, M7-ADP-02, M8-CKP-01 and the REAL-REPLACE
+M4-AGR-02, M4-AGR-04, M4-AGR-06, M4-AGR-07, MB1-ADP-06 and
+M7-ADP-01 (R10; M4-AGR-03 did too, until it landed); M5-VFY-03, M7-ADP-02, M8-CKP-01 and the REAL-REPLACE
 M5-RD-01 (R11; M2-LED-02 gains its R11 site there); M4-ADM-02 (R12;
 M4-ADM-01, M2-LED-05, M2-LED-06 and the REAL-REPLACE M2-ADM-01
 gain R12 sites there); M5-API-01, M5-API-02, M4-SIM-01, M4-NET-01,
@@ -77,8 +77,8 @@ and M9-FUT-04 gain R13 sites there); M4-SIM-02, M4-SIM-03 and the
 REAL-REPLACE M0-SIM-01 (R14; M4-SIM-01 gains its R14 site there, and the
 walking skeleton's check N9 tags M2-LED-05).
 Every other row is `todo`, except the C1 baseline and the tasks completed
-since (M3-ENG-09, M4-STO-06, M4-NET-02, M4-STO-01 and M4-STO-07,
-2026-11-14), which are `done`.
+since (M3-ENG-09, M4-STO-06, M4-NET-02, M4-STO-01, M4-STO-07 and
+M4-AGR-03, 2026-11-14), which are `done`.
 
 ---
 
@@ -282,7 +282,7 @@ for M10. ARCHITECTURE.md §0 and §15 describe each.
 |---|---|---|---|---|---|---|---|---|---|
 | M4-AGR-01 | M4 | outline | STUB | R10 | PBFT safety rules mapped from `test/flowmesh_v2_agreement/PROTOCOL.md` | `PbftSafetyRules` `MayPrepare`, `MayCommit`, `OnViewChange` (`agreement/pbft`) | trace agreement with the reference; Twins; the rules state the cross-epoch rule: a seat never signs a COMMIT for a height its own commit log decided with another header, whatever the epoch or view (a new epoch is a new `VoteKey`, so the signer log alone allows it), and a DECISION durable but refused at check 3 stays final for its height (O-89; the dev certifier's `DEV_HEIGHT_DECIDED` is the outline's form) | M4/M4-AGR-01/ | D10 |
 | M4-AGR-02 | M4 | outline | STUB | R10 | `PbftAgreement`: execute-then-vote, `Reexecute`, BLS aggregation, parent certificate in proposals; replaces the dev certifier's `OnMessage`; rules the message shapes the outline chose (O-57); adds typed durable send paths for VIEW_CHANGE and NEW_VIEW, which `SeatMesh::Send` passes without a token today (O-79); builds certificates only from durable votes (`OutboundVote`): `SeatSigner::Sign` returns a raw `VoteSignature` that could today enter a `SlotCertificate` or an opaque BULK frame; runs M4-AGR-12's fact check before every vote | `PbftAgreement::Create` (`agreement/pbft`); `DevSingleSeatCertifier::OnMessage` (`dev/dev_certifier`, `Unsupported`) | N=4 and N=7 DST with 0 violations | M4/M4-AGR-02/ | plan §3.4.1, D10 |
-| M4-AGR-03 | M4 | outline | STUB | R10 | 8-slot terms, seed-chosen leader, slow-set skip | `LeaderSchedule::LeaderFor` (`agreement/leader`) | distribution and skip tests | M4/M4-AGR-03/ | D11, BLOCKED-ON-RULING |
+| M4-AGR-03 | M4 | done | STUB | R10 | 8-slot terms, seed-chosen leader, slow-set skip (landed 2026-11-14, O-96; D11 PROVISIONAL until the owner rules; acceptance by the owner or auditor pending). `LeaderFor(authority, term, slow)` = active[LeaderSeed(seat_set_root, epoch, term) mod active]; `LeaderForView` rotates through the active seats per view | `LeaderSchedule::LeaderFor`, `LeaderForView` (`agreement/leader`); `LeaderSeed` and the other agreement digests (`agreement/digests`, tag `AGREEMENT`) | `agreement_tests/leader_schedule_is_seeded_and_skips_slow_seats` (determinism, authority-bound seed, every seat leads over 400 terms, view rotation, slow seats never lead, refusals), `agreement_tests/agreement_digests_are_domain_separated`; failed first (the API did not exist) | M4/M4-AGR-03/20261114-newmac-01/ | D11 (PROVISIONAL), O-96 |
 | M4-AGR-04 | M4 | outline | STUB | R10 | Inclusion lists; decide whether the vote signature covers the inclusion IDs (O-57) | `InclusionList::Build`/`Check` (`agreement/inclusion`) | a withheld action is forced into s+1 | M4/M4-AGR-04/ | PLAN-7 |
 | M4-AGR-05 | M4 | todo | NONE | — | Adaptive timeouts | new | G-FAULT profile | M4/M4-AGR-05/ | plan §3.4.1 |
 | M4-AGR-06 | M4 | outline | STUB | R10 | Restart high-water statements from 2f+1 seats | `RestartFence::Collect` (`agreement/restart_fence`) | a rolled-back VM retires the key | M4/M4-AGR-06/ | PLAN-8, DUR-3 |

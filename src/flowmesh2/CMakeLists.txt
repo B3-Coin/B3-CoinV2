@@ -111,6 +111,7 @@ if(BUILD_FLOWMESH2)
     admission/admission.cpp
     admission/budget.cpp
     admission/pool.cpp
+    agreement/digests.cpp
     agreement/evidence.cpp
     agreement/inclusion.cpp
     agreement/leader.cpp

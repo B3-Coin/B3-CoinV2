@@ -13,7 +13,7 @@
 namespace flowmesh2 {
 namespace {
 
-constexpr std::array<HashTagInfo, 29> HASH_TAGS{{
+constexpr std::array<HashTagInfo, 30> HASH_TAGS{{
     {HashTag::NET_DOMAIN, "DOMAIN", "B3/FM2/DOMAIN"},
     {HashTag::ACCOUNT, "ACCOUNT", "B3/FM2/ACCOUNT"},
     {HashTag::ACTION, "ACTION", "B3/FM2/ACTION"},
@@ -43,6 +43,7 @@ constexpr std::array<HashTagInfo, 29> HASH_TAGS{{
     {HashTag::PROTOCOL_ACCOUNT, "PROTOCOL_ACCOUNT", "B3/FM2/PROTOCOL_ACCOUNT"},
     {HashTag::JOURNAL, "JOURNAL", "B3/FM2/JOURNAL"},
     {HashTag::TEST_ASSET, "TEST_ASSET", "B3/FM2/TEST_ASSET"},
+    {HashTag::AGREEMENT, "AGREEMENT", "B3/FM2/AGREEMENT"},
 }};
 
 // Append-only shape: contiguous from 1, unique names, text = prefix + name.

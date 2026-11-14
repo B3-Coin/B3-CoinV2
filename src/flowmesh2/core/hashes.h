@@ -61,6 +61,7 @@ enum class HashTag : uint8_t {
     PROTOCOL_ACCOUNT = 27, //!< seat pool and treasury accounts (R5)
     JOURNAL = 28,          //!< first chain value of a journal (R8)
     TEST_ASSET = 29,       //!< synthetic test and simulator assets only
+    AGREEMENT = 30,        //!< agreement statements and seeds: u8 kind first (agreement/digests.h; M4-AGR-02)
 };
 
 //! The prefix of every tag text.

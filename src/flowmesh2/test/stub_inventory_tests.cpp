@@ -588,12 +588,6 @@ FM2_STUB_CASE(M4_AGR_02, "M4-AGR-02")
                                         Observe(certifier->OnMessage(0, message))});
 }
 
-FM2_STUB_CASE(M4_AGR_03, "M4-AGR-03")
-{
-    const agreement::LeaderSchedule schedule{4};
-    return Observe(schedule.LeaderFor(AuthorityVersion{}, 0, agreement::SlowSet{}));
-}
-
 FM2_STUB_CASE(M4_AGR_04, "M4-AGR-04")
 {
     return FirstDeviation("M4-AGR-04", {Observe(agreement::InclusionList::Build({}, 1)), Observe(agreement::InclusionList::Check({}, 4, {}, {}))});
