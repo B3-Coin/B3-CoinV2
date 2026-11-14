@@ -246,8 +246,51 @@ BOOST_AUTO_TEST_CASE(decision_rules)
     BOOST_CHECK(f.log.DecisionAt(3) == std::optional<DecisionRef>{first.Key()});
     BOOST_CHECK(!f.log.DecisionAt(2).has_value());
     BOOST_CHECK(!f.log.DecisionAt(4).has_value());
-    RequireStub(f.log.AppendPreparedQc(PreparedQcRecord{0, 3, 0, slot.header.Hash(), Bytes("qc")}), "M4-STO-07");
     BOOST_CHECK_EQUAL(f.journal->Status().appended_seq, 1U);
+}
+
+BOOST_AUTO_TEST_CASE(prepared_qc_keeps_the_highest_view)
+{
+    // M4-STO-07. Every PreparedQC is a durable fact; the index keeps the
+    // highest view per slot and never downgrades; two headers prepared in one
+    // view are a conflict (PROTOCOL.md: "conflicting equal-view complete proofs halt").
+    CommitFixture f{14};
+    const StorageSlot slot{MakeStorageSlot(3, 0, "pqc")};
+    const StorageSlot other{MakeStorageSlot(3, 0, "pqc-other")};
+    const std::vector<unsigned char> qc{slot.certificate.Encode()};
+    const std::vector<unsigned char> other_qc{other.certificate.Encode()};
+    BOOST_CHECK(!f.log.HighestPrepared(3).has_value());
+    BOOST_CHECK_EQUAL(f.log.AppendPreparedQc(PreparedQcRecord{0, 3, 1, slot.header.Hash(), qc}).value(), 1U);
+    BOOST_CHECK_EQUAL(f.log.AppendPreparedQc(PreparedQcRecord{0, 3, 1, slot.header.Hash(), qc}).value(), 1U); // idempotent
+    RequireRefusal(f.log.AppendPreparedQc(PreparedQcRecord{0, 3, 1, other.header.Hash(), other_qc}), ErrorCode::EQUIVOCATION_REFUSED,
+                   PREPARED_CONFLICT, "two headers prepared in one view");
+    RequireRefusal(f.log.AppendPreparedQc(PreparedQcRecord{0, 3, 2, slot.header.Hash(), other_qc}), ErrorCode::VERIFY_FAILED,
+                   PREPARED_CERT_HEADER, "certificate names another header");
+    RequireCode(f.log.AppendPreparedQc(PreparedQcRecord{0, 4, 0, slot.header.Hash(), Bytes("qc")}), ErrorCode::DECODE, "qc bytes are not a certificate");
+    // A lower view's proof is recorded but the highest stays; a higher one replaces it.
+    BOOST_CHECK_EQUAL(f.log.AppendPreparedQc(PreparedQcRecord{0, 3, 0, other.header.Hash(), other_qc}).value(), 2U);
+    const PreparedQcRecord first_view{0, 3, 1, slot.header.Hash(), qc};
+    BOOST_CHECK(f.log.HighestPrepared(3) == std::optional<PreparedQcRecord>{first_view});
+    BOOST_CHECK_EQUAL(f.log.AppendPreparedQc(PreparedQcRecord{0, 3, 2, other.header.Hash(), other_qc}).value(), 3U);
+    BOOST_CHECK_EQUAL(f.log.HighestPrepared(3)->view, 2U);
+    BOOST_CHECK(!f.log.HighestPrepared(4).has_value());
+    BOOST_CHECK_EQUAL(f.log.Barrier().value(), 3U);
+
+    const PreparedQcRecord r{0, 3, 2, other.header.Hash(), other_qc};
+    BOOST_CHECK(PreparedQcRecord::Decode(r.Encode()).value() == r);
+    std::vector<unsigned char> truncated{r.Encode()};
+    truncated.pop_back();
+    BOOST_CHECK(PreparedQcRecord::Decode(truncated).error().code == ErrorCode::DECODE);
+    const std::vector<JournalRecord> records{f.journal->ReadAll().value()};
+    BOOST_REQUIRE_EQUAL(records.size(), 3U);
+    BOOST_CHECK(records[2].type == RecordType::PREPARED_QC && PreparedQcRecord::Decode(records[2].payload).value() == r);
+    // Recover rebuilds the index (M4-STO-01); decisions are untouched by prepared proofs.
+    Result<CommitLog> recovered{CommitLog::Recover(*f.journal, Profile())};
+    RequireStorageOk(recovered, "Recover");
+    BOOST_CHECK(recovered->HighestPrepared(3) == f.log.HighestPrepared(3));
+    BOOST_CHECK(!recovered->DecisionAt(3).has_value());
+    RequireRefusal(recovered->AppendPreparedQc(PreparedQcRecord{0, 3, 2, slot.header.Hash(), qc}), ErrorCode::EQUIVOCATION_REFUSED,
+                   PREPARED_CONFLICT, "conflict after recovery");
 }
 
 BOOST_AUTO_TEST_CASE(decision_token_binds_the_kept_certificate)

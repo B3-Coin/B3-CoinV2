@@ -63,6 +63,42 @@ Result<IntentRecord> IntentRecord::Decode(std::span<const unsigned char> bytes)
     });
 }
 
+std::vector<unsigned char> ViewStateRecord::Encode() const
+{
+    std::vector<unsigned char> out;
+    VectorWriter{out, 0, epoch, slot, view};
+    return out;
+}
+
+Result<ViewStateRecord> ViewStateRecord::Decode(std::span<const unsigned char> bytes)
+{
+    return DecodeExactWith(bytes, VIEW_STATE_RECORD_BYTES, [](SpanReader& reader) {
+        ViewStateRecord record;
+        reader >> record.epoch >> record.slot >> record.view;
+        return record;
+    });
+}
+
+std::vector<unsigned char> NewViewAcceptedRecord::Encode() const
+{
+    std::vector<unsigned char> out;
+    VectorWriter writer{out, 0, epoch, slot, view};
+    WriteCompactSize(writer, message.size());
+    writer.write(MakeByteSpan(message));
+    return out;
+}
+
+Result<NewViewAcceptedRecord> NewViewAcceptedRecord::Decode(std::span<const unsigned char> bytes)
+{
+    const size_t max_bytes{VIEW_STATE_RECORD_BYTES + GetSizeOfCompactSize(MAX_NEW_VIEW_MESSAGE_BYTES) + MAX_NEW_VIEW_MESSAGE_BYTES};
+    return DecodeExactWith(bytes, max_bytes, [](SpanReader& reader) {
+        NewViewAcceptedRecord record;
+        reader >> record.epoch >> record.slot >> record.view;
+        ReadCappedVector(reader, record.message, MAX_NEW_VIEW_MESSAGE_BYTES);
+        return record;
+    });
+}
+
 std::vector<unsigned char> SignedVoteRecord::Encode() const
 {
     std::vector<unsigned char> out;
@@ -136,9 +172,27 @@ Result<SignerLog> SignerLog::Recover(Journal& journal, const ProfileParams& prof
             vote->second.signed_seq = record.seq;
             break;
         }
-        case RecordType::VIEW_STATE:
-        case RecordType::NEW_VIEW_ACCEPTED:
-            return NotImplemented("M4-STO-07"); // TODO(rebirth:M4-STO-07) recover the PBFT view state
+        case RecordType::VIEW_STATE: {
+            Result<ViewStateRecord> decoded{ViewStateRecord::Decode(record.payload)};
+            if (!decoded.has_value()) return decoded.error();
+            if (log.m_view_state.has_value()) {
+                const bool forward{decoded->slot > log.m_view_state->slot ||
+                                   (decoded->slot == log.m_view_state->slot && decoded->view > log.m_view_state->view)};
+                if (!forward) return inconsistent; // the log never writes a view state backwards or twice
+            }
+            log.m_view_state = *decoded;
+            log.m_view_state_seq = record.seq;
+            break;
+        }
+        case RecordType::NEW_VIEW_ACCEPTED: {
+            Result<NewViewAcceptedRecord> decoded{NewViewAcceptedRecord::Decode(record.payload)};
+            if (!decoded.has_value()) return decoded.error();
+            if (decoded->message.empty()) return inconsistent;
+            const auto [it, inserted]{log.m_new_views.emplace(ProposalKey{decoded->epoch, decoded->slot, decoded->view},
+                                                              NewViewEntry{std::move(decoded->message), record.seq})};
+            if (!inserted) return inconsistent; // one accepted NEW_VIEW per view
+            break;
+        }
         case RecordType::DECISION:
         case RecordType::APPLIED:
         case RecordType::SNAPSHOT_MARK:
@@ -231,14 +285,42 @@ Result<PendingSignedVote> SignerLog::AppendSignedFolded(const VoteKey& /*key*/, 
     return NotImplemented("M4-STO-05"); // TODO(rebirth:M4-STO-05)
 }
 
-Result<uint64_t> SignerLog::AppendViewState(const ViewStateRecord& /*record*/)
+Result<uint64_t> SignerLog::AppendViewState(const ViewStateRecord& record)
 {
-    return NotImplemented("M4-STO-07"); // TODO(rebirth:M4-STO-07)
+    if (m_journal->IsFatal()) return Error{ErrorCode::FENCED, JOURNAL_FENCED};
+    if (m_view_state.has_value()) {
+        if (*m_view_state == record) return Ok(m_view_state_seq);
+        const bool forward{record.slot > m_view_state->slot || (record.slot == m_view_state->slot && record.view > m_view_state->view)};
+        if (!forward) return Error{ErrorCode::ORDER_VIOLATION, VIEW_STATE_BACKWARDS};
+    }
+    Result<uint64_t> seq{m_journal->Append(RecordType::VIEW_STATE, record.Encode())};
+    if (!seq.has_value()) return seq.error();
+    m_view_state = record;
+    m_view_state_seq = *seq;
+    return seq;
 }
 
-Result<uint64_t> SignerLog::AppendNewViewAccepted(const NewViewAcceptedRecord& /*record*/)
+Result<uint64_t> SignerLog::AppendNewViewAccepted(const NewViewAcceptedRecord& record)
 {
-    return NotImplemented("M4-STO-07"); // TODO(rebirth:M4-STO-07)
+    if (m_journal->IsFatal()) return Error{ErrorCode::FENCED, JOURNAL_FENCED};
+    if (record.message.empty()) return Error{ErrorCode::INVALID_INPUT, NEW_VIEW_EMPTY_MESSAGE};
+    if (record.message.size() > MAX_NEW_VIEW_MESSAGE_BYTES) return Error{ErrorCode::OVERSIZE, "new-view message above its cap"};
+    const ProposalKey key{record.epoch, record.slot, record.view};
+    if (const auto it{m_new_views.find(key)}; it != m_new_views.end()) {
+        if (it->second.message != record.message) return Error{ErrorCode::EQUIVOCATION_REFUSED, NEW_VIEW_CONFLICT};
+        return Ok(it->second.seq);
+    }
+    Result<uint64_t> seq{m_journal->Append(RecordType::NEW_VIEW_ACCEPTED, record.Encode())};
+    if (!seq.has_value()) return seq.error();
+    m_new_views.emplace(key, NewViewEntry{record.message, *seq});
+    return seq;
+}
+
+std::optional<std::vector<unsigned char>> SignerLog::NewViewAccepted(uint64_t epoch, uint64_t slot, uint64_t view) const
+{
+    const auto it{m_new_views.find(ProposalKey{epoch, slot, view})};
+    if (it == m_new_views.end()) return std::nullopt;
+    return it->second.message;
 }
 
 } // namespace flowmesh2::storage

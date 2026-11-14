@@ -93,8 +93,8 @@ Result<ReplayResult> ReplayDecisions(const HeadView& genesis, std::span<const st
             // Snapshot boundaries: the mark record, its snapshot and a replay that starts there.
             return NotImplemented("M4-STO-03"); // TODO(rebirth:M4-STO-03)
         case storage::RecordType::PREPARED_QC:
-            // Durable PBFT view state in the commit journal.
-            return NotImplemented("M4-STO-07"); // TODO(rebirth:M4-STO-07)
+            // Agreement state (a prepared proof, M4-STO-07), not application state: nothing to replay.
+            break;
         default:
             if (!storage::IsKnown(record.type)) return Error{ErrorCode::DECODE, storage::RECORD_TYPE};
             return Order(storage::RECORD_ROLE);

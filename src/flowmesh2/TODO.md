@@ -63,9 +63,9 @@ M7-FEE-01 (R5); M3-ENG-02 and the REAL-REPLACE M3-ENG-01, M3-ENG-04,
 M3-ENG-13 and M3-ENG-14 (R6; M3-ENG-03 gains its second stub site there);
 M9-FUT-04 and the REAL-REPLACE M3-ENG-12 and M4-AGR-11 (R7; M3-ENG-09 did too, until it landed;
 M2-LED-05, M2-LED-06, M3-ENG-02 and M3-ENG-04 gain R7 sites there);
-M4-STO-02, M4-STO-03 and M4-STO-07 (R8; M4-STO-01 and M4-STO-06 did too,
+M4-STO-02 and M4-STO-03 (R8; M4-STO-01, M4-STO-06 and M4-STO-07 did too,
 until they landed; M4-STO-05 gains its second stub site there); M4-AGR-10 and the REAL-REPLACE
-M2-LED-10 (R9; M4-STO-03 and M4-STO-07 gain R9 sites there); M4-AGR-01,
+M2-LED-10 (R9; M4-STO-03 gains an R9 site there, as M4-STO-07 did); M4-AGR-01,
 M4-AGR-02, M4-AGR-03, M4-AGR-04, M4-AGR-06, M4-AGR-07, MB1-ADP-06 and
 M7-ADP-01 (R10); M5-VFY-03, M7-ADP-02, M8-CKP-01 and the REAL-REPLACE
 M5-RD-01 (R11; M2-LED-02 gains its R11 site there); M4-ADM-02 (R12;
@@ -77,8 +77,8 @@ and M9-FUT-04 gain R13 sites there); M4-SIM-02, M4-SIM-03 and the
 REAL-REPLACE M0-SIM-01 (R14; M4-SIM-01 gains its R14 site there, and the
 walking skeleton's check N9 tags M2-LED-05).
 Every other row is `todo`, except the C1 baseline and the tasks completed
-since (M3-ENG-09, M4-STO-06, M4-NET-02 and M4-STO-01, 2026-11-14), which
-are `done`.
+since (M3-ENG-09, M4-STO-06, M4-NET-02, M4-STO-01 and M4-STO-07,
+2026-11-14), which are `done`.
 
 ---
 
@@ -298,7 +298,7 @@ for M10. ARCHITECTURE.md §0 and §15 describe each.
 | M4-STO-04 | M4 | todo | NONE | — | kill -9 + LazyFS campaign | new | 0 equivocations; exactly-once | M4/M4-STO-04/ | D9, OWNER-GATED |
 | M4-STO-05 | M4 | outline | STUB | R3, R8 | Folded signer mode (sign, then one barrier) and A/B measurement | `SignerLog::AppendSignedFolded` (R8); `core/params` `Validate` (`FOLDED_SIGNING`) | A/B evidence; strict stays the default | M4/M4-STO-05/ | D15, BLOCKED-ON-RULING |
 | M4-STO-06 | M4 | done | STUB | R8 | Segment rollover (landed 2026-11-14: segments `<index>.seg`, a record that would not fit placed at byte 0 of the next segment, a spare segment after every barrier, `Rollover`, `ReadAll` across segments; acceptance by the owner or auditor pending) | `FileJournal::AdmitAppend` (placement), `Persist` (split writes, commits per touched segment, the spare), `Rollover`, `ReadAll`, `SegmentFileName` (`storage/file_journal`); `Journal::AdmitAppend` returns the placement and the base zero-fills the skipped tail (`storage/journal`); `ScanRecordsFrom` (`storage/record`) | `file_journal_tests/append_past_the_segment_end_moves_to_the_next_segment`, `rollover_pads_the_segment_and_group_commits_across_it`, `many_segments_read_back_after_a_crash` (twelve records over six one-page segments, the journal dropped, every segment scanned afresh from its predecessor's chain), `record_tests/scan_from_a_chain_continues_a_previous_segment`; failed first (the API did not exist). kill -9 and LazyFS campaigns stay M4-STO-04 | M4/M4-STO-06/20261114-newmac-01/ | plan §3.7 (S-9) |
-| M4-STO-07 | M4 | outline | STUB | R8, R9 | Durable PBFT view state: `VIEW_STATE`, `NEW_VIEW_ACCEPTED`, `PREPARED_QC` | `SignerLog::AppendViewState`, `SignerLog::AppendNewViewAccepted` (`storage/signer_log`); `CommitLog::AppendPreparedQc` (`storage/commit_log`); the record structs are target shapes (R8); `ReplayDecisions` on a `PREPARED_QC` record (`state/replay`, R9) | restart-in-view-change tests | M4/M4-STO-07/ | PROTOCOL.md, O-16 |
+| M4-STO-07 | M4 | done | STUB | R8, R9 | Durable PBFT view state: `VIEW_STATE`, `NEW_VIEW_ACCEPTED`, `PREPARED_QC` (landed 2026-11-14; acceptance by the owner or auditor pending). VIEW_STATE = u64 epoch, slot, view, moving (slot, view) forward only; NEW_VIEW_ACCEPTED = the exact NEW_VIEW message per (epoch, slot, view); PREPARED_QC = the prepared certificate per (epoch, slot, view), highest view kept, equal-view conflicts refused; all recovered by `Recover`; replay skips `PREPARED_QC` | `SignerLog::AppendViewState`, `ViewState`, `AppendNewViewAccepted`, `NewViewAccepted` (`storage/signer_log`); `CommitLog::AppendPreparedQc`, `HighestPrepared` (`storage/commit_log`); `ReplayDecisions` (`state/replay`) | `signer_log_tests/view_state_and_new_view_are_durable_and_monotonic`, `commit_log_tests/prepared_qc_keeps_the_highest_view`, `replay_tests/replay_skips_prepared_qc_and_snapshots_are_a_stub`; failed first (the API did not exist). Restart-in-view-change over a running agreement is exercised by the PBFT tests (M4-AGR-02) | M4/M4-STO-07/20261114-newmac-01/ | PROTOCOL.md, O-16 |
 | M4-NET-01 | M4 | outline | STUB | R13 | TCP seat mesh: 4 lanes, BIP324 cipher plus a BIP340 session signature; carries the body fetch and the collision re-request that `ShortIdCodec::Decode` (M4-NET-02) triggers | `TcpSeatMesh::Create` (`net/tcp_mesh`; target shapes `TcpMeshConfig`, `SeatEndpoint`, `DEFAULT_SEAT_MESH_PORT` 5649); a transport implements only `Transmit` and `Poll` of `net/seat_mesh` `SeatMesh`, whose send rules are real (O-76, O-79) | crypto review; interop | M4/M4-NET-01/ | D12, OWNER-GATED |
 | M4-NET-02 | M4 | done | STUB | R13 | SipHash 6-byte short IDs (landed 2026-11-14: BIP152 key derivation, low 48 bits little-endian, `Decode` answers none = fetch, several = collision; acceptance by the owner or auditor pending). The body fetch and the collision re-request are requests on the mesh and land with M4-NET-01 | `ShortIdCodec::Keys`, `SipHashOf`, `Encode`, `Decode` (`net/short_id`) | `short_id_tests` (keyed by header and nonce, bit layout, self-pinned goldens, every match returned, none for an unknown id, duplicates give two, another proposal's codec decodes nothing); failed first (the API did not exist). The fetch test moves to M4-NET-01 with the mesh | M4/M4-NET-02/20261114-newmac-01/ | PLAN-10 |
 | M4-NET-03 | M4 | outline | STUB | R13 | Sentry fan-out | `SentryFanout::Fanout` (`net/sentry`; target shape `FanoutReport`) | fan-out tests | M4/M4-NET-03/ | PLAN-10 |

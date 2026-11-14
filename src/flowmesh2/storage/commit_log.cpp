@@ -72,6 +72,25 @@ std::vector<unsigned char> AppliedRecord::Encode() const
     return out;
 }
 
+std::vector<unsigned char> PreparedQcRecord::Encode() const
+{
+    std::vector<unsigned char> out;
+    VectorWriter writer{out, 0, epoch, slot, view, header_hash};
+    WriteCompactSize(writer, qc.size());
+    writer.write(MakeByteSpan(qc));
+    return out;
+}
+
+Result<PreparedQcRecord> PreparedQcRecord::Decode(std::span<const unsigned char> bytes)
+{
+    return DecodeExactWith(bytes, MAX_ENCODED_BYTES, [](SpanReader& reader) {
+        PreparedQcRecord record;
+        reader >> record.epoch >> record.slot >> record.view >> record.header_hash;
+        ReadCappedVector(reader, record.qc, SlotCertificate::MAX_ENCODED_BYTES);
+        return record;
+    });
+}
+
 Result<AppliedRecord> AppliedRecord::Decode(std::span<const unsigned char> bytes)
 {
     return DecodeExactWith(bytes, APPLIED_RECORD_BYTES, [](SpanReader& reader) {
@@ -126,8 +145,16 @@ Result<CommitLog> CommitLog::Recover(Journal& journal, const ProfileParams& prof
         }
         case RecordType::SNAPSHOT_MARK:
             return NotImplemented("M4-STO-03"); // TODO(rebirth:M4-STO-03) recover from the last snapshot
-        case RecordType::PREPARED_QC:
-            return NotImplemented("M4-STO-07"); // TODO(rebirth:M4-STO-07) recover the prepared quorum certificate
+        case RecordType::PREPARED_QC: {
+            Result<PreparedQcRecord> decoded{PreparedQcRecord::Decode(record.payload)};
+            if (!decoded.has_value()) return decoded.error();
+            const Result<SlotCertificate> cert{SlotCertificate::Decode(decoded->qc)};
+            if (!cert.has_value() || cert->header_hash != decoded->header_hash) return inconsistent;
+            const ProposalKey key{decoded->epoch, decoded->slot, decoded->view};
+            const auto [it, inserted]{log.m_prepared.emplace(key, PreparedEntry{*decoded, record.seq})};
+            if (!inserted) return inconsistent; // one proof per (epoch, slot, view)
+            break;
+        }
         case RecordType::INTENT:
         case RecordType::SIGNED_VOTE:
         case RecordType::ACCEPTED_PROPOSAL:
@@ -189,9 +216,31 @@ std::optional<DecisionRef> CommitLog::DecisionAt(uint64_t slot) const
     return DecisionRef{slot, it->second.header_hash, it->second.cert_hash};
 }
 
-Result<uint64_t> CommitLog::AppendPreparedQc(const PreparedQcRecord& /*record*/)
+Result<uint64_t> CommitLog::AppendPreparedQc(const PreparedQcRecord& record)
 {
-    return NotImplemented("M4-STO-07"); // TODO(rebirth:M4-STO-07)
+    if (m_journal->IsFatal()) return Error{ErrorCode::FENCED, JOURNAL_FENCED};
+    const Result<SlotCertificate> cert{SlotCertificate::Decode(record.qc)};
+    if (!cert.has_value()) return cert.error();
+    if (cert->header_hash != record.header_hash) return Error{ErrorCode::VERIFY_FAILED, PREPARED_CERT_HEADER};
+    const ProposalKey key{record.epoch, record.slot, record.view};
+    if (const auto it{m_prepared.find(key)}; it != m_prepared.end()) {
+        if (it->second.record.header_hash != record.header_hash) return Error{ErrorCode::EQUIVOCATION_REFUSED, PREPARED_CONFLICT};
+        return Ok(it->second.seq);
+    }
+    Result<uint64_t> seq{m_journal->Append(RecordType::PREPARED_QC, record.Encode())};
+    if (!seq.has_value()) return seq.error();
+    m_prepared.emplace(key, PreparedEntry{record, *seq});
+    return seq;
+}
+
+std::optional<PreparedQcRecord> CommitLog::HighestPrepared(uint64_t slot) const
+{
+    std::optional<PreparedQcRecord> highest;
+    for (const auto& [key, entry] : m_prepared) {
+        if (key.slot != slot) continue;
+        if (!highest.has_value() || entry.record.view > highest->view) highest = entry.record;
+    }
+    return highest;
 }
 
 } // namespace flowmesh2::storage

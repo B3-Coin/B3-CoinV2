@@ -73,7 +73,7 @@
  *
  * Threading: a CommitLog is owned by one thread (the sealing thread,
  * section 4); it has no lock of its own and never holds the journal's.
- * Stub: AppendPreparedQc (M4-STO-07).
+ * Prepared proofs (M4-STO-07): AppendPreparedQc and HighestPrepared.
  */
 namespace flowmesh2::storage {
 
@@ -83,6 +83,8 @@ inline constexpr std::string_view DECISION_CONFLICT{"DECISION_CONFLICT"};       
 inline constexpr std::string_view APPLIED_DECISION_UNKNOWN{"APPLIED_DECISION_UNKNOWN"};   //!< (VERIFY_FAILED)
 inline constexpr std::string_view APPLIED_ROOT_MISMATCH{"APPLIED_ROOT_MISMATCH"};         //!< (VERIFY_FAILED)
 inline constexpr std::string_view APPLIED_OUT_OF_ORDER{"APPLIED_OUT_OF_ORDER"};           //!< (ORDER_VIOLATION)
+inline constexpr std::string_view PREPARED_CONFLICT{"PREPARED_CONFLICT"};                 //!< (EQUIVOCATION_REFUSED) two headers prepared in one (epoch, slot, view)
+inline constexpr std::string_view PREPARED_CERT_HEADER{"PREPARED_CERT_HEADER"};           //!< (VERIFY_FAILED) the prepared certificate names another header
 
 /** True iff `body` is the body of `header`: same actions_root, facts_root
  * and number of originals (action_count). The validity predicate (R7) and
@@ -116,13 +118,24 @@ struct AppliedRecord {
     static Result<AppliedRecord> Decode(std::span<const unsigned char> bytes);
 };
 
-//! Target shape of a PREPARED_QC record (M4-STO-07 owns its content).
+/** PREPARED_QC (M4-STO-07): a quorum of PREPARE signatures over
+ * `header_hash` in (epoch, slot, view), as a SlotCertificate encoding
+ * (`qc`; its signatures cover the prepare digest of that view, not the
+ * commit digest). Durable before the seat's COMMIT intent (PROTOCOL.md).
+ * u64 epoch | u64 slot | u64 view | header_hash | CompactSize(len) | qc.
+ */
 struct PreparedQcRecord {
     uint64_t epoch{0};
     uint64_t slot{0};
     uint64_t view{0};
     uint256 header_hash;
     std::vector<unsigned char> qc;
+
+    friend bool operator==(const PreparedQcRecord&, const PreparedQcRecord&) = default;
+
+    static constexpr size_t MAX_ENCODED_BYTES{24 + 32 + 3 + SlotCertificate::MAX_ENCODED_BYTES};
+    std::vector<unsigned char> Encode() const;
+    static Result<PreparedQcRecord> Decode(std::span<const unsigned char> bytes);
 };
 
 class CommitLog
@@ -169,8 +182,18 @@ public:
      */
     std::optional<DecisionRef> DecisionAt(uint64_t slot) const;
 
-    //! Durable PBFT view state. Stub: M4-STO-07.
+    /** A durable PreparedQC (M4-STO-07): the record's sequence number. The
+     * qc must decode as a SlotCertificate naming the record's header (DECODE
+     * or VERIFY_FAILED PREPARED_CERT_HEADER otherwise). The same (epoch,
+     * slot, view, header) again is idempotent (the first qc kept); another
+     * header for that (epoch, slot, view) is EQUIVOCATION_REFUSED
+     * (PREPARED_CONFLICT: conflicting equal-view proofs halt). Every other
+     * proof is appended as a fact; HighestPrepared keeps the highest view per
+     * slot and never downgrades. FENCED on a fatal journal.
+     */
     Result<uint64_t> AppendPreparedQc(const PreparedQcRecord& record);
+    //! The prepared proof of the highest view this log holds for `slot`, if any.
+    std::optional<PreparedQcRecord> HighestPrepared(uint64_t slot) const;
 
 private:
     explicit CommitLog(Journal& journal) : m_journal{&journal} {}
@@ -183,9 +206,15 @@ private:
         std::optional<uint64_t> applied_seq;
     };
 
+    struct PreparedEntry {
+        PreparedQcRecord record;
+        uint64_t seq{0};
+    };
+
     Journal* m_journal;
     std::map<uint64_t, DecisionEntry> m_decisions; //!< by slot
     uint64_t m_last_applied_slot{0};               //!< 0 before the first application (the genesis height)
+    std::map<ProposalKey, PreparedEntry> m_prepared; //!< by (epoch, slot, view)
 };
 
 } // namespace flowmesh2::storage

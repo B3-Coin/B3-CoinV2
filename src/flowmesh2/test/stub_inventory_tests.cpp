@@ -523,22 +523,6 @@ FM2_STUB_CASE(M4_STO_03, "M4-STO-03")
                                         Observe(state::ReplayDecisions(*head, marked))});
 }
 
-FM2_STUB_CASE(M4_STO_07, "M4-STO-07")
-{
-    // VIEW_STATE and NEW_VIEW_ACCEPTED in the signer log, PREPARED_QC in the
-    // commit log, and the replay of a PREPARED_QC record (R9).
-    auto signer_journal{NewMemoryJournal(storage::JournalRole::SIGNER, 1)};
-    auto commit_journal{NewMemoryJournal(storage::JournalRole::COMMIT, 2)};
-    storage::SignerLog signer{storage::SignerLog::Create(*signer_journal).value()};
-    storage::CommitLog commit{storage::CommitLog::Create(*commit_journal).value()};
-    HeartbeatOwner heartbeat{MakeHeartbeatOwner()};
-    const std::vector<storage::JournalRecord> prepared{{1, storage::RecordType::PREPARED_QC, {}, uint256{}}};
-    return FirstDeviation("M4-STO-07", {Observe(signer.AppendViewState(storage::ViewStateRecord{0, 1})),
-                                        Observe(signer.AppendNewViewAccepted(storage::NewViewAcceptedRecord{0, 1, Bytes("nv")})),
-                                        Observe(commit.AppendPreparedQc(storage::PreparedQcRecord{0, 1, 1, uint256::ONE, Bytes("qc")})),
-                                        Observe(state::ReplayDecisions(*heartbeat.owner->Head(), prepared))});
-}
-
 // ---- Slice R9: the state owner ----
 
 FM2_STUB_CASE(M4_AGR_10, "M4-AGR-10")

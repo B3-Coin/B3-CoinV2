@@ -255,15 +255,21 @@ BOOST_AUTO_TEST_CASE(replay_refuses_an_inconsistent_journal)
     RequireFailure(state::ReplayDecisions(other_genesis, good), ErrorCode::STALE_PARENT, state::PARENT_NOT_HEAD, "another genesis");
 }
 
-BOOST_AUTO_TEST_CASE(replay_of_snapshot_and_view_records_is_a_stub)
+BOOST_AUTO_TEST_CASE(replay_skips_prepared_qc_and_snapshots_are_a_stub)
 {
     const ReplayFixture fx;
     Records snapshot{fx.records};
     snapshot.push_back(storage::JournalRecord{snapshot.size() + 1, storage::RecordType::SNAPSHOT_MARK, {}, uint256{}});
     RequireStub(state::ReplayDecisions(fx.genesis, snapshot), "M4-STO-03");
+    // A PREPARED_QC record is agreement state, not application state: replay skips it (M4-STO-07).
     Records prepared{fx.records};
-    prepared.push_back(storage::JournalRecord{prepared.size() + 1, storage::RecordType::PREPARED_QC, {}, uint256{}});
-    RequireStub(state::ReplayDecisions(fx.genesis, prepared), "M4-STO-07");
+    prepared.insert(prepared.begin() + 1, storage::JournalRecord{2, storage::RecordType::PREPARED_QC, {0x01}, uint256{}});
+    for (size_t i{2}; i < prepared.size(); ++i) prepared[i].seq = i + 1;
+    const Result<state::ReplayResult> with{state::ReplayDecisions(fx.genesis, prepared)};
+    const Result<state::ReplayResult> without{state::ReplayDecisions(fx.genesis, fx.records)};
+    BOOST_REQUIRE(with.has_value() && without.has_value());
+    BOOST_CHECK(with->head.Header() == without->head.Header());
+    BOOST_CHECK_EQUAL(with->slots.size(), without->slots.size());
 }
 
 BOOST_AUTO_TEST_SUITE_END()

@@ -346,10 +346,58 @@ BOOST_AUTO_TEST_CASE(stubs_return_their_task_ids)
     const StorageSlot slot{MakeStorageSlot(1, 0, "stub")};
     const PendingProposal proposal{f.Accept(slot, 0)};
     RequireStub(f.log.AppendSignedFolded(CommitVoteKey(slot.header, 0), slot.header.CommitDigest(), proposal, FakeSignature(3)), "M4-STO-05");
-    RequireStub(f.log.AppendViewState(ViewStateRecord{0, 1}), "M4-STO-07");
-    RequireStub(f.log.AppendNewViewAccepted(NewViewAcceptedRecord{0, 1, Bytes("nv")}), "M4-STO-07");
-    // The stubs wrote nothing.
+    // The stub wrote nothing.
     BOOST_CHECK_EQUAL(f.journal->Status().appended_seq, 1U);
+}
+
+BOOST_AUTO_TEST_CASE(view_state_and_new_view_are_durable_and_monotonic)
+{
+    // M4-STO-07. VIEW_STATE moves (slot, view) forward only; the same state
+    // again is idempotent. NEW_VIEW_ACCEPTED is exact per (epoch, slot, view).
+    SignerFixture f{17};
+    BOOST_CHECK(!f.log.ViewState().has_value());
+    BOOST_CHECK_EQUAL(f.log.AppendViewState(ViewStateRecord{0, 3, 1}).value(), 1U);
+    BOOST_CHECK_EQUAL(f.log.AppendViewState(ViewStateRecord{0, 3, 1}).value(), 1U); // idempotent: nothing new
+    BOOST_CHECK_EQUAL(f.log.AppendViewState(ViewStateRecord{0, 3, 2}).value(), 2U);
+    RequireRefusal(f.log.AppendViewState(ViewStateRecord{0, 3, 1}), ErrorCode::ORDER_VIOLATION, VIEW_STATE_BACKWARDS, "lower view");
+    RequireRefusal(f.log.AppendViewState(ViewStateRecord{0, 2, 5}), ErrorCode::ORDER_VIOLATION, VIEW_STATE_BACKWARDS, "lower slot");
+    RequireRefusal(f.log.AppendViewState(ViewStateRecord{1, 3, 2}), ErrorCode::ORDER_VIOLATION, VIEW_STATE_BACKWARDS, "same (slot, view), another epoch");
+    const ViewStateRecord vs{1, 4, 0};
+    BOOST_CHECK_EQUAL(f.log.AppendViewState(vs).value(), 3U); // the next slot starts at view 0
+    BOOST_CHECK(f.log.ViewState() == std::optional<ViewStateRecord>{vs});
+    BOOST_CHECK_EQUAL(f.log.AppendNewViewAccepted(NewViewAcceptedRecord{1, 4, 1, Bytes("nv")}).value(), 4U);
+    BOOST_CHECK_EQUAL(f.log.AppendNewViewAccepted(NewViewAcceptedRecord{1, 4, 1, Bytes("nv")}).value(), 4U);
+    RequireRefusal(f.log.AppendNewViewAccepted(NewViewAcceptedRecord{1, 4, 1, Bytes("other")}), ErrorCode::EQUIVOCATION_REFUSED,
+                   NEW_VIEW_CONFLICT, "another bundle for one view");
+    RequireCode(f.log.AppendNewViewAccepted(NewViewAcceptedRecord{1, 4, 2, {}}), ErrorCode::INVALID_INPUT, "an empty new-view message");
+    BOOST_CHECK(f.log.NewViewAccepted(1, 4, 1) == std::optional<std::vector<unsigned char>>{Bytes("nv")});
+    BOOST_CHECK(!f.log.NewViewAccepted(1, 4, 2).has_value());
+    BOOST_CHECK_EQUAL(f.log.Barrier().value(), 4U);
+
+    // Codecs are exact.
+    BOOST_CHECK_EQUAL(vs.Encode().size(), VIEW_STATE_RECORD_BYTES);
+    BOOST_CHECK(ViewStateRecord::Decode(vs.Encode()).value() == vs);
+    std::vector<unsigned char> truncated{vs.Encode()};
+    truncated.pop_back();
+    BOOST_CHECK(ViewStateRecord::Decode(truncated).error().code == ErrorCode::DECODE);
+    const NewViewAcceptedRecord nv{1, 4, 1, Bytes("nv")};
+    BOOST_CHECK(NewViewAcceptedRecord::Decode(nv.Encode()).value() == nv);
+    std::vector<unsigned char> longer{nv.Encode()};
+    longer.push_back(0);
+    BOOST_CHECK(NewViewAcceptedRecord::Decode(longer).error().code == ErrorCode::DECODE);
+    const std::vector<JournalRecord> records{f.journal->ReadAll().value()};
+    BOOST_REQUIRE_EQUAL(records.size(), 4U);
+    BOOST_CHECK(records[0].type == RecordType::VIEW_STATE && records[3].type == RecordType::NEW_VIEW_ACCEPTED);
+    BOOST_CHECK(ViewStateRecord::Decode(records[2].payload).value() == vs);
+
+    // Recover rebuilds the view state and the accepted new views (M4-STO-01).
+    Result<SignerLog> recovered{SignerLog::Recover(*f.journal, Profile())};
+    RequireStorageOk(recovered, "Recover");
+    BOOST_CHECK(recovered->ViewState() == std::optional<ViewStateRecord>{vs});
+    BOOST_CHECK(recovered->NewViewAccepted(1, 4, 1) == std::optional<std::vector<unsigned char>>{Bytes("nv")});
+    RequireRefusal(recovered->AppendNewViewAccepted(NewViewAcceptedRecord{1, 4, 1, Bytes("other")}), ErrorCode::EQUIVOCATION_REFUSED,
+                   NEW_VIEW_CONFLICT, "conflict after recovery");
+    RequireRefusal(recovered->AppendViewState(ViewStateRecord{1, 3, 9}), ErrorCode::ORDER_VIOLATION, VIEW_STATE_BACKWARDS, "backwards after recovery");
 }
 
 BOOST_AUTO_TEST_SUITE_END()
