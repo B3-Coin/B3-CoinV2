@@ -17,7 +17,7 @@ namespace flowmesh2::storage {
 
 namespace {
 
-constexpr std::array<RecordTypeInfo, 10> RECORD_TYPES{{
+constexpr std::array<RecordTypeInfo, 12> RECORD_TYPES{{
     {RecordType::INTENT, "INTENT"},
     {RecordType::SIGNED_VOTE, "SIGNED_VOTE"},
     {RecordType::DECISION, "DECISION"},
@@ -28,6 +28,8 @@ constexpr std::array<RecordTypeInfo, 10> RECORD_TYPES{{
     {RecordType::NEW_VIEW_ACCEPTED, "NEW_VIEW_ACCEPTED"},
     {RecordType::PREPARED_QC, "PREPARED_QC"},
     {RecordType::EVIDENCE, "EVIDENCE"},
+    {RecordType::OUTBOX_ACTION, "OUTBOX_ACTION"},
+    {RecordType::OUTBOX_RESULT, "OUTBOX_RESULT"},
 }};
 
 bool AllZero(std::span<const unsigned char> bytes)
@@ -52,13 +54,14 @@ std::string_view ToString(RecordType type)
     return "UNKNOWN";
 }
 
-bool IsKnown(JournalRole role) { return role == JournalRole::SIGNER || role == JournalRole::COMMIT; }
+bool IsKnown(JournalRole role) { return role == JournalRole::SIGNER || role == JournalRole::COMMIT || role == JournalRole::OUTBOX; }
 
 std::string_view ToString(JournalRole role)
 {
     switch (role) {
     case JournalRole::SIGNER: return "SIGNER";
     case JournalRole::COMMIT: return "COMMIT";
+    case JournalRole::OUTBOX: return "OUTBOX";
     }
     return "UNKNOWN";
 }
@@ -72,6 +75,8 @@ bool RoleAccepts(JournalRole role, RecordType type)
     case JournalRole::COMMIT:
         return type == RecordType::DECISION || type == RecordType::APPLIED || type == RecordType::SNAPSHOT_MARK ||
                type == RecordType::PREPARED_QC || type == RecordType::EVIDENCE;
+    case JournalRole::OUTBOX:
+        return type == RecordType::OUTBOX_ACTION || type == RecordType::OUTBOX_RESULT;
     }
     return false;
 }

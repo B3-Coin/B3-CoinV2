@@ -180,20 +180,21 @@ ctest --test-dir build-rebirth -L flowmesh2 --no-tests=error --output-on-failure
 build-rebirth/bin/fm2-sim --scenario all --seeds 1-32   # JSON on stdout; exit 0 only if every check passed
 ```
 
-Expected after stage 2 step 5 (M5-NODE-01, 2026-11-14): 11 CTests pass
+Expected after stage 2 step 6 (M5-CLI-01, 2026-11-14): 11 CTests pass
 (`flowmesh2_foundations` with its 19 C1 cases, `flowmesh2_sim`,
-`flowmesh2_sim_cli_determinism`, `flowmesh2_unit` with 544 cases,
+`flowmesh2_sim_cli_determinism`, `flowmesh2_unit` with 551 cases,
 `flowmesh2_inventory`, `flowmesh2_todo_lint`, `flowmesh2_guards`,
 `flowmesh2_guards_selftest`, `flowmesh2_evidence_selftest`, with Clang
 `flowmesh2_negative_compile` with six negative controls and a positive one, and
-`flowmesh2_e2e_regtest`, four `fm2d` processes on loopback). After R14 and the
-review fixes (O-89 to O-92) there were 10 CTests and 526 cases.
+`flowmesh2_e2e_regtest`, four `fm2d` processes on loopback and a trade through
+`fm2-cli`). After R14 and the review fixes (O-89 to O-92) there were 10 CTests and
+526 cases.
 
 To run a regtest cluster by hand (stage 2; REGTEST only, DEV parts until
 stage 3, ARCHITECTURE.md O-105):
 
 ```sh
-build-rebirth/bin/fm2-keygen --out /tmp/fm2 --seats 4            # genesis.json, seat<i>/seat.key, seat<i>/transport.key
+build-rebirth/bin/fm2-keygen --out /tmp/fm2 --seats 4            # genesis.json, seat<index>/seat.key, seat<index>/transport.key
 for i in 0 1 2 3; do
   build-rebirth/bin/fm2d --datadir /tmp/fm2/data$i --genesis /tmp/fm2/genesis.json \
     --seat $i --keys /tmp/fm2/seat$i --devchain /tmp/fm2/devchain.log --log file &
@@ -204,8 +205,22 @@ build-rebirth/bin/fm2-devchain --file /tmp/fm2/devchain.log --genesis /tmp/fm2/g
 curl -k https://127.0.0.1:18800/v2/health                        # -k: the self-signed regtest certificate
 ```
 
-Every seat tails the same dev chain file; `fm2-cli` (M5-CLI-01) signs and
-posts actions and pins the fingerprint instead of `-k`.
+Every seat tails the same dev chain file. The client (`fm2-cli`, M5-CLI-01,
+ARCHITECTURE.md O-106) signs once, keeps the exact bytes in a durable outbox,
+posts them to every seat and verifies every answer with b3verify against
+genesis.json; it pins each seat's SPKI fingerprint (from `fm2d.ready` or
+`api.fingerprint`) instead of `-k`:
+
+```sh
+python3 -c 'import json; print(json.dumps({str(i): json.load(open(f"/tmp/fm2/data{i}/fm2d.ready"))["fingerprint"] for i in range(4)}))' > /tmp/fm2/pins.json
+CLI="build-rebirth/bin/fm2-cli --genesis /tmp/fm2/genesis.json --pins /tmp/fm2/pins.json --key /tmp/fm2/alice.key --outbox /tmp/fm2/alice.outbox"
+$CLI keygen                                                        # alice's key and account id
+build-rebirth/bin/fm2-devchain --file /tmp/fm2/devchain.log --genesis /tmp/fm2/genesis.json deposit <alice-account> rUSD 1000000000
+$CLI state                                                         # the verified leaf
+$CLI place --market B3/rUSD --side buy --price 100 --lots 5 --wait # signed once, durable, posted to every seat, verified
+$CLI outbox                                                        # what was signed and what became of it
+$CLI stream --channel slots --count 3                              # verified slot envelopes
+```
 R14 itself had 505 cases and four negative controls. The file journal tests write only under
 `build-rebirth/fm2-test-tmp/`.
 Sanitizer builds and their canaries are described in ARCHITECTURE.md §13.2. Open gates (workspace lock reconciliation, decision

@@ -261,6 +261,36 @@ if(BUILD_FLOWMESH2)
   set_target_properties(fm2_daemon PROPERTIES OUTPUT_NAME fm2d)
   target_link_libraries(fm2_daemon PRIVATE core_interface fm2_warnings fm2_dev fm2_netio)
 
+  # cli/ (stage 2 step 6, M5-CLI-01): the client's parts (the durable outbox
+  # over storage::FileJournal, the pinned TLS client, the reply JSON parser,
+  # the trust inputs and b3verify checks, the BIP340 key) and the fm2-cli
+  # binary. Never fm2_dev: a client has no dev components. Not a
+  # deterministic directory; signs with CKey::SignSchnorr (the stage 2
+  # report flags that guard rule 7 does not name it).
+  add_library(fm2_clilib STATIC
+    cli/https_client.cpp
+    cli/outbox.cpp
+    cli/reply_json.cpp
+    cli/signer.cpp
+    cli/trust.cpp
+  )
+  target_link_libraries(fm2_clilib
+    PRIVATE
+      core_interface
+      fm2_warnings
+    PUBLIC
+      fm2_core
+      fm2_verify
+      fm2_netio
+      bitcoin_common
+      univalue
+      OpenSSL::SSL
+      OpenSSL::Crypto
+  )
+  add_executable(fm2_cli cli/fm2_cli_main.cpp)
+  set_target_properties(fm2_cli PROPERTIES OUTPUT_NAME fm2-cli)
+  target_link_libraries(fm2_cli PRIVATE core_interface fm2_warnings fm2_clilib)
+
   # sim/ (slice R14): the deterministic simulator and the walking skeleton,
   # in namespace flowmesh2::sim. FakeClock and the seeded Scheduler are the
   # only clock and randomness of a run; the TraceRecorder observes the
@@ -317,6 +347,7 @@ if(BUILD_FLOWMESH2)
     test/canonical_order_tests.cpp
     test/certificate_tests.cpp
     test/chain_adapter_tests.cpp
+    test/cli_tests.cpp
     test/codec_tests.cpp
     test/codes_tests.cpp
     test/commit_log_tests.cpp
@@ -379,6 +410,7 @@ if(BUILD_FLOWMESH2)
   target_link_libraries(test_flowmesh2 PRIVATE
     core_interface
     fm2_warnings
+    fm2_clilib
     fm2_netio
     fm2_simlib
     fm2_dev
@@ -436,6 +468,7 @@ if(BUILD_FLOWMESH2)
       --keygen $<TARGET_FILE:fm2_keygen>
       --devchain $<TARGET_FILE:fm2_devchain>
       --fm2d $<TARGET_FILE:fm2_daemon>
+      --cli $<TARGET_FILE:fm2_cli>
       --workdir ${FM2_TEST_TMP}/e2e
   )
   set_tests_properties(flowmesh2_e2e_regtest PROPERTIES TIMEOUT 300 LABELS "flowmesh2;isolated;outline;e2e")

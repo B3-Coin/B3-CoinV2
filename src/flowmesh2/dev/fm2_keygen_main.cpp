@@ -34,8 +34,8 @@
  *              [--mesh-port-base 15649] [--api-port-base 18800]
  *
  * Writes <dir>/genesis.json (public; netio/genesis_doc.h) and, per seat,
- * <dir>/seat<i>/seat.key (the BLS IKM, 32 bytes hex) and
- * <dir>/seat<i>/transport.key (the secp256k1 transport secret, 32 bytes hex),
+ * <dir>/seat<index>/seat.key (the BLS IKM, 32 bytes hex) and
+ * <dir>/seat<index>/transport.key (the secp256k1 transport secret, 32 bytes hex),
  * both 0600. Real key custody is not part of this tool.
  */
 namespace {

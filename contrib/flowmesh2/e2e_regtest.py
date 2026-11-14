@@ -2,22 +2,26 @@
 # Copyright (c) 2026 The B3 developers
 # Distributed under the MIT software license, see the accompanying
 # file COPYING or http://www.opensource.org/licenses/mit-license.php.
-"""Four fm2d on regtest, end to end (stage 2 step 5, M5-NODE-01).
+"""Four fm2d on regtest, end to end (stage 2 steps 5 and 6, M5-NODE-01 and M5-CLI-01).
 
 Runs fm2-keygen for four seats on free ports, starts four fm2d over one shared
 dev chain file, waits for every seat's ready file, checks that heartbeat slots
-are decided and that every seat publishes the same height, faucets a deposit
-through fm2-devchain and checks the balance on EVERY seat, stops seat 3,
-faucets another deposit while it is down, restarts seat 3 on its datadir and
-checks that it catches up to the others' head and shows the second deposit,
-then stops everything. Exit code 0 only if every step held.
+are decided and that every seat publishes the same height, makes two client
+keys with fm2-cli, faucets deposits to their accounts through fm2-devchain and
+checks the balances on EVERY seat, trades through fm2-cli (bob's ask rests,
+alice's bid fills it, both verified with b3verify by the client and settled
+on every seat; a resend answers DUPLICATE everywhere; the outbox and a
+verified slot stream agree), stops seat 3, faucets another deposit while it
+is down, restarts seat 3 on its datadir and checks that it catches up to the
+others' head and shows the deposit and the trade, then stops everything. Exit
+code 0 only if every step held.
 
 REGTEST only: the dev chain file replaces the b3d adapter (stage 3). This
-driver talks TLS without verifying the self-signed certificate (a test on
-loopback); clients pin the SPKI fingerprint (fm2-cli, M5-CLI-01).
+driver's own reads talk TLS without verifying the self-signed certificate (a
+test on loopback); fm2-cli pins each seat's SPKI fingerprint from its ready
+file.
 """
 import argparse
-import hashlib
 import http.client
 import json
 import os
@@ -46,12 +50,6 @@ def free_port_base(count):
         if ok:
             return base
     raise RuntimeError("no free port range")
-
-
-def account_hex(label):
-    # Any 32-byte id names an account for a deposit. A real account is AccountId::FromKey of a client's key
-    # (fm2-cli, M5-CLI-01); the faucet only needs the same hex on the deposit and on the state query.
-    return hashlib.sha256(label.encode()).hexdigest()
 
 
 def get_json(port, path, timeout=5.0):
@@ -89,6 +87,8 @@ class Cluster:
         self.genesis = os.path.join(self.keys, "genesis.json")
         with open(self.genesis) as f:
             self.doc = json.load(f)
+        self.pins = os.path.join(self.work, "pins.json")
+        self.fingerprints = {}
 
     def datadir(self, i):
         return os.path.join(self.work, f"seat{i}")
@@ -110,7 +110,11 @@ class Cluster:
         while time.time() < deadline:
             if os.path.exists(ready):
                 with open(ready) as f:
-                    return json.load(f)
+                    info = json.load(f)
+                self.fingerprints[str(i)] = info["fingerprint"]
+                with open(self.pins, "w") as f:
+                    json.dump(self.fingerprints, f)
+                return info
             if self.procs[i].poll() is not None:
                 raise RuntimeError(f"seat {i} exited early with {self.procs[i].returncode}; see seat{i}.out")
             time.sleep(0.05)
@@ -151,6 +155,18 @@ class Cluster:
             cmd += [account, asset, str(amount)]
         run(cmd)
 
+    def cli(self, who, command, expect_code=0, timeout=90):
+        """fm2-cli as client `who` (its key and outbox under the work dir); the JSON object it printed."""
+        cmd = [self.args.cli, "--genesis", self.genesis, "--key", os.path.join(self.work, f"{who}.key"),
+               "--outbox", os.path.join(self.work, f"{who}.outbox"), "--pins", self.pins] + command
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        if result.returncode != expect_code:
+            raise RuntimeError(f"fm2-cli {' '.join(command)} exited {result.returncode} (want {expect_code}): {result.stdout} {result.stderr}")
+        lines = [line for line in result.stdout.splitlines() if line.strip()]
+        if not lines:
+            raise RuntimeError(f"fm2-cli {' '.join(command)} printed nothing: {result.stderr}")
+        return json.loads(lines[-1])
+
     def wait(self, predicate, what, timeout=60):
         deadline = time.time() + timeout
         last = None
@@ -186,6 +202,7 @@ def main():
     parser.add_argument("--keygen", required=True)
     parser.add_argument("--devchain", required=True)
     parser.add_argument("--fm2d", required=True)
+    parser.add_argument("--cli", required=True)
     parser.add_argument("--workdir", required=True)
     args = parser.parse_args()
     cluster = Cluster(args)
@@ -200,11 +217,15 @@ def main():
             return hs if all(h is not None and h >= 3 for h in hs) else None
         hs = cluster.wait(heights, "three heartbeat slots on every seat", timeout=60)
         steps.append(f"heartbeats: heights {hs}")
+        # Two clients: their accounts follow their keys (AccountId::FromKey).
+        alice = cluster.cli("alice", ["keygen"])["account"]
+        bob = cluster.cli("bob", ["keygen"])["account"]
+        if cluster.cli("alice", ["account"])["account"] != alice:
+            raise RuntimeError("alice's account does not follow her key")
+        steps.append("two client keys made")
         # A deposit through the faucet reaches every seat with the same balance.
         rusd = cluster.doc["assets"]["rUSD"]
         b3 = cluster.doc["assets"]["B3"]
-        alice = account_hex("fm2/e2e/alice")
-        bob = account_hex("fm2/e2e/bob")
         cluster.deposit([(alice, "rUSD", 1_000_000_000), (bob, "B3", 10_000_000_000)])
 
         def funded():
@@ -212,6 +233,49 @@ def main():
             return seen if all(v == 1_000_000_000 for v in seen) else None
         cluster.wait(funded, "alice's deposit on every seat", timeout=60)
         steps.append("deposit of block 130 settled on every seat")
+        # The trade: bob's ask rests in one slot, alice's bid fills it in a later one (a same-slot cross is M3-ENG-02).
+        ask = cluster.cli("bob", ["place", "--market", "B3/rUSD", "--side", "sell", "--price", "100", "--lots", "5", "--wait", "--wait-ms", "60000"])
+        if ask.get("accepted_by") != cluster.k or ask.get("result", {}).get("status") != "INCLUDED" or not ask["result"].get("verified"):
+            raise RuntimeError(f"bob's ask: {ask}")
+        if ask["result"]["outcome"]["code"] != "RESTING":
+            raise RuntimeError(f"bob's ask did not rest: {ask['result']['outcome']}")
+        steps.append(f"bob's ask admitted by {ask['accepted_by']} seats and rests in slot {ask['result']['height']} (verified)")
+        bid = cluster.cli("alice", ["place", "--market", "B3/rUSD", "--side", "buy", "--price", "100", "--lots", "5", "--wait", "--wait-ms", "60000"])
+        if bid.get("result", {}).get("status") != "INCLUDED" or not bid["result"].get("verified"):
+            raise RuntimeError(f"alice's bid: {bid}")
+        fills = bid["result"]["outcome"]["fills"]
+        if len(fills) != 1 or fills[0]["lots"] != 5 or fills[0]["price_ticks"] != 100:
+            raise RuntimeError(f"alice's bid did not fill bob's ask: {bid['result']['outcome']}")
+        steps.append(f"alice's bid filled 5 lots at 100 in slot {bid['result']['height']} (verified)")
+
+        def balance(state_json, asset):
+            for b in state_json["leaf"]["balances"]:
+                if b["asset"] == asset:
+                    return b["available"]
+            return 0
+        alice_state = cluster.cli("alice", ["state"])
+        bob_state = cluster.cli("bob", ["state"])
+        if not alice_state.get("verified") or balance(alice_state, "B3") != 5_000_000 or balance(alice_state, "rUSD") != 1_000_000_000 - 500:
+            raise RuntimeError(f"alice's verified state after the trade: {alice_state}")
+        # The seller pays the fee (D5): fee_ppm 100 of 500 quote atoms rounds up to 1 (core/fee_math.h), so bob keeps 499.
+        if not bob_state.get("verified") or balance(bob_state, "B3") != 10_000_000_000 - 5_000_000 or balance(bob_state, "rUSD") != 499:
+            raise RuntimeError(f"bob's verified state after the trade: {bob_state}")
+        if fills[0]["seller_fee"] != 1:
+            raise RuntimeError(f"the fill's seller fee is not 1: {fills[0]}")
+        steps.append(f"verified balances: alice B3 {balance(alice_state, 'B3')} rUSD {balance(alice_state, 'rUSD')}, bob rUSD {balance(bob_state, 'rUSD')}")
+        # The exact bytes again: every seat answers DUPLICATE, nothing is re-signed.
+        again = cluster.cli("alice", ["resend", "--label", bid["label"]])
+        if again.get("accepted_by") != cluster.k or any(a.get("code") != "DUPLICATE" for a in again["admission"]):
+            raise RuntimeError(f"resend: {again}")
+        outbox = cluster.cli("alice", ["outbox"])
+        if len(outbox["entries"]) != 1 or outbox["entries"][0]["result"]["outcome"] != "INCLUDED":
+            raise RuntimeError(f"outbox: {outbox}")
+        steps.append("resend answered DUPLICATE on every seat; the outbox holds the included bid")
+        # A slot stream event from seat 0, verified by the client.
+        event = cluster.cli("alice", ["stream", "--channel", "slots", "--count", "1", "--limit-ms", "10000", "--seat", "0"])
+        if not event.get("verified"):
+            raise RuntimeError(f"stream: {event}")
+        steps.append("a streamed slot envelope verified")
         head_before = max(cluster.health(i)["published_height"] for i in range(cluster.k))
         # Seat 3 goes down; the rest keep deciding; a second deposit lands meanwhile.
         code = cluster.stop(3)
@@ -236,15 +300,17 @@ def main():
             return hs if hs[3] >= max(hs[:3]) - 1 and hs[3] >= head_before + 3 else None
         hs = cluster.wait(caught_up, "seat 3 to catch up", timeout=90)
         steps.append(f"seat 3 caught up: heights {hs}")
-        if balance_of(cluster.state(3, alice), rusd) != 1_000_000_005:
+        if balance_of(cluster.state(3, alice), rusd) != 1_000_000_000 - 500 + 5:
             # The second deposit may still be in flight on seat 3's published view; wait for it.
-            cluster.wait(lambda: balance_of(cluster.state(3, alice), rusd) == 1_000_000_005, "the second deposit on seat 3", timeout=30)
-        steps.append("seat 3 shows both deposits")
-        # Every seat agrees on alice's balance and bob's.
+            cluster.wait(lambda: balance_of(cluster.state(3, alice), rusd) == 1_000_000_000 - 500 + 5, "the second deposit on seat 3", timeout=30)
+        if balance_of(cluster.state(3, alice), b3) != 5_000_000:
+            raise RuntimeError("seat 3 does not show alice's filled lots")
+        steps.append("seat 3 shows both deposits and the trade")
+        # Every seat agrees on alice's balances and bob's.
         for i in range(cluster.k):
-            if balance_of(cluster.state(i, bob), b3) != 10_000_000_000:
-                raise RuntimeError(f"seat {i} disagrees on bob's balance")
-        steps.append("every seat agrees on both balances")
+            if balance_of(cluster.state(i, bob), b3) != 10_000_000_000 - 5_000_000 or balance_of(cluster.state(i, alice), b3) != 5_000_000:
+                raise RuntimeError(f"seat {i} disagrees on the balances")
+        steps.append("every seat agrees on every balance")
         codes = [cluster.stop(i) for i in range(cluster.k)]
         if any(c != 0 for c in codes):
             raise RuntimeError(f"exit codes {codes}")

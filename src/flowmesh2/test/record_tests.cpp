@@ -47,7 +47,8 @@ BOOST_AUTO_TEST_CASE(registry_pinned)
     // APPEND-ONLY registry (ARCHITECTURE.md 7.1): integers and names pinned.
     const std::vector<std::pair<int, std::string>> expected{
         {1, "INTENT"}, {2, "SIGNED_VOTE"}, {3, "DECISION"}, {4, "APPLIED"}, {5, "SNAPSHOT_MARK"},
-        {6, "ACCEPTED_PROPOSAL"}, {7, "VIEW_STATE"}, {8, "NEW_VIEW_ACCEPTED"}, {9, "PREPARED_QC"}, {10, "EVIDENCE"}};
+        {6, "ACCEPTED_PROPOSAL"}, {7, "VIEW_STATE"}, {8, "NEW_VIEW_ACCEPTED"}, {9, "PREPARED_QC"}, {10, "EVIDENCE"},
+        {11, "OUTBOX_ACTION"}, {12, "OUTBOX_RESULT"}};
     BOOST_REQUIRE_EQUAL(RecordTypeRegistry().size(), expected.size());
     for (size_t i{0}; i < expected.size(); ++i) {
         BOOST_CHECK_EQUAL(static_cast<int>(RecordTypeRegistry()[i].type), expected[i].first);
@@ -56,26 +57,30 @@ BOOST_AUTO_TEST_CASE(registry_pinned)
         BOOST_CHECK_EQUAL(std::string{ToString(RecordTypeRegistry()[i].type)}, expected[i].second);
     }
     BOOST_CHECK(!IsKnown(RecordType{0}));
-    BOOST_CHECK(!IsKnown(RecordType{11}));
-    BOOST_CHECK_EQUAL(std::string{ToString(RecordType{11})}, "UNKNOWN");
+    BOOST_CHECK(!IsKnown(RecordType{13}));
+    BOOST_CHECK_EQUAL(std::string{ToString(RecordType{13})}, "UNKNOWN");
     BOOST_CHECK_EQUAL(static_cast<int>(JournalRole::SIGNER), 1);
     BOOST_CHECK_EQUAL(static_cast<int>(JournalRole::COMMIT), 2);
+    BOOST_CHECK_EQUAL(static_cast<int>(JournalRole::OUTBOX), 3);
+    BOOST_CHECK_EQUAL(std::string{ToString(JournalRole::OUTBOX)}, "OUTBOX");
     BOOST_CHECK(!IsKnown(JournalRole{0}));
-    BOOST_CHECK(!IsKnown(JournalRole{3}));
-    BOOST_CHECK_EQUAL(std::string{ToString(JournalRole{3})}, "UNKNOWN");
+    BOOST_CHECK(!IsKnown(JournalRole{4}));
+    BOOST_CHECK_EQUAL(std::string{ToString(JournalRole{4})}, "UNKNOWN");
 }
 
 BOOST_AUTO_TEST_CASE(role_acceptance_table)
 {
-    // SIGNER holds {1, 2, 6, 7, 8}; COMMIT holds {3, 4, 5, 9, 10}; nothing else.
+    // SIGNER holds {1, 2, 6, 7, 8}; COMMIT holds {3, 4, 5, 9, 10}; OUTBOX holds {11, 12}; nothing else.
     for (int t{0}; t <= 255; ++t) {
         const RecordType type{static_cast<RecordType>(t)};
         const bool signer{t == 1 || t == 2 || t == 6 || t == 7 || t == 8};
         const bool commit{t == 3 || t == 4 || t == 5 || t == 9 || t == 10};
+        const bool outbox{t == 11 || t == 12};
         BOOST_CHECK_EQUAL(RoleAccepts(JournalRole::SIGNER, type), signer);
         BOOST_CHECK_EQUAL(RoleAccepts(JournalRole::COMMIT, type), commit);
+        BOOST_CHECK_EQUAL(RoleAccepts(JournalRole::OUTBOX, type), outbox);
         BOOST_CHECK(!RoleAccepts(JournalRole{0}, type));
-        BOOST_CHECK(!RoleAccepts(JournalRole{3}, type));
+        BOOST_CHECK(!RoleAccepts(JournalRole{4}, type));
     }
 }
 
@@ -123,7 +128,7 @@ BOOST_AUTO_TEST_CASE(encode_refusals)
 {
     const uint256 genesis{JournalGenesisChain(JournalRole::SIGNER, 1)};
     RequireRefusal(EncodeRecord(genesis, RecordType{0}, {}), ErrorCode::INVALID_INPUT, RECORD_TYPE, "type 0");
-    RequireRefusal(EncodeRecord(genesis, RecordType{11}, {}), ErrorCode::INVALID_INPUT, RECORD_TYPE, "type 11");
+    RequireRefusal(EncodeRecord(genesis, RecordType{13}, {}), ErrorCode::INVALID_INPUT, RECORD_TYPE, "type 13");
     const std::vector<unsigned char> at_cap(MAX_RECORD_PAYLOAD_BYTES);
     const Result<EncodedRecord> ok{EncodeRecord(genesis, RecordType::INTENT, at_cap)};
     RequireStorageOk(ok, "payload at the cap");
