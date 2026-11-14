@@ -88,7 +88,7 @@ std::string SpkiFingerprint(EVP_PKEY* key)
 {
     unsigned char* der{nullptr};
     const int len{i2d_PUBKEY(key, &der)};
-    if (len <= 0 || der == nullptr) return {};
+    if (len <= 0 || der == nullptr) return std::string{};
     unsigned char digest[SHA256_DIGEST_LENGTH];
     SHA256(der, static_cast<size_t>(len), digest);
     OPENSSL_free(der);
