@@ -83,7 +83,8 @@ per-market ledger and call it a V2 account.**
 ## 0. Gates that are still open
 
 These gates come from the outline review. Each row says how the slices treat
-it; none of them is closed by the outline itself.
+it; none of them is closed by the outline itself. Stage 2 (section 17) landed
+under the same gates; the decisions it took for the owner are in 17.1.
 
 | Gate | What is open | Effect on the outline |
 |---|---|---|
@@ -1781,3 +1782,72 @@ outline does not resolve on its own.
   an entry needs an owner ruling.
 - When a TODO task is completed, its row in the module table (section 2.1) moves
   from "Typed stubs" or "REAL-REPLACE" to "Real".
+
+---
+
+## 17. Stage 2 as landed (real node and network, 2026-11-14)
+
+The owner's instruction of 2026-11-14 (TODO.md preamble) made stage 2 "the
+real node and network". It landed in eight commits on `rebirth`, each
+building and passing `ctest -L flowmesh2`, each with a failing test first
+and an evidence bundle under `B3-FlowMesh-200ms-evidence/`:
+
+| Step | Commit | What | Items |
+|---|---|---|---|
+| 1 | `8eb95ddd` | `seat::SeatNode` extracted from the simulated node; `fm2-sim` byte-identical | M5-NODE-01 step 1 |
+| 2 | `bea481f6` | catch-up over BULK sync messages, idle grace, the fetched re-proposal | O-101 |
+| 3 | `9f657596` | the TCP seat mesh over a BIP324-style channel, BLS-vouched transport keys | M4-NET-01, O-102, D12 PROVISIONAL |
+| 4a | `2c85d633` | the stream hub: cursors, snapshots, deltas, gap replay | M5-API-02, O-103 |
+| 4b | `32ef80b1` (+ `a001ef50`) | HTTPS + SSE over TLS 1.3 (libevent, OpenSSL) | M5-API-01, O-104, SEC-7 PROVISIONAL |
+| 5 | `8ebdea84` | `fm2d`, `fm2-keygen`, `fm2-devchain`, the dev chain file, the four-seat e2e; two liveness fixes of the agreement | M5-NODE-01, O-105 |
+| 6 | `0cde36e3` | `fm2-cli`: durable outbox, pinned TLS, b3verify trust; the e2e trades | M5-CLI-01, O-106 |
+
+What a regtest operator can do now: `fm2-keygen` writes a cluster, four
+`fm2d` run it, `fm2-devchain` deposits, `fm2-cli` trades, and every answer
+the client prints as verified was checked with b3verify against
+genesis.json. The CTest `flowmesh2_e2e_regtest` does all of that, with a
+seat stopped and restarted in the middle.
+
+### 17.1 Decisions taken on the way, for the owner to confirm or overrule
+
+- **D12 PROVISIONAL** (O-102, M4-NET-05): the mesh port, the BIP324-style
+  channel (ElligatorSwift, HKDF under `"fm2_v1_shared_secret" || magic`,
+  FSChaCha20-Poly1305) and the BLS-vouched BIP340 transport key await the
+  crypto review. Seat keys are BLS, so the plan's "BIP340 by the seat key"
+  is read as a transport key signed by the seat key.
+- **SEC-7 PROVISIONAL** (O-104): libevent's evhttp with `bufferevent_openssl`,
+  TLS 1.3 only, 0-RTT off; the self-signed regtest certificate with an SPKI
+  pin; the request limits of O-104 (5).
+- **N-R11 deferred** (O-104 (7)): regtest seats serve the API themselves
+  until sentries land (M4-NET-03).
+- **The outbox** (O-106 (2)): a `storage::FileJournal` of role OUTBOX
+  instead of the plan's SQLite WAL; send-to-every-seat instead of the hedged
+  dual send.
+- **O-98** (stage 1): a follower adopts the proposer's parent certificate
+  after verifying it; O-105 (9) builds on that (two valid certificates for
+  one parent are both accepted; a re-proposal carries the selection's).
+- **Pushed decisions** (O-105 (10)): a seat that hears about a slot it has
+  decided pushes the decision; a pushed reply for the slot after the head is
+  accepted after verification. One certificate check per push, bounded by
+  the mesh's inbox caps.
+- **Plan 3.2 single binary** deferred: `fm2d`, `fm2-keygen`, `fm2-devchain`
+  and `fm2-cli` are four executables.
+- **The owner-protected guard tables** (`contrib/flowmesh2/check_guards.py`)
+  do not yet name `fm2_netio`, `fm2_clilib`, `fm2_keygen`, `fm2_devchain`,
+  `fm2_daemon` or `fm2_cli` in `LINK_GUARDED`/`NODE_CLEAN`/`DEV_CLEAN`/
+  `ALWAYS_INSPECTED`, and rule 7 does not match `SignSchnorr(` (used by
+  `cli/signer.cpp`, as `sim/sim_client.cpp` already did). Proposed additions
+  are in the stage 2 report; the executables in `fm2_all` are inspected by
+  rule 3 already.
+- **The simulator suite's bytes** changed once (O-105 (10)); its sha256 is
+  recorded there.
+
+### 17.2 Still open after stage 2
+
+M4-AGR-06 (restart fence; the TCP mesh now exists, so the HIGH_WATER
+exchange can be built), M4-AGR-04 (inclusion lists), M4-NET-03 (sentries and
+action gossip: clients still submit to every seat), M3-ENG-02 (same-slot
+crossing orders), M4-STO-03 (snapshots and the decided-but-unapplied tail
+on restore), M4-NET-05 (crypto review), the gates of section 0 (G-1 above
+all). Stage 3 (chain assets on regtest) starts with the b3d adapter
+(M7-ADP-01) replacing the dev chain file, then MB1.
