@@ -116,8 +116,11 @@ Result<void> SeatNode::BuildComponents(bool restart)
     Result<std::unique_ptr<net::LaneSet>> lanes{net::LaneSet::Create(net::ProvisionalLaneLimits(m_config.profile))};
     if (!lanes.has_value()) return lanes.error();
     m_lanes = std::move(lanes).value();
-    Result<std::unique_ptr<net::InProcessApi>> api{
-        net::InProcessApi::Create(m_config.profile, *m_lanes, *m_admission, *m_pool, *m_read, net::ApiLimits{m_config.max_replies})};
+    Result<std::unique_ptr<net::StreamHub>> streams{net::StreamHub::Create(m_config.streams, m_config.stream_epoch)};
+    if (!streams.has_value()) return streams.error();
+    m_streams = std::move(streams).value();
+    Result<std::unique_ptr<net::InProcessApi>> api{net::InProcessApi::Create(m_config.profile, *m_lanes, *m_admission, *m_pool, *m_read,
+                                                                             net::ApiLimits{m_config.max_replies}, m_streams.get())};
     if (!api.has_value()) return api.error();
     m_api = std::move(api).value();
 
@@ -269,6 +272,7 @@ Result<SealReport> SeatNode::Finish(uint64_t height, state::Candidate candidate,
     if (!view.has_value()) return FenceAfterApply(view.error());
     if (const Result<void> published{m_read->Publish(*token, *view)}; !published.has_value()) return FenceAfterApply(published.error());
     Hooks().Record("read.publish", "slot=" + std::to_string(height));
+    m_streams->Publish(next, *view);
 
     // 9. The pool learns of the slot last.
     Result<admission::CommitReport> report{m_pool->OnCommitted(*token, *next, outcomes, decision.body)};

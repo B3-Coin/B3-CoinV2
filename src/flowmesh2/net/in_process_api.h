@@ -63,6 +63,8 @@
  */
 namespace flowmesh2::net {
 
+class StreamHub;
+
 // Static details (ErrorCode in parentheses).
 inline constexpr std::string_view API_PROFILE_MISMATCH{"an API component has another profile"};                    //!< (INVALID_INPUT)
 inline constexpr std::string_view API_LIMIT_ZERO{"zero API limit"};                                               //!< (INVALID_INPUT)
@@ -107,7 +109,7 @@ public:
      */
     static Result<std::unique_ptr<InProcessApi>> Create(const ProfileParams& profile, LaneSet& lanes, admission::Admission& admission,
                                                         const admission::ActionPool& pool, const read::ReadService& read,
-                                                        const ApiLimits& limits);
+                                                        const ApiLimits& limits, StreamHub* streams = nullptr);
 
     InProcessApi(const InProcessApi&) = delete;
     InProcessApi& operator=(const InProcessApi&) = delete;
@@ -119,8 +121,11 @@ public:
     std::optional<ApiReply> TakeReply(RequestId id) override EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
     Result<ActionStatusReply> GetAction(const ActionV2& original) const override;
     Result<read::AccountReply> GetState(const AccountId& account) const override;
-    //! Stub: NotImplemented(M5-API-02).
+    //! Streams (M5-API-02): the hub's, or INVALID_INPUT STREAM_NO_HUB without one.
     Result<StreamId> Subscribe(const StreamRequest& request) override;
+    Result<std::vector<StreamEvent>> TakeEvents(StreamId id, size_t max) override;
+    Result<void> Unsubscribe(StreamId id) override;
+    StreamHub* Streams() const { return m_streams; }
 
     //! Answer at most `max` queued requests (see the file comment). INVARIANT API_FOREIGN_REQUEST or API_REQUEST_KIND.
     Result<PumpReport> Pump(size_t max) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
@@ -137,7 +142,7 @@ public:
 
 private:
     InProcessApi(const ProfileParams& profile, LaneSet& lanes, admission::Admission& admission, const admission::ActionPool& pool,
-                 const read::ReadService& read, const ApiLimits& limits);
+                 const read::ReadService& read, const ApiLimits& limits, StreamHub* streams);
 
     struct Request {
         RequestState state{RequestState::QUEUED};
@@ -157,6 +162,7 @@ private:
     const admission::ActionPool& m_pool;
     const read::ReadService& m_read;
     const ApiLimits m_limits;
+    StreamHub* m_streams;
 
     std::atomic<uint64_t> m_next_id{1};
     mutable Mutex m_mutex;

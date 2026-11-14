@@ -609,12 +609,6 @@ FM2_STUB_CASE(M5_API_01, "M5-API-01")
     return Observe(net::HttpsSseApi::Create(net::HttpsSseConfig{}, *rig.api));
 }
 
-FM2_STUB_CASE(M5_API_02, "M5-API-02")
-{
-    ApiRig rig;
-    return Observe(rig.api->Subscribe(net::StreamRequest{}));
-}
-
 // ---- Slice R13: net/ seat mesh ----
 
 FM2_STUB_CASE(M4_NET_03, "M4-NET-03")

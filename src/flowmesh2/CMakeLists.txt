@@ -140,6 +140,7 @@ if(BUILD_FLOWMESH2)
     net/seat_mesh.cpp
     net/sentry.cpp
     net/short_id.cpp
+    net/stream_hub.cpp
     net/sync.cpp
     read/read_service.cpp
     read/views.cpp
@@ -331,6 +332,7 @@ if(BUILD_FLOWMESH2)
     test/slot_tests.cpp
     test/state_owner_tests.cpp
     test/state_root_tests.cpp
+    test/stream_hub_tests.cpp
     test/stub_inventory_tests.cpp
     test/sync_tests.cpp
     test/tcp_mesh_tests.cpp

@@ -22,6 +22,7 @@
 #include <flowmesh2/net/in_process_api.h>
 #include <flowmesh2/net/lanes.h>
 #include <flowmesh2/net/seat_mesh.h>
+#include <flowmesh2/net/stream_hub.h>
 #include <flowmesh2/net/sync.h>
 #include <flowmesh2/read/read_service.h>
 #include <flowmesh2/read/views.h>
@@ -190,6 +191,8 @@ struct SeatNodeConfig {
     std::vector<unsigned char> ikm; //!< this seat's BLS IKM (SeatSigner::FromIKM)
     size_t max_replies{64};         //!< InProcessApi::ApiLimits
     agreement::PbftConfig pbft;     //!< k > 1; self_seat and start_ms are set by the node
+    uint64_t stream_epoch{1};          //!< the stream hub's epoch (M5-API-02); a daemon uses a fresh random value per start
+    net::StreamHubLimits streams;      //!< the stream hub's limits
     uint64_t sync_backoff_ms{250};     //!< catch-up (O-101): the first retry period of a request nobody answered
     uint64_t sync_backoff_max_ms{2'000}; //!< the retry period doubles up to this
 };
@@ -298,6 +301,7 @@ public:
     admission::ActionPool& Pool() { return *m_pool; }
     admission::Admission& Admitter() { return *m_admission; }
     net::InProcessApi& Api() { return *m_api; }
+    net::StreamHub& Streams() { return *m_streams; }
     storage::CommitLog& CommitLog() { return *m_commit_log; }
     storage::SignerLog& SignerLog() { return *m_signer_log; }
     storage::SeatSigner& Signer() { return *m_signer; }
@@ -360,6 +364,7 @@ private:
     std::unique_ptr<admission::ActionPool> m_pool;
     std::unique_ptr<admission::Admission> m_admission;
     std::unique_ptr<net::LaneSet> m_lanes;
+    std::unique_ptr<net::StreamHub> m_streams;
     std::unique_ptr<net::InProcessApi> m_api;
     std::unique_ptr<agreement::Agreement> m_certifier; //!< k = 1 (the factory's)
     std::unique_ptr<agreement::PbftSafetyRules> m_rules;
