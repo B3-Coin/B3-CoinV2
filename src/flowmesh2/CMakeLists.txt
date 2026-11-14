@@ -143,6 +143,7 @@ if(BUILD_FLOWMESH2)
     net/tcp_mesh.cpp
     read/read_service.cpp
     read/views.cpp
+    seat/seat_node.cpp
     state/candidate.cpp
     state/replay.cpp
     state/state_owner.cpp
