@@ -62,8 +62,9 @@
  *   slot, if any (used by the certifier before it signs, O-89).
  * - Every Append and Confirm of a fatal journal is FENCED.
  * - Create needs a COMMIT journal (ORDER_VIOLATION, LOG_ROLE) that is not
- *   fatal (FENCED) and has no records yet; rebuilding the decision index of
- *   a journal with history is recovery, M4-STO-01.
+ *   fatal (FENCED) and has no records yet (ORDER_VIOLATION, LOG_HAS_HISTORY
+ *   otherwise); Recover rebuilds the decision index of a journal with
+ *   history (M4-STO-01).
  *
  * Record payloads (exact codecs, used by replay in R9):
  * - DECISION: header (366) | CompactSize(len) | certificate (len bytes) |
@@ -127,7 +128,22 @@ struct PreparedQcRecord {
 class CommitLog
 {
 public:
+    //! A log over an empty COMMIT journal; a journal with records is ORDER_VIOLATION (LOG_HAS_HISTORY): use Recover.
     static Result<CommitLog> Create(Journal& journal);
+    /** A log over a COMMIT journal with history (M4-STO-01): rebuilds the
+     * decision index and the last applied slot from Journal::ReadAll, so
+     * DecisionAt answers for every decided slot, re-appends are idempotent,
+     * another header for a decided slot is refused and the next APPLIED must
+     * follow the last one. ORDER_VIOLATION (LOG_ROLE) for another role,
+     * FENCED for a fatal journal, the record decoders' errors, VERIFY_FAILED
+     * (RECOVER_INCONSISTENT) for a history this log would never have written
+     * (an APPLIED without its decision or with another header hash or state
+     * root, applications out of slot order, a second decision for a slot).
+     * SNAPSHOT_MARK (M4-STO-03) and PREPARED_QC (M4-STO-07) records are
+     * NotImplemented until those land. State replay from the same records
+     * is state::ReplayDecisions.
+     */
+    static Result<CommitLog> Recover(Journal& journal, const ProfileParams& profile);
 
     CommitLog(CommitLog&&) noexcept = default;
     CommitLog& operator=(CommitLog&&) noexcept = default;

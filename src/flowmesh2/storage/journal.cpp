@@ -14,6 +14,17 @@ Journal::Journal(ImplKey, JournalRole role, uint64_t instance_id, BarrierObserve
 {
 }
 
+Journal::Journal(ImplKey, JournalRole role, uint64_t instance_id, BarrierObserver* observer, const RecoveredState& recovered)
+    : m_role{role},
+      m_instance_id{instance_id},
+      m_observer{observer},
+      m_chain{recovered.last_chain},
+      m_appended_seq{recovered.records},
+      m_durable_seq{recovered.records},
+      m_unwritten_offset{recovered.image_end}
+{
+}
+
 Result<uint64_t> Journal::Append(RecordType type, std::span<const unsigned char> payload)
 {
     uint64_t seq{0};

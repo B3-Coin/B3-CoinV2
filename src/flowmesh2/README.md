@@ -108,9 +108,10 @@ durability tokens that only `Journal::Confirm` mints after a barrier, the
 signer log (accepted proposals, intents and signed votes with the
 equivocation rule), the seat signer whose `Sign` takes only a
 `DurableIntent`, the commit log (decisions with their bodies, and
-applications) and `agreement/outbound.h`; reopening a file journal, group
-commit, snapshots, folded signing and the PBFT view-state records are
-typed stubs (segment rollover and `ReadAll` landed with M4-STO-06); and **R9**, the state owner in `state/`: the core
+applications) and `agreement/outbound.h`; group commit, snapshots,
+folded signing and the PBFT view-state records are typed stubs (segment
+rollover, `ReadAll` and reopen with recovery landed with M4-STO-06 and
+M4-STO-01); and **R9**, the state owner in `state/`: the core
 state and its genesis, owned committed heads, slot candidates that only
 the engine can produce (with the originals in canonical order, so a
 permuted proposal gives the same header), the single-writer `StateOwner`
@@ -180,7 +181,7 @@ build-rebirth/bin/fm2-sim --scenario all --seeds 1-32   # JSON on stdout; exit 0
 
 Expected after R14 and the review fixes (O-89 to O-92): 10 CTests pass
 (`flowmesh2_foundations` with its 19 C1 cases, `flowmesh2_sim`,
-`flowmesh2_sim_cli_determinism`, `flowmesh2_unit` with 515 cases,
+`flowmesh2_sim_cli_determinism`, `flowmesh2_unit` with 518 cases,
 `flowmesh2_inventory`, `flowmesh2_todo_lint`, `flowmesh2_guards`,
 `flowmesh2_guards_selftest`, `flowmesh2_evidence_selftest` and, with Clang,
 `flowmesh2_negative_compile` with six negative controls and a positive one).

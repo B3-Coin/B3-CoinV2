@@ -76,7 +76,59 @@ BOOST_AUTO_TEST_CASE(create_checks_role_fence_and_history)
     RequireRefusal(SignerLog::Create(*fatal), ErrorCode::FENCED, JOURNAL_FENCED, "fatal journal");
     auto used{NewMemoryJournal(JournalRole::SIGNER, 3)};
     RequireStorageOk(used->Append(RecordType::INTENT, Bytes("history")), "append");
-    RequireStub(SignerLog::Create(*used), "M4-STO-01");
+    RequireRefusal(SignerLog::Create(*used), ErrorCode::ORDER_VIOLATION, LOG_HAS_HISTORY, "journal with history: Recover");
+}
+
+BOOST_AUTO_TEST_CASE(recover_rebuilds_the_equivocation_index)
+{
+    // M4-STO-01: a log over a journal with history refuses exactly what the
+    // original log refused and hands out the original pending records.
+    SignerFixture f{13};
+    const StorageSlot slot{MakeStorageSlot(6, 2, "recover")};
+    const StorageSlot other{MakeStorageSlot(6, 2, "recover-other")};
+    const PendingProposal proposal{f.Accept(slot, 0)};
+    const PendingIntent pending{f.Intend(slot, 0, proposal)};
+    const DurableIntent intent{f.DurableIntentFor(pending)};
+    const VoteSignature sig{FakeSignature(0x6b)};
+    const PendingSignedVote signed_pending{f.log.AppendSignedVote(intent, sig).value()};
+    BOOST_CHECK_EQUAL(f.log.Barrier().value(), 3U);
+    // A second view: proposal and intent, no signature yet.
+    const PendingProposal second{f.Accept(slot, 1)};
+    const PendingIntent second_intent{f.Intend(slot, 1, second)};
+    BOOST_CHECK_EQUAL(f.log.Barrier().value(), 5U);
+
+    Result<SignerLog> recovered{SignerLog::Recover(*f.journal, Profile())};
+    RequireStorageOk(recovered, "Recover");
+    SignerLog& log{*recovered};
+    // Idempotent re-appends return the original records (same sequence numbers); nothing new is written.
+    BOOST_CHECK(log.AppendAcceptedProposal(ProposalKey{2, 6, 0}, slot.header, slot.body).value() == proposal);
+    BOOST_CHECK(log.AppendIntent(CommitVoteKey(slot.header, 0), slot.header.CommitDigest(), proposal).value() == pending);
+    BOOST_CHECK(log.Knows(intent));
+    BOOST_CHECK(log.AppendSignedVote(intent, sig).value() == signed_pending);
+    BOOST_CHECK(log.AppendIntent(CommitVoteKey(slot.header, 1), slot.header.CommitDigest(), second).value() == second_intent);
+    BOOST_CHECK(f.journal->Status() == (JournalStatus{5, 5, false}));
+    // The equivocation rules hold against the history.
+    RequireRefusal(log.AppendAcceptedProposal(ProposalKey{2, 6, 0}, other.header, other.body), ErrorCode::EQUIVOCATION_REFUSED,
+                   PROPOSAL_CONFLICT, "another header for the key");
+    RequireRefusal(log.AppendSignedVote(intent, FakeSignature(0x6c)), ErrorCode::EQUIVOCATION_REFUSED, SIGNED_VOTE_CONFLICT, "another signature");
+    // The second intent can still be signed: its vote is new.
+    const DurableIntent second_durable{f.journal->Confirm(second_intent).value()};
+    BOOST_CHECK(log.Knows(second_durable));
+    BOOST_CHECK_EQUAL(log.AppendSignedVote(second_durable, FakeSignature(0x6d)).value().Seq(), 6U);
+
+    // Recover refuses a history that contradicts the rules, the wrong role and a fatal journal.
+    auto planted{NewMemoryJournal(JournalRole::SIGNER, 14)};
+    RequireStorageOk(planted->Append(RecordType::INTENT, IntentRecord{CommitVoteKey(slot.header, 0), slot.header.CommitDigest(), 1}.Encode()),
+                     "intent without its proposal");
+    // Only durable records are history: before the barrier Recover sees an empty journal.
+    RequireStorageOk(SignerLog::Recover(*planted, Profile()), "planted record not yet durable");
+    RequireStorageOk(planted->Barrier(), "barrier");
+    RequireRefusal(SignerLog::Recover(*planted, Profile()), ErrorCode::VERIFY_FAILED, RECOVER_INCONSISTENT, "intent without its proposal");
+    auto commit{NewMemoryJournal(JournalRole::COMMIT, 15)};
+    RequireRefusal(SignerLog::Recover(*commit, Profile()), ErrorCode::ORDER_VIOLATION, LOG_ROLE, "commit journal");
+    auto fatal{NewMemoryJournal(JournalRole::SIGNER, 16, MemoryJournalFaults{.fail_barrier = 1})};
+    RequireCode(fatal->Barrier(), ErrorCode::STORAGE_FATAL, "make the journal fatal");
+    RequireRefusal(SignerLog::Recover(*fatal, Profile()), ErrorCode::FENCED, JOURNAL_FENCED, "fatal journal");
 }
 
 BOOST_AUTO_TEST_CASE(strict_order_writes_the_expected_records)

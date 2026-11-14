@@ -128,39 +128,56 @@ Result<ScanResult> ScanRecords(std::span<const unsigned char> bytes, JournalRole
 Result<ScanResult> ScanRecordsFrom(std::span<const unsigned char> bytes, JournalRole role, const uint256& prev_chain, uint64_t first_seq)
 {
     if (!IsKnown(role)) return Error{ErrorCode::INVALID_INPUT, "unknown journal role"};
-    ScanResult out;
-    out.last_chain = prev_chain;
+    PartialScan scan{ScanRecordsPartial(bytes, role, prev_chain, first_seq)};
+    if (scan.refusal.has_value()) return *scan.refusal;
+    return Ok(std::move(scan.accepted));
+}
+
+PartialScan ScanRecordsPartial(std::span<const unsigned char> bytes, JournalRole role, const uint256& prev_chain, uint64_t first_seq)
+{
+    PartialScan out;
+    out.accepted.last_chain = prev_chain;
+    if (!IsKnown(role)) {
+        out.refusal = Error{ErrorCode::INVALID_INPUT, "unknown journal role"};
+        return out;
+    }
+    const auto refuse = [&out](size_t at, Error error) {
+        out.refused_at = at;
+        out.refusal = error;
+        return out;
+    };
     size_t pos{0};
     while (pos < bytes.size()) {
         const std::span<const unsigned char> rest{bytes.subspan(pos)};
         if (rest.size() < RECORD_HEADER_BYTES) {
             if (AllZero(rest)) break; // zero tail shorter than a header
-            return Error{ErrorCode::DECODE, RECORD_LENGTH};
+            return refuse(pos, Error{ErrorCode::DECODE, RECORD_LENGTH});
         }
         const uint32_t len{ReadLE32(rest.data())};
         const uint32_t crc{ReadLE32(rest.data() + 4)};
         const uint8_t type_byte{rest[8]};
         if (len == 0 && crc == 0 && type_byte == 0) {
-            if (!AllZero(rest)) return Error{ErrorCode::DECODE, RECORD_TAIL};
+            if (!AllZero(rest)) return refuse(pos, Error{ErrorCode::DECODE, RECORD_TAIL});
             break;
         }
         if (len > MAX_RECORD_PAYLOAD_BYTES || rest.size() - RECORD_HEADER_BYTES < size_t{len} + RECORD_CHAIN_BYTES) {
-            return Error{ErrorCode::DECODE, RECORD_LENGTH};
+            return refuse(pos, Error{ErrorCode::DECODE, RECORD_LENGTH});
         }
         const RecordType type{static_cast<RecordType>(type_byte)};
         const std::span<const unsigned char> payload{rest.subspan(RECORD_HEADER_BYTES, len)};
         uint256 chain;
         std::copy_n(rest.begin() + RECORD_HEADER_BYTES + len, RECORD_CHAIN_BYTES, chain.begin());
-        if (RecordCrc(type, payload, chain) != crc) return Error{ErrorCode::VERIFY_FAILED, RECORD_CRC};
-        if (!IsKnown(type)) return Error{ErrorCode::DECODE, RECORD_TYPE};
-        if (!RoleAccepts(role, type)) return Error{ErrorCode::ORDER_VIOLATION, RECORD_ROLE};
-        if (NextChain(out.last_chain, type, payload) != chain) return Error{ErrorCode::VERIFY_FAILED, RECORD_CHAIN};
-        out.records.push_back(JournalRecord{first_seq + out.records.size() + 1, type, std::vector<unsigned char>(payload.begin(), payload.end()), chain});
-        out.last_chain = chain;
+        if (RecordCrc(type, payload, chain) != crc) return refuse(pos, Error{ErrorCode::VERIFY_FAILED, RECORD_CRC});
+        if (!IsKnown(type)) return refuse(pos, Error{ErrorCode::DECODE, RECORD_TYPE});
+        if (!RoleAccepts(role, type)) return refuse(pos, Error{ErrorCode::ORDER_VIOLATION, RECORD_ROLE});
+        if (NextChain(out.accepted.last_chain, type, payload) != chain) return refuse(pos, Error{ErrorCode::VERIFY_FAILED, RECORD_CHAIN});
+        out.accepted.records.push_back(JournalRecord{first_seq + out.accepted.records.size() + 1, type,
+                                                     std::vector<unsigned char>(payload.begin(), payload.end()), chain});
+        out.accepted.last_chain = chain;
         pos += RECORD_OVERHEAD_BYTES + len;
-        out.end_offset = pos;
+        out.accepted.end_offset = pos;
     }
-    return Ok(std::move(out));
+    return out;
 }
 
 } // namespace flowmesh2::storage

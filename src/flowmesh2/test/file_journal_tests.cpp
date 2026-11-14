@@ -356,15 +356,159 @@ BOOST_AUTO_TEST_CASE(many_segments_read_back_after_a_crash)
     }
 }
 
-BOOST_AUTO_TEST_CASE(open_existing_is_not_implemented)
+//! Overwrite bytes of a file at `offset` (a torn write or corruption).
+void PatchFile(const fs::path& file, uint64_t offset, const std::vector<unsigned char>& bytes)
 {
-    const TestDir root{"open_existing"};
+    const int fd{open(file.c_str(), O_WRONLY)};
+    BOOST_REQUIRE(fd >= 0);
+    BOOST_REQUIRE(pwrite(fd, bytes.data(), bytes.size(), static_cast<off_t>(offset)) == static_cast<ssize_t>(bytes.size()));
+    BOOST_REQUIRE(close(fd) == 0);
+}
+
+BOOST_AUTO_TEST_CASE(open_existing_reopens_and_continues_the_chain)
+{
+    // M4-STO-01. Three durable records over two one-page segments, the
+    // journal object dropped (a restart), then reopened.
+    const TestDir root{"reopen"};
     {
-        auto journal{MustCreate(root.path, JournalRole::SIGNER, 8)};
-        BOOST_CHECK_EQUAL(journal->Append(RecordType::INTENT, Bytes("i")).value(), 1U);
+        auto journal{MustCreate(root.path, JournalRole::COMMIT, 8, SEGMENT_PAGE_BYTES)};
+        const std::vector<unsigned char> big(SEGMENT_PAGE_BYTES / 2, 0x11);
+        BOOST_CHECK_EQUAL(journal->Append(RecordType::DECISION, big).value(), 1U);
         BOOST_CHECK_EQUAL(journal->Barrier().value(), 1U);
+        BOOST_CHECK_EQUAL(journal->Append(RecordType::DECISION, big).value(), 2U); // segment 1
+        BOOST_CHECK_EQUAL(journal->Append(RecordType::APPLIED, Bytes("a")).value(), 3U);
+        BOOST_CHECK_EQUAL(journal->Barrier().value(), 3U);
+        BOOST_CHECK_EQUAL(journal->CurrentSegment(), 1U);
     }
-    RequireStub(FileJournal::OpenExisting(root.path, JournalRole::SIGNER, 8), "M4-STO-01");
+    // The segments carry no header: the first record's chain binds role and instance (O-94).
+    RequireRefusal(FileJournal::OpenExisting(root.path, JournalRole::SIGNER, 8), ErrorCode::VERIFY_FAILED, JOURNAL_IDENTITY_MISMATCH, "wrong role");
+    RequireRefusal(FileJournal::OpenExisting(root.path, JournalRole::COMMIT, 9), ErrorCode::VERIFY_FAILED, JOURNAL_IDENTITY_MISMATCH, "wrong instance");
+    RequireRefusal(FileJournal::OpenExisting(root.path / fs::u8path("missing"), JournalRole::COMMIT, 8), ErrorCode::INVALID_INPUT, JOURNAL_DIR_MISSING, "missing dir");
+    const fs::path no_segment{root.Sub("no_segment")};
+    RequireRefusal(FileJournal::OpenExisting(no_segment, JournalRole::COMMIT, 8), ErrorCode::INVALID_INPUT, JOURNAL_SEGMENT_MISSING, "dir without a first segment");
+
+    Result<std::unique_ptr<FileJournal>> reopened{FileJournal::OpenExisting(root.path, JournalRole::COMMIT, 8)};
+    RequireStorageOk(reopened, "OpenExisting");
+    FileJournal& journal{**reopened};
+    BOOST_CHECK(journal.Status() == (JournalStatus{3, 3, false}));
+    BOOST_CHECK_EQUAL(journal.SegmentBytes(), SEGMENT_PAGE_BYTES);
+    BOOST_CHECK_EQUAL(journal.Recovery().records, 3U);
+    BOOST_CHECK_EQUAL(journal.Recovery().truncated_bytes, 0U);
+    BOOST_CHECK_EQUAL(journal.CurrentSegment(), 1U);
+    BOOST_CHECK_EQUAL(journal.SegmentCount(), 3U); // the spare exists after a reopen too
+    const Result<std::vector<JournalRecord>> all{journal.ReadAll()};
+    RequireStorageOk(all, "ReadAll after reopen");
+    BOOST_REQUIRE_EQUAL(all->size(), 3U);
+    // The chain continues: record 4 chains on record 3 and the whole image scans clean.
+    BOOST_CHECK_EQUAL(journal.Append(RecordType::APPLIED, Bytes("b")).value(), 4U);
+    BOOST_CHECK_EQUAL(journal.Barrier().value(), 4U);
+    const std::vector<JournalRecord> records{ScanSegments(root.path, JournalRole::COMMIT, 8, journal.SegmentCount())};
+    BOOST_REQUIRE_EQUAL(records.size(), 4U);
+    BOOST_CHECK(records[3].payload == Bytes("b"));
+    BOOST_CHECK(records[3].chain == NextChain(records[2].chain, RecordType::APPLIED, Bytes("b")));
+    // Tokens mint against the recovered sequence numbers too.
+    BOOST_CHECK_EQUAL(journal.DurableSeq(), 4U);
+
+    // A fresh, empty journal reopens with nothing.
+    const TestDir empty{"reopen_empty"};
+    { MustCreate(empty.path, JournalRole::SIGNER, 1, SEGMENT_PAGE_BYTES); }
+    Result<std::unique_ptr<FileJournal>> fresh{FileJournal::OpenExisting(empty.path, JournalRole::SIGNER, 1)};
+    RequireStorageOk(fresh, "reopen an empty journal");
+    BOOST_CHECK((*fresh)->Status() == (JournalStatus{0, 0, false}));
+}
+
+BOOST_AUTO_TEST_CASE(torn_tail_is_truncated_on_reopen)
+{
+    // M4-STO-01. A crash in the middle of a barrier's write leaves a record's
+    // prefix at the image end, then the segment's zero tail. Nothing that left
+    // the node was in it (only durable records leave), so recovery drops it
+    // and the journal continues where the durable records end, for both roles.
+    for (const JournalRole role : {JournalRole::COMMIT, JournalRole::SIGNER}) {
+        const TestDir root{role == JournalRole::COMMIT ? "torn_commit" : "torn_signer"};
+        const RecordType type{role == JournalRole::COMMIT ? RecordType::DECISION : RecordType::INTENT};
+        uint256 last_chain;
+        uint64_t end{0};
+        {
+            auto journal{MustCreate(root.path, role, 3, SMALL_SEGMENT)};
+            BOOST_CHECK_EQUAL(journal->Append(type, Bytes("one")).value(), 1U);
+            BOOST_CHECK_EQUAL(journal->Append(type, Bytes("two")).value(), 2U);
+            BOOST_CHECK_EQUAL(journal->Barrier().value(), 2U);
+            const ScanResult scan{ScanRecords(ReadFile(journal->SegmentPath()), role, 3).value()};
+            last_chain = scan.last_chain;
+            end = scan.end_offset;
+        }
+        const fs::path seg{root.path / fs::u8path(FIRST_SEGMENT_NAME)};
+        const EncodedRecord third{EncodeRecord(last_chain, type, Bytes("three-torn")).value()};
+        const std::vector<unsigned char> half(third.bytes.begin(), third.bytes.begin() + static_cast<std::ptrdiff_t>(third.bytes.size() / 2));
+        PatchFile(seg, end, half);
+        // With an intact header the zero tail supplies the missing bytes, so the torn record fails its CRC.
+        RequireRefusal(ScanRecords(ReadFile(seg), role, 3), ErrorCode::VERIFY_FAILED, RECORD_CRC, "the torn image does not scan");
+        Result<std::unique_ptr<FileJournal>> reopened{FileJournal::OpenExisting(root.path, role, 3)};
+        RequireStorageOk(reopened, "reopen with a torn tail");
+        FileJournal& journal{**reopened};
+        BOOST_CHECK(journal.Status() == (JournalStatus{2, 2, false}));
+        BOOST_CHECK_EQUAL(journal.Recovery().records, 2U);
+        BOOST_CHECK_EQUAL(journal.Recovery().truncated_bytes, half.size());
+        // The tail is zero again on disk, and the journal continues at record 3.
+        const std::vector<unsigned char> image{ReadFile(seg)};
+        BOOST_CHECK(std::all_of(image.begin() + static_cast<std::ptrdiff_t>(end), image.end(), [](unsigned char b) { return b == 0; }));
+        BOOST_CHECK_EQUAL(journal.Append(type, Bytes("three")).value(), 3U);
+        BOOST_CHECK_EQUAL(journal.Barrier().value(), 3U);
+        const ScanResult after{ScanRecords(ReadFile(seg), role, 3).value()};
+        BOOST_REQUIRE_EQUAL(after.records.size(), 3U);
+        BOOST_CHECK(after.records[2].payload == Bytes("three"));
+        // A torn header shorter than the 9 header bytes is a torn tail as well.
+        {
+            const TestDir short_root{role == JournalRole::COMMIT ? "torn_commit_short" : "torn_signer_short"};
+            uint64_t short_end{0};
+            {
+                auto j{MustCreate(short_root.path, role, 3, SMALL_SEGMENT)};
+                BOOST_CHECK_EQUAL(j->Append(type, Bytes("one")).value(), 1U);
+                BOOST_CHECK_EQUAL(j->Barrier().value(), 1U);
+                short_end = ScanRecords(ReadFile(j->SegmentPath()), role, 3).value().end_offset;
+            }
+            PatchFile(short_root.path / fs::u8path(FIRST_SEGMENT_NAME), short_end, {0x05, 0x01, 0x02});
+            Result<std::unique_ptr<FileJournal>> j{FileJournal::OpenExisting(short_root.path, role, 3)};
+            RequireStorageOk(j, "reopen with a torn header");
+            BOOST_CHECK((*j)->Status() == (JournalStatus{1, 1, false}));
+            BOOST_CHECK_EQUAL((*j)->Recovery().truncated_bytes, 3U);
+        }
+    }
+}
+
+BOOST_AUTO_TEST_CASE(corruption_is_fatal_and_retires_the_signer_key)
+{
+    // M4-STO-01. A flipped byte inside a durable record, or non-zero bytes
+    // beyond one torn record, is corruption, not a torn tail: the commit
+    // journal refuses to open (JOURNAL_CORRUPT, restore from peers) and the
+    // signer journal retires its key (SIGNER_KEY_RETIRED, M4-AGR-06).
+    for (const JournalRole role : {JournalRole::COMMIT, JournalRole::SIGNER}) {
+        const TestDir root{role == JournalRole::COMMIT ? "corrupt_commit" : "corrupt_signer"};
+        const RecordType type{role == JournalRole::COMMIT ? RecordType::DECISION : RecordType::INTENT};
+        const std::string_view want{role == JournalRole::COMMIT ? JOURNAL_CORRUPT : SIGNER_KEY_RETIRED};
+        {
+            auto journal{MustCreate(root.path, role, 4, SMALL_SEGMENT)};
+            for (int i{0}; i < 3; ++i) RequireStorageOk(journal->Append(type, Bytes("r")), "append");
+            BOOST_CHECK_EQUAL(journal->Barrier().value(), 3U);
+        }
+        const fs::path seg{root.path / fs::u8path(FIRST_SEGMENT_NAME)};
+        const std::vector<unsigned char> clean{ReadFile(seg)};
+        // Flip the payload byte of record 2.
+        const size_t flip{RECORD_OVERHEAD_BYTES + 1 + RECORD_HEADER_BYTES};
+        PatchFile(seg, flip, {static_cast<unsigned char>(clean[flip] ^ 0xff)});
+        RequireRefusal(FileJournal::OpenExisting(root.path, role, 4), ErrorCode::STORAGE_FATAL, want, "flipped byte in the middle");
+        // Restored, it opens; garbage longer than the record its header claims is corruption again.
+        PatchFile(seg, 0, clean);
+        RequireStorageOk(FileJournal::OpenExisting(root.path, role, 4), "clean again");
+        const ScanResult scan{ScanRecords(clean, role, 4).value()};
+        const std::vector<unsigned char> garbage(2 * RECORD_OVERHEAD_BYTES + 64, 0xEE);
+        PatchFile(seg, scan.end_offset, garbage);
+        RequireRefusal(FileJournal::OpenExisting(root.path, role, 4), ErrorCode::STORAGE_FATAL, want, "garbage beyond one record");
+        // Non-zero bytes in a later segment after the image end are corruption too.
+        PatchFile(seg, 0, clean);
+        PatchFile(root.path / fs::u8path(SegmentFileName(1)), 100, {0x01});
+        RequireRefusal(FileJournal::OpenExisting(root.path, role, 4), ErrorCode::STORAGE_FATAL, want, "bytes in the spare");
+    }
 }
 
 BOOST_AUTO_TEST_SUITE_END()

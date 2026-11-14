@@ -67,12 +67,44 @@
  * a refusal (what recovery makes of it is M4-STO-01).
  *
  * The segments carry no header: role and instance are bound by the chain
- * (record.h), so whoever reopens a journal must know them.
+ * (record.h), so whoever reopens a journal must know them (O-94: the
+ * deployer gives every journal of a role its own instance id; the first
+ * record's chain refuses a wrong role or instance, JOURNAL_IDENTITY_MISMATCH).
  *
- * Stubs: OpenExisting (M4-STO-01: reopen, torn-tail handling, key
- * retirement on a gap or CRC break). Until M4-STO-01 lands the outline makes
- * no crash-recovery claim for real files. POSIX only in practice: the
- * Windows branches are not compiled on this host (O-24 pattern).
+ * OpenExisting(dir, role, instance_id) (M4-STO-01) reopens a journal after a
+ * restart or a crash. It reads every segment (consecutively numbered, all of
+ * the first segment's size) and scans them in order with the chain continued
+ * across segments. The records that scan clean are the journal: appended,
+ * durable (every record on disk reached its barrier, or was in the barrier
+ * the crash interrupted), the chain continues after them and the next record
+ * goes right after them. The first refusal decides between two cases:
+ * - a TORN TAIL: the refused bytes are at most one record long (the header
+ *   is incomplete, or its length is plausible and the non-zero bytes end
+ *   within the record it claims) and every byte after them, in this and in
+ *   every later segment, is zero. That is what a crash in the middle of a
+ *   barrier's write leaves. Nothing that left the node was in it (only
+ *   durable records leave: a vote needs its DurableSignedVote, a decision
+ *   its DurableDecision), so the bytes are zeroed and committed again and
+ *   the journal continues where the clean records end. Recovery() reports
+ *   the records and the truncated bytes. Both roles truncate.
+ * - CORRUPTION: anything else (a CRC break or chain break before the tail, a
+ *   non-zero byte after a zero header, garbage longer than one record, a
+ *   non-zero byte in a later segment). For the COMMIT journal that is
+ *   STORAGE_FATAL (JOURNAL_CORRUPT): the operator restores the decisions
+ *   from peers (the certificates are public). For the SIGNER journal it is
+ *   STORAGE_FATAL (SIGNER_KEY_RETIRED): the seat may have signed what the
+ *   journal no longer shows, so its key must never sign again (the restart
+ *   statements of M4-AGR-06 are how the seat rejoins with a new key).
+ * A missing directory is INVALID_INPUT (JOURNAL_DIR_MISSING), one without
+ * `00000000.seg` or with a gap in the numbering JOURNAL_SEGMENT_MISSING, a
+ * segment whose size is not the first's or not a whole-page size in range
+ * STORAGE_FATAL (JOURNAL_SEGMENT_SIZE). After a reopen the spare segment
+ * exists, as after a barrier. The logs rebuild their indexes from ReadAll
+ * (SignerLog::Recover, CommitLog::Recover); state replays the DECISION
+ * bodies (state::ReplayDecisions).
+ *
+ * POSIX only in practice: the Windows branches are not compiled on this
+ * host (O-24 pattern).
  */
 namespace flowmesh2::storage {
 
@@ -90,6 +122,17 @@ inline constexpr std::string_view JOURNAL_SEGMENT_WRITE{"JOURNAL_SEGMENT_WRITE"}
 inline constexpr std::string_view JOURNAL_SEGMENT_READ{"JOURNAL_SEGMENT_READ"};                     //!< (STORAGE_FATAL) ReadAll could not read a segment file
 inline constexpr std::string_view JOURNAL_SEGMENT_FULL{"JOURNAL_SEGMENT_FULL"};                     //!< (BUSY) the next segment does not exist yet: Barrier or Rollover first
 inline constexpr std::string_view JOURNAL_RECORD_EXCEEDS_SEGMENT{"JOURNAL_RECORD_EXCEEDS_SEGMENT"}; //!< (OVERSIZE) a record longer than a segment
+inline constexpr std::string_view JOURNAL_SEGMENT_MISSING{"JOURNAL_SEGMENT_MISSING"};               //!< (INVALID_INPUT) no first segment, or a gap in the numbering
+inline constexpr std::string_view JOURNAL_IDENTITY_MISMATCH{"JOURNAL_IDENTITY_MISMATCH"};           //!< (VERIFY_FAILED) the first record is not this role's and instance's
+inline constexpr std::string_view JOURNAL_CORRUPT{"JOURNAL_CORRUPT"};                               //!< (STORAGE_FATAL) a commit journal with a bad record before its tail
+inline constexpr std::string_view SIGNER_KEY_RETIRED{"SIGNER_KEY_RETIRED"};                         //!< (STORAGE_FATAL) a signer journal with a gap or CRC break: the key must retire
+
+//! What OpenExisting found (M4-STO-01).
+struct RecoveryReport {
+    uint64_t records{0};         //!< records that scanned clean: the journal's appended and durable sequence number
+    uint64_t truncated_bytes{0}; //!< bytes of a torn tail zeroed again (0 for a clean image)
+    friend bool operator==(const RecoveryReport&, const RecoveryReport&) = default;
+};
 
 //! `<index as 8 hex digits>.seg`; index 0 is FIRST_SEGMENT_NAME.
 std::string SegmentFileName(uint64_t index);
@@ -116,8 +159,11 @@ public:
                                                                         SegmentCommitHook commit,
                                                                         BarrierObserver* observer = nullptr);
 
-    //! Reopen a journal after a restart. Stub: M4-STO-01.
-    static Result<std::unique_ptr<FileJournal>> OpenExisting(const fs::path& dir, JournalRole role, uint64_t instance_id);
+    //! Reopen a journal after a restart or a crash (see the file comment).
+    static Result<std::unique_ptr<FileJournal>> OpenExisting(const fs::path& dir, JournalRole role, uint64_t instance_id,
+                                                             BarrierObserver* observer = nullptr);
+    //! What OpenExisting found; zeros for a journal CreateNew made.
+    const RecoveryReport& Recovery() const { return m_recovery; }
     //! The durable records, read back from every segment file (see the file comment).
     Result<std::vector<JournalRecord>> ReadAll() const override EXCLUSIVE_LOCKS_REQUIRED(!m_segments_mutex);
     //! End the current segment early (see the file comment). FENCED on a fatal journal.
@@ -136,6 +182,8 @@ public:
 private:
     FileJournal(JournalRole role, uint64_t instance_id, BarrierObserver* observer, fs::path dir, int first_fd,
                 uint64_t segment_bytes, SegmentCommitHook commit);
+    FileJournal(JournalRole role, uint64_t instance_id, BarrierObserver* observer, fs::path dir, std::vector<int> fds,
+                uint64_t segment_bytes, const RecoveredState& recovered, const RecoveryReport& report);
 
     Result<uint64_t> AdmitAppend(uint64_t append_number, uint64_t offset, size_t size) override
         EXCLUSIVE_LOCKS_REQUIRED(!m_segments_mutex);
@@ -144,13 +192,14 @@ private:
 
     //! Create `<dir>/<SegmentFileName(index)>` zero-filled and committed, and commit the directory; the open descriptor.
     static Result<int> CreateSegment(const fs::path& dir, uint64_t index, uint64_t segment_bytes);
-    //! Create every missing segment up to `index` (no lock during the I/O).
+    //! Create every missing segment up to `index` (no lock during the I/O; takes the table lock only to update it).
     Result<void> EnsureSegments(uint64_t index) EXCLUSIVE_LOCKS_REQUIRED(!m_segments_mutex);
 
     const fs::path m_dir;
     const fs::path m_first_segment_path;
     const uint64_t m_segment_bytes;
     const SegmentCommitHook m_commit;
+    const RecoveryReport m_recovery;
 
     //! Never held together with the base journal's lock across I/O: AdmitAppend
     //! takes it under the base lock without I/O; Persist, Rollover and ReadAll

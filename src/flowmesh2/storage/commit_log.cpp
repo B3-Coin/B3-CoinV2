@@ -86,11 +86,57 @@ Result<CommitLog> CommitLog::Create(Journal& journal)
     if (journal.Role() != JournalRole::COMMIT) return Error{ErrorCode::ORDER_VIOLATION, LOG_ROLE};
     const JournalStatus status{journal.Status()};
     if (status.fatal) return Error{ErrorCode::FENCED, JOURNAL_FENCED};
-    if (status.appended_seq != 0) {
-        // Rebuilding the decision index from a journal with history is recovery.
-        return NotImplemented("M4-STO-01"); // TODO(rebirth:M4-STO-01)
-    }
+    if (status.appended_seq != 0) return Error{ErrorCode::ORDER_VIOLATION, LOG_HAS_HISTORY};
     return Ok(CommitLog{journal});
+}
+
+Result<CommitLog> CommitLog::Recover(Journal& journal, const ProfileParams& profile)
+{
+    if (journal.Role() != JournalRole::COMMIT) return Error{ErrorCode::ORDER_VIOLATION, LOG_ROLE};
+    if (journal.IsFatal()) return Error{ErrorCode::FENCED, JOURNAL_FENCED};
+    Result<std::vector<JournalRecord>> records{journal.ReadAll()};
+    if (!records.has_value()) return records.error();
+    CommitLog log{journal};
+    const Error inconsistent{ErrorCode::VERIFY_FAILED, RECOVER_INCONSISTENT};
+    for (const JournalRecord& record : *records) {
+        switch (record.type) {
+        case RecordType::DECISION: {
+            Result<DecisionRecord> decoded{DecisionRecord::Decode(record.payload, profile)};
+            if (!decoded.has_value()) return decoded.error();
+            const uint256 header_hash{decoded->header.Hash()};
+            if (decoded->certificate.header_hash != header_hash || !BodyMatchesHeader(decoded->header, decoded->body)) return inconsistent;
+            const auto [it, inserted]{log.m_decisions.emplace(
+                decoded->header.height,
+                DecisionEntry{header_hash, decoded->certificate.Hash(), decoded->header.state_root, record.seq, std::nullopt})};
+            if (!inserted) return inconsistent; // one DECISION record per slot
+            break;
+        }
+        case RecordType::APPLIED: {
+            Result<AppliedRecord> decoded{AppliedRecord::Decode(record.payload)};
+            if (!decoded.has_value()) return decoded.error();
+            const auto it{log.m_decisions.find(decoded->slot)};
+            if (it == log.m_decisions.end() || it->second.header_hash != decoded->header_hash ||
+                it->second.state_root != decoded->state_root || it->second.applied_seq.has_value() ||
+                log.m_last_applied_slot == UINT64_MAX || decoded->slot != log.m_last_applied_slot + 1) {
+                return inconsistent;
+            }
+            it->second.applied_seq = record.seq;
+            log.m_last_applied_slot = decoded->slot;
+            break;
+        }
+        case RecordType::SNAPSHOT_MARK:
+            return NotImplemented("M4-STO-03"); // TODO(rebirth:M4-STO-03) recover from the last snapshot
+        case RecordType::PREPARED_QC:
+            return NotImplemented("M4-STO-07"); // TODO(rebirth:M4-STO-07) recover the prepared quorum certificate
+        case RecordType::INTENT:
+        case RecordType::SIGNED_VOTE:
+        case RecordType::ACCEPTED_PROPOSAL:
+        case RecordType::VIEW_STATE:
+        case RecordType::NEW_VIEW_ACCEPTED:
+            return Error{ErrorCode::ORDER_VIOLATION, RECORD_ROLE};
+        }
+    }
+    return Ok(std::move(log));
 }
 
 Result<PendingDecision> CommitLog::AppendDecision(const SlotHeaderV2& header, const SlotCertificate& certificate, const SlotBody& body)

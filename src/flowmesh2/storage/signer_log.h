@@ -61,10 +61,11 @@
  *   verify the signature: SeatSigner made it, and peers verify it.
  * - Every Append and Confirm of a fatal journal is FENCED.
  * - Create needs a SIGNER journal (ORDER_VIOLATION, LOG_ROLE) that is not
- *   fatal (FENCED) and has no records yet. A journal with history needs its
- *   equivocation index rebuilt first: recovery, M4-STO-01.
+ *   fatal (FENCED) and has no records yet (ORDER_VIOLATION, LOG_HAS_HISTORY
+ *   otherwise); Recover rebuilds the indexes of a journal with history
+ *   (M4-STO-01).
  *
- * Record payloads (exact codecs; recovery in M4-STO-01 reads them):
+ * Record payloads (exact codecs; Recover reads them):
  * - ACCEPTED_PROPOSAL: ProposalKey (u64 epoch | u64 slot | u64 view) |
  *   header (366) | body (SlotBody encoding, the rest).
  * - INTENT: VoteKey (57) | digest | u64 proposal_seq: 97 bytes.
@@ -142,7 +143,21 @@ struct NewViewAcceptedRecord {
 class SignerLog
 {
 public:
+    //! A log over an empty SIGNER journal; a journal with records is ORDER_VIOLATION (LOG_HAS_HISTORY): use Recover.
     static Result<SignerLog> Create(Journal& journal);
+    /** A log over a SIGNER journal with history (M4-STO-01): rebuilds the
+     * proposal and equivocation indexes from Journal::ReadAll, so re-appends
+     * are idempotent against the history and another digest for a VoteKey
+     * is refused exactly as before the restart. ORDER_VIOLATION (LOG_ROLE)
+     * for another role, FENCED for a fatal journal, the record decoders'
+     * errors for a payload that does not decode, VERIFY_FAILED
+     * (RECOVER_INCONSISTENT) for a history this log would never have written
+     * (an intent without its proposal or with another digest for its key, a
+     * signed vote without its intent or with another signature, two
+     * proposals for one key). Records of M4-STO-07 are NotImplemented until
+     * it lands. An empty journal recovers to the same log Create gives.
+     */
+    static Result<SignerLog> Recover(Journal& journal, const ProfileParams& profile);
 
     SignerLog(SignerLog&&) noexcept = default;
     SignerLog& operator=(SignerLog&&) noexcept = default;

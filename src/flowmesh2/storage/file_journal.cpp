@@ -6,9 +6,12 @@
 
 #include <flowmesh2/storage/journal_commit.h>
 
+#include <crypto/common.h>
+
 #include <algorithm>
 #include <array>
 #include <limits>
+#include <optional>
 #include <system_error>
 #include <utility>
 
@@ -130,6 +133,18 @@ FileJournal::FileJournal(JournalRole role, uint64_t instance_id, BarrierObserver
 {
 }
 
+FileJournal::FileJournal(JournalRole role, uint64_t instance_id, BarrierObserver* observer, fs::path dir, std::vector<int> fds,
+                         uint64_t segment_bytes, const RecoveredState& recovered, const RecoveryReport& report)
+    : Journal(ImplKey{}, role, instance_id, observer, recovered),
+      m_dir{std::move(dir)},
+      m_first_segment_path{m_dir / fs::u8path(FIRST_SEGMENT_NAME)},
+      m_segment_bytes{segment_bytes},
+      m_commit{&JournalCommit},
+      m_recovery{report},
+      m_fds{std::move(fds)}
+{
+}
+
 FileJournal::~FileJournal()
 {
     for (const int fd : m_fds) CloseFd(fd);
@@ -207,10 +222,135 @@ Result<std::unique_ptr<FileJournal>> FileJournal::CreateNewWithCommitHook(const 
     return Ok(std::unique_ptr<FileJournal>{new FileJournal{role, instance_id, observer, empty_dir, *fd, segment_bytes, commit}});
 }
 
-Result<std::unique_ptr<FileJournal>> FileJournal::OpenExisting(const fs::path& /*dir*/, JournalRole /*role*/,
-                                                               uint64_t /*instance_id*/)
+namespace {
+
+bool AllZeroBytes(std::span<const unsigned char> bytes)
 {
-    return NotImplemented("M4-STO-01"); // TODO(rebirth:M4-STO-01)
+    return std::all_of(bytes.begin(), bytes.end(), [](unsigned char b) { return b == 0; });
+}
+
+int OpenSegmentForWriting(const fs::path& path)
+{
+#ifdef WIN32
+    return _wopen(path.c_str(), _O_RDWR | _O_BINARY);
+#else
+    return open(path.c_str(), O_RDWR | O_CLOEXEC);
+#endif
+}
+
+} // namespace
+
+Result<std::unique_ptr<FileJournal>> FileJournal::OpenExisting(const fs::path& dir, JournalRole role, uint64_t instance_id,
+                                                               BarrierObserver* observer)
+{
+    if (!IsKnown(role)) return Error{ErrorCode::INVALID_INPUT, "unknown journal role"};
+    std::error_code ec;
+    if (!fs::is_directory(dir, ec) || ec) return Error{ErrorCode::INVALID_INPUT, JOURNAL_DIR_MISSING};
+    const fs::path first{dir / fs::u8path(FIRST_SEGMENT_NAME)};
+    if (!fs::is_regular_file(first, ec) || ec) return Error{ErrorCode::INVALID_INPUT, JOURNAL_SEGMENT_MISSING};
+    const uint64_t segment_bytes{fs::file_size(first, ec)};
+    if (ec || segment_bytes < SEGMENT_PAGE_BYTES || segment_bytes > MAX_SEGMENT_BYTES || segment_bytes % SEGMENT_PAGE_BYTES != 0) {
+        return Error{ErrorCode::STORAGE_FATAL, JOURNAL_SEGMENT_SIZE};
+    }
+    // The segments: consecutively numbered, every one of the first's size.
+    std::vector<std::vector<unsigned char>> images;
+    for (uint64_t index{0};; ++index) {
+        const fs::path path{dir / fs::u8path(SegmentFileName(index))};
+        if (!fs::is_regular_file(path, ec) || ec) break; // the numbering ends here (a gap: the rest is ignored and refused on write)
+        if (fs::file_size(path, ec) != segment_bytes || ec) return Error{ErrorCode::STORAGE_FATAL, JOURNAL_SEGMENT_SIZE};
+        Result<std::vector<unsigned char>> image{ReadWholeFile(path, segment_bytes)};
+        if (!image.has_value()) return image.error();
+        if (image->size() != segment_bytes) return Error{ErrorCode::STORAGE_FATAL, JOURNAL_SEGMENT_SIZE};
+        images.push_back(std::move(image).value());
+    }
+    // Scan in order, the chain continued across segments; the first refusal ends the journal.
+    RecoveredState recovered;
+    recovered.last_chain = JournalGenesisChain(role, instance_id);
+    RecoveryReport report;
+    std::optional<std::pair<uint64_t, size_t>> torn; // (segment, start) of the torn bytes to zero
+    for (uint64_t index{0}; index < images.size(); ++index) {
+        const std::vector<unsigned char>& image{images[index]};
+        const PartialScan scan{ScanRecordsPartial(image, role, recovered.last_chain, recovered.records)};
+        recovered.records += scan.accepted.records.size();
+        recovered.last_chain = scan.accepted.last_chain;
+        if (!scan.accepted.records.empty()) recovered.image_end = index * segment_bytes + scan.accepted.end_offset;
+        if (!scan.refusal.has_value()) continue;
+        const Error refusal{*scan.refusal};
+        const size_t p{scan.refused_at};
+        // The first record of the journal that is not this role's or instance's: another journal's files.
+        if (index == 0 && p == 0 && (refusal.detail == RECORD_ROLE || refusal.detail == RECORD_CHAIN)) {
+            return Error{ErrorCode::VERIFY_FAILED, JOURNAL_IDENTITY_MISMATCH};
+        }
+        const Error corrupt{ErrorCode::STORAGE_FATAL, role == JournalRole::SIGNER ? SIGNER_KEY_RETIRED : JOURNAL_CORRUPT};
+        if (refusal.detail != RECORD_LENGTH && refusal.detail != RECORD_CRC) return corrupt; // chain, role, type, tail: never a torn write
+        // q: one past the last non-zero byte of this segment.
+        size_t q{image.size()};
+        while (q > p && image[q - 1] == 0) --q;
+        if (q <= p) return corrupt; // cannot happen: a refusal needs a non-zero byte
+        const std::span<const unsigned char> broken{std::span{image}.subspan(p, q - p)};
+        bool within_one_record{broken.size() < RECORD_HEADER_BYTES};
+        if (!within_one_record) {
+            const uint32_t len{ReadLE32(broken.data())};
+            within_one_record = len <= MAX_RECORD_PAYLOAD_BYTES && broken.size() <= RECORD_OVERHEAD_BYTES + size_t{len};
+        }
+        if (!within_one_record) return corrupt;
+        for (uint64_t later{index + 1}; later < images.size(); ++later) {
+            if (!AllZeroBytes(images[later])) return corrupt;
+        }
+        torn = std::pair{index, p};
+        report.truncated_bytes = broken.size();
+        break;
+    }
+    report.records = recovered.records;
+    // Descriptors: the segment holding the next write and every later one; earlier ones stay closed.
+    const uint64_t current{recovered.image_end / segment_bytes};
+    std::vector<int> fds(images.size(), -1);
+    const auto close_all = [&fds] {
+        for (const int fd : fds) CloseFd(fd);
+    };
+    for (uint64_t index{current}; index < images.size(); ++index) {
+        fds[index] = OpenSegmentForWriting(dir / fs::u8path(SegmentFileName(index)));
+        if (fds[index] < 0) {
+            close_all();
+            return Error{ErrorCode::STORAGE_FATAL, JOURNAL_SEGMENT_CREATE};
+        }
+    }
+    // Zero the torn bytes again and commit, so the image is exactly the clean records plus zeros.
+    if (torn.has_value()) {
+        const auto [index, start]{*torn};
+        if (fds[index] < 0) {
+            fds[index] = OpenSegmentForWriting(dir / fs::u8path(SegmentFileName(index)));
+            if (fds[index] < 0) {
+                close_all();
+                return Error{ErrorCode::STORAGE_FATAL, JOURNAL_SEGMENT_CREATE};
+            }
+        }
+        const std::vector<unsigned char> zeros(static_cast<size_t>(report.truncated_bytes), 0);
+        if (const Result<void> written{WriteAllAt(fds[index], zeros, start)}; !written.has_value()) {
+            close_all();
+            return written.error();
+        }
+        if (const Result<void> committed{JournalCommit(fds[index])}; !committed.has_value()) {
+            close_all();
+            return committed.error();
+        }
+        if (index != current) {
+            CloseFd(fds[index]);
+            fds[index] = -1;
+        }
+    }
+    // The spare, as after a barrier: the segment the next record can go to exists before the journal does.
+    const uint64_t end{recovered.image_end};
+    const uint64_t needed{end / segment_bytes + (end % segment_bytes == 0 ? 0 : 1)};
+    while (fds.size() <= needed) {
+        const Result<int> fd{CreateSegment(dir, fds.size(), segment_bytes)};
+        if (!fd.has_value()) {
+            close_all();
+            return fd.error();
+        }
+        fds.push_back(*fd);
+    }
+    return Ok(std::unique_ptr<FileJournal>{new FileJournal{role, instance_id, observer, dir, std::move(fds), segment_bytes, recovered, report}});
 }
 
 Result<std::vector<JournalRecord>> FileJournal::ReadAll() const

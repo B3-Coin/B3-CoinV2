@@ -55,8 +55,8 @@
  *   the pending record's reference, which the logs built from the record
  *   they appended. Two journals of the SAME role with the same instance id
  *   cannot be told apart here; giving each journal of a role its own
- *   instance id is the deployer's (the segment header that names role and
- *   instance is M4-STO-01's).
+ *   instance id is the deployer's (O-94: the segments carry no header, the
+ *   first record's chain binds role and instance on reopen).
  *
  * After a fatal error Append is FENCED, Barrier is STORAGE_FATAL and Confirm
  * is refused, so no new token can be minted; the node fences admission and
@@ -90,6 +90,8 @@ inline constexpr std::string_view CONFIRM_ROLE{"CONFIRM_ROLE"};                 
 // Shared by the logs over a journal (SignerLog, CommitLog).
 inline constexpr std::string_view LOG_ROLE{"LOG_ROLE"};                                    //!< (ORDER_VIOLATION) journal of the wrong role
 inline constexpr std::string_view TOKEN_OTHER_LOG{"TOKEN_OTHER_LOG"};                      //!< (VERIFY_FAILED) pending or token not of this log
+inline constexpr std::string_view LOG_HAS_HISTORY{"LOG_HAS_HISTORY"};                      //!< (ORDER_VIOLATION) Create on a journal with records: use Recover (M4-STO-01)
+inline constexpr std::string_view RECOVER_INCONSISTENT{"RECOVER_INCONSISTENT"};            //!< (VERIFY_FAILED) the journal's records contradict the log's own rules
 
 /** Sees every accepted append and every barrier of a journal, in order.
  * Callbacks run on the calling thread without the journal lock, so they may
@@ -164,6 +166,18 @@ protected:
     };
 
     Journal(ImplKey, JournalRole role, uint64_t instance_id, BarrierObserver* observer);
+
+    /** What a reopen recovered from disk (FileJournal::OpenExisting,
+     * M4-STO-01): `records` records scanned clean, so they are appended and
+     * durable; the chain continues from `last_chain`; the next record goes at
+     * image byte `image_end`.
+     */
+    struct RecoveredState {
+        uint64_t records{0};
+        uint256 last_chain;
+        uint64_t image_end{0};
+    };
+    Journal(ImplKey, JournalRole role, uint64_t instance_id, BarrierObserver* observer, const RecoveredState& recovered);
 
     /** Called with the journal lock held, before a framed record of `size`
      * bytes is queued at byte `offset` of the journal image; `append_number`

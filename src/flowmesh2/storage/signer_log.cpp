@@ -84,11 +84,69 @@ Result<SignerLog> SignerLog::Create(Journal& journal)
     if (journal.Role() != JournalRole::SIGNER) return Error{ErrorCode::ORDER_VIOLATION, LOG_ROLE};
     const JournalStatus status{journal.Status()};
     if (status.fatal) return Error{ErrorCode::FENCED, JOURNAL_FENCED};
-    if (status.appended_seq != 0) {
-        // The equivocation index of a journal with history must be rebuilt first: recovery.
-        return NotImplemented("M4-STO-01"); // TODO(rebirth:M4-STO-01)
-    }
+    if (status.appended_seq != 0) return Error{ErrorCode::ORDER_VIOLATION, LOG_HAS_HISTORY};
     return Ok(SignerLog{journal});
+}
+
+Result<SignerLog> SignerLog::Recover(Journal& journal, const ProfileParams& profile)
+{
+    if (journal.Role() != JournalRole::SIGNER) return Error{ErrorCode::ORDER_VIOLATION, LOG_ROLE};
+    if (journal.IsFatal()) return Error{ErrorCode::FENCED, JOURNAL_FENCED};
+    Result<std::vector<JournalRecord>> records{journal.ReadAll()};
+    if (!records.has_value()) return records.error();
+    SignerLog log{journal};
+    const Error inconsistent{ErrorCode::VERIFY_FAILED, RECOVER_INCONSISTENT};
+    for (const JournalRecord& record : *records) {
+        switch (record.type) {
+        case RecordType::ACCEPTED_PROPOSAL: {
+            Result<AcceptedProposalRecord> decoded{AcceptedProposalRecord::Decode(record.payload, profile)};
+            if (!decoded.has_value()) return decoded.error();
+            if (!BodyMatchesHeader(decoded->header, decoded->body) || decoded->header.authority_epoch != decoded->key.epoch ||
+                decoded->header.height != decoded->key.slot) {
+                return inconsistent;
+            }
+            const uint256 header_hash{decoded->header.Hash()};
+            const auto [it, inserted]{log.m_proposals.emplace(
+                decoded->key, ProposalEntry{header_hash, decoded->header.domain, decoded->header.CommitDigest(), record.seq})};
+            if (!inserted) return inconsistent; // the log never writes a key twice
+            break;
+        }
+        case RecordType::INTENT: {
+            Result<IntentRecord> decoded{IntentRecord::Decode(record.payload)};
+            if (!decoded.has_value()) return decoded.error();
+            const auto proposal{log.m_proposals.find(decoded->key.Proposal())};
+            if (proposal == log.m_proposals.end() || proposal->second.seq != decoded->proposal_seq ||
+                proposal->second.domain != decoded->key.domain ||
+                (decoded->key.phase == VotePhase::COMMIT && decoded->digest != proposal->second.commit_digest)) {
+                return inconsistent;
+            }
+            const auto [it, inserted]{log.m_votes.emplace(decoded->key, VoteEntry{decoded->digest, record.seq, std::nullopt, 0})};
+            if (!inserted) return inconsistent; // one intent record per VoteKey
+            break;
+        }
+        case RecordType::SIGNED_VOTE: {
+            Result<SignedVoteRecord> decoded{SignedVoteRecord::Decode(record.payload)};
+            if (!decoded.has_value()) return decoded.error();
+            const auto vote{log.m_votes.find(decoded->key)};
+            if (vote == log.m_votes.end() || vote->second.digest != decoded->digest || vote->second.intent_seq != decoded->intent_seq ||
+                vote->second.signature.has_value()) {
+                return inconsistent;
+            }
+            vote->second.signature = decoded->signature;
+            vote->second.signed_seq = record.seq;
+            break;
+        }
+        case RecordType::VIEW_STATE:
+        case RecordType::NEW_VIEW_ACCEPTED:
+            return NotImplemented("M4-STO-07"); // TODO(rebirth:M4-STO-07) recover the PBFT view state
+        case RecordType::DECISION:
+        case RecordType::APPLIED:
+        case RecordType::SNAPSHOT_MARK:
+        case RecordType::PREPARED_QC:
+            return Error{ErrorCode::ORDER_VIOLATION, RECORD_ROLE};
+        }
+    }
+    return Ok(std::move(log));
 }
 
 Result<PendingProposal> SignerLog::AppendAcceptedProposal(const ProposalKey& key, const SlotHeaderV2& header, const SlotBody& body)

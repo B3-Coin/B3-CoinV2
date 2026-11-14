@@ -51,7 +51,56 @@ BOOST_AUTO_TEST_CASE(create_checks_role_fence_and_history)
     RequireRefusal(CommitLog::Create(*fatal), ErrorCode::FENCED, JOURNAL_FENCED, "fatal journal");
     auto used{NewMemoryJournal(JournalRole::COMMIT, 3)};
     RequireStorageOk(used->Append(RecordType::DECISION, Bytes("history")), "append");
-    RequireStub(CommitLog::Create(*used), "M4-STO-01");
+    RequireRefusal(CommitLog::Create(*used), ErrorCode::ORDER_VIOLATION, LOG_HAS_HISTORY, "journal with history: Recover");
+}
+
+BOOST_AUTO_TEST_CASE(recover_rebuilds_the_decision_index)
+{
+    // M4-STO-01: the decisions and applications in the journal's history are
+    // the recovered log's index: DecisionAt answers, conflicts are refused,
+    // re-appends are idempotent and the next application follows the last.
+    OwnerFixture f{11};
+    const state::Candidate c1{f.Preview(f.Inputs(FundingFacts(f.actions), {}))};
+    const SlotCertificate cert1{TestCertificate(c1.Header())};
+    const PendingDecision p1{f.log.AppendDecision(c1.Header(), cert1, c1.Body()).value()};
+    BOOST_CHECK_EQUAL(f.log.Barrier().value(), 1U);
+    const DurableDecision d1{f.log.Confirm(p1).value()};
+    state::Candidate copy1{c1};
+    const state::AppliedSlot a1{f.owner->Apply(std::move(copy1), d1, f.authority).value()};
+    const PendingApplied pa1{f.log.AppendApplied(a1.receipt).value()};
+    BOOST_CHECK_EQUAL(f.log.Barrier().value(), 2U);
+    f.Sync();
+    // Slot 2 decided but not applied: a crash between B-DECISION and B-APPLIED.
+    const state::Candidate c2{f.Preview(f.Inputs({}, {}))};
+    const SlotCertificate cert2{TestCertificate(c2.Header())};
+    const PendingDecision p2{f.log.AppendDecision(c2.Header(), cert2, c2.Body()).value()};
+    BOOST_CHECK_EQUAL(f.log.Barrier().value(), 3U);
+
+    Result<CommitLog> recovered{CommitLog::Recover(*f.journal, Profile())};
+    RequireStorageOk(recovered, "Recover");
+    CommitLog& log{*recovered};
+    BOOST_CHECK(log.DecisionAt(1) == (DecisionRef{1, c1.Header().Hash(), cert1.Hash()}));
+    BOOST_CHECK(log.DecisionAt(2) == (DecisionRef{2, c2.Header().Hash(), cert2.Hash()}));
+    BOOST_CHECK(!log.DecisionAt(3).has_value());
+    BOOST_CHECK(log.AppendDecision(c1.Header(), cert1, c1.Body()).value() == p1);
+    BOOST_CHECK(log.AppendApplied(a1.receipt).value() == pa1);
+    const StorageSlot other{MakeStorageSlot(2, c2.Header().authority_epoch, "other")};
+    RequireRefusal(log.AppendDecision(other.header, other.certificate, other.body), ErrorCode::EQUIVOCATION_REFUSED, DECISION_CONFLICT,
+                   "another header for slot 2");
+    const DurableDecision d2{log.Confirm(p2).value()};
+    state::Candidate copy2{c2};
+    const state::AppliedSlot a2{f.owner->Apply(std::move(copy2), d2, f.authority).value()};
+    BOOST_CHECK_EQUAL(log.AppendApplied(a2.receipt).value().Seq(), 4U);
+    BOOST_CHECK_EQUAL(log.Barrier().value(), 4U);
+    BOOST_CHECK(f.journal->Status() == (JournalStatus{4, 4, false}));
+
+    // A history that contradicts the rules is refused.
+    auto planted{NewMemoryJournal(JournalRole::COMMIT, 12)};
+    RequireStorageOk(planted->Append(RecordType::APPLIED, AppliedRecord{1, uint256::ONE, uint256::ONE}.Encode()), "applied without its decision");
+    RequireStorageOk(planted->Barrier(), "barrier");
+    RequireRefusal(CommitLog::Recover(*planted, Profile()), ErrorCode::VERIFY_FAILED, RECOVER_INCONSISTENT, "applied without its decision");
+    auto signer{NewMemoryJournal(JournalRole::SIGNER, 13)};
+    RequireRefusal(CommitLog::Recover(*signer, Profile()), ErrorCode::ORDER_VIOLATION, LOG_ROLE, "signer journal");
 }
 
 BOOST_AUTO_TEST_CASE(decision_then_applied)

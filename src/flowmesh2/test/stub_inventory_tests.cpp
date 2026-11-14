@@ -37,9 +37,9 @@
  * adds the engine's CANCEL_ALL branch (M3-ENG-09, done since: its case is
  * gone) and futures phase 7 (M9-FUT-04), and extends M2-LED-05 and M2-LED-06 to probe the engine
  * branches of WITHDRAW and the spot/futures transfers (engine PhaseOf) as
- * well. Slice R8 adds the file journal's reopen and the logs' recovery over
- * a journal with history (M4-STO-01; the read-back probe left with
- * M4-STO-06, which landed segment rollover and ReadAll),
+ * well. Slice R8 added the file journal's reopen and the logs' recovery over
+ * a journal with history (M4-STO-01, done since: its case is gone; segment
+ * rollover and ReadAll landed with M4-STO-06, also done),
  * the group-commit writer (M4-STO-02), snapshots (M4-STO-03) and the view
  * state records (M4-STO-07), and extends M4-STO-05 to probe the signer
  * log's folded signing as well. Slice R9 adds the state owner's pipelined
@@ -501,23 +501,6 @@ FM2_STUB_CASE(M9_FUT_04, "M9-FUT-04")
 }
 
 // ---- Slice R8: storage/file_journal ----
-
-FM2_STUB_CASE(M4_STO_01, "M4-STO-01")
-{
-    // Reopening a journal from disk.
-    const TestDir dir{"stub_m4_sto_01"};
-    auto journal{storage::FileJournal::CreateNew(dir.path, storage::JournalRole::SIGNER, 1, storage::SEGMENT_PAGE_BYTES).value()};
-    // And the logs over a journal that already has records (index rebuild).
-    auto signer{NewMemoryJournal(storage::JournalRole::SIGNER, 2)};
-    auto commit{NewMemoryJournal(storage::JournalRole::COMMIT, 3)};
-    if (!signer->Append(storage::RecordType::INTENT, Bytes("history")).has_value() ||
-        !commit->Append(storage::RecordType::DECISION, Bytes("history")).has_value()) {
-        return StubObservation{true, std::nullopt}; // the probe's own setup failed: report it as a deviation
-    }
-    // ReadAll landed with M4-STO-06; OpenExisting and the logs' index rebuild stay.
-    return FirstDeviation("M4-STO-01", {Observe(storage::FileJournal::OpenExisting(dir.path, storage::JournalRole::SIGNER, 1)),
-                                        Observe(storage::SignerLog::Create(*signer)), Observe(storage::CommitLog::Create(*commit))});
-}
 
 // ---- Slice R8: storage logs, writer and snapshots ----
 

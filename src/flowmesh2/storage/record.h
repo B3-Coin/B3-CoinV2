@@ -10,6 +10,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <string_view>
 #include <vector>
@@ -166,6 +167,18 @@ Result<ScanResult> ScanRecords(std::span<const unsigned char> bytes, JournalRole
  * not the chain the segment continues.
  */
 Result<ScanResult> ScanRecordsFrom(std::span<const unsigned char> bytes, JournalRole role, const uint256& prev_chain, uint64_t first_seq);
+
+/** ScanRecordsFrom that keeps what scanned clean before the first refusal:
+ * recovery (M4-STO-01) decides from `refused_at` and the bytes after it
+ * whether the refusal is a torn tail or corruption. With no refusal
+ * `accepted` is the whole image and `refusal` is empty.
+ */
+struct PartialScan {
+    ScanResult accepted;          //!< the records before the first refusal (all of them if none)
+    std::optional<Error> refusal; //!< the first problem, if any (the same errors as ScanRecords)
+    size_t refused_at{0};         //!< byte offset of the record that was refused (unused without a refusal)
+};
+PartialScan ScanRecordsPartial(std::span<const unsigned char> bytes, JournalRole role, const uint256& prev_chain, uint64_t first_seq);
 
 } // namespace flowmesh2::storage
 
