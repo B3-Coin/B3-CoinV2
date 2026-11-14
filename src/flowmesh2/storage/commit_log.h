@@ -78,6 +78,7 @@
 namespace flowmesh2::storage {
 
 inline constexpr std::string_view BODY_HEADER_MISMATCH{"BODY_HEADER_MISMATCH"};           //!< (VERIFY_FAILED)
+inline constexpr std::string_view EVIDENCE_EMPTY{"an EVIDENCE record needs the encoded evidence"}; //!< (INVALID_INPUT)
 inline constexpr std::string_view DECISION_CERT_HEADER{"DECISION_CERT_HEADER"};           //!< (VERIFY_FAILED)
 inline constexpr std::string_view DECISION_CONFLICT{"DECISION_CONFLICT"};                 //!< (EQUIVOCATION_REFUSED)
 inline constexpr std::string_view APPLIED_DECISION_UNKNOWN{"APPLIED_DECISION_UNKNOWN"};   //!< (VERIFY_FAILED)
@@ -197,6 +198,15 @@ public:
     //! The prepared proof of the highest view this log holds for `slot`, if any.
     std::optional<PreparedQcRecord> HighestPrepared(uint64_t slot) const;
 
+    /** An EVIDENCE record (M4-AGR-07): the encoded agreement evidence
+     * message, appended as a fact (the evidence store checks and verifies
+     * it; the caller barriers). INVALID_INPUT EVIDENCE_EMPTY for no bytes,
+     * FENCED on a fatal journal. EvidenceRecords() returns every EVIDENCE
+     * payload this log holds, recovered or appended, in journal order.
+     */
+    Result<uint64_t> AppendEvidence(std::span<const unsigned char> payload);
+    const std::vector<std::vector<unsigned char>>& EvidenceRecords() const { return m_evidence; }
+
 private:
     explicit CommitLog(Journal& journal) : m_journal{&journal} {}
 
@@ -218,6 +228,7 @@ private:
     std::map<uint64_t, DecisionEntry> m_decisions; //!< by slot
     uint64_t m_last_applied_slot{0};               //!< 0 before the first application (the genesis height)
     std::map<ProposalKey, PreparedEntry> m_prepared; //!< by (epoch, slot, view)
+    std::vector<std::vector<unsigned char>> m_evidence; //!< EVIDENCE payloads in journal order (M4-AGR-07)
 };
 
 } // namespace flowmesh2::storage

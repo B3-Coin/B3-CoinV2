@@ -80,7 +80,7 @@ static_assert(HasDurableKind(RecordType::INTENT) && HasDurableKind(RecordType::S
               HasDurableKind(RecordType::DECISION) && HasDurableKind(RecordType::APPLIED));
 static_assert(!HasDurableKind(RecordType::ACCEPTED_PROPOSAL) && !HasDurableKind(RecordType::SNAPSHOT_MARK) &&
               !HasDurableKind(RecordType::VIEW_STATE) && !HasDurableKind(RecordType::NEW_VIEW_ACCEPTED) &&
-              !HasDurableKind(RecordType::PREPARED_QC));
+              !HasDurableKind(RecordType::PREPARED_QC) && !HasDurableKind(RecordType::EVIDENCE));
 
 //! A commit log over a fresh memory journal.
 struct CommitFixture {

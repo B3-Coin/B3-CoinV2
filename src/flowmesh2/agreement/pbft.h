@@ -6,6 +6,7 @@
 #define B3_FLOWMESH2_AGREEMENT_PBFT_H
 
 #include <flowmesh2/agreement/agreement.h>
+#include <flowmesh2/agreement/evidence.h>
 #include <flowmesh2/agreement/leader.h>
 #include <flowmesh2/agreement/messages.h>
 #include <flowmesh2/agreement/safety.h>
@@ -209,6 +210,7 @@ struct PbftContext {
     SafetyRules& safety;              //!< PbftSafetyRules
     MessageSink& sink;                //!< proposals (and evidence) to the seat mesh
     VoteSink& votes;                  //!< durable votes and statements to the seat mesh
+    EvidenceStore& evidence;          //!< recorded safety violations; a halted store fences the agreement (M4-AGR-07)
 };
 
 //! The agreement's view of the slot in flight, for callers and tests.
@@ -221,6 +223,7 @@ struct PbftStatus {
     bool proposal_accepted{false};
     bool prepared{false};
     bool decided{false};         //!< a decision is waiting in TakeDecision
+    bool halted{false};          //!< evidence was recorded (here or received): this seat signs and votes no more (M4-AGR-07)
     uint32_t prepare_votes{0};
     uint32_t commit_votes{0};
 
@@ -323,6 +326,10 @@ private:
     Result<void> SendToAll(std::span<const unsigned char> message);
     Result<void> SendVoteToAll(const OutboundVote& vote, const uint256& header_hash);
     Result<void> SendStatementToAll(const OutboundVote& statement, std::span<const unsigned char> message);
+    //! Two verified PREPARE votes of one seat for two headers: record the evidence, spread it, halt (M4-AGR-07).
+    Result<void> OnDoubleVote(const Vote& first, const Vote& second);
+    //! Evidence from another seat: record it (verified) and halt.
+    Result<void> OnEvidence(const Evidence& evidence);
 
     const ProfileParams m_profile;
     const PbftConfig m_config;
@@ -334,6 +341,7 @@ private:
     SafetyRules& m_safety;
     MessageSink& m_sink;
     VoteSink& m_votes;
+    EvidenceStore& m_evidence;
     SeatSet m_seats;
     uint256 m_domain;
     uint64_t m_now_ms; //!< config.start_ms, then the last OnTimeout

@@ -35,6 +35,7 @@ struct Seat {
     std::unique_ptr<AgreementRig> rig;
     PbftSafetyRules rules;
     std::unique_ptr<RecordingMesh> mesh;
+    std::unique_ptr<EvidenceStore> evidence;
     std::unique_ptr<PbftAgreement> pbft;
 };
 
@@ -63,8 +64,11 @@ struct Cluster {
             options.self_seat = i;
             seat->rig = std::make_unique<AgreementRig>(options);
             seat->mesh = RecordingMesh::Make(TestMeshConfig(i, k));
+            Result<EvidenceStore> evidence{EvidenceStore::Create(seat->rig->profile, *seat->rig->adapter, seat->rig->commit_log)};
+            RequireOk(evidence, "EvidenceStore::Create");
+            seat->evidence = std::make_unique<EvidenceStore>(std::move(evidence).value());
             const PbftContext context{*seat->rig->adapter, *seat->rig->owner, seat->rig->signer, seat->rig->signer_log,
-                                      seat->rig->commit_log, seat->rules, *seat->mesh, *seat->mesh};
+                                      seat->rig->commit_log, seat->rules, *seat->mesh, *seat->mesh, *seat->evidence};
             PbftConfig config{base};
             config.self_seat = i;
             Result<std::unique_ptr<PbftAgreement>> pbft{PbftAgreement::Create(seat->rig->profile, config, context)};
@@ -348,7 +352,7 @@ BOOST_AUTO_TEST_CASE(silent_leader_is_replaced_and_a_restart_resumes_the_view)
         Seat& seat{c.At(restarted)};
         seat.pbft.reset();
         const PbftContext context{*seat.rig->adapter, *seat.rig->owner, seat.rig->signer, seat.rig->signer_log, seat.rig->commit_log,
-                                  seat.rules, *seat.mesh, *seat.mesh};
+                                  seat.rules, *seat.mesh, *seat.mesh, *seat.evidence};
         PbftConfig config;
         config.self_seat = restarted;
         Result<std::unique_ptr<PbftAgreement>> pbft{PbftAgreement::Create(seat.rig->profile, config, context)};
@@ -438,13 +442,8 @@ BOOST_AUTO_TEST_CASE(forged_wrong_seat_and_double_votes_are_refused)
     RequireRefusal(pbft.OnMessage((other + 1) % 4 == target ? (other + 2) % 4 : (other + 1) % 4,
                                   EncodeMessage(Message{impostor}, c.At(target).rig->profile).value()),
                    ErrorCode::INVALID_INPUT, PBFT_VOTE_SEAT, "wrong sender");
-    // A valid vote, then a second one from the same seat for another header: a double vote.
+    // A valid vote; the same valid vote again is a retransmission.
     RequireOk(pbft.OnMessage(other, EncodeMessage(Message{impostor}, c.At(target).rig->profile).value()), "a valid prepare vote");
-    const uint256 other_hash{LabelHash("fm2/test/pbft/other-header")};
-    Vote doubled{SignedVote("s" + std::to_string(other), other, storage::VotePhase::PREPARE, 0, 0, 1, other_hash, PrepareDigest(0, other_hash))};
-    RequireRefusal(pbft.OnMessage(other, EncodeMessage(Message{doubled}, c.At(target).rig->profile).value()), ErrorCode::EQUIVOCATION_REFUSED,
-                   PBFT_DOUBLE_VOTE, "double vote");
-    // The same valid vote again is a retransmission.
     RequireOk(pbft.OnMessage(other, EncodeMessage(Message{impostor}, c.At(target).rig->profile).value()), "retransmission");
     BOOST_CHECK_EQUAL(pbft.Status().prepare_votes, 2U);
     // A VOTE message with a statement phase never counts.
@@ -462,6 +461,71 @@ BOOST_AUTO_TEST_CASE(forged_wrong_seat_and_double_votes_are_refused)
                    PBFT_WRONG_LEADER, "proposal from a non-leader");
     RequireRefusal(pbft.OnMessage(target, EncodeMessage(Message{impostor}, c.At(target).rig->profile).value()), ErrorCode::INVALID_INPUT,
                    PBFT_VOTE_SEAT, "a message from itself");
+    // A second vote from the same seat for another header: a double vote, refused, recorded, spread, and the seat halts (M4-AGR-07).
+    const uint256 other_hash{LabelHash("fm2/test/pbft/other-header")};
+    Vote doubled{SignedVote("s" + std::to_string(other), other, storage::VotePhase::PREPARE, 0, 0, 1, other_hash, PrepareDigest(0, other_hash))};
+    BOOST_CHECK(!pbft.Status().halted);
+    RequireRefusal(pbft.OnMessage(other, EncodeMessage(Message{doubled}, c.At(target).rig->profile).value()), ErrorCode::EQUIVOCATION_REFUSED,
+                   PBFT_DOUBLE_VOTE, "double vote");
+    BOOST_CHECK(pbft.Status().halted);
+    BOOST_CHECK(c.At(target).evidence->Halted());
+    RequireRefusal(pbft.OnMessage(other, EncodeMessage(Message{impostor}, c.At(target).rig->profile).value()), ErrorCode::FENCED, PBFT_FENCED,
+                   "a halted seat");
+}
+
+BOOST_AUTO_TEST_CASE(a_double_vote_halts_the_seat_and_spreads_as_evidence)
+{
+    Cluster c{4};
+    const uint32_t leader{c.Leader()};
+    const state::Candidate candidate{c.At(leader).rig->Preview(c.InputsFromChain(leader))};
+    RequireOk(c.At(leader).pbft->Propose(candidate, c.Authority()), "Propose");
+    c.Deliver([](uint32_t, uint32_t, const std::vector<unsigned char>& frame) {
+        return frame.size() > 1 && frame[1] == static_cast<unsigned char>(MessageType::PROPOSAL);
+    });
+    for (auto& seat : c.seats) seat->mesh->sent.clear();
+    const uint32_t target{(leader + 1) % 4};
+    const uint32_t other{(leader + 2) % 4};
+    const uint256 hash{candidate.Header().Hash()};
+    const uint256 other_hash{LabelHash("fm2/test/pbft/evidence-header")};
+    const Vote honest{SignedVote("s" + std::to_string(other), other, storage::VotePhase::PREPARE, 0, 0, 1, hash, PrepareDigest(0, hash))};
+    const Vote doubled{SignedVote("s" + std::to_string(other), other, storage::VotePhase::PREPARE, 0, 0, 1, other_hash, PrepareDigest(0, other_hash))};
+    const ProfileParams& profile{c.At(target).rig->profile};
+    RequireOk(c.At(target).pbft->OnMessage(other, EncodeMessage(Message{honest}, profile).value()), "the honest vote");
+    RequireRefusal(c.At(target).pbft->OnMessage(other, EncodeMessage(Message{doubled}, profile).value()), ErrorCode::EQUIVOCATION_REFUSED,
+                   PBFT_DOUBLE_VOTE, "the double vote");
+    // The target recorded it durably (an EVIDENCE record after a barrier) and sent it to every other seat on CRITICAL.
+    const Result<std::vector<Evidence>> recorded{c.At(target).evidence->Load()};
+    RequireOk(recorded, "Load");
+    BOOST_REQUIRE_EQUAL(recorded->size(), 1U);
+    BOOST_CHECK(recorded->front().Kind() == EvidenceKind::DOUBLE_VOTE);
+    const Result<std::vector<storage::JournalRecord>> commit{c.At(target).rig->commit_journal->ReadAll()};
+    RequireOk(commit, "ReadAll");
+    BOOST_REQUIRE(!commit->empty());
+    BOOST_CHECK(commit->back().type == storage::RecordType::EVIDENCE);
+    BOOST_CHECK_EQUAL(c.At(target).rig->commit_journal->Status().durable_seq, commit->back().seq);
+    size_t evidence_frames{0};
+    for (const RecordingMesh::Sent& s : c.At(target).mesh->sent) {
+        if (s.frame.size() > 1 && s.frame[1] == static_cast<unsigned char>(MessageType::EVIDENCE)) {
+            ++evidence_frames;
+            BOOST_CHECK(s.lane == net::Lane::CRITICAL);
+        }
+    }
+    BOOST_CHECK_EQUAL(evidence_frames, 3U);
+    // Delivered, every seat verifies, records and halts; the leader's slot never decides.
+    c.Deliver();
+    for (uint32_t i{0}; i < 4; ++i) {
+        BOOST_CHECK_MESSAGE(c.At(i).pbft->Status().halted, "seat " << i << " not halted");
+        BOOST_CHECK_EQUAL(c.At(i).evidence->Size(), 1U);
+        BOOST_CHECK(!c.At(i).pbft->Status().decided);
+    }
+    RequireRefusal(c.At(other).pbft->OnTimeout(1'000), ErrorCode::FENCED, PBFT_FENCED, "a halted seat's timer");
+    // A recovered commit log carries the evidence: the store stays halted after a restart.
+    Result<storage::CommitLog> recovered{storage::CommitLog::Recover(*c.At(target).rig->commit_journal, profile)};
+    RequireOk(recovered, "CommitLog::Recover");
+    Result<EvidenceStore> again{EvidenceStore::Create(profile, *c.At(target).rig->adapter, *recovered)};
+    RequireOk(again, "EvidenceStore::Create after a restart");
+    BOOST_CHECK(again->Halted());
+    BOOST_CHECK(again->Load().value() == *recorded);
 }
 
 BOOST_AUTO_TEST_CASE(create_checks_the_seat_and_the_key)
@@ -472,7 +536,8 @@ BOOST_AUTO_TEST_CASE(create_checks_the_seat_and_the_key)
     AgreementRig rig{options};
     PbftSafetyRules rules;
     auto mesh{RecordingMesh::Make(TestMeshConfig(1, 4))};
-    const PbftContext context{*rig.adapter, *rig.owner, rig.signer, rig.signer_log, rig.commit_log, rules, *mesh, *mesh};
+    EvidenceStore evidence{EvidenceStore::Create(rig.profile, *rig.adapter, rig.commit_log).value()};
+    const PbftContext context{*rig.adapter, *rig.owner, rig.signer, rig.signer_log, rig.commit_log, rules, *mesh, *mesh, evidence};
     PbftConfig config;
     config.self_seat = 4;
     RequireRefusal(PbftAgreement::Create(rig.profile, config, context), ErrorCode::INVALID_INPUT, PBFT_SELF_SEAT, "seat outside the set");

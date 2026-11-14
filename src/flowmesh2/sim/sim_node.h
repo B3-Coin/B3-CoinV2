@@ -10,6 +10,7 @@
 #endif
 
 #include <flowmesh2/admission/admission.h>
+#include <flowmesh2/agreement/evidence.h>
 #include <flowmesh2/agreement/pbft.h>
 #include <flowmesh2/net/seat_mesh.h>
 #include <flowmesh2/admission/pool.h>
@@ -249,6 +250,7 @@ public:
     storage::MemoryJournal& SignerJournal() { return *m_signer_journal; }
     storage::MemoryJournal& CommitJournal() { return *m_commit_journal; }
     storage::CommitLog& CommitLog() { return *m_commit_log; }
+    agreement::EvidenceStore& Evidence() { return *m_evidence; }
     storage::SignerLog& SignerLog() { return *m_signer_log; }
     TraceRecorder& Trace() { return m_trace; }
     const std::vector<SealedSlot>& Sealed() const { return m_sealed; }
@@ -287,6 +289,7 @@ private:
     std::unique_ptr<storage::MemoryJournal> m_commit_journal;
     std::unique_ptr<storage::SignerLog> m_signer_log;
     std::unique_ptr<storage::CommitLog> m_commit_log;
+    std::unique_ptr<agreement::EvidenceStore> m_evidence;
     std::unique_ptr<storage::SeatSigner> m_signer;
     const SeatSet m_seats;
     const AuthorityVersion m_genesis_authority;

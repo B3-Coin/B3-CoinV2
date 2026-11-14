@@ -269,6 +269,7 @@ if(BUILD_FLOWMESH2)
     test/durable_tests.cpp
     test/engine_property_tests.cpp
     test/engine_tests.cpp
+    test/evidence_tests.cpp
     test/facts_tests.cpp
     test/fake_chain_tests.cpp
     test/fee_math_tests.cpp

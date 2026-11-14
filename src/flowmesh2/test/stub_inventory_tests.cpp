@@ -569,12 +569,6 @@ FM2_STUB_CASE(M4_AGR_06, "M4-AGR-06")
     return Observe(agreement::RestartFence::Collect({}, TestSeats({"s0"}), 0));
 }
 
-FM2_STUB_CASE(M4_AGR_07, "M4-AGR-07")
-{
-    agreement::EvidenceStore store;
-    return FirstDeviation("M4-AGR-07", {Observe(store.Record(agreement::Evidence{agreement::DoubleVote{}})), Observe(store.Load())});
-}
-
 // ---- Slice R11: b3verify ----
 
 //! A certified header of the k = 1 test seat over one synthetic account leaf.

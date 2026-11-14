@@ -138,11 +138,7 @@ BOOST_AUTO_TEST_CASE(inclusion_fence_and_evidence_are_stubs)
 
     const std::vector<HighWaterStatement> statements{HighWaterStatement{1, 0, 0, 5, 0, {}}};
     RequireStub(RestartFence::Collect(statements, seats, 0), "M4-AGR-06");
-
-    EvidenceStore store;
-    const Evidence evidence{DoubleVote{}};
-    RequireStub(store.Record(evidence), "M4-AGR-07");
-    RequireStub(store.Load(), "M4-AGR-07");
+    // The evidence store landed with M4-AGR-07 (evidence_tests).
 }
 
 BOOST_AUTO_TEST_SUITE_END()

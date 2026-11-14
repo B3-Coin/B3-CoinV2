@@ -17,7 +17,7 @@ namespace flowmesh2::storage {
 
 namespace {
 
-constexpr std::array<RecordTypeInfo, 9> RECORD_TYPES{{
+constexpr std::array<RecordTypeInfo, 10> RECORD_TYPES{{
     {RecordType::INTENT, "INTENT"},
     {RecordType::SIGNED_VOTE, "SIGNED_VOTE"},
     {RecordType::DECISION, "DECISION"},
@@ -27,6 +27,7 @@ constexpr std::array<RecordTypeInfo, 9> RECORD_TYPES{{
     {RecordType::VIEW_STATE, "VIEW_STATE"},
     {RecordType::NEW_VIEW_ACCEPTED, "NEW_VIEW_ACCEPTED"},
     {RecordType::PREPARED_QC, "PREPARED_QC"},
+    {RecordType::EVIDENCE, "EVIDENCE"},
 }};
 
 bool AllZero(std::span<const unsigned char> bytes)
@@ -70,7 +71,7 @@ bool RoleAccepts(JournalRole role, RecordType type)
                type == RecordType::VIEW_STATE || type == RecordType::NEW_VIEW_ACCEPTED;
     case JournalRole::COMMIT:
         return type == RecordType::DECISION || type == RecordType::APPLIED || type == RecordType::SNAPSHOT_MARK ||
-               type == RecordType::PREPARED_QC;
+               type == RecordType::PREPARED_QC || type == RecordType::EVIDENCE;
     }
     return false;
 }

@@ -155,6 +155,10 @@ Result<CommitLog> CommitLog::Recover(Journal& journal, const ProfileParams& prof
             if (!inserted) return inconsistent; // one proof per (epoch, slot, view)
             break;
         }
+        case RecordType::EVIDENCE:
+            if (record.payload.empty()) return inconsistent;
+            log.m_evidence.push_back(record.payload); // decoded and checked by the evidence store (agreement/evidence)
+            break;
         case RecordType::INTENT:
         case RecordType::SIGNED_VOTE:
         case RecordType::ACCEPTED_PROPOSAL:
@@ -164,6 +168,16 @@ Result<CommitLog> CommitLog::Recover(Journal& journal, const ProfileParams& prof
         }
     }
     return Ok(std::move(log));
+}
+
+Result<uint64_t> CommitLog::AppendEvidence(std::span<const unsigned char> payload)
+{
+    if (m_journal->IsFatal()) return Error{ErrorCode::FENCED, JOURNAL_FENCED};
+    if (payload.empty()) return Error{ErrorCode::INVALID_INPUT, EVIDENCE_EMPTY};
+    Result<uint64_t> seq{m_journal->Append(RecordType::EVIDENCE, payload)};
+    if (!seq.has_value()) return seq.error();
+    m_evidence.emplace_back(payload.begin(), payload.end());
+    return seq;
 }
 
 Result<PendingDecision> CommitLog::AppendDecision(const SlotHeaderV2& header, const SlotCertificate& certificate, const SlotBody& body)

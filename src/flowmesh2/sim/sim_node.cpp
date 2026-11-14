@@ -184,6 +184,10 @@ Result<void> SimNode::BuildComponents(bool restart)
                                                   : storage::CommitLog::Create(*m_commit_journal)};
     if (!commit_log.has_value()) return commit_log.error();
     m_commit_log = std::make_unique<storage::CommitLog>(std::move(commit_log).value());
+    // Recorded evidence (M4-AGR-07): a restarted node that recorded any stays halted.
+    Result<agreement::EvidenceStore> evidence{agreement::EvidenceStore::Create(m_profile, *m_traced, *m_commit_log)};
+    if (!evidence.has_value()) return evidence.error();
+    m_evidence = std::make_unique<agreement::EvidenceStore>(std::move(evidence).value());
 
     // The signer of this seat.
     Result<storage::SeatSigner> signer{storage::SeatSigner::FromIKM(std::span<const unsigned char>{m_ikm.data(), m_ikm.size()}, *m_signer_log)};
@@ -242,7 +246,7 @@ Result<void> SimNode::BuildComponents(bool restart)
     agreement::PbftConfig config{m_config.pbft};
     config.self_seat = m_self_seat;
     config.start_ms = m_now_ms;
-    const agreement::PbftContext context{*m_traced, *m_owner, *m_signer, *m_signer_log, *m_commit_log, *m_rules, *m_mesh, *m_mesh};
+    const agreement::PbftContext context{*m_traced, *m_owner, *m_signer, *m_signer_log, *m_commit_log, *m_rules, *m_mesh, *m_mesh, *m_evidence};
     Result<std::unique_ptr<agreement::PbftAgreement>> pbft{agreement::PbftAgreement::Create(m_profile, config, context)};
     if (!pbft.has_value()) return pbft.error();
     m_pbft = std::move(pbft).value();

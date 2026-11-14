@@ -110,6 +110,7 @@ PbftAgreement::PbftAgreement(const ProfileParams& profile, const PbftConfig& con
       m_safety{context.safety},
       m_sink{context.sink},
       m_votes{context.votes},
+      m_evidence{context.evidence},
       m_seats{std::move(seats)},
       m_domain{context.owner.Head()->Header().domain},
       m_parent_cert{std::move(parent_cert)},
@@ -117,7 +118,7 @@ PbftAgreement::PbftAgreement(const ProfileParams& profile, const PbftConfig& con
 {
 }
 
-bool PbftAgreement::Fenced() const { return m_halted || m_signer_log.IsFatal() || m_commit_log.IsFatal(); }
+bool PbftAgreement::Fenced() const { return m_halted || m_evidence.Halted() || m_signer_log.IsFatal() || m_commit_log.IsFatal(); }
 
 uint64_t PbftAgreement::TimeoutMs(uint64_t view) const
 {
@@ -225,6 +226,7 @@ PbftStatus PbftAgreement::Status()
     status.proposal_accepted = m_slot.accepted.has_value();
     status.prepared = m_slot.prepared.has_value();
     status.decided = m_decision.has_value();
+    status.halted = m_halted || m_evidence.Halted();
     status.prepare_votes = static_cast<uint32_t>(m_slot.prepares.size());
     status.commit_votes = static_cast<uint32_t>(m_slot.commits.size());
     return status;
@@ -522,7 +524,7 @@ Result<void> PbftAgreement::OnVote(uint32_t from, const Vote& vote)
             return ok.error();
         }
         if (const auto it{m_slot.prepares.find(vote.seat)}; it != m_slot.prepares.end()) {
-            if (it->second.header_hash != vote.header_hash) return Error{ErrorCode::EQUIVOCATION_REFUSED, PBFT_DOUBLE_VOTE};
+            if (it->second.header_hash != vote.header_hash) return OnDoubleVote(it->second, vote);
             return Ok(); // a retransmission
         }
         if (vote.header_hash != accepted) return Ok(); // a valid vote for a header we did not accept: not ours to count
@@ -633,6 +635,27 @@ Result<void> PbftAgreement::Decide()
     return Ok();
 }
 
+// ---- Evidence (M4-AGR-07) ------------------------------------------------------------
+
+Result<void> PbftAgreement::OnDoubleVote(const Vote& first, const Vote& second)
+{
+    // Both votes verified against the seat's key; one encoding per conflict (ascending header hash).
+    const bool ordered{first.header_hash < second.header_hash};
+    const Evidence evidence{DoubleVote{ordered ? first : second, ordered ? second : first}};
+    if (const Result<void> recorded{m_evidence.Record(evidence)}; !recorded.has_value()) return recorded.error();
+    m_halted = true;
+    Result<std::vector<unsigned char>> bytes{EncodeMessage(Message{evidence}, m_profile)};
+    if (bytes.has_value()) (void)SendToAll(*bytes); // best effort: the evidence is durable here whatever the mesh says
+    return Error{ErrorCode::EQUIVOCATION_REFUSED, PBFT_DOUBLE_VOTE};
+}
+
+Result<void> PbftAgreement::OnEvidence(const Evidence& evidence)
+{
+    if (const Result<void> recorded{m_evidence.Record(evidence)}; !recorded.has_value()) return recorded.error();
+    m_halted = true;
+    return Ok();
+}
+
 // ---- Messages and time -------------------------------------------------------------
 
 Result<void> PbftAgreement::OnMessage(uint32_t from_seat, std::span<const unsigned char> bytes)
@@ -654,8 +677,7 @@ Result<void> PbftAgreement::OnMessage(uint32_t from_seat, std::span<const unsign
             } else if constexpr (std::is_same_v<T, NewView>) {
                 return OnNewView(from_seat, std::move(message), bytes);
             } else {
-                // Evidence: checked structurally; recording and the halt are M4-AGR-07.
-                return CheckEvidence(message);
+                return OnEvidence(message);
             }
         },
         std::move(*decoded));
