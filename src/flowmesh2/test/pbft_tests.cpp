@@ -685,4 +685,70 @@ BOOST_AUTO_TEST_CASE(a_new_leader_reproposes_a_fetched_selection)
     BOOST_CHECK(decided == hash);
 }
 
+BOOST_AUTO_TEST_CASE(a_reproposal_carries_the_selections_parent_certificate)
+{
+    // The stall of 2026-11-14 (O-105 (9)): two seats decide one slot with two different valid certificates (two quorums of
+    // COMMIT votes); the next slot's header binds its proposer's; after a view change the new leader re-proposes the
+    // selected header, which only works with the selection's own parent certificate, never with the new leader's.
+    uint32_t next_leader{4};
+    {
+        Cluster probe{4};
+        probe.Tick(PbftConfig{}.view_timeout_floor_ms);
+        next_leader = probe.Leader();
+        BOOST_REQUIRE_LT(next_leader, 4U);
+    }
+    Cluster c{4};
+    const uint32_t leader{c.Leader()};
+    BOOST_REQUIRE_NE(leader, next_leader);
+    // Slot 1 decides everywhere, but the leader's COMMIT vote never reaches the next leader: the leader's certificate
+    // aggregates its own vote and two more, the next leader's the three other seats'.
+    const state::Candidate first{c.At(leader).rig->Preview(c.InputsFromChain(leader))};
+    RequireOk(c.At(leader).pbft->Propose(first, c.Authority()), "Propose slot 1");
+    const Filter without_leader_commit{[leader, next_leader](uint32_t from, uint32_t to, const std::vector<unsigned char>& frame) {
+        return !(IsCommitVote(frame) && from == leader && to == next_leader);
+    }};
+    c.Deliver(without_leader_commit);
+    for (uint32_t i{0}; i < 4; ++i) BOOST_REQUIRE_MESSAGE(c.At(i).pbft->Status().decided, "seat " << i << " undecided at slot 1");
+    BOOST_CHECK(c.ApplyDecisions(first, leader) == first.Header().Hash());
+    const std::optional<SlotCertificate> leaders{c.At(leader).rig->commit_log.CertificateAt(1)};
+    const std::optional<SlotCertificate> nexts{c.At(next_leader).rig->commit_log.CertificateAt(1)};
+    BOOST_REQUIRE(leaders.has_value() && nexts.has_value());
+    BOOST_CHECK(leaders->header_hash == nexts->header_hash);
+    BOOST_REQUIRE(leaders->Hash() != nexts->Hash());
+    // Slot 2 as in the previous case: the proposal never reaches the next leader, commits are dropped, the view times out
+    // prepared and the next leader must re-propose the selection.
+    BOOST_REQUIRE_EQUAL(c.Leader(), leader);
+    const state::Candidate second{c.At(leader).rig->Preview(c.InputsFromChain(leader))};
+    RequireOk(c.At(leader).pbft->Propose(second, c.Authority()), "Propose slot 2");
+    const uint256 hash{second.Header().Hash()};
+    const Filter keep{[next_leader](uint32_t, uint32_t to, const std::vector<unsigned char>& frame) {
+        if (frame.size() > 1 && frame[1] == static_cast<unsigned char>(MessageType::PROPOSAL) && to == next_leader) return false;
+        return !IsCommitVote(frame);
+    }};
+    c.Deliver(keep);
+    const uint64_t timeout{PbftConfig{}.view_timeout_floor_ms};
+    c.Tick(timeout, keep);
+    BOOST_REQUIRE_EQUAL(c.Leader(), next_leader);
+    PbftAgreement& fresh{*c.At(next_leader).pbft};
+    BOOST_REQUIRE(fresh.SelectedHeader() == std::optional<uint256>{hash});
+    const std::optional<Proposal> held{c.At(leader).pbft->KnownProposal(hash)};
+    BOOST_REQUIRE(held.has_value() && held->parent_cert.has_value());
+    BOOST_CHECK(held->parent_cert->Hash() == leaders->Hash());
+    // With its own certificate the re-proposal cannot match the header; a forged certificate is refused; the selection's is right.
+    RequireRefusal(fresh.ProposeSelected(held->header, held->body), ErrorCode::INVALID_INPUT, PROPOSAL_PARENT_CERT, "own certificate");
+    SlotCertificate forged{*held->parent_cert};
+    forged.aggregate[0] ^= 0x01;
+    RequireRefusal(fresh.ProposeSelected(held->header, held->body, forged), ErrorCode::VERIFY_FAILED, PBFT_PARENT_CERT, "a forged certificate");
+    SlotCertificate other_head{*held->parent_cert};
+    other_head.header_hash = LabelHash("fm2/test/pbft/other-head");
+    RequireRefusal(fresh.ProposeSelected(held->header, held->body, other_head), ErrorCode::VERIFY_FAILED, PBFT_PARENT_CERT, "another head");
+    RequireOk(fresh.ProposeSelected(held->header, held->body, held->parent_cert), "ProposeSelected with the selection's certificate");
+    BOOST_CHECK(!fresh.Status().selected_missing);
+    c.Deliver();
+    c.Tick(timeout + PbftConfig{}.retry_ms);
+    for (uint32_t i{0}; i < 4; ++i) BOOST_CHECK_MESSAGE(c.At(i).pbft->Status().decided, "seat " << i << " undecided at slot 2");
+    BOOST_CHECK(c.ApplyDecisions() == hash);
+    for (uint32_t i{0}; i < 4; ++i) BOOST_CHECK_EQUAL(c.At(i).rig->owner->Head()->Header().height, 2U);
+}
+
 BOOST_AUTO_TEST_SUITE_END()

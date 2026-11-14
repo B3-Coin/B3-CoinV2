@@ -148,6 +148,7 @@ inline constexpr std::string_view PBFT_VOTE_SIGNATURE{"vote signature does not v
 inline constexpr std::string_view PBFT_DOUBLE_VOTE{"a second header from one seat for one vote key"};         //!< (EQUIVOCATION_REFUSED)
 inline constexpr std::string_view PBFT_REPORT_SIGNATURE{"view-change report signature does not verify"};     //!< (VERIFY_FAILED)
 inline constexpr std::string_view PBFT_PREPARED_CERT{"a carried PreparedQC does not verify"};                //!< (VERIFY_FAILED)
+inline constexpr std::string_view PBFT_PARENT_CERT{"the selection's parent certificate does not certify the head"}; //!< (VERIFY_FAILED)
 inline constexpr std::string_view PBFT_NEW_VIEW_QUORUM{"new view without a quorum of reports"};              //!< (INVALID_INPUT)
 inline constexpr std::string_view PBFT_CERTIFICATE{"the aggregate certificate does not verify"};             //!< (INVARIANT)
 inline constexpr std::string_view PBFT_DECISION_NOT_TAKEN{"the previous decision was not taken"};            //!< (ORDER_VIOLATION)
@@ -267,14 +268,25 @@ public:
     bool IsLeader();
     //! The header a NEW_VIEW of the current view selected for re-proposal; zero or nullopt when none.
     std::optional<uint256> SelectedHeader();
+    //! The slot the last message given to OnMessage was about (a proposal's height, a vote's, report's or new view's slot); nullopt
+    //! for evidence or before any message. The node uses it to push a decision to a peer still working on a decided slot (O-105 (10)).
+    std::optional<uint64_t> LastMessageSlot() const { return m_last_message_slot; }
     //! The proposal of `header_hash` this seat holds for the slot in flight (accepted or seen), if any.
     std::optional<Proposal> KnownProposal(const uint256& header_hash);
     /** The new leader re-proposes the selected header from a fetched body
      * (O-101): the header must be the selection (PBFT_NEW_VIEW_SELECTED),
      * build on the head and reproduce exactly (Reexecute), its facts must be
      * the adapter's (CheckFacts); then the leader's path (ProposeHeaderBody).
+     * The header binds its proposer's parent certificate (parent_cert_hash),
+     * and two seats may hold two different valid certificates for one parent
+     * (different quorums of COMMIT votes), so the re-proposal carries the
+     * selection's own `parent_cert`: it must certify the head
+     * (PBFT_PARENT_CERT) and is then this seat's parent certificate too. Without
+     * it the re-proposal is refused whenever this seat's certificate is another
+     * one (PROPOSAL_PARENT_CERT; the stall of 2026-11-14, O-105 (9)).
      */
-    Result<void> ProposeSelected(const SlotHeaderV2& header, const SlotBody& body);
+    Result<void> ProposeSelected(const SlotHeaderV2& header, const SlotBody& body,
+                                 const std::optional<SlotCertificate>& parent_cert = std::nullopt);
     //! The node has work for the slot (pending actions or facts): tighten the first view's deadline (idle_grace_ms).
     void OnLocalWork();
     /** Catch-up hint (O-101): the slot that at least f + 1 distinct peers
@@ -388,6 +400,7 @@ private:
     std::optional<Decision> m_decision;
     bool m_halted{false};
     std::map<uint32_t, uint64_t> m_claims; //!< per peer: the highest slot it named beyond this seat's (O-101)
+    std::optional<uint64_t> m_last_message_slot;
 };
 
 } // namespace flowmesh2::agreement

@@ -2,6 +2,7 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
+#include <flowmesh2/agreement/messages.h>
 #include <flowmesh2/net/in_process_mesh.h>
 #include <flowmesh2/net/sync.h>
 #include <flowmesh2/seat/seat_node.h>
@@ -259,12 +260,96 @@ BOOST_AUTO_TEST_CASE(a_seat_alone_behind_a_partition_catches_up_by_fetching_deci
     BOOST_CHECK_EQUAL(cluster.Node(3).Sealed().size(), 3U);
     BOOST_CHECK_EQUAL(cluster.Node(3).Sealed()[1].height, 2U);
     BOOST_CHECK(!cluster.Node(3).Fenced());
-    // A reply nobody asked for is refused and changes nothing.
-    const Result<std::vector<unsigned char>> stray{net::EncodeSync(net::DecisionsReply{4, *two}, profile)};
+    // A reply nobody asked for: one for the slot after the head is a push (O-105 (10)) and is checked like any fetched record
+    // (this one holds slot 2, not slot 4); one for a farther slot is refused; one for an applied slot is late and ignored.
+    const Result<std::vector<unsigned char>> pushed{net::EncodeSync(net::DecisionsReply{4, *two}, profile)};
+    RequireOk(pushed, "EncodeSync");
+    RequireRefusal(cluster.Node(3).OnFrame(net::InboundFrame{0, net::Lane::BULK, *pushed}), ErrorCode::STALE_PARENT, seat::SEAT_SYNC_SLOT,
+                   "a pushed record of another slot");
+    const Result<std::vector<unsigned char>> stray{net::EncodeSync(net::DecisionsReply{5, *two}, profile)};
     RequireOk(stray, "EncodeSync");
     RequireRefusal(cluster.Node(3).OnFrame(net::InboundFrame{0, net::Lane::BULK, *stray}), ErrorCode::INVALID_INPUT, seat::SEAT_SYNC_UNSOLICITED,
                    "unsolicited reply");
+    const Result<std::vector<unsigned char>> late{net::EncodeSync(net::DecisionsReply{1, *one}, profile)};
+    RequireOk(late, "EncodeSync");
+    RequireOk(cluster.Node(3).OnFrame(net::InboundFrame{0, net::Lane::BULK, *late}), "a late push for an applied slot is ignored");
     BOOST_CHECK_EQUAL(cluster.Node(3).Owner().Head()->Header().height, 3U);
+}
+
+BOOST_AUTO_TEST_CASE(a_seat_that_decided_pushes_the_decision_to_peers_stuck_in_a_view_change)
+{
+    // O-105 (10), the second stall the e2e found: with seat 3 away, seat 2 decides slot 2 alone (its COMMIT votes never reach
+    // seats 0 and 1, which hold two commits each) and moves on; seats 0 and 1 time out into a view change that can never
+    // gather a quorum of reports (two reporters, seat 2 past the slot, seat 3 gone), and nobody is ahead by f + 1 claims, so
+    // the request path never fires. The seat that holds the decision hears their reports about the decided slot and pushes it.
+    TraceRecorder trace;
+    SimNodeConfig config;
+    config.faults.partition = {{0}, {1}, {2}, {3}}; // the pump delivers nothing: every frame goes through this test's hands
+    Result<std::unique_ptr<SimCluster>> created{SimCluster::Create(4, config, trace)};
+    RequireOk(created, "SimCluster::Create(4)");
+    SimCluster& cluster{**created};
+    for (size_t i{0}; i < 4; ++i) RequireOk(cluster.Node(i).Chain().AppendBlock(SimBlockHash(SIM_BASE_HEIGHT + 1), {}), "AppendBlock");
+    const auto is_commit{[](const std::vector<unsigned char>& frame) {
+        return frame.size() > 2 && frame[1] == static_cast<unsigned char>(agreement::MessageType::VOTE) &&
+               frame[2] == static_cast<unsigned char>(storage::VotePhase::COMMIT);
+    }};
+    size_t dropped{0};
+    uint64_t now{1};
+    // Propose when a leader can, deliver everything among seats 0..2 (seat 3 is away; seat 2's COMMIT votes are dropped on
+    // request) until nothing moves, then pump time; until `wait_for` reach `height` or the limit passes.
+    const auto drive{[&](uint64_t height, const std::vector<uint32_t>& wait_for, bool drop_commits_from_2) {
+        const uint64_t deadline{now + 6'000};
+        while (now < deadline) {
+            if (const std::optional<uint32_t> leader{cluster.Leader()}) {
+                SimNode& node{cluster.Node(*leader)};
+                const std::optional<agreement::PbftStatus> status{node.AgreementStatus()};
+                if (node.Owner().Head()->Header().height < height && status.has_value() && !status->proposal_accepted && !status->decided) {
+                    (void)node.ProposeSlot();
+                }
+            }
+            for (int round{0}; round < 64; ++round) {
+                const std::vector<net::InProcessFrame> frames{cluster.Fabric()->Drain()};
+                if (frames.empty()) break;
+                for (const net::InProcessFrame& frame : frames) {
+                    if (frame.from == 3 || frame.to == 3) continue;
+                    if (drop_commits_from_2 && frame.from == 2 && is_commit(frame.bytes)) {
+                        ++dropped;
+                        continue;
+                    }
+                    (void)cluster.Node(frame.to).OnFrame(net::InboundFrame{frame.from, frame.lane, frame.bytes});
+                }
+            }
+            RequireOk(cluster.Pump(now), "Pump");
+            ++now;
+            bool all{true};
+            for (const uint32_t i : wait_for) all = all && cluster.Node(i).Owner().Head()->Header().height >= height;
+            if (all) return;
+        }
+    }};
+    drive(1, {0, 1, 2}, false);
+    for (uint32_t i{0}; i < 3; ++i) BOOST_REQUIRE_EQUAL(cluster.Node(i).Owner().Head()->Header().height, 1U);
+    // Slot 2: seat 2 decides alone.
+    drive(2, {2}, true);
+    BOOST_REQUIRE_EQUAL(cluster.Node(2).Owner().Head()->Header().height, 2U);
+    BOOST_CHECK_GE(dropped, 2U);
+    BOOST_CHECK_EQUAL(cluster.Node(0).Owner().Head()->Header().height, 1U);
+    BOOST_CHECK_EQUAL(cluster.Node(1).Owner().Head()->Header().height, 1U);
+    // Everything flows again among the three. Without the push, seats 0 and 1 stay at height 1 for ever.
+    drive(2, {0, 1, 2}, false);
+    for (uint32_t i{0}; i < 3; ++i) {
+        BOOST_CHECK_MESSAGE(cluster.Node(i).Owner().Head()->Header().height >= 2, "seat " << i << " is stuck at height "
+                                                                                           << cluster.Node(i).Owner().Head()->Header().height);
+    }
+    BOOST_CHECK_GE(CountEvents(trace, "sync.push", "slot=2"), 1U);
+    BOOST_CHECK_EQUAL(CountEvents(trace, "sync.apply", "slot=2"), 2U);
+    BOOST_CHECK_EQUAL(CountEvents(trace, "sync.request"), 0U); // one peer ahead is not f + 1 claims: the request path never fired
+    // And the three go on to slot 3 on one head.
+    drive(3, {0, 1, 2}, false);
+    for (uint32_t i{0}; i < 3; ++i) {
+        BOOST_CHECK_EQUAL(cluster.Node(i).Owner().Head()->Header().height, 3U);
+        BOOST_CHECK(cluster.Node(i).Owner().Head()->HeaderHash() == cluster.Node(0).Owner().Head()->HeaderHash());
+        BOOST_CHECK(!cluster.Node(i).Fenced());
+    }
 }
 
 BOOST_AUTO_TEST_SUITE_END()

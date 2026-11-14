@@ -38,6 +38,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <map>
 #include <optional>
 #include <span>
 #include <string>
@@ -243,7 +244,8 @@ public:
      * agreement (its errors are returned; only STORAGE_FATAL and FENCED fence
      * the node); BULK frames are sync messages (net/sync.h, O-101): a
      * DECISIONS_REQUEST is answered from the commit log's recent records, a
-     * DECISIONS_REPLY this seat asked for is verified and applied
+     * DECISIONS_REPLY this seat asked for, or one a peer pushed for the
+     * slot after the head (O-105 (10)), is verified and applied
      * (ApplyFetched), a PROPOSAL_REQUEST from the agreement's known proposals,
      * a PROPOSAL_REPLY the leader asked for re-proposes the selected header;
      * anything else is ignored.
@@ -332,6 +334,8 @@ private:
     NodeHooks& Hooks() { return *m_hooks; }
     Result<void> OnBulk(const net::InboundFrame& frame);
     Result<void> SendSync(uint32_t seat, const net::SyncMessage& message);
+    //! A peer sent a message about `slot`, which this seat has decided: send it the decision (once per sync_backoff_ms per peer).
+    Result<void> PushDecision(uint32_t peer, uint64_t slot);
     uint32_t NextPeer();
     //! One request in flight at a time (O-101).
     struct SyncState {
@@ -341,6 +345,7 @@ private:
         uint64_t sent_ms{0};
         uint64_t backoff_ms{0};
         uint32_t next_peer{0};
+        std::map<uint32_t, std::pair<uint64_t, uint64_t>> pushed; //!< per peer: the last (slot, m_now_ms) a decision was pushed
     };
 
     const SeatNodeConfig m_config;

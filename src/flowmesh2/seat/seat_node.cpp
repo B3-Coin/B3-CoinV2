@@ -303,9 +303,16 @@ Result<uint64_t> SeatNode::ProposeSlot()
 {
     if (m_pbft == nullptr) return Error{ErrorCode::INVALID_INPUT, SEAT_MULTI_SEAT};
     if (!m_pbft->IsLeader()) return Error{ErrorCode::INVALID_INPUT, SEAT_NOT_LEADER};
-    // A NEW_VIEW selected a header this seat does not hold: fetch it (Tick) instead of building a fresh candidate (O-101).
-    if (const std::optional<uint256> selected{m_pbft->SelectedHeader()}; selected.has_value() && !m_pbft->KnownProposal(*selected)) {
-        return Error{ErrorCode::NEED_DATA, SEAT_SELECTED_MISSING};
+    // A NEW_VIEW selected a header: re-propose it when this seat holds it, with the parent certificate the header binds; fetch
+    // it (Tick) when not. A fresh candidate would be refused in either case (PBFT_NEW_VIEW_SELECTED; O-101).
+    if (const std::optional<uint256> selected{m_pbft->SelectedHeader()}; selected.has_value()) {
+        const std::optional<agreement::Proposal> known{m_pbft->KnownProposal(*selected)};
+        if (!known.has_value()) return Error{ErrorCode::NEED_DATA, SEAT_SELECTED_MISSING};
+        Hooks().Record("slot.repropose", "slot=" + std::to_string(known->header.height) + ",seat=" + std::to_string(m_config.self_seat));
+        if (const Result<void> proposed{m_pbft->ProposeSelected(known->header, known->body, known->parent_cert)}; !proposed.has_value()) {
+            return FenceOn(proposed.error());
+        }
+        return Ok(known->header.height);
     }
     const std::shared_ptr<const state::HeadView> head{m_owner->Head()};
     const uint64_t height{head->Header().height + 1};
@@ -326,6 +333,11 @@ Result<void> SeatNode::OnFrame(const net::InboundFrame& frame)
     if (frame.lane == net::Lane::BULK) return OnBulk(frame);
     if (frame.lane != net::Lane::CRITICAL && frame.lane != net::Lane::PROPOSAL) return Ok();
     const Result<void> handled{m_pbft->OnMessage(frame.from_seat, frame.bytes)};
+    // A message about a slot this seat has decided means the peer is behind: push it the decision (O-105 (10)). The agreement
+    // ignores such a message itself, and a peer stuck in a view change for that slot may have nobody else to learn from.
+    if (const std::optional<uint64_t> slot{m_pbft->LastMessageSlot()}; slot.has_value() && *slot <= m_owner->Head()->Header().height) {
+        (void)PushDecision(frame.from_seat, *slot);
+    }
     if (!handled.has_value()) {
         if (handled.error().code == ErrorCode::STORAGE_FATAL || handled.error().code == ErrorCode::FENCED) Fence(handled.error());
         Hooks().Record("pbft.refuse", "seat=" + std::to_string(m_config.self_seat) + ",from=" + std::to_string(frame.from_seat) + "," +
@@ -399,11 +411,22 @@ Result<void> SeatNode::SendSync(uint32_t seat, const net::SyncMessage& message)
 
 // ---- Catch-up (O-101) --------------------------------------------------------------
 
+Result<void> SeatNode::PushDecision(uint32_t peer, uint64_t slot)
+{
+    std::pair<uint64_t, uint64_t>& last{m_sync.pushed[peer]};
+    if (last.first == slot && last.second != 0 && m_now_ms - last.second < m_config.sync_backoff_ms) return Ok();
+    const std::optional<std::vector<unsigned char>> record{m_commit_log->RecentDecisionRecord(slot)};
+    if (!record.has_value()) return Ok(); // older than the commit log's ring: the peer's own request path remains
+    last = std::pair<uint64_t, uint64_t>{slot, m_now_ms == 0 ? 1 : m_now_ms};
+    Hooks().Record("sync.push", "slot=" + std::to_string(slot) + ",to=" + std::to_string(peer));
+    return SendSync(peer, net::DecisionsReply{slot, *record});
+}
+
 Result<void> SeatNode::OnBulk(const net::InboundFrame& frame)
 {
     Result<net::SyncMessage> decoded{net::DecodeSync(frame.bytes, m_config.profile)};
     if (!decoded.has_value()) {
-        Hooks().Record("sync.refuse", "from=" + std::to_string(frame.from_seat) + "," + std::string{ToString(decoded.error().code)});
+        Hooks().Record("sync.refuse", "from=" + std::to_string(frame.from_seat) + "," + std::string{ToString(decoded.error().code)} + "," + std::string{decoded.error().detail});
         return decoded.error();
     }
     if (const auto* request{std::get_if<net::DecisionsRequest>(&*decoded)}) {
@@ -418,12 +441,17 @@ Result<void> SeatNode::OnBulk(const net::InboundFrame& frame)
         return Ok();
     }
     if (const auto* reply{std::get_if<net::DecisionsReply>(&*decoded)}) {
-        if (!m_sync.pending_peer.has_value() || *m_sync.pending_peer != frame.from_seat || m_sync.pending_proposal ||
-            reply->slot != m_sync.pending_slot) {
+        const uint64_t next{m_owner->Head()->Header().height + 1};
+        const bool solicited{m_sync.pending_peer.has_value() && *m_sync.pending_peer == frame.from_seat && !m_sync.pending_proposal &&
+                             reply->slot == m_sync.pending_slot};
+        if (solicited) m_sync.pending_peer.reset();
+        // A reply for a slot applied already (a push got there first) is late and ignored, asked for or not.
+        if (reply->slot < next) return Ok();
+        if (!solicited && (reply->slot != next || reply->record.empty())) {
+            // A pushed decision for the slot after the head is welcome (O-105 (10)); anything else nobody asked for is refused.
             Hooks().Record("sync.refuse", "from=" + std::to_string(frame.from_seat) + ",unsolicited");
             return Error{ErrorCode::INVALID_INPUT, SEAT_SYNC_UNSOLICITED};
         }
-        m_sync.pending_peer.reset();
         if (reply->record.empty()) {
             m_pbft->ResetClaim(frame.from_seat);
             Hooks().Record("sync.reply", "from=" + std::to_string(frame.from_seat) + ",slot=" + std::to_string(reply->slot) + ",none");
@@ -431,10 +459,10 @@ Result<void> SeatNode::OnBulk(const net::InboundFrame& frame)
         }
         Result<storage::DecisionRecord> record{storage::DecisionRecord::Decode(reply->record, m_config.profile)};
         if (!record.has_value()) {
-            Hooks().Record("sync.refuse", "from=" + std::to_string(frame.from_seat) + "," + std::string{ToString(record.error().code)});
+            Hooks().Record("sync.refuse", "from=" + std::to_string(frame.from_seat) + "," + std::string{ToString(record.error().code)} + "," + std::string{record.error().detail});
             return record.error();
         }
-        Hooks().Record("sync.reply", "from=" + std::to_string(frame.from_seat) + ",slot=" + std::to_string(reply->slot));
+        Hooks().Record("sync.reply", "from=" + std::to_string(frame.from_seat) + ",slot=" + std::to_string(reply->slot) + (solicited ? "" : ",pushed"));
         const Result<void> applied{ApplyFetched(*record)};
         if (!applied.has_value()) {
             Hooks().Record("sync.refuse", "from=" + std::to_string(frame.from_seat) + "," + std::string{ToString(applied.error().code)} + "," +
@@ -442,6 +470,7 @@ Result<void> SeatNode::OnBulk(const net::InboundFrame& frame)
             return applied.error();
         }
         m_sync.backoff_ms = m_config.sync_backoff_ms;
+        if (!solicited && m_sync.pending_peer.has_value() && m_sync.pending_slot == reply->slot) m_sync.pending_peer.reset(); // the request is moot
         return Ok();
     }
     if (const auto* request{std::get_if<net::ProposalRequest>(&*decoded)}) {
@@ -470,9 +499,9 @@ Result<void> SeatNode::OnBulk(const net::InboundFrame& frame)
     const auto* proposal{std::get_if<agreement::Proposal>(&*message)};
     if (proposal == nullptr || proposal->header.Hash() != reply.header_hash) return Error{ErrorCode::INVALID_INPUT, SEAT_SYNC_UNSOLICITED};
     Hooks().Record("sync.reply", "from=" + std::to_string(frame.from_seat) + ",proposal=" + reply.header_hash.GetHex());
-    const Result<void> proposed{m_pbft->ProposeSelected(proposal->header, proposal->body)};
+    const Result<void> proposed{m_pbft->ProposeSelected(proposal->header, proposal->body, proposal->parent_cert)};
     if (!proposed.has_value()) {
-        Hooks().Record("sync.refuse", "from=" + std::to_string(frame.from_seat) + "," + std::string{ToString(proposed.error().code)});
+        Hooks().Record("sync.refuse", "from=" + std::to_string(frame.from_seat) + "," + std::string{ToString(proposed.error().code)} + "," + std::string{proposed.error().detail});
         return FenceOn(proposed.error());
     }
     m_sync.backoff_ms = m_config.sync_backoff_ms;

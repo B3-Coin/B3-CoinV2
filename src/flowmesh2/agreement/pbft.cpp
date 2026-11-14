@@ -199,7 +199,7 @@ std::optional<Proposal> PbftAgreement::KnownProposal(const uint256& header_hash)
     return std::nullopt;
 }
 
-Result<void> PbftAgreement::ProposeSelected(const SlotHeaderV2& header, const SlotBody& body)
+Result<void> PbftAgreement::ProposeSelected(const SlotHeaderV2& header, const SlotBody& body, const std::optional<SlotCertificate>& parent_cert)
 {
     if (Fenced()) return Error{ErrorCode::FENCED, PBFT_FENCED};
     if (const Result<void> synced{SyncHead()}; !synced.has_value()) return synced.error();
@@ -208,6 +208,14 @@ Result<void> PbftAgreement::ProposeSelected(const SlotHeaderV2& header, const Sl
     if (header.height != m_slot.slot) return Invalid(PBFT_CANDIDATE_SLOT);
     const std::shared_ptr<const state::HeadView> head{m_owner.Head()};
     if (header.parent_hash != head->HeaderHash()) return Error{ErrorCode::STALE_PARENT, PBFT_PARENT};
+    if (parent_cert.has_value()) {
+        // The selection's own parent certificate: another valid quorum over the same head is as good as this seat's.
+        if (parent_cert->header_hash != head->HeaderHash()) return Error{ErrorCode::VERIFY_FAILED, PBFT_PARENT_CERT};
+        if (const Result<void> ok{CheckCertificate(*parent_cert, head->Header().CommitDigest(), m_seats, PBFT_PARENT_CERT)}; !ok.has_value()) {
+            return ok.error();
+        }
+        m_parent_cert = *parent_cert;
+    }
     Proposal fetched;
     fetched.epoch = m_slot.epoch;
     fetched.view = m_slot.view;
@@ -749,9 +757,13 @@ Result<void> PbftAgreement::OnMessage(uint32_t from_seat, std::span<const unsign
         [&](const auto& message) {
             using T = std::decay_t<decltype(message)>;
             if constexpr (std::is_same_v<T, Proposal>) {
+                m_last_message_slot = message.header.height;
                 NoteClaim(from_seat, message.header.height);
             } else if constexpr (std::is_same_v<T, Vote> || std::is_same_v<T, ViewChange> || std::is_same_v<T, NewView>) {
+                m_last_message_slot = message.slot;
                 NoteClaim(from_seat, message.slot);
+            } else {
+                m_last_message_slot.reset();
             }
         },
         *decoded);
@@ -950,10 +962,12 @@ Result<void> PbftAgreement::BuildNewView(uint64_t target)
     m_slot.own_new_view = *bytes;
     m_slot.own_new_view_statement = *statement;
     if (const Result<void> sent{SendStatementToAll(*statement, *bytes)}; !sent.has_value()) return sent.error();
-    // Re-propose the selected header if this seat holds its body; otherwise the caller proposes.
+    // Re-propose the selected header if this seat holds its body (with the certificate that header binds, verified when the
+    // proposal was accepted); otherwise the caller fetches and proposes it (ProposeSelected).
     if (!message.selected.IsNull()) {
         if (const auto it{m_slot.known_proposals.find(message.selected)}; it != m_slot.known_proposals.end()) {
             const Proposal known{it->second};
+            if (known.parent_cert.has_value()) m_parent_cert = *known.parent_cert;
             return ProposeHeaderBody(known.header, known.body, known.header.Authority());
         }
     }

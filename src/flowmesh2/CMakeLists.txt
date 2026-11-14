@@ -197,6 +197,7 @@ if(BUILD_FLOWMESH2)
   add_library(fm2_netio STATIC
     netio/api_json.cpp
     netio/bip324_session.cpp
+    netio/genesis_doc.cpp
     netio/https_sse_api.cpp
     netio/mesh_handshake.cpp
     netio/tcp_mesh.cpp
@@ -228,16 +229,37 @@ if(BUILD_FLOWMESH2)
   add_library(fm2_dev STATIC
     dev/dev_budget.cpp
     dev/dev_certifier.cpp
+    dev/dev_chain_file.cpp
     dev/fake_chain.cpp
   )
   target_compile_definitions(fm2_dev PUBLIC FM2_DEV_COMPONENTS)
   target_link_libraries(fm2_dev
     PRIVATE
       core_interface
+      crc32c
       fm2_warnings
     PUBLIC
       fm2_core
   )
+
+  # Regtest tools (stage 2 step 5, M5-NODE-01; DEV ONLY): fm2-keygen writes a
+  # cluster's genesis.json and seat keys, fm2-devchain is the faucet over the
+  # shared dev chain file. Both link fm2_dev and fm2_netio; no executable
+  # here links bitcoin_node (guard rule 3: no V1 flowmesh:: symbol).
+  add_executable(fm2_keygen dev/fm2_keygen_main.cpp)
+  set_target_properties(fm2_keygen PROPERTIES OUTPUT_NAME fm2-keygen)
+  target_link_libraries(fm2_keygen PRIVATE core_interface fm2_warnings fm2_dev fm2_netio)
+  add_executable(fm2_devchain dev/fm2_devchain_main.cpp)
+  set_target_properties(fm2_devchain PROPERTIES OUTPUT_NAME fm2-devchain)
+  target_link_libraries(fm2_devchain PRIVATE core_interface fm2_warnings fm2_dev fm2_netio)
+
+  # daemon/ (stage 2 step 5, M5-NODE-01): fm2d, one seat as a process over
+  # file journals, the TCP mesh and the HTTPS + SSE API. REGTEST only in this
+  # stage: it links fm2_dev for the shared dev chain file and the dev budget
+  # (the b3d adapter is stage 3). Never bitcoin_node (guard rule 3).
+  add_executable(fm2_daemon daemon/fm2d_main.cpp)
+  set_target_properties(fm2_daemon PROPERTIES OUTPUT_NAME fm2d)
+  target_link_libraries(fm2_daemon PRIVATE core_interface fm2_warnings fm2_dev fm2_netio)
 
   # sim/ (slice R14): the deterministic simulator and the walking skeleton,
   # in namespace flowmesh2::sim. FakeClock and the seeded Scheduler are the
@@ -308,6 +330,7 @@ if(BUILD_FLOWMESH2)
     test/fake_chain_tests.cpp
     test/fee_math_tests.cpp
     test/file_journal_tests.cpp
+    test/genesis_doc_tests.cpp
     test/hashes_tests.cpp
     test/https_sse_tests.cpp
     test/ids_tests.cpp
@@ -404,6 +427,18 @@ if(BUILD_FLOWMESH2)
       --selftest
   )
   set_tests_properties(flowmesh2_inventory PROPERTIES TIMEOUT 300 LABELS "flowmesh2;isolated;outline;lint")
+
+  # Four fm2d on regtest (M5-NODE-01): keygen, the dev chain faucet, four seats
+  # that heartbeat and agree, a deposit seen on every seat, a seat killed and
+  # restarted that catches up. The driver names no CMake target (guard rule 4).
+  add_test(NAME flowmesh2_e2e_regtest
+    COMMAND ${Python3_EXECUTABLE} -I -B ${FM2_CONTRIB}/e2e_regtest.py
+      --keygen $<TARGET_FILE:fm2_keygen>
+      --devchain $<TARGET_FILE:fm2_devchain>
+      --fm2d $<TARGET_FILE:fm2_daemon>
+      --workdir ${FM2_TEST_TMP}/e2e
+  )
+  set_tests_properties(flowmesh2_e2e_regtest PROPERTIES TIMEOUT 300 LABELS "flowmesh2;isolated;outline;e2e")
 
   add_test(NAME flowmesh2_todo_lint
     COMMAND ${Python3_EXECUTABLE} -I -B ${FM2_CONTRIB}/check_todo.py
