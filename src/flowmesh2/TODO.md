@@ -1,9 +1,27 @@
 # FlowMesh V2 clean core: task ledger (`rebirth`)
 
 Date: 2026-10-16. Branch: `rebirth`, based on `18051472`.
-This is the complete task list for the new core. Claude builds the outline
-(slices R1 to R14). Codex then completes every other task here, and starts by
-auditing the outline (M0-AUD-01). The design is in [ARCHITECTURE.md](ARCHITECTURE.md).
+This is the complete task list for the new core. Claude built the outline
+(slices R1 to R14). The design is in [ARCHITECTURE.md](ARCHITECTURE.md).
+
+**Owner instruction of 2026-11-14** (supersedes the role split above): the goal
+is a fully usable, Hyperliquid-style DEX on this core, tested on regtest
+first (then testnet), a hard fork of the modern chain being acceptable, with
+assets, trading and the bridge all functional. Claude completes the ledger
+in stages, each ending in a regtest demo and committed on `rebirth`; the
+owner rules on open decisions when asked, in plain text. Order: (1) durable
+multi-seat core (M4-STO-01, M4-STO-07, M4-AGR-01..07, M4-AGR-12, M4-SIM-01,
+M4-SIM-02); (2) real node and network (M4-NET-01, M5-API-01, M5-API-02,
+M5-CLI-01, an `fm2d` process); (3) chain assets on regtest (MB1, M6-DEX-04,
+M7-GOV-01, M7-SEAT-01, M7-FEE-01, M7-ADP-01); (4) bridge (M8-BRG-01..04,
+M8-CKP-01, M8-EXIT-01); (5) UX and perps (M7-TAPE-01, M5-QT-01, M9). Rows
+completed by Claude are marked `done` with their evidence; the owner's or
+the auditor's acceptance of each is pending until the owner says otherwise.
+Provisional defaults used (owner to override): rUSD as the regtest quote,
+bUSD through the bridge later; 4 regtest seats as local processes;
+withdrawals released by 2/3-of-seats checkpoints; V2 vault outputs on the
+modern chain from a regtest fork height, V1 balances migrate later; spot
+before perps; a separate `fm2d` process beside b3d.
 
 Landed outline slices: **R1** (build gate, error model, Boost.Test runner,
 inventory and TODO lint), **R2** (guards, compile-fail controls, evidence
