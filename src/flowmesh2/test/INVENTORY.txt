@@ -199,6 +199,9 @@ hashes_tests/registry_pinned
 hashes_tests/tagged_matches_the_bip340_definition
 hashes_tests/tags_unique_prefixed_and_distinct
 hashes_tests/unknown_tags_are_refused
+https_sse_tests/limits_and_timeouts_refuse_and_never_leak
+https_sse_tests/older_tls_and_plaintext_are_refused
+https_sse_tests/posts_reads_and_streams_over_tls
 ids_tests/account_id_golden
 ids_tests/ids_encode_as_raw_bytes
 ids_tests/ids_order_lexicographic
@@ -489,7 +492,6 @@ stub_inventory/M4_SIM_03
 stub_inventory/M4_STO_02
 stub_inventory/M4_STO_03
 stub_inventory/M4_STO_05
-stub_inventory/M5_API_01
 stub_inventory/M5_VFY_03
 stub_inventory/M7_ADP_01
 stub_inventory/M7_ADP_02

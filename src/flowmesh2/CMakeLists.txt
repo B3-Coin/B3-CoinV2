@@ -133,7 +133,6 @@ if(BUILD_FLOWMESH2)
     ledger/nonce_window.cpp
     ledger/state_commitment.cpp
     net/client_api.cpp
-    net/https_sse_api.cpp
     net/in_process_api.cpp
     net/in_process_mesh.cpp
     net/lanes.cpp
@@ -192,8 +191,13 @@ if(BUILD_FLOWMESH2)
   # ElligatorSwift ECDH, the BIP340 transport signatures and the socket
   # helpers, which fm2_core may not link (guard rule 4); only executables
   # and the tests link fm2_netio, never fm2_core, fm2_verify or fm2_types.
+  # Since M5-API-01 it also holds the HTTPS + SSE API (libevent's evhttp over
+  # bufferevent_openssl; OpenSSL and libevent are REQUIRED by the top-level
+  # build whenever BUILD_TESTS is on, so they are not new dependencies).
   add_library(fm2_netio STATIC
+    netio/api_json.cpp
     netio/bip324_session.cpp
+    netio/https_sse_api.cpp
     netio/mesh_handshake.cpp
     netio/tcp_mesh.cpp
   )
@@ -205,6 +209,13 @@ if(BUILD_FLOWMESH2)
       fm2_core
       bitcoin_common
       bitcoin_crypto
+      univalue
+      OpenSSL::SSL
+      OpenSSL::Crypto
+      libevent::core
+      libevent::extra
+      libevent::openssl
+      $<TARGET_NAME_IF_EXISTS:libevent::pthreads>
   )
 
   # dev/ (slice R10): REGTEST-only dev components, in namespace
@@ -298,6 +309,7 @@ if(BUILD_FLOWMESH2)
     test/fee_math_tests.cpp
     test/file_journal_tests.cpp
     test/hashes_tests.cpp
+    test/https_sse_tests.cpp
     test/ids_tests.cpp
     test/in_process_api_tests.cpp
     test/journal_tests.cpp

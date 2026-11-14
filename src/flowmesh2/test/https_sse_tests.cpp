@@ -1,0 +1,474 @@
+// Copyright (c) 2026 The B3 developers
+// Distributed under the MIT software license, see the accompanying
+// file COPYING or http://www.opensource.org/licenses/mit-license.php.
+
+#include <flowmesh2/core/facts.h>
+#include <flowmesh2/net/https_sse_api.h>
+#include <flowmesh2/netio/api_json.h>
+#include <flowmesh2/sim/sim_client.h>
+#include <flowmesh2/sim/sim_node.h>
+#include <flowmesh2/sim/trace.h>
+#include <flowmesh2/test/util/ledger_fixtures.h>
+#include <flowmesh2/test/util/require.h>
+#include <flowmesh2/test/util/storage_fixtures.h>
+#include <univalue.h>
+#include <util/fs.h>
+
+#include <openssl/bio.h>
+#include <openssl/err.h>
+#include <openssl/sha.h>
+#include <openssl/ssl.h>
+#include <openssl/x509.h>
+
+#include <boost/test/unit_test.hpp>
+
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+#include <atomic>
+#include <chrono>
+#include <fstream>
+#include <memory>
+#include <optional>
+#include <string>
+#include <thread>
+#include <vector>
+
+/** The HTTPS + SSE API (M5-API-01, O-104) over a simulated k = 1 node: TLS 1.3
+ * with a self-signed certificate whose SPKI fingerprint the client pins,
+ * actions posted and read back, state and health, the stream as SSE with
+ * cursors and heartbeats; TLS 1.2 and plaintext refused; limits refuse the
+ * excess and a timed-out request still takes its reply so nothing leaks.
+ */
+using namespace flowmesh2;
+using namespace flowmesh2::net;
+using namespace flowmesh2::sim;
+using namespace flowmesh2::test;
+
+namespace {
+
+struct Response {
+    int status{0};
+    std::string body;
+    std::string headers;
+};
+
+//! A blocking TLS client for the tests: one connection per request (Connection: close).
+class TlsClient
+{
+public:
+    TlsClient(uint16_t port, int min_version, int max_version) : m_port{port}, m_min{min_version}, m_max{max_version} {}
+    ~TlsClient() { Disconnect(); }
+    bool Connected()
+    {
+        Connect();
+        return m_connected;
+    }
+    std::string PeerSpkiFingerprint()
+    {
+        Connect();
+        if (!m_connected) return {};
+        X509* cert{SSL_get1_peer_certificate(m_ssl)};
+        if (cert == nullptr) return {};
+        EVP_PKEY* key{X509_get0_pubkey(cert)};
+        unsigned char* der{nullptr};
+        const int len{i2d_PUBKEY(key, &der)};
+        unsigned char digest[SHA256_DIGEST_LENGTH];
+        SHA256(der, static_cast<size_t>(len), digest);
+        OPENSSL_free(der);
+        X509_free(cert);
+        return netio::ToHex(std::span<const unsigned char>{digest, SHA256_DIGEST_LENGTH});
+    }
+    //! One request on its own connection, the whole reply read.
+    Response Request(const std::string& method, const std::string& path, const std::string& body = {},
+                     const std::string& content_type = "application/octet-stream")
+    {
+        Disconnect();
+        Connect();
+        BOOST_REQUIRE(m_connected);
+        std::string request{method + " " + path + " HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n"};
+        if (!body.empty() || method == "POST") {
+            request += "Content-Type: " + content_type + "\r\nContent-Length: " + std::to_string(body.size()) + "\r\n";
+        }
+        request += "\r\n" + body;
+        BOOST_REQUIRE(BIO_write(m_bio, request.data(), static_cast<int>(request.size())) == static_cast<int>(request.size()));
+        std::string raw;
+        char buf[4096];
+        for (;;) {
+            const int n{BIO_read(m_bio, buf, sizeof(buf))};
+            if (n <= 0) break;
+            raw.append(buf, static_cast<size_t>(n));
+        }
+        Disconnect();
+        return Parse(raw);
+    }
+    //! Open a stream and read until `until` appears in the decoded body or the limit passes; the connection stays open.
+    std::string Stream(const std::string& path, const std::string& until, std::chrono::milliseconds limit)
+    {
+        Disconnect();
+        Connect();
+        BOOST_REQUIRE(m_connected);
+        const std::string request{"GET " + path + " HTTP/1.1\r\nHost: 127.0.0.1\r\nAccept: text/event-stream\r\n\r\n"};
+        BOOST_REQUIRE(BIO_write(m_bio, request.data(), static_cast<int>(request.size())) == static_cast<int>(request.size()));
+        std::string raw;
+        char buf[4096];
+        const auto deadline{std::chrono::steady_clock::now() + limit};
+        while (std::chrono::steady_clock::now() < deadline) {
+            const int n{BIO_read(m_bio, buf, sizeof(buf))};
+            if (n <= 0) break;
+            raw.append(buf, static_cast<size_t>(n));
+            if (DecodeChunked(raw).find(until) != std::string::npos) break;
+        }
+        return DecodeChunked(raw);
+    }
+
+    static Response Parse(const std::string& raw)
+    {
+        Response out;
+        const size_t end{raw.find("\r\n\r\n")};
+        if (end == std::string::npos) return out;
+        out.headers = raw.substr(0, end);
+        if (out.headers.size() > 12) out.status = std::atoi(out.headers.substr(9, 3).c_str());
+        const std::string rest{raw.substr(end + 4)};
+        out.body = out.headers.find("Transfer-Encoding: chunked") != std::string::npos ? DecodeChunks(rest) : rest;
+        return out;
+    }
+    //! The decoded body of a (possibly partial) chunked response.
+    static std::string DecodeChunked(const std::string& raw)
+    {
+        const size_t end{raw.find("\r\n\r\n")};
+        if (end == std::string::npos) return {};
+        return DecodeChunks(raw.substr(end + 4));
+    }
+    static std::string DecodeChunks(const std::string& data)
+    {
+        std::string out;
+        size_t pos{0};
+        for (;;) {
+            const size_t line_end{data.find("\r\n", pos)};
+            if (line_end == std::string::npos) break;
+            const size_t size{static_cast<size_t>(std::strtoul(data.substr(pos, line_end - pos).c_str(), nullptr, 16))};
+            if (size == 0) break;
+            if (line_end + 2 + size > data.size()) break;
+            out += data.substr(line_end + 2, size);
+            pos = line_end + 2 + size + 2;
+        }
+        return out;
+    }
+
+private:
+    void Connect()
+    {
+        if (m_bio != nullptr) return;
+        m_ctx = SSL_CTX_new(TLS_client_method());
+        BOOST_REQUIRE(m_ctx != nullptr);
+        SSL_CTX_set_min_proto_version(m_ctx, m_min);
+        SSL_CTX_set_max_proto_version(m_ctx, m_max);
+        SSL_CTX_set_verify(m_ctx, SSL_VERIFY_NONE, nullptr); // the pin above replaces the CA check
+        m_bio = BIO_new_ssl_connect(m_ctx);
+        BOOST_REQUIRE(m_bio != nullptr);
+        BIO_get_ssl(m_bio, &m_ssl);
+        BOOST_REQUIRE(m_ssl != nullptr);
+        const std::string target{"127.0.0.1:" + std::to_string(m_port)};
+        BIO_set_conn_hostname(m_bio, target.c_str());
+        m_connected = BIO_do_connect(m_bio) > 0 && BIO_do_handshake(m_bio) > 0;
+    }
+    void Disconnect()
+    {
+        if (m_bio != nullptr) BIO_free_all(m_bio);
+        if (m_ctx != nullptr) SSL_CTX_free(m_ctx);
+        m_bio = nullptr;
+        m_ctx = nullptr;
+        m_ssl = nullptr;
+        m_connected = false;
+    }
+
+    uint16_t m_port;
+    int m_min;
+    int m_max;
+    SSL_CTX* m_ctx{nullptr};
+    BIO* m_bio{nullptr};
+    SSL* m_ssl{nullptr};
+    bool m_connected{false};
+};
+
+UniValue Json(const std::string& text)
+{
+    UniValue value;
+    BOOST_REQUIRE_MESSAGE(value.read(text), "not JSON: " + text);
+    return value;
+}
+
+struct Rig {
+    TraceRecorder trace;
+    std::unique_ptr<SimNode> node;
+    std::optional<SimClient> alice;
+    std::optional<SimClient> bob;
+    std::unique_ptr<HttpsSseApi> api;
+    std::atomic<bool> pumping{true};
+    std::thread pumper;
+    fs::path dir;
+
+    explicit Rig(HttpsSseConfig config = {})
+    {
+        Result<std::unique_ptr<SimNode>> created{SimNode::Create(SimNodeConfig{}, trace)};
+        RequireOk(created, "SimNode::Create");
+        node = std::move(created).value();
+        const std::vector<MarketDescriptor> markets{node->Markets().begin(), node->Markets().end()};
+        alice = SimClient::Create("alice", node->Profile(), node->Domain(), node->Seats(), markets).value();
+        bob = SimClient::Create("bob", node->Profile(), node->Domain(), node->Seats(), markets).value();
+        std::vector<Fact> facts;
+        DepositFact a;
+        a.cursor = FactCursor{SIM_BASE_HEIGHT + 1, 0};
+        a.outpoint = Outpoint{SimLabelHash("fm2/test/https/T1"), 0};
+        a.account = alice->Account();
+        a.asset = SimAsset("rUSD");
+        a.amount = 1'000'000'000;
+        DepositFact b;
+        b.cursor = FactCursor{SIM_BASE_HEIGHT + 1, 1};
+        b.outpoint = Outpoint{SimLabelHash("fm2/test/https/T2"), 0};
+        b.account = bob->Account();
+        b.asset = AssetId::Native();
+        b.amount = 10'000'000'000;
+        facts.push_back(Fact{a});
+        facts.push_back(Fact{b});
+        RequireOk(node->Chain().AppendBlock(SimBlockHash(SIM_BASE_HEIGHT + 1), facts), "AppendBlock");
+        RequireOk(node->SealSlot(), "SealSlot 1");
+        dir = fs::PathFromString(FM2_TEST_TMP_DIR) / fs::u8path("https_sse_" + std::to_string(reinterpret_cast<uintptr_t>(this)));
+        fs::remove_all(dir);
+        fs::create_directories(dir);
+        config.profile = node->Profile();
+        config.dev_self_signed = true;
+        config.self_signed_dir = fs::PathToString(dir);
+        if (config.heartbeat_ms == 1'000) config.heartbeat_ms = 150;
+        Result<std::unique_ptr<HttpsSseApi>> served{HttpsSseApi::Create(config, node->Api())};
+        RequireOk(served, "HttpsSseApi::Create");
+        api = std::move(served).value();
+        StartPumper();
+    }
+    void StartPumper()
+    {
+        pumping = true;
+        pumper = std::thread{[this] {
+            while (pumping) {
+                (void)node->Pump(16);
+                api->Notify();
+                std::this_thread::sleep_for(std::chrono::milliseconds{2});
+            }
+        }};
+    }
+    ~Rig()
+    {
+        pumping = false;
+        if (pumper.joinable()) pumper.join();
+        api->Stop();
+        fs::remove_all(dir);
+    }
+    std::string Frame(const std::vector<unsigned char>& bytes) const { return std::string{bytes.begin(), bytes.end()}; }
+};
+
+} // namespace
+
+BOOST_AUTO_TEST_SUITE(https_sse_tests)
+
+BOOST_AUTO_TEST_CASE(posts_reads_and_streams_over_tls)
+{
+    Rig rig;
+    const uint16_t port{rig.api->Port()};
+    BOOST_CHECK_NE(port, 0);
+    // The pin: the client's view of the certificate equals the server's fingerprint and the file the daemon writes.
+    {
+        TlsClient client{port, TLS1_3_VERSION, TLS1_3_VERSION};
+        BOOST_REQUIRE(client.Connected());
+        BOOST_CHECK_EQUAL(client.PeerSpkiFingerprint(), rig.api->CertificateFingerprint());
+        std::ifstream fingerprint{fs::PathToString(rig.dir / fs::u8path("api.fingerprint"))};
+        std::string line;
+        std::getline(fingerprint, line);
+        BOOST_CHECK_EQUAL(line, rig.api->CertificateFingerprint());
+        const Response health{client.Request("GET", "/v2/health")};
+        BOOST_CHECK_EQUAL(health.status, 200);
+        const UniValue h{Json(health.body)};
+        BOOST_CHECK(!h["fenced"].get_bool());
+        BOOST_CHECK_EQUAL(h["published_height"].getInt<uint64_t>(), 1U);
+    }
+    // POST alice's bid: ADMITTED with its id; the same bytes again: DUPLICATE; GET by id: PENDING, then INCLUDED after the slot.
+    const MarketDescriptor m1{SimMarketM1()};
+    const std::vector<unsigned char> bid{rig.alice->Place("bid", 1, m1, Side::BUY, TimeInForce::GTC, 100, 3, 1).value()};
+    std::string action_id;
+    {
+        TlsClient client{port, TLS1_3_VERSION, TLS1_3_VERSION};
+        const Response posted{client.Request("POST", "/v2/actions", rig.Frame(bid))};
+        BOOST_REQUIRE_EQUAL(posted.status, 200);
+        const UniValue reply{Json(posted.body)};
+        BOOST_CHECK_EQUAL(reply["code"].get_str(), "ADMITTED");
+        action_id = reply["action_id"].get_str();
+        BOOST_CHECK_EQUAL(action_id.size(), 64U);
+    }
+    {
+        TlsClient client{port, TLS1_3_VERSION, TLS1_3_VERSION};
+        const Response again{client.Request("POST", "/v2/actions", rig.Frame(bid))};
+        BOOST_REQUIRE_EQUAL(again.status, 200);
+        BOOST_CHECK_EQUAL(Json(again.body)["code"].get_str(), "DUPLICATE");
+    }
+    {
+        TlsClient client{port, TLS1_3_VERSION, TLS1_3_VERSION};
+        const Response status{client.Request("GET", "/v2/actions/" + action_id)};
+        BOOST_REQUIRE_EQUAL(status.status, 200);
+        BOOST_CHECK_EQUAL(Json(status.body)["status"].get_str(), "PENDING");
+    }
+    RequireOk(rig.node->SealSlot(), "SealSlot 2");
+    {
+        TlsClient client{port, TLS1_3_VERSION, TLS1_3_VERSION};
+        const Response status{client.Request("GET", "/v2/actions/" + action_id)};
+        BOOST_REQUIRE_EQUAL(status.status, 200);
+        const UniValue s{Json(status.body)};
+        BOOST_CHECK_EQUAL(s["status"].get_str(), "INCLUDED");
+        BOOST_CHECK_EQUAL(s["included"]["ref"]["height"].getInt<uint64_t>(), 2U);
+        BOOST_CHECK_EQUAL(s["included"]["outcome"]["code"].get_str(), "RESTING");
+        BOOST_CHECK(!s["included"]["envelope"].get_str().empty());
+        // The status by the original bytes too.
+        const Response by_bytes{client.Request("POST", "/v2/actions/status", rig.Frame(bid))};
+        BOOST_REQUIRE_EQUAL(by_bytes.status, 200);
+        BOOST_CHECK_EQUAL(Json(by_bytes.body)["status"].get_str(), "INCLUDED");
+    }
+    {
+        TlsClient client{port, TLS1_3_VERSION, TLS1_3_VERSION};
+        const Response state{client.Request("GET", "/v2/state/" + rig.alice->Account().id.GetHex())};
+        BOOST_REQUIRE_EQUAL(state.status, 200);
+        const UniValue s{Json(state.body)};
+        BOOST_CHECK_EQUAL(s["status"].get_str(), "FOUND");
+        BOOST_CHECK_EQUAL(s["head"]["label"].get_str(), "CERTIFIED");
+        BOOST_CHECK_EQUAL(s["head"]["height"].getInt<uint64_t>(), 2U);
+        BOOST_CHECK_EQUAL(s["witness"]["leaf"]["open_orders"].getInt<uint64_t>(), 1U);
+        BOOST_CHECK(!s["witness"]["proof"]["encoded"].get_str().empty());
+        const Response unknown{client.Request("GET", "/v2/state/" + std::string(64, '0'))};
+        BOOST_CHECK_EQUAL(unknown.status, 200);
+        BOOST_CHECK_EQUAL(Json(unknown.body)["status"].get_str(), "UNKNOWN");
+        const Response bad{client.Request("GET", "/v2/state/zz")};
+        BOOST_CHECK_EQUAL(bad.status, 400);
+        const Response missing{client.Request("GET", "/v2/nothing")};
+        BOOST_CHECK_EQUAL(missing.status, 404);
+        const Response garbage{client.Request("POST", "/v2/actions", "not an action")};
+        BOOST_CHECK_EQUAL(garbage.status, 200); // a definite admission answer
+        BOOST_CHECK_NE(Json(garbage.body)["code"].get_str(), "ADMITTED"); // a definite refusal code (WRONG_DOMAIN here: A2 before the shape)
+        const Response unknown_id{client.Request("GET", "/v2/actions/" + std::string(64, 'a'))};
+        BOOST_CHECK_EQUAL(unknown_id.status, 404);
+    }
+    // A static document.
+    rig.api->AddStatic("/v2/genesis", "application/json", "{\"hello\":1}");
+    {
+        TlsClient client{port, TLS1_3_VERSION, TLS1_3_VERSION};
+        const Response genesis{client.Request("GET", "/v2/genesis")};
+        BOOST_CHECK_EQUAL(genesis.status, 200);
+        BOOST_CHECK_EQUAL(genesis.body, "{\"hello\":1}");
+    }
+    // The stream: a snapshot of slot 2, a heartbeat, then slot 3 as a delta.
+    {
+        TlsClient client{port, TLS1_3_VERSION, TLS1_3_VERSION};
+        std::thread sealer{[&] {
+            std::this_thread::sleep_for(std::chrono::milliseconds{400});
+            RequireOk(rig.node->SealSlot(), "SealSlot 3");
+        }};
+        const std::string events{client.Stream("/v2/stream?channel=slots", "\"head_slot\":3", std::chrono::milliseconds{5'000})};
+        sealer.join();
+        BOOST_CHECK(events.find("event: snapshot") != std::string::npos);
+        BOOST_CHECK(events.find("event: heartbeat") != std::string::npos);
+        BOOST_CHECK(events.find("event: delta") != std::string::npos);
+        BOOST_CHECK(events.find("id: " + std::to_string(rig.node->Seat().Streams().StreamEpoch()) + ":1:2") != std::string::npos);
+        BOOST_CHECK(events.find("\"channel\":\"slots\"") != std::string::npos);
+    }
+    {
+        TlsClient client{port, TLS1_3_VERSION, TLS1_3_VERSION};
+        const Response bad{client.Request("GET", "/v2/stream?channel=nope")};
+        BOOST_CHECK_EQUAL(bad.status, 400);
+        const Response filter{client.Request("GET", "/v2/stream?channel=account")};
+        BOOST_CHECK_EQUAL(filter.status, 400);
+    }
+    const HttpsSseStatus status{rig.api->Status()};
+    BOOST_CHECK_GE(status.requests_served, 12U);
+    BOOST_CHECK_EQUAL(status.port, port);
+}
+
+BOOST_AUTO_TEST_CASE(older_tls_and_plaintext_are_refused)
+{
+    Rig rig;
+    const uint16_t port{rig.api->Port()};
+    TlsClient old{port, TLS1_2_VERSION, TLS1_2_VERSION};
+    BOOST_CHECK(!old.Connected());
+    TlsClient fresh{port, TLS1_3_VERSION, TLS1_3_VERSION};
+    BOOST_CHECK(fresh.Connected());
+    // Plaintext: the server speaks TLS only, so an HTTP request gets no HTTP answer.
+    const int fd{::socket(AF_INET, SOCK_STREAM, 0)};
+    BOOST_REQUIRE(fd >= 0);
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    BOOST_REQUIRE(::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0);
+    const std::string request{"GET /v2/health HTTP/1.0\r\n\r\n"};
+    BOOST_REQUIRE(::send(fd, request.data(), request.size(), 0) == static_cast<ssize_t>(request.size()));
+    timeval tv{1, 0};
+    ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    char buf[256];
+    const ssize_t n{::recv(fd, buf, sizeof(buf), 0)};
+    ::close(fd);
+    const bool no_http{n <= 0 || std::string(buf, static_cast<size_t>(n)).find("HTTP/1.") == std::string::npos};
+    BOOST_CHECK(no_http);
+    // Refusals at Create.
+    HttpsSseConfig zero_rtt;
+    zero_rtt.zero_rtt = true;
+    RequireRefusal(HttpsSseApi::Create(zero_rtt, rig.node->Api()), ErrorCode::INVALID_INPUT, HTTPS_ZERO_RTT, "0-RTT");
+    HttpsSseConfig no_cert;
+    RequireRefusal(HttpsSseApi::Create(no_cert, rig.node->Api()), ErrorCode::INVALID_INPUT, HTTPS_CERTIFICATE, "no certificate");
+}
+
+BOOST_AUTO_TEST_CASE(limits_and_timeouts_refuse_and_never_leak)
+{
+    {
+        HttpsSseConfig config;
+        config.max_connections_per_ip = 2;
+        Rig rig{config};
+        const uint16_t port{rig.api->Port()};
+        // Two streams hold the per-IP budget; a third request is refused with 429 while they are open.
+        TlsClient one{port, TLS1_3_VERSION, TLS1_3_VERSION};
+        TlsClient two{port, TLS1_3_VERSION, TLS1_3_VERSION};
+        (void)one.Stream("/v2/stream?channel=slots", "event: snapshot", std::chrono::milliseconds{3'000});
+        (void)two.Stream("/v2/stream?channel=slots", "event: snapshot", std::chrono::milliseconds{3'000});
+        TlsClient three{port, TLS1_3_VERSION, TLS1_3_VERSION};
+        const Response refused{three.Request("GET", "/v2/health")};
+        BOOST_CHECK_EQUAL(refused.status, 429);
+        BOOST_CHECK_GE(rig.api->Status().refused, 1U);
+        BOOST_CHECK_EQUAL(rig.api->Status().streams, 2U);
+    }
+    {
+        // Without the node's pump a POST times out with 504; once the node pumps, the reply is taken: no open request stays behind.
+        HttpsSseConfig config;
+        config.reply_deadline_ms = 50;
+        Rig rig{config};
+        rig.pumping = false;
+        if (rig.pumper.joinable()) rig.pumper.join();
+        const MarketDescriptor m1{SimMarketM1()};
+        const std::vector<unsigned char> bid{rig.alice->Place("late", 1, m1, Side::BUY, TimeInForce::GTC, 100, 1, 1).value()};
+        TlsClient client{rig.api->Port(), TLS1_3_VERSION, TLS1_3_VERSION};
+        const Response timed_out{client.Request("POST", "/v2/actions", rig.Frame(bid))};
+        BOOST_CHECK_EQUAL(timed_out.status, 504);
+        BOOST_CHECK_EQUAL(rig.node->Api().OpenRequests(), 1U);
+        RequireOk(rig.node->Pump(4), "Pump");
+        rig.api->Notify();
+        const auto deadline{std::chrono::steady_clock::now() + std::chrono::seconds{3}};
+        while (rig.node->Api().OpenRequests() > 0 && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds{5});
+        }
+        BOOST_CHECK_EQUAL(rig.node->Api().OpenRequests(), 0U);
+        // The action was admitted meanwhile, so its status is known afterwards (the pump running again).
+        rig.StartPumper();
+        TlsClient later{rig.api->Port(), TLS1_3_VERSION, TLS1_3_VERSION};
+        const Response status{later.Request("POST", "/v2/actions/status", rig.Frame(bid))};
+        BOOST_CHECK_EQUAL(status.status, 200);
+        BOOST_CHECK_EQUAL(Json(status.body)["status"].get_str(), "PENDING");
+    }
+}
+
+BOOST_AUTO_TEST_SUITE_END()

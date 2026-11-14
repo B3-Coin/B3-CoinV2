@@ -603,12 +603,6 @@ FM2_STUB_CASE(M7_ADP_02, "M7-ADP-02")
 
 // ---- Slice R13: net/ client API ----
 
-FM2_STUB_CASE(M5_API_01, "M5-API-01")
-{
-    ApiRig rig;
-    return Observe(net::HttpsSseApi::Create(net::HttpsSseConfig{}, *rig.api));
-}
-
 // ---- Slice R13: net/ seat mesh ----
 
 FM2_STUB_CASE(M4_NET_03, "M4-NET-03")

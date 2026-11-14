@@ -20,7 +20,8 @@
  * EVERY seat on the ACTION lane (dedup by ActionId at each seat), so no
  * single seat can censor by silence. It serves verified views, streams and
  * proofs but is never a source of truth (SEC-5); seats never serve the
- * public API (research N-R11). A BUSY lane to one seat does not stop the
+ * public API (research N-R11; deferred until this task lands: regtest seats
+ * serve the API themselves, O-104). A BUSY lane to one seat does not stop the
  * others; the report says how many seats queued the frame.
  *
  * Stub: Fanout returns NotImplemented(M4-NET-03).
