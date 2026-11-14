@@ -62,13 +62,14 @@
  *   only input CommitLog::AppendApplied takes: APPLIED, and so publication,
  *   can only follow an Apply that passed check 3 (O-92).
  * - Head(): the current head; never null.
- * - Restore(base, records): install a head rebuilt from a snapshot and the
- *   DECISION records after it. Stub M4-STO-03; ReplayDecisions
- *   (state/replay.h) is the real, pure part of recovery. Restore installs
- *   ReplayResult::head (the last APPLIED slot); a decided slot without
- *   APPLIED is applied only after check 3 passes again under the current
- *   authority, and a refusal leaves the head there and the node fenced
- *   (O-89).
+ * - Restore(base, records): install the head ReplayDecisions rebuilds from
+ *   the genesis `base` and the whole commit journal (M4-STO-01's restart,
+ *   landed 2026-11-14): the owner must still be at its genesis
+ *   (ORDER_VIOLATION, RESTORE_NOT_FRESH) and `base` must be it
+ *   (INVALID_INPUT, OWNER_NOT_GENESIS). A decided slot without APPLIED is
+ *   applied only after check 3 passes again under the current authority
+ *   (O-89); until M4-STO-03 lands that case, and a snapshot base, are
+ *   NotImplemented.
  *
  * Create(profile, genesis, commit_journal_instance) takes a GENESIS head
  * only (height 0, zero parent hash, parent certificate hash and certificate
@@ -95,6 +96,7 @@ inline constexpr std::string_view OWNER_SEAT_SET_MISMATCH{"initial header names 
 inline constexpr std::string_view OWNER_STATE_ROOT_MISMATCH{"initial header does not commit to its state"};    //!< (VERIFY_FAILED)
 inline constexpr std::string_view DECISION_OTHER_HEADER{"decision token for another header"};                 //!< (VERIFY_FAILED)
 inline constexpr std::string_view AUTHORITY_SUPERSEDED{"candidate authority is not the current authority"};   //!< (AUTHORITY_CHANGED)
+inline constexpr std::string_view RESTORE_NOT_FRESH{"restore onto an owner whose head already moved"};         //!< (ORDER_VIOLATION)
 
 //! What a successful Apply gives: the new head, and the receipt CommitLog::AppendApplied requires (O-92).
 struct AppliedSlot {

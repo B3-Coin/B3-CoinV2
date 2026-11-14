@@ -4,6 +4,8 @@
 
 #include <flowmesh2/sim/scenario.h>
 
+#include <flowmesh2/sim/checks.h>
+
 #include <flowmesh2/admission/admission.h>
 #include <flowmesh2/admission/pool.h>
 #include <flowmesh2/core/account_leaf.h>
@@ -42,10 +44,10 @@ namespace flowmesh2::sim {
 
 namespace {
 
-constexpr std::array<std::string_view, 21> ALL_CHECKS{"P1", "P2", "P3", "P4", "P5", "P6", "P7", "P8", "N1",  "N2",  "N3",
-                                                      "N4", "N5", "N6", "N7", "N8", "N9", "N10", "N11", "N12", "N13"};
+constexpr std::array<std::string_view, 27> ALL_CHECKS{"P1", "P2", "P3", "P4", "P5", "P6", "P7", "P8", "N1",  "N2",  "N3", "N4", "N5", "N6",
+                                                      "N7", "N8", "N9", "N10", "N11", "N12", "N13", "Q1", "Q2", "Q3", "Q4", "Q5", "Q6"};
 constexpr std::array<std::string_view, 1> SUITE_CHECKS{"P6"};
-constexpr std::array<Variant, 3> ALL_VARIANTS{Variant::WALKING_SKELETON, Variant::STORAGE_FAULT, Variant::AUTHORITY_FAULT};
+constexpr std::array<Variant, 4> ALL_VARIANTS{Variant::WALKING_SKELETON, Variant::STORAGE_FAULT, Variant::AUTHORITY_FAULT, Variant::PBFT_CLUSTER};
 
 /** P1: the canonical body order of slots 2, 3 and 4 by outbox label. Pinned
  * from the first run of the outline (every seed gives these; the order is
@@ -60,38 +62,8 @@ constexpr uint64_t JITTER_MS{8};
 constexpr uint64_t STEP_EVENT_LIMIT{10'000};
 constexpr int MAX_COLLECT_ATTEMPTS{64};
 
-std::string ErrorText(const Error& error) { return std::string{ToString(error.code)} + " " + std::string{error.detail}; }
-
-//! The results of the checks of one run (or of a suite).
-class Checks
-{
-public:
-    void Expect(std::string_view id, bool ok, std::string_view what)
-    {
-        CheckResult& result{m_results[std::string{id}]};
-        if (!result.ran) {
-            result.ran = true;
-            result.passed = true;
-        }
-        if (!ok && result.passed) {
-            result.passed = false;
-            result.detail = std::string{what};
-        }
-    }
-    template <class T>
-    void ExpectOk(std::string_view id, const Result<T>& result, std::string_view what)
-    {
-        if (result.has_value()) {
-            Expect(id, true, what);
-        } else {
-            Expect(id, false, std::string{what} + ": " + ErrorText(result.error()));
-        }
-    }
-    const CheckMap& Results() const { return m_results; }
-
-private:
-    CheckMap m_results;
-};
+using detail::Checks;
+using detail::ErrorText;
 
 //! One submission of a step and what came back.
 struct Submission {
@@ -1394,6 +1366,8 @@ std::string_view ToString(Variant variant)
         return "walking_skeleton_storage_fault";
     case Variant::AUTHORITY_FAULT:
         return "walking_skeleton_authority_fault";
+    case Variant::PBFT_CLUSTER:
+        return "pbft_cluster";
     }
     return "UNKNOWN";
 }
@@ -1419,6 +1393,8 @@ std::vector<std::string_view> ManifestOf(Variant variant)
         return {"P2", "P3", "P4", "P8", "N10"};
     case Variant::AUTHORITY_FAULT:
         return {"P2", "P3", "P4", "P8", "N11"};
+    case Variant::PBFT_CLUSTER:
+        return {"Q1", "Q2", "Q3", "Q4", "Q5", "Q6"};
     }
     return std::vector<std::string_view>{}; // an unregistered variant runs nothing
 }
@@ -1438,11 +1414,12 @@ bool RunReport::Passed() const
 
 RunReport RunWalkingSkeleton(uint64_t seed, Variant variant)
 {
+    if (variant == Variant::PBFT_CLUSTER) return RunPbftCluster(seed);
     Driver driver{seed, variant};
     return driver.Run();
 }
 
-CheckResult EvaluateP6(std::span<const RunReport> first, std::span<const RunReport> second, bool need_distinct)
+CheckResult EvaluateP6(std::span<const RunReport> first, std::span<const RunReport> second, bool need_distinct, bool need_same_headers)
 {
     Checks p6;
     if (first.empty()) return CheckResult{false, false, "no run"};
@@ -1458,9 +1435,11 @@ CheckResult EvaluateP6(std::span<const RunReport> first, std::span<const RunRepo
             p6.Expect("P6", run.headers == again.headers && run.final_state_root == again.final_state_root,
                       where + ": the same seed twice gives other headers or root");
         }
-        p6.Expect("P6", run.headers == first[0].headers, where + ": header hashes differ from seed " + std::to_string(first[0].seed));
-        p6.Expect("P6", run.final_state_root == first[0].final_state_root,
-                  where + ": final state root differs from seed " + std::to_string(first[0].seed));
+        if (need_same_headers) {
+            p6.Expect("P6", run.headers == first[0].headers, where + ": header hashes differ from seed " + std::to_string(first[0].seed));
+            p6.Expect("P6", run.final_state_root == first[0].final_state_root,
+                      where + ": final state root differs from seed " + std::to_string(first[0].seed));
+        }
         digests.insert(run.trace_digest);
     }
     if (need_distinct && first.size() >= 8) {
@@ -1488,7 +1467,7 @@ SuiteReport RunSuite(std::span<const Variant> variants, uint64_t seed_from, uint
         std::set<uint256> digests;
         for (const RunReport& run : first) digests.insert(run.trace_digest);
         report.distinct_trace_digests[std::string{ToString(variant)}] = digests.size();
-        const CheckResult p6{EvaluateP6(first, second, variant == Variant::WALKING_SKELETON)};
+        const CheckResult p6{EvaluateP6(first, second, variant == Variant::WALKING_SKELETON, variant != Variant::PBFT_CLUSTER)};
         suite.Expect("P6", p6.ran && p6.passed, p6.detail);
         for (RunReport& run : first) report.runs.push_back(std::move(run));
     }

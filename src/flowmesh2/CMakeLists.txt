@@ -218,6 +218,7 @@ if(BUILD_FLOWMESH2)
   # the tests and the fm2-sim CLI links it.
   add_library(fm2_simlib STATIC
     sim/cluster.cpp
+    sim/cluster_scenario.cpp
     sim/scenario.cpp
     sim/scheduler.cpp
     sim/sim_client.cpp
@@ -299,6 +300,7 @@ if(BUILD_FLOWMESH2)
     test/seat_set_tests.cpp
     test/seat_signer_tests.cpp
     test/signer_log_tests.cpp
+    test/sim_cluster_tests.cpp
     test/sim_node_tests.cpp
     test/sim_scheduler_tests.cpp
     test/sim_trace_tests.cpp

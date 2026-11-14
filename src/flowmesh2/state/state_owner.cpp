@@ -4,6 +4,8 @@
 
 #include <flowmesh2/state/state_owner.h>
 
+#include <flowmesh2/state/replay.h>
+
 #include <flowmesh2/core/state_root.h>
 #include <flowmesh2/storage/journal.h>
 
@@ -92,10 +94,22 @@ Result<AppliedSlot> StateOwner::Apply(Candidate&& candidate, const DurableDecisi
     return Ok(AppliedSlot{std::move(installed), std::move(receipt)});
 }
 
-Result<void> StateOwner::Restore(const HeadView& /*base*/, std::span<const storage::JournalRecord> /*records*/)
+Result<void> StateOwner::Restore(const HeadView& base, std::span<const storage::JournalRecord> records)
 {
-    // Snapshot plus exactly-once replay of the DECISION records after it (plan section 3.7).
-    return NotImplemented("M4-STO-03"); // TODO(rebirth:M4-STO-03)
+    // Replay from the genesis head over the whole commit journal (M4-STO-01's
+    // restart; a snapshot base is M4-STO-03's).
+    Result<ReplayResult> replayed{ReplayDecisions(base, records)};
+    if (!replayed.has_value()) return replayed.error();
+    if (!(replayed->decided_head.Header() == replayed->head.Header())) {
+        // A decided slot without APPLIED: check 3 must run again under the current authority before it is applied.
+        return NotImplemented("M4-STO-03"); // TODO(rebirth:M4-STO-03) apply the decided-but-unapplied tail on restore
+    }
+    std::shared_ptr<const HeadView> installed{std::make_shared<const HeadView>(replayed->head)};
+    LOCK(m_mutex);
+    if (m_head->Header().height != 0) return Error{ErrorCode::ORDER_VIOLATION, RESTORE_NOT_FRESH};
+    if (!(m_head->Header() == base.Header())) return Error{ErrorCode::INVALID_INPUT, OWNER_NOT_GENESIS};
+    m_head = std::move(installed);
+    return Ok();
 }
 
 } // namespace flowmesh2::state

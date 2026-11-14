@@ -59,9 +59,9 @@
  * M2-LED-05 and M2-LED-06 (and M3-ENG-09 until it landed) to probe admission's kind rule
  * (KindAdmissible, whose Unsupported refusals become UNSUPPORTED_KIND).
  * Slice R13 adds the client API's HTTPS + SSE transport (M5-API-01) and
- * streams (M5-API-02, InProcessApi::Subscribe); the in-process (M4-SIM-01)
- * and TCP (M4-NET-01) seat meshes, short IDs (M4-NET-02, until the codec
- * landed) and sentry fan-out (M4-NET-03); the bridge's mint (M8-BRG-01)
+ * streams (M5-API-02, InProcessApi::Subscribe); the in-process (M4-SIM-01,
+ * until the mesh landed) and TCP (M4-NET-01) seat meshes, short IDs
+ * (M4-NET-02, until the codec landed) and sentry fan-out (M4-NET-03); the bridge's mint (M8-BRG-01)
  * and release limits (M8-BRG-03); the futures oracle (M9-FUT-02) and
  * margin (M9-FUT-03); removals (M7-GOV-02) and versioned parameters
  * (M7-GOV-03). It extends M8-BRG-02 to probe BuildWithdrawalPacket,
@@ -512,14 +512,14 @@ FM2_STUB_CASE(M4_STO_02, "M4-STO-02")
 
 FM2_STUB_CASE(M4_STO_03, "M4-STO-03")
 {
-    // Write and Load; the store touches no file in the outline. StateOwner::Restore (R9).
+    // Write and Load; the store touches no file in the outline. StateOwner::Restore from the genesis landed with
+    // M4-SIM-02 (a restarted simulated node); a snapshot base and the decided-but-unapplied tail stay M4-STO-03's.
     storage::SnapshotStore store{fs::PathFromString(FM2_TEST_TMP_DIR) / fs::u8path("stub_m4_sto_03_never_created")};
     const storage::SnapshotMark mark{1, uint256::ONE, uint256::ONE};
     HeartbeatOwner heartbeat{MakeHeartbeatOwner()};
     const std::shared_ptr<const state::HeadView> head{heartbeat.owner->Head()};
     const std::vector<storage::JournalRecord> marked{{1, storage::RecordType::SNAPSHOT_MARK, {}, uint256{}}};
     return FirstDeviation("M4-STO-03", {Observe(store.Write(mark, Bytes("state"))), Observe(store.Load(mark)),
-                                        Observe(heartbeat.owner->Restore(*head, {})),
                                         Observe(state::ReplayDecisions(*head, marked))});
 }
 
@@ -623,14 +623,6 @@ FM2_STUB_CASE(M5_API_02, "M5-API-02")
 
 // ---- Slice R13: net/ seat mesh ----
 
-FM2_STUB_CASE(M4_SIM_01, "M4-SIM-01")
-{
-    // R13: the in-process seat mesh; R14: a simulated cluster of more than one node.
-    sim::TraceRecorder trace;
-    return FirstDeviation("M4-SIM-01", {Observe(net::InProcessSeatMesh::Create(TestMeshConfig(0, 4), 4)),
-                                        Observe(sim::SimCluster::Create(4, sim::SimNodeConfig{}, trace))});
-}
-
 FM2_STUB_CASE(M4_NET_01, "M4-NET-01")
 {
     return Observe(net::TcpSeatMesh::Create(net::TcpMeshConfig{TestMeshConfig(0, 4), net::DEFAULT_SEAT_MESH_PORT, {}}));
@@ -690,20 +682,6 @@ FM2_STUB_CASE(M7_GOV_03, "M7-GOV-03")
 }
 
 // ---- Slice R14: sim/ ----
-
-FM2_STUB_CASE(M4_SIM_02, "M4-SIM-02")
-{
-    // Each target-shape fault on its own is the stub; the three real faults are not.
-    std::vector<sim::FaultPlan> plans(5);
-    plans[0].crash_before_slot = 2;
-    plans[1].drop.push_back(sim::DropRule{0, 1, 1'000});
-    plans[2].delay.push_back(sim::DelayRule{0, 1, 5});
-    plans[3].partition.push_back({0});
-    plans[4].skew.push_back(sim::SkewRule{0, 3});
-    std::vector<StubObservation> observed;
-    for (const sim::FaultPlan& plan : plans) observed.push_back(Observe(sim::CheckFaultPlan(plan)));
-    return FirstDeviation("M4-SIM-02", observed);
-}
 
 FM2_STUB_CASE(M4_SIM_03, "M4-SIM-03")
 {

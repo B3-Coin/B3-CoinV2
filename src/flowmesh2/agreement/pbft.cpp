@@ -112,7 +112,8 @@ PbftAgreement::PbftAgreement(const ProfileParams& profile, const PbftConfig& con
       m_votes{context.votes},
       m_seats{std::move(seats)},
       m_domain{context.owner.Head()->Header().domain},
-      m_parent_cert{std::move(parent_cert)}
+      m_parent_cert{std::move(parent_cert)},
+      m_now_ms{config.start_ms}
 {
 }
 

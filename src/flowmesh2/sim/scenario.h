@@ -50,19 +50,20 @@
  */
 namespace flowmesh2::sim {
 
-//! The three walking-skeleton variants. APPEND-ONLY; zero is never a value.
+//! The scenario variants. APPEND-ONLY; zero is never a value.
 enum class Variant : uint8_t {
     WALKING_SKELETON = 1,
     STORAGE_FAULT = 2,   //!< walking_skeleton_storage_fault (N10)
     AUTHORITY_FAULT = 3, //!< walking_skeleton_authority_fault (N11)
+    PBFT_CLUSTER = 4,    //!< pbft_cluster: four seats, PBFT, faults (M4-SIM-01, M4-SIM-02; sim/cluster_scenario.cpp)
 };
 
-//! The CLI name: walking_skeleton, walking_skeleton_storage_fault, walking_skeleton_authority_fault.
+//! The CLI name: walking_skeleton, walking_skeleton_storage_fault, walking_skeleton_authority_fault, pbft_cluster.
 std::string_view ToString(Variant variant);
 std::optional<Variant> VariantFromName(std::string_view name);
 std::span<const Variant> AllVariants();
 
-//! P1..P8, N1..N13, in that order.
+//! P1..P8, N1..N13, Q1..Q6, in that order.
 std::span<const std::string_view> AllChecks();
 //! The checks one run of `variant` must execute and pass.
 std::vector<std::string_view> ManifestOf(Variant variant);
@@ -92,7 +93,10 @@ struct RunReport {
     bool Passed() const;
 };
 
+//! One run of `variant` (the walking-skeleton variants, or RunPbftCluster for PBFT_CLUSTER).
 RunReport RunWalkingSkeleton(uint64_t seed, Variant variant);
+//! The four-seat PBFT cluster under faults (sim/cluster_scenario.cpp): checks Q1..Q6.
+RunReport RunPbftCluster(uint64_t seed);
 
 struct SuiteReport {
     std::vector<Variant> variants;
@@ -112,8 +116,12 @@ struct SuiteReport {
  * the headers and final root of first[0], first and second have the same
  * size, and, when `need_distinct` and first holds at least 8 runs, at least
  * two of first's trace digests differ. Ran is true unless first is empty.
+ * With `need_same_headers` false (the PBFT cluster: the leader a view change
+ * picks, and so a slot's body, depend on the seeded drops) the headers and
+ * root are compared only between the two runs of one seed.
  */
-CheckResult EvaluateP6(std::span<const RunReport> first, std::span<const RunReport> second, bool need_distinct);
+CheckResult EvaluateP6(std::span<const RunReport> first, std::span<const RunReport> second, bool need_distinct,
+                       bool need_same_headers = true);
 
 /** Every variant of `variants` for every seed in [seed_from, seed_to], each
  * run twice (P6, EvaluateP6; need_distinct for walking_skeleton). Empty

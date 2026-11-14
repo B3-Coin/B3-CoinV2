@@ -7,9 +7,10 @@
  *
  *   fm2-sim [--scenario <name>|all] [--seed <n> | --seeds <a>-<b>]
  *
- * Runs every selected walking-skeleton variant (walking_skeleton,
- * walking_skeleton_storage_fault, walking_skeleton_authority_fault; default
- * all) for every seed (default 1-32), each seed twice (P6), and prints one
+ * Runs every selected scenario variant (walking_skeleton,
+ * walking_skeleton_storage_fault, walking_skeleton_authority_fault and,
+ * since M4-SIM-01, pbft_cluster; default all) for every seed (default
+ * 1-32), each seed twice (P6), and prints one
  * JSON document (sorted keys; no times, paths or pointers) on stdout.
  *
  * Exit status: 0 iff every check of the required manifest ran and passed
@@ -44,7 +45,7 @@ std::optional<uint64_t> ParseU64(std::string_view text)
 int Usage(std::string_view problem)
 {
     std::cerr << "fm2-sim: " << problem << "\n"
-              << "usage: fm2-sim [--scenario <walking_skeleton|walking_skeleton_storage_fault|walking_skeleton_authority_fault|all>]"
+              << "usage: fm2-sim [--scenario <walking_skeleton|walking_skeleton_storage_fault|walking_skeleton_authority_fault|pbft_cluster|all>]"
               << " [--seed <n> | --seeds <a>-<b>]\n";
     return 2;
 }

@@ -10,6 +10,8 @@
 #endif
 
 #include <flowmesh2/admission/admission.h>
+#include <flowmesh2/agreement/pbft.h>
+#include <flowmesh2/net/seat_mesh.h>
 #include <flowmesh2/admission/pool.h>
 #include <flowmesh2/agreement/agreement.h>
 #include <flowmesh2/core/authority.h>
@@ -115,6 +117,10 @@ inline constexpr std::string_view SIM_FAULT_SLOT{"fault plan slot must be at lea
 inline constexpr std::string_view SIM_NOT_SEALED{"no sealed slot at that height"};                          //!< (INVALID_INPUT)
 inline constexpr std::string_view SIM_BAD_KEY{"a simulator key label gives no key"};                        //!< (INVALID_INPUT)
 inline constexpr std::string_view SIM_FENCED{"the node is fenced and seals nothing"};                       //!< (FENCED)
+inline constexpr std::string_view SIM_MULTI_SEAT{"a multi-seat node is driven by ProposeSlot, OnFrame, Tick and Complete"}; //!< (INVALID_INPUT)
+inline constexpr std::string_view SIM_NOT_LEADER{"this seat does not lead the current view"};                  //!< (INVALID_INPUT)
+inline constexpr std::string_view SIM_MESH_MISSING{"a multi-seat node needs its mesh end"};                   //!< (INVALID_INPUT)
+inline constexpr std::string_view SIM_SEAT_RANGE{"self_seat outside seat_count"};                            //!< (INVALID_INPUT)
 
 //! The synthetic TEST network of the simulator: chain REGTEST, magic f2 51 4d 01, ModernChainDomain SHA256("fm2/sim/domain").
 NetworkId SimNetwork();
@@ -138,6 +144,15 @@ struct SimNodeConfig {
     size_t max_replies{64};
     uint64_t signer_journal_instance{1};
     uint64_t commit_journal_instance{2};
+    // Multi-seat (M4-SIM-01): with seat_count > 1 the node signs as seat
+    // self_seat of the k simulator seats (IKM SHA256("fm2/sim/seat<i>")) and
+    // runs PbftAgreement over `mesh`, its end of the in-process mesh, which
+    // the cluster owns and which must outlive the node. seat_count 1 is the
+    // k = 1 dev certifier of the walking skeleton, byte for byte.
+    uint32_t seat_count{1};
+    uint32_t self_seat{0};
+    net::SeatMesh* mesh{nullptr};
+    agreement::PbftConfig pbft; //!< self_seat is taken from above
 };
 
 //! One slot this node sealed: everything a later check or N13 needs.
@@ -169,8 +184,43 @@ public:
     SimNode& operator=(const SimNode&) = delete;
     ~SimNode();
 
-    //! Seal the next slot; see the file comment.
+    //! Seal the next slot (k = 1 only; INVALID_INPUT SIM_MULTI_SEAT otherwise); see the file comment.
     Result<SealReport> SealSlot();
+
+    // ---- Multi-seat (k > 1, M4-SIM-01): the cluster drives these ----------------
+
+    //! True iff this seat leads the current view of the slot after its head (PbftAgreement::IsLeader); false for k = 1.
+    bool IsLeader();
+    /** The leader's half of a slot: steps 0 to 4 of SealSlot (poll, take,
+     * preview, the plan's bump) and PbftAgreement::Propose. INVALID_INPUT
+     * (SIM_NOT_LEADER) when this seat does not lead; the agreement's and the
+     * components' errors as in SealSlot (the fencing rules of O-90 before the
+     * head moves). The candidate is kept for Complete.
+     */
+    Result<uint64_t> ProposeSlot();
+    //! A frame from the mesh: CRITICAL and PROPOSAL frames go to the agreement (its errors are returned; only STORAGE_FATAL and FENCED fence the node); others are ignored.
+    Result<void> OnFrame(const net::InboundFrame& frame);
+    //! Time: PbftAgreement::OnTimeout(now_ms).
+    Result<void> Tick(uint64_t now_ms);
+    /** Steps 6 to 9 of SealSlot for a decision the agreement reached: the
+     * kept candidate when it is the decided header's (the leader), else
+     * StateOwner::Reexecute of the decided header and body (a follower); then
+     * Apply (check 3), APPLIED, publication and the pool. nullopt when no
+     * decision is waiting.
+     */
+    Result<std::optional<SealReport>> Complete();
+    //! The agreement's view of the slot in flight (k > 1).
+    std::optional<agreement::PbftStatus> AgreementStatus();
+    /** A crash and restart (M4-SIM-02): the journals and the chain stay; the
+     * logs are rebuilt by Recover, the state by Restore over the commit
+     * journal (NotImplemented M4-STO-03 while a decided slot is unapplied),
+     * the read service, pool, admission, lanes, API, signer and agreement are
+     * fresh; the agreement resumes its durable view state. The trace records
+     * node.restart.
+     */
+    Result<void> Restart();
+    uint32_t SeatCount() const { return m_seat_count; }
+    uint32_t SelfSeat() const { return m_self_seat; }
     //! Answer at most `max` queued API requests (InProcessApi::Pump).
     Result<net::PumpReport> Pump(size_t max);
     /** Apply sealed slot `height`'s candidate copy and durable decision again,
@@ -198,6 +248,8 @@ public:
     net::InProcessApi& Api() { return *m_api; }
     storage::MemoryJournal& SignerJournal() { return *m_signer_journal; }
     storage::MemoryJournal& CommitJournal() { return *m_commit_journal; }
+    storage::CommitLog& CommitLog() { return *m_commit_log; }
+    storage::SignerLog& SignerLog() { return *m_signer_log; }
     TraceRecorder& Trace() { return m_trace; }
     const std::vector<SealedSlot>& Sealed() const { return m_sealed; }
     //! True once STORAGE_FATAL, FENCED or AUTHORITY_CHANGED fenced admission.
@@ -209,6 +261,12 @@ private:
 
     //! The steps of SealSlot after slot.begin.
     Result<SealReport> SealNext(const std::shared_ptr<const state::HeadView>& head, uint64_t height);
+    //! Steps 0 to 4: poll, take, preview and the plan's bump; the candidate and the taken ids.
+    Result<std::pair<state::Candidate, std::vector<ActionId>>> Prepare(const std::shared_ptr<const state::HeadView>& head, uint64_t height);
+    //! Steps 6 to 9: apply, APPLIED, publish, pool.
+    Result<SealReport> Finish(uint64_t height, state::Candidate candidate, agreement::Decision decision, std::vector<ActionId> taken);
+    //! Build (or rebuild, on restart) every component after the journals and the chain.
+    Result<void> BuildComponents(bool restart);
     //! Fence admission (once; the trace records node.fence with the code).
     void Fence(const Error& error);
     /** Before the head moves: fence after `error` if it is STORAGE_FATAL,
@@ -242,7 +300,18 @@ private:
     std::unique_ptr<admission::Admission> m_admission;
     std::unique_ptr<net::LaneSet> m_lanes;
     std::unique_ptr<net::InProcessApi> m_api;
-    std::unique_ptr<dev::DevSingleSeatCertifier> m_certifier;
+    std::unique_ptr<dev::DevSingleSeatCertifier> m_certifier; //!< k = 1
+    // k > 1 (M4-SIM-01).
+    const SimNodeConfig m_config;
+    const uint32_t m_seat_count;
+    const uint32_t m_self_seat;
+    const uint256 m_ikm;
+    net::SeatMesh* m_mesh{nullptr};
+    std::unique_ptr<agreement::PbftSafetyRules> m_rules;
+    std::unique_ptr<agreement::PbftAgreement> m_pbft;
+    std::optional<state::Candidate> m_proposed;
+    std::vector<ActionId> m_proposed_ids;
+    uint64_t m_now_ms{0}; //!< the last Tick; a rebuilt agreement starts its timers here
     std::vector<SealedSlot> m_sealed;
 };
 

@@ -191,6 +191,12 @@ struct PbftConfig {
     uint32_t self_seat{0};              //!< this seat's index in the seat set of each epoch
     uint64_t view_timeout_floor_ms{50}; //!< plan 3.4.1 co-located floor; PROVISIONAL (M4-AGR-05)
     uint64_t retry_ms{10};              //!< retransmission period of the last proposal, votes and report; PROVISIONAL
+    /** The clock reading at Create: the first slot's view timer and retry
+     * period start here, and OnTimeout refuses an earlier time. A seat
+     * created in the middle of a run (a restart, M4-SIM-02) passes its
+     * current clock, or its first view times out at once.
+     */
+    uint64_t start_ms{0};
 };
 
 //! What a PBFT instance works with; every reference must outlive it.
@@ -330,7 +336,7 @@ private:
     VoteSink& m_votes;
     SeatSet m_seats;
     uint256 m_domain;
-    uint64_t m_now_ms{0};
+    uint64_t m_now_ms; //!< config.start_ms, then the last OnTimeout
     std::optional<SlotCertificate> m_parent_cert; //!< the head's certificate (none at genesis)
     Slot m_slot;
     std::optional<Decision> m_decision;
