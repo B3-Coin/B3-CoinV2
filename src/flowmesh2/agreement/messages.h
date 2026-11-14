@@ -123,6 +123,7 @@ inline constexpr std::string_view PROPOSAL_EPOCH{"proposal epoch is not the head
 inline constexpr std::string_view PROPOSAL_PARENT_CERT{"parent certificate does not match the header"}; //!< (INVALID_INPUT)
 inline constexpr std::string_view PROPOSAL_BODY{"proposal body does not match the header"};             //!< (INVALID_INPUT)
 inline constexpr std::string_view VOTE_GENESIS{"vote for the genesis height"};                          //!< (INVALID_INPUT)
+inline constexpr std::string_view VOTE_PHASE_NOT_VOTE{"a VOTE message with a statement phase"};         //!< (INVALID_INPUT)
 inline constexpr std::string_view VOTE_INCLUSION_ORDER{"inclusion IDs not strictly ascending"};         //!< (INVALID_INPUT)
 inline constexpr std::string_view VOTE_INCLUSION_PHASE{"inclusion IDs on a vote that is not PREPARE"};  //!< (INVALID_INPUT)
 inline constexpr std::string_view VIEW_CHANGE_TARGET{"view change to view 0"};                          //!< (INVALID_INPUT)

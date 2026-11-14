@@ -558,35 +558,6 @@ FM2_STUB_CASE(M7_ADP_01, "M7-ADP-01")
 
 // ---- Slice R10: agreement ----
 
-//! A sink that refuses everything (the stubs never send).
-class StubSink final : public agreement::MessageSink
-{
-public:
-    Result<void> Send(uint32_t, std::span<const unsigned char>) override { return Error{ErrorCode::BUSY, "stub sink"}; }
-};
-
-FM2_STUB_CASE(M4_AGR_01, "M4-AGR-01")
-{
-    agreement::PbftSafetyRules rules;
-    const agreement::Proposal proposal{};
-    return FirstDeviation("M4-AGR-01", {Observe(rules.MayPrepare(proposal)), Observe(rules.MayCommit(proposal, agreement::PreparedCert{})),
-                                        Observe(rules.OnViewChange(agreement::ViewChange{}))});
-}
-
-FM2_STUB_CASE(M4_AGR_02, "M4-AGR-02")
-{
-    AgreementRig rig;
-    agreement::PbftSafetyRules rules;
-    StubSink sink;
-    const agreement::PbftContext context{*rig.adapter, *rig.owner, rig.signer, rig.signer_log, rig.commit_log, rules, sink};
-    // The k = 1 dev certifier receives no messages: its OnMessage is PBFT's to replace.
-    const auto certifier{dev::DevSingleSeatCertifier::Create(rig.profile, *rig.adapter, rig.seats, rig.signer, rig.signer_log,
-                                                             rig.commit_log)
-                             .value()};
-    const std::vector<unsigned char> message{1};
-    return FirstDeviation("M4-AGR-02", {Observe(agreement::PbftAgreement::Create(rig.profile, agreement::PbftConfig{}, context)),
-                                        Observe(certifier->OnMessage(0, message))});
-}
 
 FM2_STUB_CASE(M4_AGR_04, "M4-AGR-04")
 {

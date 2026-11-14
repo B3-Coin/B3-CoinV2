@@ -238,12 +238,18 @@ BOOST_AUTO_TEST_CASE(reexecute_on_checks_genesis_and_parent)
     skipped.height += 1;
     RequireFailure(state::ReexecuteOn(fx.engine, fx.head, skipped, c.Body()), ErrorCode::STALE_PARENT, state::PARENT_NOT_HEAD,
                    "a height that skips one");
-    // The parent certificate is part of the header: a follower holding another
-    // certificate for the same parent re-executes to another header (O-51).
+    // The parent certificate hash is the proposer's (O-98): certificates are not
+    // unique (O-4b), so a follower holding another certificate for the same
+    // parent re-executes to the proposer's header, with that hash, once it has
+    // verified the carried certificate (agreement/pbft.h). Everything else is
+    // still recomputed.
     SlotHeaderV2 other_cert{c.Header()};
     other_cert.parent_cert_hash = LabelHash("fm2/test/cert/other");
-    RequireFailure(state::ReexecuteOn(fx.engine, fx.head, other_cert, c.Body()), ErrorCode::VERIFY_FAILED,
-                   state::REEXECUTE_HEADER_MISMATCH, "another parent certificate");
+    const Result<state::Candidate> rebound{state::ReexecuteOn(fx.engine, fx.head, other_cert, c.Body())};
+    RequireOk(rebound, "another parent certificate");
+    BOOST_CHECK(rebound->Header() == other_cert);
+    BOOST_CHECK(rebound->Header().Hash() != c.Header().Hash());
+    BOOST_CHECK(rebound->Header().state_root == c.Header().state_root);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

@@ -104,9 +104,10 @@ private:
 };
 
 struct RigOptions {
-    std::vector<std::string> seat_names{"s0"}; //!< the seat set; seat 0 is this rig's signer
+    std::vector<std::string> seat_names{"s0"}; //!< the seat set
     storage::MemoryJournalFaults signer_faults;
     storage::MemoryJournalFaults commit_faults;
+    uint32_t self_seat{0}; //!< which seat this rig signs as (M4-AGR-02 tests)
 };
 
 /** Everything an agreement needs, in memory: the regtest profile, a seat set
@@ -142,7 +143,7 @@ struct AgreementRig {
           commit_journal{NewMemoryJournal(storage::JournalRole::COMMIT, 2, options.commit_faults, &tee)},
           signer_log{storage::SignerLog::Create(*signer_journal).value()},
           commit_log{storage::CommitLog::Create(*commit_journal).value()},
-          signer{storage::SeatSigner::FromIKM(SeatIkm(options.seat_names.front()), signer_log).value()},
+          signer{storage::SeatSigner::FromIKM(SeatIkm(options.seat_names.at(options.self_seat)), signer_log).value()},
           genesis{state::GenesisHead(profile, std::vector<MarketDescriptor>{MarketM1(), MarketM2()}, TestDomain(), authority,
                                      TestAnchor(129), FactCursor{130, 0})
                       .value()},

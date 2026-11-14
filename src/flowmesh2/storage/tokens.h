@@ -57,11 +57,20 @@ class CommitLog;
 
 //! Vote phases. APPEND-ONLY.
 enum class VotePhase : uint8_t {
-    PREPARE = 1, //!< PBFT prepare (M4-AGR-02); its digest is not defined in the outline
-    COMMIT = 2,  //!< signs SlotHeaderV2::CommitDigest()
+    PREPARE = 1,     //!< PBFT prepare: signs agreement::PrepareDigest(view, header hash) (M4-AGR-02)
+    COMMIT = 2,      //!< signs SlotHeaderV2::CommitDigest()
+    VIEW_CHANGE = 3, //!< a statement, not a vote: signs agreement::ViewChangeDigest (M4-AGR-02)
+    NEW_VIEW = 4,    //!< a statement: signs agreement::NewViewDigest (M4-AGR-02)
+    HIGH_WATER = 5,  //!< a statement: signs agreement::HighWaterDigest (M4-AGR-06)
 };
 
-constexpr bool IsKnown(VotePhase phase) { return phase == VotePhase::PREPARE || phase == VotePhase::COMMIT; }
+constexpr bool IsKnown(VotePhase phase)
+{
+    return phase == VotePhase::PREPARE || phase == VotePhase::COMMIT || phase == VotePhase::VIEW_CHANGE || phase == VotePhase::NEW_VIEW ||
+           phase == VotePhase::HIGH_WATER;
+}
+//! PREPARE and COMMIT vote for a proposal; the other phases sign statements that have none.
+constexpr bool IsVotePhase(VotePhase phase) { return phase == VotePhase::PREPARE || phase == VotePhase::COMMIT; }
 
 //! The 96-byte compressed BLS signature of a vote.
 using VoteSignature = std::array<unsigned char, bls::SIGNATURE_SIZE>;

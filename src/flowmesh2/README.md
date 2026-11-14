@@ -126,9 +126,9 @@ batch must pass `CheckBatch`), the capped agreement messages and the
 `Agreement` and `SafetyRules` interfaces in `agreement/`, and the new
 REGTEST-only `fm2_dev` library with a scripted fake chain and the k = 1
 dev certifier, which writes `ACCEPTED_PROPOSAL`, `INTENT`, `SIGNED_VOTE`
-and `DECISION` in barrier order with both authority checks; PBFT, the
-leader schedule, inclusion lists, the restart fence, the evidence store
-and the b3d adapters are typed stubs; and **R11**, certified reads in
+and `DECISION` in barrier order with both authority checks; inclusion lists, the restart fence, the evidence
+store and the b3d adapters are typed stubs (PBFT over k seats and the
+leader schedule landed with M4-AGR-01/02/03); and **R11**, certified reads in
 `read/`: an immutable `SlotView` per committed slot (header, certificate,
 outcomes, v0 account leaves with their tree levels, action and order-fill
 indexes), and the `ReadService`, which publishes only after B-APPLIED
@@ -181,7 +181,7 @@ build-rebirth/bin/fm2-sim --scenario all --seeds 1-32   # JSON on stdout; exit 0
 
 Expected after R14 and the review fixes (O-89 to O-92): 10 CTests pass
 (`flowmesh2_foundations` with its 19 C1 cases, `flowmesh2_sim`,
-`flowmesh2_sim_cli_determinism`, `flowmesh2_unit` with 520 cases,
+`flowmesh2_sim_cli_determinism`, `flowmesh2_unit` with 522 cases,
 `flowmesh2_inventory`, `flowmesh2_todo_lint`, `flowmesh2_guards`,
 `flowmesh2_guards_selftest`, `flowmesh2_evidence_selftest` and, with Clang,
 `flowmesh2_negative_compile` with six negative controls and a positive one).

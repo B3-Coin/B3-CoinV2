@@ -356,7 +356,7 @@ BOOST_AUTO_TEST_CASE(decode_refuses_malformed_bytes)
             RequireRefusal(DecodeMessage(b, RegtestProfile()), ErrorCode::DECODE, MESSAGE_TYPE_UNKNOWN, "unknown type");
         }
     }
-    for (unsigned char phase : {0, 3}) {
+    for (unsigned char phase : {0, 9}) {
         std::vector<unsigned char> b{vote};
         b[2] = phase;
         ExpectDecode(b, ErrorCode::DECODE, "unknown vote phase");

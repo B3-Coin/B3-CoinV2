@@ -31,13 +31,6 @@ using namespace flowmesh2::test;
 
 namespace {
 
-//! A sink that refuses everything; PbftAgreement::Create never sends.
-class NullSink final : public MessageSink
-{
-public:
-    Result<void> Send(uint32_t, std::span<const unsigned char>) override { return Error{ErrorCode::BUSY, "test sink"}; }
-};
-
 } // namespace
 
 // Decision carries a move-only durability token, so it is move-only too.
@@ -48,8 +41,9 @@ static_assert(std::is_abstract_v<SafetyRules>);
 static_assert(std::is_abstract_v<MessageSink>);
 static_assert(std::is_base_of_v<SafetyRules, PbftSafetyRules>);
 static_assert(!std::is_abstract_v<PbftSafetyRules>);
-// PBFT agreement, inclusion lists and the restart fence have no instances in the outline.
+// Inclusion lists and the restart fence have no instances in the outline; PBFT is created by Create.
 static_assert(!std::is_default_constructible_v<PbftAgreement>);
+static_assert(std::is_base_of_v<Agreement, PbftAgreement>);
 static_assert(!std::is_default_constructible_v<InclusionList>);
 static_assert(!std::is_default_constructible_v<RestartFence>);
 
@@ -61,27 +55,6 @@ BOOST_AUTO_TEST_CASE(provisional_constants_pinned)
     BOOST_CHECK_EQUAL(INCLUSION_AGE_SLOTS, 2U);
     BOOST_CHECK_EQUAL(PbftConfig{}.view_timeout_floor_ms, 50U);
     BOOST_CHECK_EQUAL(LeaderSchedule{7}.SeatCount(), 7U);
-}
-
-BOOST_AUTO_TEST_CASE(pbft_safety_rules_are_stubs)
-{
-    PbftSafetyRules rules;
-    SafetyRules& as_interface{rules};
-    const Proposal proposal{};
-    RequireStub(as_interface.MayPrepare(proposal), "M4-AGR-01");
-    RequireStub(as_interface.MayCommit(proposal, PreparedCert{}), "M4-AGR-01");
-    RequireStub(as_interface.OnViewChange(ViewChange{}), "M4-AGR-01");
-}
-
-BOOST_AUTO_TEST_CASE(pbft_agreement_is_a_stub)
-{
-    AgreementRig rig;
-    PbftSafetyRules rules;
-    NullSink sink;
-    const PbftContext context{*rig.adapter, *rig.owner, rig.signer, rig.signer_log, rig.commit_log, rules, sink};
-    RequireStub(PbftAgreement::Create(rig.profile, PbftConfig{}, context), "M4-AGR-02");
-    // Nothing was written.
-    BOOST_CHECK(rig.recorder.events.empty());
 }
 
 BOOST_AUTO_TEST_CASE(leader_schedule_is_seeded_and_skips_slow_seats)

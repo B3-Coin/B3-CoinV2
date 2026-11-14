@@ -181,6 +181,8 @@ public:
      * the certifier asks this before it signs a height (O-89).
      */
     std::optional<DecisionRef> DecisionAt(uint64_t slot) const;
+    //! The certificate the DECISION record of `slot` holds, if the slot was decided here (the next proposal's parent certificate, M4-AGR-02).
+    std::optional<SlotCertificate> CertificateAt(uint64_t slot) const;
 
     /** A durable PreparedQC (M4-STO-07): the record's sequence number. The
      * qc must decode as a SlotCertificate naming the record's header (DECODE
@@ -201,6 +203,7 @@ private:
     struct DecisionEntry {
         uint256 header_hash;
         uint256 cert_hash; //!< of the certificate the DECISION record holds
+        SlotCertificate certificate;
         uint256 state_root;
         uint64_t seq{0};
         std::optional<uint64_t> applied_seq;

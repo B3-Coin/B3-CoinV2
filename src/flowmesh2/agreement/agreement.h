@@ -5,10 +5,12 @@
 #ifndef B3_FLOWMESH2_AGREEMENT_AGREEMENT_H
 #define B3_FLOWMESH2_AGREEMENT_AGREEMENT_H
 
+#include <flowmesh2/agreement/outbound.h>
 #include <flowmesh2/core/authority.h>
 #include <flowmesh2/core/body.h>
 #include <flowmesh2/core/certificate.h>
 #include <flowmesh2/core/result.h>
+#include <flowmesh2/core/slot.h>
 #include <flowmesh2/state/candidate.h>
 #include <flowmesh2/storage/durable.h>
 
@@ -56,11 +58,12 @@
  */
 namespace flowmesh2::agreement {
 
-//! A decided slot: the durable DECISION and what its record holds besides the header.
+//! A decided slot: the durable DECISION and what its record holds.
 struct Decision {
     DurableDecision decision; //!< names the slot, the header hash and the certificate hash
     SlotCertificate certificate;
     SlotBody body;
+    SlotHeaderV2 header; //!< the decided header (a follower re-executes header and body to apply; M4-AGR-02)
 };
 
 class MessageSink
@@ -69,6 +72,20 @@ public:
     virtual ~MessageSink() = default;
     //! Queue one encoded message to `seat`; BUSY when its lane is full (nothing queued).
     virtual Result<void> Send(uint32_t seat, std::span<const unsigned char> message) = 0;
+};
+
+/** Where an agreement sends what only a durable record may let out
+ * (M4-AGR-02; ARCHITECTURE.md 7.3): a vote, as an OutboundVote, which exists
+ * only for a durable SIGNED_VOTE; and a VIEW_CHANGE or NEW_VIEW statement,
+ * whose signature must be the OutboundVote's of the matching statement
+ * intent. The seat mesh implements it (net/seat_mesh.h).
+ */
+class VoteSink
+{
+public:
+    virtual ~VoteSink() = default;
+    virtual Result<void> SendVote(uint32_t seat, const OutboundVote& vote, const uint256& header_hash) = 0;
+    virtual Result<void> SendStatement(uint32_t seat, const OutboundVote& statement, std::span<const unsigned char> message) = 0;
 };
 
 class Agreement

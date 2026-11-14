@@ -106,14 +106,14 @@ Result<void> DevSingleSeatCertifier::Propose(const state::Candidate& candidate, 
     Result<DurableDecision> durable_decision{m_commit_log.Confirm(*decision)};
     if (!durable_decision.has_value()) return durable_decision.error();
 
-    m_decision.emplace(agreement::Decision{std::move(durable_decision).value(), std::move(certificate), candidate.Body()});
+    m_decision.emplace(agreement::Decision{std::move(durable_decision).value(), std::move(certificate), candidate.Body(), header});
     return Ok();
 }
 
 Result<void> DevSingleSeatCertifier::OnMessage(uint32_t /*from_seat*/, std::span<const unsigned char> /*bytes*/)
 {
-    // One seat receives nothing; the multi-seat message path is PBFT's.
-    return Unsupported("M4-AGR-02"); // TODO(rebirth:M4-AGR-02)
+    // One seat receives nothing; the multi-seat message path is PbftAgreement's (agreement/pbft.h).
+    return Error{ErrorCode::INVALID_INPUT, DEV_NO_MESSAGES};
 }
 
 Result<void> DevSingleSeatCertifier::OnTimeout(uint64_t /*now_ms*/)

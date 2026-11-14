@@ -462,6 +462,7 @@ Result<void> CheckProposal(const Proposal& proposal)
 Result<void> CheckVote(const Vote& vote)
 {
     if (vote.slot == 0) return Invalid(VOTE_GENESIS);
+    if (!storage::IsVotePhase(vote.phase)) return Invalid(VOTE_PHASE_NOT_VOTE);
     if (!vote.inclusion.empty() && vote.phase != storage::VotePhase::PREPARE) return Invalid(VOTE_INCLUSION_PHASE);
     for (size_t i{1}; i < vote.inclusion.size(); ++i) {
         if (!(vote.inclusion[i - 1] < vote.inclusion[i])) return Invalid(VOTE_INCLUSION_ORDER);

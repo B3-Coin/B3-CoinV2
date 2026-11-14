@@ -62,6 +62,12 @@ Candidate::Candidate(SlotHeaderV2 header, std::vector<OutcomeV2> outcomes, std::
 
 Result<Candidate> BuildCandidate(const engine::Engine& engine, const HeadView& parent, const SlotInputs& inputs)
 {
+    return BuildCandidateBinding(engine, parent, inputs, parent.CertHash());
+}
+
+Result<Candidate> BuildCandidateBinding(const engine::Engine& engine, const HeadView& parent, const SlotInputs& inputs,
+                                        const uint256& parent_cert_hash)
+{
     const SlotHeaderV2& head{parent.Header()};
 
     // 1. The authority the slot is certified under.
@@ -109,7 +115,7 @@ Result<Candidate> BuildCandidate(const engine::Engine& engine, const HeadView& p
     header.authority_epoch = inputs.authority.epoch;
     header.height = slot->Height();
     header.parent_hash = parent.HeaderHash();
-    header.parent_cert_hash = parent.CertHash();
+    header.parent_cert_hash = parent_cert_hash;
     header.anchor = inputs.anchor;
     header.facts_from = inputs.facts_from;
     header.facts_to = inputs.facts_to;
@@ -140,7 +146,9 @@ Result<Candidate> ReexecuteOn(const engine::Engine& engine, const HeadView& pare
     inputs.facts_from = header.facts_from;
     inputs.facts_to = header.facts_to;
     inputs.body = body;
-    Result<Candidate> candidate{BuildCandidate(engine, parent, inputs)};
+    // The proposer's parent certificate hash is kept: certificates are not unique (O-4b), the
+    // caller verified the carried certificate against the parent header (O-98).
+    Result<Candidate> candidate{BuildCandidateBinding(engine, parent, inputs, header.parent_cert_hash)};
     if (!candidate.has_value()) return candidate.error();
     if (!(candidate->Header() == header)) return Error{ErrorCode::VERIFY_FAILED, REEXECUTE_HEADER_MISMATCH};
     if (!(candidate->Body() == body)) return Error{ErrorCode::VERIFY_FAILED, REEXECUTE_BODY_MISMATCH};

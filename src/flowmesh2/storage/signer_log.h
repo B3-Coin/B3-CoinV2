@@ -197,7 +197,17 @@ public:
 
     Result<PendingProposal> AppendAcceptedProposal(const ProposalKey& key, const SlotHeaderV2& header, const SlotBody& body);
     Result<PendingIntent> AppendIntent(const VoteKey& key, const uint256& digest, const PendingProposal& proposal);
+    /** The intent of a signed STATEMENT (M4-AGR-02): a VIEW_CHANGE report, a
+     * NEW_VIEW or a HIGH_WATER statement, which have no proposal. INVALID_INPUT
+     * (VOTE_PHASE) for a vote phase (use AppendIntent). The equivocation rule
+     * is the same: one digest per VoteKey forever (one report per target
+     * view), the same digest again idempotent. The record's proposal_seq is 0.
+     * SeatSigner::Sign and AppendSignedVote then work exactly as for a vote.
+     */
+    Result<PendingIntent> AppendStatementIntent(const VoteKey& key, const uint256& digest);
     Result<PendingSignedVote> AppendSignedVote(const DurableIntent& intent, const VoteSignature& signature);
+    //! The signature this log holds for `key` (a vote or a statement), if it was signed.
+    std::optional<VoteSignature> SignedStatement(const VoteKey& key) const;
     //! Journal::Barrier of the signer journal (B-INTENT, B-VOTE).
     Result<uint64_t> Barrier() { return m_journal->Barrier(); }
     //! Journal::Confirm: B-INTENT.

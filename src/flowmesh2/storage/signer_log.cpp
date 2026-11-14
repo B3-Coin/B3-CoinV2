@@ -150,11 +150,15 @@ Result<SignerLog> SignerLog::Recover(Journal& journal, const ProfileParams& prof
         case RecordType::INTENT: {
             Result<IntentRecord> decoded{IntentRecord::Decode(record.payload)};
             if (!decoded.has_value()) return decoded.error();
-            const auto proposal{log.m_proposals.find(decoded->key.Proposal())};
-            if (proposal == log.m_proposals.end() || proposal->second.seq != decoded->proposal_seq ||
-                proposal->second.domain != decoded->key.domain ||
-                (decoded->key.phase == VotePhase::COMMIT && decoded->digest != proposal->second.commit_digest)) {
-                return inconsistent;
+            if (IsVotePhase(decoded->key.phase)) {
+                const auto proposal{log.m_proposals.find(decoded->key.Proposal())};
+                if (proposal == log.m_proposals.end() || proposal->second.seq != decoded->proposal_seq ||
+                    proposal->second.domain != decoded->key.domain ||
+                    (decoded->key.phase == VotePhase::COMMIT && decoded->digest != proposal->second.commit_digest)) {
+                    return inconsistent;
+                }
+            } else if (decoded->proposal_seq != 0) {
+                return inconsistent; // a statement intent names no proposal
             }
             const auto [it, inserted]{log.m_votes.emplace(decoded->key, VoteEntry{decoded->digest, record.seq, std::nullopt, 0})};
             if (!inserted) return inconsistent; // one intent record per VoteKey
@@ -223,10 +227,33 @@ Result<PendingProposal> SignerLog::AppendAcceptedProposal(const ProposalKey& key
     return Ok(PendingProposal{m_journal->InstanceId(), *seq, ref});
 }
 
+Result<PendingIntent> SignerLog::AppendStatementIntent(const VoteKey& key, const uint256& digest)
+{
+    if (m_journal->IsFatal()) return Error{ErrorCode::FENCED, JOURNAL_FENCED};
+    if (!IsKnown(key.phase) || IsVotePhase(key.phase)) return Error{ErrorCode::INVALID_INPUT, VOTE_PHASE};
+    const VoteRef ref{key, digest};
+    if (const auto it{m_votes.find(key)}; it != m_votes.end()) {
+        if (it->second.digest != digest) return Error{ErrorCode::EQUIVOCATION_REFUSED, VOTE_EQUIVOCATION};
+        return Ok(PendingIntent{m_journal->InstanceId(), it->second.intent_seq, ref});
+    }
+    const std::vector<unsigned char> payload{IntentRecord{key, digest, 0}.Encode()};
+    Result<uint64_t> seq{m_journal->Append(RecordType::INTENT, payload)};
+    if (!seq.has_value()) return seq.error();
+    m_votes.emplace(key, VoteEntry{digest, *seq, std::nullopt, 0});
+    return Ok(PendingIntent{m_journal->InstanceId(), *seq, ref});
+}
+
+std::optional<VoteSignature> SignerLog::SignedStatement(const VoteKey& key) const
+{
+    const auto it{m_votes.find(key)};
+    if (it == m_votes.end()) return std::nullopt;
+    return it->second.signature;
+}
+
 Result<PendingIntent> SignerLog::AppendIntent(const VoteKey& key, const uint256& digest, const PendingProposal& proposal)
 {
     if (m_journal->IsFatal()) return Error{ErrorCode::FENCED, JOURNAL_FENCED};
-    if (!IsKnown(key.phase)) return Error{ErrorCode::INVALID_INPUT, VOTE_PHASE};
+    if (!IsVotePhase(key.phase)) return Error{ErrorCode::INVALID_INPUT, VOTE_PHASE};
     if (proposal.JournalInstance() != m_journal->InstanceId()) return Error{ErrorCode::VERIFY_FAILED, TOKEN_OTHER_LOG};
     const auto proposal_it{m_proposals.find(proposal.Key().key)};
     if (proposal_it == m_proposals.end() || proposal_it->second.seq != proposal.Seq() ||

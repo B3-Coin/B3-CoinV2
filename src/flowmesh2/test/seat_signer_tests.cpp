@@ -186,7 +186,7 @@ BOOST_AUTO_TEST_CASE(sign_observer_sees_each_signature_and_no_refusal)
 BOOST_AUTO_TEST_CASE(from_ikm_refuses_short_material)
 {
     auto journal{NewMemoryJournal(JournalRole::SIGNER, 6)};
-    const SignerLog log{SignerLog::Create(*journal).value()};
+    SignerLog log{SignerLog::Create(*journal).value()}; // a signer keeps a mutable pointer to its log (SignDurably, M4-AGR-02)
     RequireCode(SeatSigner::FromIKM(Ikm().first(31), log), ErrorCode::INVALID_INPUT, "31-byte IKM");
     RequireStorageOk(SeatSigner::FromIKM(Ikm(), log), "32-byte IKM");
 }

@@ -287,6 +287,7 @@ if(BUILD_FLOWMESH2)
     test/nonce_rule_tests.cpp
     test/nonce_window_tests.cpp
     test/outcome_tests.cpp
+    test/pbft_tests.cpp
     test/params_tests.cpp
     test/pool_tests.cpp
     test/read_tests.cpp

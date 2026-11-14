@@ -13,6 +13,7 @@
 #include <uint256.h>
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <span>
 #include <string_view>
@@ -72,7 +73,7 @@ public:
      * must stay at its address and outlive the signer (do not move or
      * destroy a log a signer uses; SimNode and AgreementRig keep it fixed).
      */
-    static Result<SeatSigner> FromIKM(std::span<const unsigned char> ikm, const SignerLog& log);
+    static Result<SeatSigner> FromIKM(std::span<const unsigned char> ikm, SignerLog& log);
 
     SeatSigner(SeatSigner&&) noexcept;
     SeatSigner& operator=(SeatSigner&&) noexcept;
@@ -87,15 +88,28 @@ public:
     //! The only BLS vote signing path; see the file comment.
     Result<VoteSignature> Sign(const DurableIntent& intent) const;
 
+    /** The strict signing sequence of ARCHITECTURE.md 7.3 for one intent of
+     * this signer's log, in the signing module (M4-AGR-02): the log's Barrier
+     * (B-INTENT) and Confirm give the DurableIntent; `before_sign` runs with
+     * the intent durable and nothing signed (the agreement's authority check
+     * 2: a refusal leaves a durable INTENT and no signature, and the log keeps
+     * refusing another digest for that key); then Sign, AppendSignedVote,
+     * Barrier (B-VOTE) and Confirm give the DurableSignedVote, the only thing
+     * an OutboundVote is built from. Every step's error is returned as is and
+     * nothing after it runs. The caller owns the sealing thread, as the log
+     * does.
+     */
+    Result<DurableSignedVote> SignDurably(const PendingIntent& intent, const std::function<Result<void>()>& before_sign);
+
     //! Report every successful Sign to `observer` (nullptr: none). The observer must outlive the signer.
     void SetSignObserver(SignObserver* observer) { m_observer = observer; }
 
 private:
     struct Key;
-    SeatSigner(std::unique_ptr<const Key> key, const SignerLog& log);
+    SeatSigner(std::unique_ptr<const Key> key, SignerLog& log);
 
     std::unique_ptr<const Key> m_key;
-    const SignerLog* m_log;
+    SignerLog* m_log;
     SignObserver* m_observer{nullptr};
 };
 

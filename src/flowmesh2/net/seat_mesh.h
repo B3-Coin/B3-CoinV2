@@ -84,6 +84,8 @@ inline constexpr std::string_view MESH_SELF{"a seat does not send to itself"};  
 inline constexpr std::string_view MESH_FRAME_OVERSIZE{"frame above the mesh's max_frame_bytes"};                  //!< (OVERSIZE)
 inline constexpr std::string_view MESH_VOTE_NOT_TYPED{"a vote leaves only through SendVote"};                      //!< (INVALID_INPUT)
 inline constexpr std::string_view MESH_LANE_CONTENT{"the frame is not a message of its lane"};                    //!< (INVALID_INPUT)
+inline constexpr std::string_view MESH_STATEMENT_NOT_TYPED{"a view change or new view leaves only through SendStatement"}; //!< (INVALID_INPUT)
+inline constexpr std::string_view MESH_STATEMENT_MISMATCH{"the statement message is not the durable statement's"};    //!< (INVALID_INPUT)
 
 struct MeshConfig {
     uint32_t self_seat{0};
@@ -99,7 +101,7 @@ struct InboundFrame {
     std::vector<unsigned char> bytes;
 };
 
-class SeatMesh : public agreement::MessageSink
+class SeatMesh : public agreement::MessageSink, public agreement::VoteSink
 {
 public:
     ~SeatMesh() override = default;
@@ -111,11 +113,21 @@ public:
 
     const MeshConfig& Config() const { return m_config; }
 
-    //! Send a durable vote to `seat` on CRITICAL (see the file comment).
-    Result<void> SendVote(uint32_t seat, const agreement::OutboundVote& vote, const uint256& header_hash);
+    //! agreement::VoteSink: send a durable vote to `seat` on CRITICAL (see the file comment).
+    Result<void> SendVote(uint32_t seat, const agreement::OutboundVote& vote, const uint256& header_hash) final;
+    /** agreement::VoteSink: send a VIEW_CHANGE or NEW_VIEW message whose
+     * signature is `statement`'s (the durable statement intent of the same
+     * epoch, slot, target view and phase, by this seat) on CRITICAL;
+     * INVALID_INPUT MESH_STATEMENT_MISMATCH otherwise (M4-AGR-02, O-79).
+     */
+    Result<void> SendStatement(uint32_t seat, const agreement::OutboundVote& statement, std::span<const unsigned char> message) final;
     //! Send a non-vote frame to `seat` on `lane` (see the file comment).
     Result<void> Send(uint32_t seat, Lane lane, std::span<const unsigned char> bytes);
-    //! agreement::MessageSink: an encoded agreement message, routed by its type; a VOTE is refused.
+    /** agreement::MessageSink: an encoded agreement message, routed by its
+     * type: PROPOSAL to PROPOSAL, EVIDENCE to CRITICAL. A VOTE is refused
+     * (MESH_VOTE_NOT_TYPED); since M4-AGR-02 so are VIEW_CHANGE and NEW_VIEW
+     * (MESH_STATEMENT_NOT_TYPED): they leave through SendStatement.
+     */
     Result<void> Send(uint32_t seat, std::span<const unsigned char> message) final;
 
     //! The next frame received from another seat; nullopt when none is waiting.

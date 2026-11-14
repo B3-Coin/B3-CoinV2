@@ -126,7 +126,7 @@ Result<CommitLog> CommitLog::Recover(Journal& journal, const ProfileParams& prof
             if (decoded->certificate.header_hash != header_hash || !BodyMatchesHeader(decoded->header, decoded->body)) return inconsistent;
             const auto [it, inserted]{log.m_decisions.emplace(
                 decoded->header.height,
-                DecisionEntry{header_hash, decoded->certificate.Hash(), decoded->header.state_root, record.seq, std::nullopt})};
+                DecisionEntry{header_hash, decoded->certificate.Hash(), decoded->certificate, decoded->header.state_root, record.seq, std::nullopt})};
             if (!inserted) return inconsistent; // one DECISION record per slot
             break;
         }
@@ -182,7 +182,7 @@ Result<PendingDecision> CommitLog::AppendDecision(const SlotHeaderV2& header, co
     const std::vector<unsigned char> payload{DecisionRecord{header, certificate, body}.Encode()};
     Result<uint64_t> seq{m_journal->Append(RecordType::DECISION, payload)};
     if (!seq.has_value()) return seq.error();
-    m_decisions.emplace(header.height, DecisionEntry{header_hash, cert_hash, header.state_root, *seq, std::nullopt});
+    m_decisions.emplace(header.height, DecisionEntry{header_hash, cert_hash, certificate, header.state_root, *seq, std::nullopt});
     return Ok(PendingDecision{m_journal->InstanceId(), *seq, DecisionRef{header.height, header_hash, cert_hash}});
 }
 
@@ -207,6 +207,13 @@ Result<PendingApplied> CommitLog::AppendApplied(const ApplyReceipt& receipt)
     entry.applied_seq = *seq;
     m_last_applied_slot = receipt.Slot();
     return Ok(PendingApplied{m_journal->InstanceId(), *seq, ref});
+}
+
+std::optional<SlotCertificate> CommitLog::CertificateAt(uint64_t slot) const
+{
+    const auto it{m_decisions.find(slot)};
+    if (it == m_decisions.end()) return std::nullopt;
+    return it->second.certificate;
 }
 
 std::optional<DecisionRef> CommitLog::DecisionAt(uint64_t slot) const

@@ -84,8 +84,8 @@
  * applied, the node fences, and step 0 refuses any other header for that
  * height (O-89; the cross-epoch rule of M4-AGR-01, the proof M10-SPEC-01).
  *
- * OnMessage: Unsupported (M4-AGR-02): with one seat there is nothing to
- * receive. OnTimeout: Ok and no effect: Propose decides or fails
+ * OnMessage: INVALID_INPUT (DEV_NO_MESSAGES): with one seat there is nothing
+ * to receive; PbftAgreement (agreement/pbft.h) is the multi-seat path. OnTimeout: Ok and no effect: Propose decides or fails
  * synchronously, so a timeout never has pending work (no view change with
  * one seat).
  */
@@ -101,6 +101,7 @@ inline constexpr std::string_view DEV_CANDIDATE_AUTHORITY{"authority is not the 
 inline constexpr std::string_view DEV_SEAT_SET{"candidate header names another seat set"};                 //!< (INVALID_INPUT)
 inline constexpr std::string_view DEV_CERTIFICATE{"the one-seat certificate does not verify"};             //!< (INVARIANT)
 inline constexpr std::string_view DEV_HEIGHT_DECIDED{"the commit log decided this height with another header"}; //!< (EQUIVOCATION_REFUSED)
+inline constexpr std::string_view DEV_NO_MESSAGES{"the one-seat certifier receives no agreement messages"};      //!< (INVALID_INPUT)
 
 class DevSingleSeatCertifier final : public agreement::Agreement
 {
@@ -110,7 +111,7 @@ public:
                                                                   storage::SignerLog& signer_log, storage::CommitLog& commit_log);
 
     Result<void> Propose(const state::Candidate& candidate, const AuthorityVersion& authority) override;
-    //! Unsupported: M4-AGR-02.
+    //! INVALID_INPUT (DEV_NO_MESSAGES): one seat receives nothing; PBFT (agreement/pbft.h) has the message path.
     Result<void> OnMessage(uint32_t from_seat, std::span<const unsigned char> bytes) override;
     //! Ok, no effect.
     Result<void> OnTimeout(uint64_t now_ms) override;

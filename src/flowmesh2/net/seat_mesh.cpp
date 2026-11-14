@@ -5,6 +5,7 @@
 #include <flowmesh2/net/seat_mesh.h>
 
 #include <utility>
+#include <variant>
 
 namespace flowmesh2::net {
 
@@ -77,11 +78,34 @@ Result<void> SeatMesh::Send(uint32_t seat, std::span<const unsigned char> messag
 {
     const std::optional<agreement::MessageType> type{EnvelopeType(message)};
     if (type == agreement::MessageType::VOTE) return Error{ErrorCode::INVALID_INPUT, MESH_VOTE_NOT_TYPED};
-    if (type == agreement::MessageType::PROPOSAL) return Send(seat, Lane::PROPOSAL, message);
-    if (type == agreement::MessageType::VIEW_CHANGE || type == agreement::MessageType::NEW_VIEW || type == agreement::MessageType::EVIDENCE) {
-        return Send(seat, Lane::CRITICAL, message);
+    if (type == agreement::MessageType::VIEW_CHANGE || type == agreement::MessageType::NEW_VIEW) {
+        return Error{ErrorCode::INVALID_INPUT, MESH_STATEMENT_NOT_TYPED};
     }
+    if (type == agreement::MessageType::PROPOSAL) return Send(seat, Lane::PROPOSAL, message);
+    if (type == agreement::MessageType::EVIDENCE) return Send(seat, Lane::CRITICAL, message);
     return Error{ErrorCode::INVALID_INPUT, MESH_LANE_CONTENT};
+}
+
+Result<void> SeatMesh::SendStatement(uint32_t seat, const agreement::OutboundVote& statement, std::span<const unsigned char> message)
+{
+    if (Result<void> route{CheckRoute(seat, Lane::CRITICAL, message.size())}; !route.has_value()) return route.error();
+    const std::optional<agreement::MessageType> type{EnvelopeType(message)};
+    if (type != agreement::MessageType::VIEW_CHANGE && type != agreement::MessageType::NEW_VIEW) {
+        return Error{ErrorCode::INVALID_INPUT, MESH_LANE_CONTENT};
+    }
+    Result<agreement::Message> decoded{agreement::DecodeMessage(message, m_config.profile)};
+    if (!decoded.has_value()) return decoded.error();
+    const storage::VoteKey& key{statement.Key()};
+    bool matches{false};
+    if (const auto* report{std::get_if<agreement::ViewChange>(&*decoded)}) {
+        matches = key.phase == storage::VotePhase::VIEW_CHANGE && report->epoch == key.epoch && report->slot == key.slot &&
+                  report->new_view == key.view && report->seat == m_config.self_seat && report->signature == statement.Signature();
+    } else if (const auto* new_view{std::get_if<agreement::NewView>(&*decoded)}) {
+        matches = key.phase == storage::VotePhase::NEW_VIEW && new_view->epoch == key.epoch && new_view->slot == key.slot &&
+                  new_view->view == key.view && new_view->seat == m_config.self_seat && new_view->signature == statement.Signature();
+    }
+    if (!matches) return Error{ErrorCode::INVALID_INPUT, MESH_STATEMENT_MISMATCH};
+    return Transmit(seat, Lane::CRITICAL, message);
 }
 
 } // namespace flowmesh2::net

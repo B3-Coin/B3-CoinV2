@@ -320,7 +320,7 @@ BOOST_AUTO_TEST_CASE(record_codecs_golden_and_exact)
     bytes.resize(INTENT_RECORD_BYTES - 1);
     RequireCode(IntentRecord::Decode(bytes), ErrorCode::DECODE, "intent - 1 byte");
     bytes = intent.Encode();
-    bytes[VOTE_KEY_BYTES - 1] = 3; // phase byte
+    bytes[VOTE_KEY_BYTES - 1] = 9; // phase byte (3 to 5 are the statement phases since M4-AGR-02)
     RequireCode(IntentRecord::Decode(bytes), ErrorCode::DECODE, "unknown phase");
     std::vector<unsigned char> vote_bytes{vote.Encode()};
     vote_bytes.pop_back();
