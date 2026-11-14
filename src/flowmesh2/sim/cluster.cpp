@@ -4,6 +4,8 @@
 
 #include <flowmesh2/sim/cluster.h>
 
+#include <flowmesh2/net/sync.h>
+
 #include <crypto/sha256.h>
 #include <flowmesh2/agreement/messages.h>
 
@@ -39,7 +41,7 @@ Result<std::unique_ptr<SimCluster>> SimCluster::Create(size_t nodes, const SimNo
     if (nodes > 1) {
         Result<ProfileParams> profile{DevRegtestProfile(ChainType::REGTEST)};
         if (!profile.has_value()) return profile.error();
-        const net::MeshConfig prototype{0, static_cast<uint32_t>(nodes), agreement::MaxMessageBytes(*profile), *profile};
+        const net::MeshConfig prototype{0, static_cast<uint32_t>(nodes), net::MaxBulkFrameBytes(*profile), *profile};
         Result<net::InProcessMesh> created{net::InProcessSeatMesh::Create(prototype, static_cast<uint32_t>(nodes))};
         if (!created.has_value()) return created.error();
         mesh = std::move(created).value();

@@ -198,6 +198,14 @@ struct PbftConfig {
      * current clock, or its first view times out at once.
      */
     uint64_t start_ms{0};
+    /** Idle grace (stage 2, O-101): the first view of a slot times out
+     * idle_grace_ms + TimeoutMs(0) after the slot starts unless work shows
+     * up first (a proposal arrives, this seat proposes, or the node calls
+     * OnLocalWork), which tightens the deadline to TimeoutMs(view) from now.
+     * 0 (the default; the simulator) is the plain PBFT timer; a daemon sets
+     * its heartbeat period, so an idle cluster does not churn views.
+     */
+    uint64_t idle_grace_ms{0};
 };
 
 //! What a PBFT instance works with; every reference must outlive it.
@@ -226,9 +234,17 @@ struct PbftStatus {
     bool halted{false};          //!< evidence was recorded (here or received): this seat signs and votes no more (M4-AGR-07)
     uint32_t prepare_votes{0};
     uint32_t commit_votes{0};
+    bool selected_missing{false}; //!< a NEW_VIEW selected a header this seat does not hold (the leader must fetch it, O-101)
+    uint64_t ahead_hint{0};       //!< AheadHint() or 0: f + 1 peers claim a slot beyond this one (catch-up, O-101)
 
     friend bool operator==(const PbftStatus&, const PbftStatus&) = default;
 };
+
+/** `cert` carries at least a quorum of `seats` and its aggregate verifies
+ * over `digest` (VERIFY_FAILED `detail` otherwise; the bitmap's own errors
+ * as they are). The agreement's and the catch-up's certificate check.
+ */
+Result<void> CheckCertificate(const SlotCertificate& cert, const uint256& digest, const SeatSet& seats, std::string_view detail);
 
 class PbftAgreement final : public Agreement
 {
@@ -251,6 +267,25 @@ public:
     bool IsLeader();
     //! The header a NEW_VIEW of the current view selected for re-proposal; zero or nullopt when none.
     std::optional<uint256> SelectedHeader();
+    //! The proposal of `header_hash` this seat holds for the slot in flight (accepted or seen), if any.
+    std::optional<Proposal> KnownProposal(const uint256& header_hash);
+    /** The new leader re-proposes the selected header from a fetched body
+     * (O-101): the header must be the selection (PBFT_NEW_VIEW_SELECTED),
+     * build on the head and reproduce exactly (Reexecute), its facts must be
+     * the adapter's (CheckFacts); then the leader's path (ProposeHeaderBody).
+     */
+    Result<void> ProposeSelected(const SlotHeaderV2& header, const SlotBody& body);
+    //! The node has work for the slot (pending actions or facts): tighten the first view's deadline (idle_grace_ms).
+    void OnLocalWork();
+    /** Catch-up hint (O-101): the slot that at least f + 1 distinct peers
+     * (k - Quorum() + 1) have claimed in a message beyond this seat's slot,
+     * or nullopt. Claims come from authenticated peers' PROPOSAL, VOTE,
+     * VIEW_CHANGE and NEW_VIEW slots and are never verified further, so one
+     * Byzantine peer alone cannot drive a fetch.
+     */
+    std::optional<uint64_t> AheadHint() const;
+    //! A peer answered that it does not hold what its claim implied: forget its claim.
+    void ResetClaim(uint32_t seat);
     const SeatSet& Seats() const { return m_seats; }
 
 private:
@@ -291,6 +326,9 @@ private:
     void StartSlot(const state::HeadView& head);
     Result<void> ResumeViewState(const state::HeadView& head);
     uint64_t TimeoutMs(uint64_t view) const;
+    //! Work showed up: the deadline becomes now + TimeoutMs(view) if that is sooner.
+    void TightenDeadline();
+    void NoteClaim(uint32_t from, uint64_t slot);
     Result<uint32_t> LeaderOf(uint64_t view) const;
     bool Fenced() const;
     void Tell();
@@ -349,6 +387,7 @@ private:
     Slot m_slot;
     std::optional<Decision> m_decision;
     bool m_halted{false};
+    std::map<uint32_t, uint64_t> m_claims; //!< per peer: the highest slot it named beyond this seat's (O-101)
 };
 
 } // namespace flowmesh2::agreement

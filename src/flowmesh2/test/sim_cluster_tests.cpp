@@ -3,6 +3,9 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <flowmesh2/net/in_process_mesh.h>
+#include <flowmesh2/net/sync.h>
+#include <flowmesh2/seat/seat_node.h>
+#include <flowmesh2/storage/commit_log.h>
 #include <flowmesh2/sim/cluster.h>
 #include <flowmesh2/sim/scenario.h>
 #include <flowmesh2/sim/sim_node.h>
@@ -164,6 +167,104 @@ BOOST_AUTO_TEST_CASE(an_inconsistent_fault_plan_is_refused)
     SimNodeConfig config;
     config.faults = twice;
     RequireError(SimCluster::Create(4, config, trace), ErrorCode::INVALID_INPUT, "the cluster checks the plan");
+}
+
+namespace {
+
+//! Drive the leader among `able` until every node in `wait_for` is at `height` or `limit_ms` passes; the clock reached.
+uint64_t DriveUntil(SimCluster& cluster, uint64_t& now, uint64_t height, const std::vector<uint32_t>& wait_for, uint64_t limit_ms)
+{
+    const uint64_t deadline{now + limit_ms};
+    while (now < deadline) {
+        if (const std::optional<uint32_t> leader{cluster.Leader()}) {
+            SimNode& node{cluster.Node(*leader)};
+            if (node.Owner().Head()->Header().height < height) {
+                const std::optional<agreement::PbftStatus> status{node.AgreementStatus()};
+                if (status.has_value() && !status->proposal_accepted && !status->decided) (void)node.ProposeSlot();
+            }
+        }
+        RequireOk(cluster.Pump(now), "Pump");
+        ++now;
+        bool all{true};
+        for (const uint32_t i : wait_for) all = all && cluster.Node(i).Owner().Head()->Header().height >= height;
+        if (all) return now;
+    }
+    return now;
+}
+
+size_t CountEvents(const TraceRecorder& trace, std::string_view kind, std::string_view detail_prefix = {})
+{
+    size_t n{0};
+    for (const TraceEvent& event : trace.Events()) {
+        if (event.kind == kind && (detail_prefix.empty() || event.detail.starts_with(detail_prefix))) ++n;
+    }
+    return n;
+}
+
+} // namespace
+
+BOOST_AUTO_TEST_CASE(a_seat_alone_behind_a_partition_catches_up_by_fetching_decisions)
+{
+    TraceRecorder trace;
+    SimNodeConfig config;
+    config.faults.partition = {{0, 1, 2}, {3}};
+    Result<std::unique_ptr<SimCluster>> created{SimCluster::Create(4, config, trace)};
+    RequireOk(created, "SimCluster::Create(4)");
+    SimCluster& cluster{**created};
+    for (size_t i{0}; i < 4; ++i) RequireOk(cluster.Node(i).Chain().AppendBlock(SimBlockHash(SIM_BASE_HEIGHT + 1), {}), "AppendBlock");
+    // The majority decides two slots while seat 3 is alone.
+    uint64_t now{1};
+    now = DriveUntil(cluster, now, 2, {0, 1, 2}, 6'000);
+    for (uint32_t i{0}; i < 3; ++i) BOOST_REQUIRE_EQUAL(cluster.Node(i).Owner().Head()->Header().height, 2U);
+    BOOST_CHECK_EQUAL(cluster.Node(3).Owner().Head()->Header().height, 0U);
+    BOOST_CHECK_EQUAL(CountEvents(trace, "sync.apply"), 0U);
+
+    // Before the heal: a fetched record is checked. Slot 2 is not the slot after seat 3's head; a tampered certificate fails;
+    // the real record of slot 1 applies.
+    seat::SeatNode& behind{cluster.Node(3).Seat()};
+    const ProfileParams& profile{cluster.Node(0).Profile()};
+    const std::optional<std::vector<unsigned char>> two{cluster.Node(0).CommitLog().RecentDecisionRecord(2)};
+    const std::optional<std::vector<unsigned char>> one{cluster.Node(0).CommitLog().RecentDecisionRecord(1)};
+    BOOST_REQUIRE(two.has_value() && one.has_value());
+    const storage::DecisionRecord record_two{storage::DecisionRecord::Decode(*two, profile).value()};
+    storage::DecisionRecord record_one{storage::DecisionRecord::Decode(*one, profile).value()};
+    RequireRefusal(behind.ApplyFetched(record_two), ErrorCode::STALE_PARENT, seat::SEAT_SYNC_SLOT, "slot 2 before slot 1");
+    storage::DecisionRecord forged{record_one};
+    forged.certificate.aggregate[7] ^= 0x01;
+    RequireRefusal(behind.ApplyFetched(forged), ErrorCode::VERIFY_FAILED, seat::SEAT_SYNC_CERT, "a tampered certificate");
+    storage::DecisionRecord renamed{record_one};
+    renamed.certificate.header_hash = uint256::ONE;
+    RequireRefusal(behind.ApplyFetched(renamed), ErrorCode::VERIFY_FAILED, seat::SEAT_SYNC_CERT_HEADER, "a certificate of another header");
+    BOOST_CHECK_EQUAL(cluster.Node(3).Owner().Head()->Header().height, 0U);
+    BOOST_CHECK(!cluster.Node(3).Fenced());
+    RequireOk(behind.ApplyFetched(record_one), "the real record of slot 1");
+    BOOST_CHECK_EQUAL(cluster.Node(3).Owner().Head()->Header().height, 1U);
+    BOOST_CHECK(cluster.Node(3).Owner().Head()->HeaderHash() == cluster.Node(0).Sealed()[0].head->HeaderHash());
+    BOOST_CHECK_EQUAL(CountEvents(trace, "sync.apply", "slot=1"), 1U);
+    // An applied slot is below the head: the record is refused as not the next slot, and nothing moves.
+    RequireRefusal(behind.ApplyFetched(record_one), ErrorCode::STALE_PARENT, seat::SEAT_SYNC_SLOT, "slot 1 again");
+    BOOST_CHECK_EQUAL(cluster.Node(3).Owner().Head()->Header().height, 1U);
+
+    // The heal: the majority goes on to slot 3; seat 3 hears about it from f + 1 peers, fetches slot 2 and takes part in slot 3.
+    cluster.HealPartition();
+    now = DriveUntil(cluster, now, 3, {0, 1, 2, 3}, 6'000);
+    for (uint32_t i{0}; i < 4; ++i) {
+        BOOST_CHECK_MESSAGE(cluster.Node(i).Owner().Head()->Header().height == 3, "seat " << i << " is at "
+                                                                                             << cluster.Node(i).Owner().Head()->Header().height);
+        BOOST_CHECK(cluster.Node(i).Owner().Head()->HeaderHash() == cluster.Node(0).Owner().Head()->HeaderHash());
+        BOOST_CHECK(cluster.Node(i).Owner().Head()->Header().state_root == cluster.Node(0).Owner().Head()->Header().state_root);
+    }
+    BOOST_CHECK_GE(CountEvents(trace, "sync.request"), 1U);
+    BOOST_CHECK_EQUAL(CountEvents(trace, "sync.apply", "slot=2"), 1U);
+    BOOST_CHECK_EQUAL(cluster.Node(3).Sealed().size(), 3U);
+    BOOST_CHECK_EQUAL(cluster.Node(3).Sealed()[1].height, 2U);
+    BOOST_CHECK(!cluster.Node(3).Fenced());
+    // A reply nobody asked for is refused and changes nothing.
+    const Result<std::vector<unsigned char>> stray{net::EncodeSync(net::DecisionsReply{4, *two}, profile)};
+    RequireOk(stray, "EncodeSync");
+    RequireRefusal(cluster.Node(3).OnFrame(net::InboundFrame{0, net::Lane::BULK, *stray}), ErrorCode::INVALID_INPUT, seat::SEAT_SYNC_UNSOLICITED,
+                   "unsolicited reply");
+    BOOST_CHECK_EQUAL(cluster.Node(3).Owner().Head()->Header().height, 3U);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

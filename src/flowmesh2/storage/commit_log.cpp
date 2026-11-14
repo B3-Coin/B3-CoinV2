@@ -128,6 +128,7 @@ Result<CommitLog> CommitLog::Recover(Journal& journal, const ProfileParams& prof
                 decoded->header.height,
                 DecisionEntry{header_hash, decoded->certificate.Hash(), decoded->certificate, decoded->header.state_root, record.seq, std::nullopt})};
             if (!inserted) return inconsistent; // one DECISION record per slot
+            log.Remember(decoded->header.height, record.payload);
             break;
         }
         case RecordType::APPLIED: {
@@ -170,6 +171,20 @@ Result<CommitLog> CommitLog::Recover(Journal& journal, const ProfileParams& prof
     return Ok(std::move(log));
 }
 
+void CommitLog::Remember(uint64_t slot, std::vector<unsigned char> payload)
+{
+    m_recent.emplace_back(slot, std::move(payload));
+    while (m_recent.size() > RECENT_DECISION_RECORDS) m_recent.pop_front();
+}
+
+std::optional<std::vector<unsigned char>> CommitLog::RecentDecisionRecord(uint64_t slot) const
+{
+    for (const auto& [s, payload] : m_recent) {
+        if (s == slot) return payload;
+    }
+    return std::nullopt;
+}
+
 Result<uint64_t> CommitLog::AppendEvidence(std::span<const unsigned char> payload)
 {
     if (m_journal->IsFatal()) return Error{ErrorCode::FENCED, JOURNAL_FENCED};
@@ -197,6 +212,7 @@ Result<PendingDecision> CommitLog::AppendDecision(const SlotHeaderV2& header, co
     Result<uint64_t> seq{m_journal->Append(RecordType::DECISION, payload)};
     if (!seq.has_value()) return seq.error();
     m_decisions.emplace(header.height, DecisionEntry{header_hash, cert_hash, certificate, header.state_root, *seq, std::nullopt});
+    Remember(header.height, payload);
     return Ok(PendingDecision{m_journal->InstanceId(), *seq, DecisionRef{header.height, header_hash, cert_hash}});
 }
 

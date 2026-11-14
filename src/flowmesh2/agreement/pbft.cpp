@@ -13,6 +13,8 @@
 #include <flowmesh2/storage/tokens.h>
 
 #include <algorithm>
+#include <functional>
+#include <iterator>
 #include <utility>
 #include <variant>
 
@@ -145,10 +147,77 @@ void PbftAgreement::StartSlot(const state::HeadView& head)
     m_slot = Slot{};
     m_slot.slot = head.Header().height + 1;
     m_slot.epoch = m_adapter.CurrentAuthority().epoch;
-    m_slot.deadline_ms = m_now_ms + TimeoutMs(0);
+    m_slot.deadline_ms = m_now_ms + m_config.idle_grace_ms + TimeoutMs(0);
     m_slot.timer_running = true;
     m_slot.last_retry_ms = m_now_ms;
+    for (auto it{m_claims.begin()}; it != m_claims.end();) {
+        it = it->second <= m_slot.slot ? m_claims.erase(it) : std::next(it);
+    }
     Tell();
+}
+
+void PbftAgreement::TightenDeadline()
+{
+    if (!m_slot.timer_running) return;
+    const uint64_t soon{m_now_ms + TimeoutMs(m_slot.view)};
+    if (soon < m_slot.deadline_ms) m_slot.deadline_ms = soon;
+}
+
+void PbftAgreement::OnLocalWork()
+{
+    if (Fenced()) return;
+    (void)SyncHead();
+    TightenDeadline();
+}
+
+void PbftAgreement::NoteClaim(uint32_t from, uint64_t slot)
+{
+    if (slot <= m_slot.slot) return;
+    uint64_t& claim{m_claims[from]};
+    claim = std::max(claim, slot);
+}
+
+std::optional<uint64_t> PbftAgreement::AheadHint() const
+{
+    std::vector<uint64_t> claims;
+    for (const auto& [seat, slot] : m_claims) {
+        if (slot > m_slot.slot) claims.push_back(slot);
+    }
+    const size_t need{m_seats.Size() - m_seats.Quorum() + 1}; // f + 1
+    if (claims.size() < need) return std::nullopt;
+    std::sort(claims.begin(), claims.end(), std::greater<>{});
+    return claims[need - 1];
+}
+
+void PbftAgreement::ResetClaim(uint32_t seat) { m_claims.erase(seat); }
+
+std::optional<Proposal> PbftAgreement::KnownProposal(const uint256& header_hash)
+{
+    (void)SyncHead();
+    if (const auto it{m_slot.known_proposals.find(header_hash)}; it != m_slot.known_proposals.end()) return it->second;
+    if (m_slot.accepted.has_value() && m_slot.accepted->header.Hash() == header_hash) return m_slot.accepted;
+    return std::nullopt;
+}
+
+Result<void> PbftAgreement::ProposeSelected(const SlotHeaderV2& header, const SlotBody& body)
+{
+    if (Fenced()) return Error{ErrorCode::FENCED, PBFT_FENCED};
+    if (const Result<void> synced{SyncHead()}; !synced.has_value()) return synced.error();
+    const uint256 hash{header.Hash()};
+    if (m_slot.selected.IsNull() || m_slot.selected != hash) return Invalid(PBFT_NEW_VIEW_SELECTED);
+    if (header.height != m_slot.slot) return Invalid(PBFT_CANDIDATE_SLOT);
+    const std::shared_ptr<const state::HeadView> head{m_owner.Head()};
+    if (header.parent_hash != head->HeaderHash()) return Error{ErrorCode::STALE_PARENT, PBFT_PARENT};
+    Proposal fetched;
+    fetched.epoch = m_slot.epoch;
+    fetched.view = m_slot.view;
+    fetched.header = header;
+    fetched.body = body;
+    if (const Result<void> facts{CheckFacts(fetched)}; !facts.has_value()) return facts.error();
+    // Execute-then-propose: the body must reproduce the header exactly before this seat puts its name on it.
+    const Result<state::Candidate> candidate{m_owner.Reexecute(header, body)};
+    if (!candidate.has_value()) return candidate.error();
+    return ProposeHeaderBody(header, body, header.Authority());
 }
 
 Result<void> PbftAgreement::ResumeViewState(const state::HeadView& head)
@@ -229,6 +298,8 @@ PbftStatus PbftAgreement::Status()
     status.halted = m_halted || m_evidence.Halted();
     status.prepare_votes = static_cast<uint32_t>(m_slot.prepares.size());
     status.commit_votes = static_cast<uint32_t>(m_slot.commits.size());
+    status.selected_missing = !m_slot.selected.IsNull() && !m_slot.known_proposals.contains(m_slot.selected);
+    status.ahead_hint = AheadHint().value_or(0);
     return status;
 }
 
@@ -306,18 +377,23 @@ Result<SlotCertificate> PbftAgreement::AggregateVotes(const std::map<uint32_t, V
     return Ok(std::move(cert));
 }
 
-Result<void> PbftAgreement::VerifyCertificate(const SlotCertificate& cert, const uint256& digest) const
+Result<void> CheckCertificate(const SlotCertificate& cert, const uint256& digest, const SeatSet& seats, std::string_view detail)
 {
-    const Result<std::vector<uint32_t>> signers{cert.SignerIndices(m_seats.Size())};
+    const Result<std::vector<uint32_t>> signers{cert.SignerIndices(seats.Size())};
     if (!signers.has_value()) return signers.error();
-    if (signers->size() < m_seats.Quorum()) return Error{ErrorCode::VERIFY_FAILED, PBFT_PREPARED_CERT};
+    if (signers->size() < seats.Quorum()) return Error{ErrorCode::VERIFY_FAILED, detail};
     std::vector<bls::VerifiedPublicKey> keys;
-    for (const uint32_t seat : *signers) keys.push_back(m_seats.Keys()[seat]);
+    for (const uint32_t seat : *signers) keys.push_back(seats.Keys()[seat]);
     const std::optional<bls::Signature> aggregate{bls::Signature::Decode(cert.aggregate)};
     if (!aggregate.has_value() || !bls::FastAggregateVerify(keys, std::span<const unsigned char>{digest.data(), digest.size()}, *aggregate)) {
-        return Error{ErrorCode::VERIFY_FAILED, PBFT_PREPARED_CERT};
+        return Error{ErrorCode::VERIFY_FAILED, detail};
     }
     return Ok();
+}
+
+Result<void> PbftAgreement::VerifyCertificate(const SlotCertificate& cert, const uint256& digest) const
+{
+    return CheckCertificate(cert, digest, m_seats, PBFT_PREPARED_CERT);
 }
 
 Result<void> PbftAgreement::SendToAll(std::span<const unsigned char> message)
@@ -399,6 +475,7 @@ Result<void> PbftAgreement::ProposeHeaderBody(const SlotHeaderV2& header, const 
     m_slot.accepted_pending = *pending;
     m_slot.known_proposals.emplace(hash, proposal);
     m_slot.own_proposal = *bytes;
+    TightenDeadline();
     Tell();
     if (const Result<void> sent{SendToAll(*bytes)}; !sent.has_value()) return sent.error();
     // The leader prepares its own proposal like a follower (it executed it already).
@@ -447,6 +524,7 @@ Result<void> PbftAgreement::OnProposal(uint32_t from, Proposal proposal)
     if (proposal.view < m_slot.view) return Ok(); // an abandoned view
     if (proposal.view > m_slot.view || m_slot.changing) {
         // Its NEW_VIEW (or the quorum that leads there) has not arrived yet: one proposal waits.
+        TightenDeadline();
         m_slot.pending_proposal = std::pair{from, std::move(proposal)};
         return Ok();
     }
@@ -479,6 +557,7 @@ Result<void> PbftAgreement::OnProposal(uint32_t from, Proposal proposal)
     m_slot.accepted = proposal;
     m_slot.accepted_pending = *pending;
     m_slot.known_proposals.emplace(hash, proposal);
+    TightenDeadline();
     Tell();
     if (const Result<void> voted{VotePrepare(proposal)}; !voted.has_value()) return voted.error();
     return ReplayEarlyVotes();
@@ -665,6 +744,17 @@ Result<void> PbftAgreement::OnMessage(uint32_t from_seat, std::span<const unsign
     if (from_seat >= m_seats.Size() || from_seat == m_config.self_seat) return Invalid(PBFT_VOTE_SEAT);
     Result<Message> decoded{DecodeMessage(bytes, m_profile)};
     if (!decoded.has_value()) return decoded.error();
+    // The slot the peer is working on, for the catch-up hint (O-101); never trusted further.
+    std::visit(
+        [&](const auto& message) {
+            using T = std::decay_t<decltype(message)>;
+            if constexpr (std::is_same_v<T, Proposal>) {
+                NoteClaim(from_seat, message.header.height);
+            } else if constexpr (std::is_same_v<T, Vote> || std::is_same_v<T, ViewChange> || std::is_same_v<T, NewView>) {
+                NoteClaim(from_seat, message.slot);
+            }
+        },
+        *decoded);
     return std::visit(
         [&](auto&& message) -> Result<void> {
             using T = std::decay_t<decltype(message)>;

@@ -22,6 +22,7 @@
 #include <flowmesh2/net/in_process_api.h>
 #include <flowmesh2/net/lanes.h>
 #include <flowmesh2/net/seat_mesh.h>
+#include <flowmesh2/net/sync.h>
 #include <flowmesh2/read/read_service.h>
 #include <flowmesh2/read/views.h>
 #include <flowmesh2/state/candidate.h>
@@ -120,6 +121,13 @@ inline constexpr std::string_view SEAT_RANGE{"self_seat outside seat_count"};   
 inline constexpr std::string_view SEAT_NO_AGREEMENT{"a one-seat node needs an agreement factory"};             //!< (INVALID_INPUT)
 inline constexpr std::string_view SEAT_PARTS_MISSING{"a node needs its chain adapter, journals and budget"};   //!< (INVALID_INPUT)
 inline constexpr std::string_view SEAT_SET_SIZE{"seat_count differs from the seat set"};                       //!< (INVALID_INPUT)
+inline constexpr std::string_view SEAT_SELECTED_MISSING{"the new view selected a header this seat must fetch first"}; //!< (NEED_DATA)
+inline constexpr std::string_view SEAT_SYNC_SLOT{"fetched decision is not for the slot after the head"};        //!< (STALE_PARENT)
+inline constexpr std::string_view SEAT_SYNC_PARENT{"fetched decision does not build on the head"};              //!< (STALE_PARENT)
+inline constexpr std::string_view SEAT_SYNC_CERT_HEADER{"fetched certificate names another header"};            //!< (VERIFY_FAILED)
+inline constexpr std::string_view SEAT_SYNC_CERT{"fetched certificate does not verify"};                        //!< (VERIFY_FAILED)
+inline constexpr std::string_view SEAT_SYNC_CONFLICT{"fetched decision conflicts with this seat's decision"};   //!< (EQUIVOCATION_REFUSED)
+inline constexpr std::string_view SEAT_SYNC_UNSOLICITED{"sync reply nobody asked for"};                         //!< (INVALID_INPUT)
 
 /** What the owner of a node observes and may inject (the simulator's trace
  * and fault plan; a daemon's log). Every method has a no-op default and is
@@ -182,6 +190,8 @@ struct SeatNodeConfig {
     std::vector<unsigned char> ikm; //!< this seat's BLS IKM (SeatSigner::FromIKM)
     size_t max_replies{64};         //!< InProcessApi::ApiLimits
     agreement::PbftConfig pbft;     //!< k > 1; self_seat and start_ms are set by the node
+    uint64_t sync_backoff_ms{250};     //!< catch-up (O-101): the first retry period of a request nobody answered
+    uint64_t sync_backoff_max_ms{2'000}; //!< the retry period doubles up to this
 };
 
 //! What the caller owns and the node borrows; every pointer but `mesh`, `sign_observer`, `hooks` and `agreement` is required.
@@ -226,10 +236,37 @@ public:
      * candidate is kept for Complete.
      */
     Result<uint64_t> ProposeSlot();
-    //! A frame from the mesh: CRITICAL and PROPOSAL frames go to the agreement (its errors are returned; only STORAGE_FATAL and FENCED fence the node); others are ignored.
+    /** A frame from the mesh: CRITICAL and PROPOSAL frames go to the
+     * agreement (its errors are returned; only STORAGE_FATAL and FENCED fence
+     * the node); BULK frames are sync messages (net/sync.h, O-101): a
+     * DECISIONS_REQUEST is answered from the commit log's recent records, a
+     * DECISIONS_REPLY this seat asked for is verified and applied
+     * (ApplyFetched), a PROPOSAL_REQUEST from the agreement's known proposals,
+     * a PROPOSAL_REPLY the leader asked for re-proposes the selected header;
+     * anything else is ignored.
+     */
     Result<void> OnFrame(const net::InboundFrame& frame);
-    //! Time: PbftAgreement::OnTimeout(now_ms).
+    /** Time: PbftAgreement::OnTimeout(now_ms), then the catch-up driver
+     * (O-101): while f + 1 peers claim a slot beyond head + 1 this seat asks
+     * the next peer round-robin for head + 1 (one request in flight, the
+     * retry period doubling from sync_backoff_ms while replies are empty);
+     * a leader whose NEW_VIEW selected a header it does not hold asks for
+     * that proposal the same way.
+     */
     Result<void> Tick(uint64_t now_ms);
+    //! The node has pending actions or facts: the agreement tightens its idle deadline (PbftConfig::idle_grace_ms).
+    void OnLocalWork();
+    /** A decided slot fetched from a peer (or found in the journal's tail):
+     * height head + 1 (SEAT_SYNC_SLOT), parent the head (SEAT_SYNC_PARENT), the
+     * certificate names the header (SEAT_SYNC_CERT_HEADER) and verifies with a
+     * quorum of its epoch's seats (SEAT_SYNC_CERT); a slot this seat decided
+     * itself is skipped when the headers agree and is CONFLICTING_CERTIFICATES
+     * evidence when they do not (SEAT_SYNC_CONFLICT); a decision the agreement
+     * holds for Complete is left to it. Then Reexecute, DECISION (idempotent),
+     * B-DECISION, and steps 6 to 9 (Finish). Refusals do not fence (they are
+     * the peer's fault); the Finish errors fence as always.
+     */
+    Result<void> ApplyFetched(const storage::DecisionRecord& record);
     /** Steps 6 to 9 of SealSlot for a decision the agreement reached: the
      * kept candidate when it is the decided header's (the leader), else
      * StateOwner::Reexecute of the decided header and body (a follower).
@@ -289,6 +326,18 @@ private:
     //! After Apply moved the head: always fence; returns `error` (O-90).
     Error FenceAfterApply(const Error& error);
     NodeHooks& Hooks() { return *m_hooks; }
+    Result<void> OnBulk(const net::InboundFrame& frame);
+    Result<void> SendSync(uint32_t seat, const net::SyncMessage& message);
+    uint32_t NextPeer();
+    //! One request in flight at a time (O-101).
+    struct SyncState {
+        std::optional<uint32_t> pending_peer;
+        bool pending_proposal{false}; //!< the request in flight is a PROPOSAL_REQUEST
+        uint64_t pending_slot{0};
+        uint64_t sent_ms{0};
+        uint64_t backoff_ms{0};
+        uint32_t next_peer{0};
+    };
 
     const SeatNodeConfig m_config;
     NodeHooks m_no_hooks;
@@ -318,6 +367,7 @@ private:
     std::optional<state::Candidate> m_proposed;
     std::vector<ActionId> m_proposed_ids;
     uint64_t m_now_ms{0}; //!< the last Tick; a rebuilt agreement starts its timers here
+    SyncState m_sync;
 };
 
 } // namespace flowmesh2::seat

@@ -572,4 +572,117 @@ BOOST_AUTO_TEST_CASE(create_checks_the_seat_and_the_key)
     RequireRefusal(fresh.MayCommit(p, PreparedCert{}), ErrorCode::ORDER_VIOLATION, PBFT_NO_PROPOSAL, "commit without a proposal");
 }
 
+BOOST_AUTO_TEST_CASE(idle_grace_holds_the_first_timeout_until_work_arrives)
+{
+    PbftConfig base;
+    base.idle_grace_ms = 1'000;
+    const uint64_t timeout{base.view_timeout_floor_ms};
+    Cluster c{4, base};
+    const uint32_t leader{c.Leader()};
+    // Nothing happens for far longer than a view timeout: nobody changes view while the slot is idle.
+    c.Tick(timeout * 5);
+    for (uint32_t i{0}; i < 4; ++i) BOOST_CHECK(!c.At(i).pbft->Status().changing);
+    // Local work tightens every seat's deadline to a plain view timeout from now.
+    for (auto& seat : c.seats) seat->pbft->OnLocalWork();
+    c.Tick(timeout * 5 + timeout - 1);
+    for (uint32_t i{0}; i < 4; ++i) BOOST_CHECK(!c.At(i).pbft->Status().changing);
+    c.Tick(timeout * 6);
+    for (uint32_t i{0}; i < 4; ++i) BOOST_CHECK_EQUAL(c.At(i).pbft->Status().view, 1U);
+    BOOST_CHECK_NE(c.Leader(), leader);
+
+    // A proposal tightens the followers' deadlines too: with the votes dropped, they time out a view timeout after it.
+    Cluster d{4, base};
+    const uint32_t first{d.Leader()};
+    const state::Candidate candidate{d.At(first).rig->Preview(d.InputsFromChain(first))};
+    RequireOk(d.At(first).pbft->Propose(candidate, d.Authority()), "Propose");
+    d.Deliver([](uint32_t, uint32_t, const std::vector<unsigned char>& frame) {
+        return frame.size() > 1 && frame[1] == static_cast<unsigned char>(MessageType::PROPOSAL);
+    });
+    d.Tick(timeout - 1, [](uint32_t, uint32_t, const std::vector<unsigned char>& frame) {
+        return frame.size() > 1 && frame[1] == static_cast<unsigned char>(MessageType::PROPOSAL);
+    });
+    for (uint32_t i{0}; i < 4; ++i) BOOST_CHECK(!d.At(i).pbft->Status().changing);
+    d.Tick(timeout, [](uint32_t, uint32_t, const std::vector<unsigned char>& frame) {
+        return frame.size() > 1 && frame[1] == static_cast<unsigned char>(MessageType::PROPOSAL);
+    });
+    for (uint32_t i{0}; i < 4; ++i) BOOST_CHECK(d.At(i).pbft->Status().view >= 1 || d.At(i).pbft->Status().changing);
+}
+
+BOOST_AUTO_TEST_CASE(claims_from_f_plus_one_peers_give_the_ahead_hint)
+{
+    Cluster c{4};
+    PbftAgreement& pbft{*c.At(0).pbft};
+    const ProfileParams& profile{c.At(0).rig->profile};
+    BOOST_CHECK(!pbft.AheadHint().has_value());
+    BOOST_CHECK_EQUAL(pbft.Status().ahead_hint, 0U);
+    // One peer's claim is not a hint (one Byzantine seat cannot drive a fetch); the vote itself is for another slot and ignored.
+    const uint256 h{LabelHash("fm2/test/pbft/ahead")};
+    const Vote far{SignedVote("s1", 1, storage::VotePhase::PREPARE, 0, 0, 5, h, PrepareDigest(0, h))};
+    RequireOk(pbft.OnMessage(1, EncodeMessage(Message{far}, profile).value()), "a vote for slot 5");
+    BOOST_CHECK(!pbft.AheadHint().has_value());
+    // A second peer claiming slot 7: the f + 1 = 2 claims give the lower one, slot 5.
+    const Vote further{SignedVote("s2", 2, storage::VotePhase::PREPARE, 0, 0, 7, h, PrepareDigest(0, h))};
+    RequireOk(pbft.OnMessage(2, EncodeMessage(Message{further}, profile).value()), "a vote for slot 7");
+    BOOST_CHECK(pbft.AheadHint() == std::optional<uint64_t>{5});
+    BOOST_CHECK_EQUAL(pbft.Status().ahead_hint, 5U);
+    // A claim for the current slot (or below) is none; a reset forgets a peer's claim.
+    const Vote current{SignedVote("s3", 3, storage::VotePhase::PREPARE, 0, 0, 1, h, PrepareDigest(0, h))};
+    (void)pbft.OnMessage(3, EncodeMessage(Message{current}, profile).value());
+    BOOST_CHECK(pbft.AheadHint() == std::optional<uint64_t>{5});
+    pbft.ResetClaim(2);
+    BOOST_CHECK(!pbft.AheadHint().has_value());
+    pbft.ResetClaim(1);
+    BOOST_CHECK(!pbft.AheadHint().has_value());
+}
+
+BOOST_AUTO_TEST_CASE(a_new_leader_reproposes_a_fetched_selection)
+{
+    // Which seat leads view 1 of slot 1? The schedule is seeded by the seat set, so a throwaway cluster tells.
+    uint32_t next_leader{4};
+    {
+        Cluster probe{4};
+        probe.Tick(PbftConfig{}.view_timeout_floor_ms);
+        next_leader = probe.Leader();
+        BOOST_REQUIRE_LT(next_leader, 4U);
+    }
+    Cluster c{4};
+    const uint32_t leader{c.Leader()};
+    BOOST_REQUIRE_NE(leader, next_leader);
+    const state::Candidate candidate{c.At(leader).rig->Preview(c.InputsFromChain(leader))};
+    RequireOk(c.At(leader).pbft->Propose(candidate, c.Authority()), "Propose");
+    const uint256 hash{candidate.Header().Hash()};
+    // The proposal never reaches the next leader; commit votes are dropped everywhere, so the view times out prepared.
+    const Filter keep{[next_leader](uint32_t, uint32_t to, const std::vector<unsigned char>& frame) {
+        if (frame.size() > 1 && frame[1] == static_cast<unsigned char>(MessageType::PROPOSAL) && to == next_leader) return false;
+        return !IsCommitVote(frame);
+    }};
+    c.Deliver(keep);
+    BOOST_CHECK(!c.At(next_leader).pbft->Status().proposal_accepted);
+    BOOST_CHECK(c.At(leader).pbft->Status().prepared);
+    const uint64_t timeout{PbftConfig{}.view_timeout_floor_ms};
+    c.Tick(timeout, keep);
+    BOOST_REQUIRE_EQUAL(c.Leader(), next_leader);
+    PbftAgreement& fresh{*c.At(next_leader).pbft};
+    const PbftStatus status{fresh.Status()};
+    BOOST_CHECK_EQUAL(status.view, 1U);
+    BOOST_CHECK(!status.changing);
+    BOOST_CHECK(fresh.SelectedHeader() == std::optional<uint256>{hash});
+    BOOST_CHECK(status.selected_missing);
+    BOOST_CHECK(!fresh.KnownProposal(hash).has_value());
+    // Another header is not the selection; the body a peer holds is, and re-proposing it decides the slot in view 1.
+    const std::optional<Proposal> held{c.At(leader).pbft->KnownProposal(hash)};
+    BOOST_REQUIRE(held.has_value());
+    SlotHeaderV2 other{held->header};
+    other.anchor.height += 1;
+    RequireRefusal(fresh.ProposeSelected(other, held->body), ErrorCode::INVALID_INPUT, PBFT_NEW_VIEW_SELECTED, "another header");
+    RequireOk(fresh.ProposeSelected(held->header, held->body), "ProposeSelected");
+    BOOST_CHECK(!fresh.Status().selected_missing);
+    BOOST_CHECK(fresh.KnownProposal(hash).has_value());
+    c.Deliver();
+    c.Tick(timeout + PbftConfig{}.retry_ms);
+    for (uint32_t i{0}; i < 4; ++i) BOOST_CHECK_MESSAGE(c.At(i).pbft->Status().decided, "seat " << i << " undecided");
+    const uint256 decided{c.ApplyDecisions()};
+    BOOST_CHECK(decided == hash);
+}
+
 BOOST_AUTO_TEST_SUITE_END()

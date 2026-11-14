@@ -17,6 +17,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <map>
 #include <optional>
 #include <span>
@@ -207,6 +208,14 @@ public:
     Result<uint64_t> AppendEvidence(std::span<const unsigned char> payload);
     const std::vector<std::vector<unsigned char>>& EvidenceRecords() const { return m_evidence; }
 
+    /** The encoded DECISION record of `slot` if it is among the last
+     * RECENT_DECISION_RECORDS this log appended or recovered (the catch-up
+     * replies of O-101 come from memory, never from a journal read on the
+     * sealing thread); nullopt otherwise.
+     */
+    std::optional<std::vector<unsigned char>> RecentDecisionRecord(uint64_t slot) const;
+    static constexpr size_t RECENT_DECISION_RECORDS{16};
+
 private:
     explicit CommitLog(Journal& journal) : m_journal{&journal} {}
 
@@ -229,6 +238,8 @@ private:
     uint64_t m_last_applied_slot{0};               //!< 0 before the first application (the genesis height)
     std::map<ProposalKey, PreparedEntry> m_prepared; //!< by (epoch, slot, view)
     std::vector<std::vector<unsigned char>> m_evidence; //!< EVIDENCE payloads in journal order (M4-AGR-07)
+    std::deque<std::pair<uint64_t, std::vector<unsigned char>>> m_recent; //!< (slot, DECISION payload) of the last RECENT_DECISION_RECORDS
+    void Remember(uint64_t slot, std::vector<unsigned char> payload);
 };
 
 } // namespace flowmesh2::storage
