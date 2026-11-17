@@ -200,4 +200,65 @@ BOOST_AUTO_TEST_CASE(an_error_after_the_head_moved_fences_the_node)
     BOOST_CHECK(reply->code == AdmissionCode::HALTED);
 }
 
+BOOST_AUTO_TEST_CASE(a_restart_applies_a_decided_but_unapplied_slot)
+{
+    // Review of 2026-11-16, defect 8: a crash between B-DECISION and B-APPLIED (a window open on every slot) left a
+    // node that could not restart: Restore answered NotImplemented for the decided-but-unapplied tail. The restart
+    // now re-executes that slot, runs check 3 under the current authority, writes APPLIED and publishes it.
+    SimNodeConfig config;
+    config.faults.crash_after_decision_at = 2;
+    NodeRig rig{config};
+    RequireOk(rig.node->SealSlot(), "SealSlot 1");
+    RequireCodeAndDetail(rig.node->SealSlot(), ErrorCode::STORAGE_FATAL, SIM_CRASH_AFTER_DECISION, "SealSlot 2 (the crash)");
+    BOOST_REQUIRE(rig.node->Fenced());
+    BOOST_CHECK_EQUAL(rig.node->Owner().Head()->Header().height, 1U);
+    {
+        const Result<std::vector<storage::JournalRecord>> records{rig.node->CommitJournal().ReadAll()};
+        RequireOk(records, "commit ReadAll");
+        BOOST_REQUIRE_EQUAL(records->size(), 3U); // DECISION 1, APPLIED 1, DECISION 2
+        BOOST_CHECK(records->back().type == storage::RecordType::DECISION);
+    }
+    const size_t sealed_before{rig.node->Sealed().size()};
+    RequireOk(rig.node->Restart(), "Restart");
+    BOOST_CHECK(!rig.node->Fenced());
+    BOOST_CHECK_EQUAL(rig.node->Owner().Head()->Header().height, 2U);
+    BOOST_CHECK(rig.node->Read().PublishedHeight() == std::optional<uint64_t>{2});
+    BOOST_CHECK_EQUAL(rig.node->Sealed().size(), sealed_before + 1);
+    {
+        const Result<std::vector<storage::JournalRecord>> records{rig.node->CommitJournal().ReadAll()};
+        RequireOk(records, "commit ReadAll after the restart");
+        BOOST_REQUIRE_EQUAL(records->size(), 4U); // ... APPLIED 2
+        BOOST_CHECK(records->back().type == storage::RecordType::APPLIED);
+        BOOST_CHECK_EQUAL(storage::AppliedRecord::Decode(records->back().payload).value().slot, 2U);
+    }
+    // The node goes on from there.
+    RequireOk(rig.node->SealSlot(), "SealSlot 3");
+    BOOST_CHECK_EQUAL(rig.node->Owner().Head()->Header().height, 3U);
+    BOOST_CHECK_EQUAL(rig.SignedVotesAt(2), 1U); // slot 2 was never re-decided
+}
+
+BOOST_AUTO_TEST_CASE(a_restart_after_a_check_3_refusal_keeps_the_live_head_and_stays_fenced)
+{
+    // The other way into the same journal state: slot 2's DECISION durable, check 3 refused under a moved authority.
+    // The restart re-runs check 3, which refuses again; the head stays at slot 1, nothing is applied or published for
+    // slot 2, and the node starts fenced (O-89: the height is never re-decided with another header).
+    SimNodeConfig config;
+    config.faults.bump_authority_before_apply_at = 2;
+    NodeRig rig{config};
+    RequireOk(rig.node->SealSlot(), "SealSlot 1");
+    RequireCodeAndDetail(rig.node->SealSlot(), ErrorCode::AUTHORITY_CHANGED, state::AUTHORITY_SUPERSEDED, "SealSlot 2 (check 3)");
+    BOOST_REQUIRE(rig.node->Fenced());
+    RequireOk(rig.node->Restart(), "Restart");
+    BOOST_CHECK(rig.node->Fenced());
+    BOOST_CHECK_EQUAL(rig.node->Owner().Head()->Header().height, 1U);
+    // The read service is rebuilt empty on every restart and publishes from the next applied slot on (M4-STO-01); nothing
+    // was applied here, so nothing is published, and slot 2 in particular never was.
+    BOOST_CHECK(!rig.node->Read().PublishedHeight().has_value());
+    const Result<std::vector<storage::JournalRecord>> records{rig.node->CommitJournal().ReadAll()};
+    RequireOk(records, "commit ReadAll");
+    BOOST_CHECK_EQUAL(records->size(), 3U); // no APPLIED 2
+    RequireCodeAndDetail(rig.node->SealSlot(), ErrorCode::FENCED, SIM_FENCED, "SealSlot after the restart");
+    BOOST_CHECK_EQUAL(rig.SignedVotesAt(2), 1U);
+}
+
 BOOST_AUTO_TEST_SUITE_END()

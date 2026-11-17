@@ -66,10 +66,11 @@
  *   the genesis `base` and the whole commit journal (M4-STO-01's restart,
  *   landed 2026-11-14): the owner must still be at its genesis
  *   (ORDER_VIOLATION, RESTORE_NOT_FRESH) and `base` must be it
- *   (INVALID_INPUT, OWNER_NOT_GENESIS). A decided slot without APPLIED is
- *   applied only after check 3 passes again under the current authority
- *   (O-89); until M4-STO-03 lands that case, and a snapshot base, are
- *   NotImplemented.
+ *   (INVALID_INPUT, OWNER_NOT_GENESIS). The head installed is the last
+ *   APPLIED slot; a decided slot after it is the seat node's to re-execute
+ *   and apply after check 3 passes again under the current authority
+ *   (O-89; SeatNode::ApplyUnappliedTail, review of 2026-11-16, defect 8).
+ *   A snapshot base is NotImplemented until M4-STO-03 lands it.
  *
  * Create(profile, genesis, commit_journal_instance) takes a GENESIS head
  * only (height 0, zero parent hash, parent certificate hash and certificate
@@ -130,7 +131,7 @@ public:
     Result<AppliedSlot> Apply(Candidate&& candidate, const DurableDecision& decision, const AuthorityVersion& current)
         EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
 
-    //! Snapshot `base` plus the commit journal `records` after it. Stub: M4-STO-03.
+    //! Install the committed head ReplayDecisions rebuilds from the genesis `base` and the whole commit journal (file comment).
     Result<void> Restore(const HeadView& base, std::span<const storage::JournalRecord> records) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
 
 private:

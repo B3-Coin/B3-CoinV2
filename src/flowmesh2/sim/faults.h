@@ -37,13 +37,18 @@
  * - bump_authority_before_apply_at = s: the authority is bumped after slot
  *   s's DECISION is durable and before Apply, so check 3 refuses a decided
  *   slot (O-89; sim_node_tests). The walking-skeleton variants do not use it.
+ * - crash_after_decision_at = s: the node stops after slot s's DECISION is
+ *   durable and before Apply (the hook answers STORAGE_FATAL and the node
+ *   fences), which is what a kill -9 or power loss there leaves: a restart
+ *   re-executes and applies the slot (SeatNode::ApplyUnappliedTail;
+ *   review of 2026-11-16, defect 8). sim_node_tests.
  *
  * Cluster faults (M4-SIM-02, landed 2026-11-14; sim/cluster.h applies them
  * to a cluster of more than one node, the fabric's seed being fabric_seed):
  * - crash_before_slot = s, crash_seat = i: the driver restarts node i before
  *   slot s (SimCluster::RestartNode: journals and chain stay, everything
  *   else is rebuilt, M4-STO-01 recovery; a decided-but-unapplied slot is
- *   M4-STO-03's and refuses);
+ *   applied on the restart after check 3, or keeps the node fenced);
  * - DropRule{from, to, per_mille}: that fraction of the frames from one
  *   seat to another vanishes (seeded);
  * - DelayRule{from, to, delay_ms}: frames from one seat to another arrive
@@ -83,6 +88,7 @@ struct FaultPlan {
     std::optional<uint64_t> fail_commit_barrier_at;
     std::optional<uint64_t> bump_authority_at;
     std::optional<uint64_t> bump_authority_before_apply_at;
+    std::optional<uint64_t> crash_after_decision_at;
 
     // Cluster faults (M4-SIM-02; see the file comment).
     std::optional<uint64_t> crash_before_slot;

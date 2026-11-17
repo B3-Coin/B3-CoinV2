@@ -84,6 +84,7 @@ inline constexpr std::string_view SIM_POLL_AUTHORITY{seat::SEAT_POLL_AUTHORITY};
 inline constexpr std::string_view SIM_NO_DECISION{seat::SEAT_NO_DECISION};       //!< (INVARIANT)
 inline constexpr std::string_view SIM_FAULT_MAPPING{"commit barriers so far do not match the fault plan"};  //!< (INVARIANT)
 inline constexpr std::string_view SIM_FAULT_SLOT{"fault plan slot must be at least 1"};                     //!< (INVALID_INPUT)
+inline constexpr std::string_view SIM_CRASH_AFTER_DECISION{"the plan's crash after the decision"};             //!< (STORAGE_FATAL)
 inline constexpr std::string_view SIM_NOT_SEALED{"no sealed slot at that height"};                          //!< (INVALID_INPUT)
 inline constexpr std::string_view SIM_BAD_KEY{"a simulator key label gives no key"};                        //!< (INVALID_INPUT)
 inline constexpr std::string_view SIM_FENCED{seat::SEAT_FENCED};                                            //!< (FENCED)
@@ -204,7 +205,7 @@ private:
         void EndSlot(uint64_t height, std::string_view result) override;
         bool Withhold(const ActionV2& action) override;
         Result<void> AfterPreview(uint64_t height) override;
-        void AfterDecision(uint64_t height) override;
+        Result<void> AfterDecision(uint64_t height) override;
         void OnSealed(SealedSlot&& sealed) override;
 
     private:

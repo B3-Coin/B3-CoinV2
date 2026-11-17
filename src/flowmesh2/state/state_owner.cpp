@@ -100,10 +100,9 @@ Result<void> StateOwner::Restore(const HeadView& base, std::span<const storage::
     // restart; a snapshot base is M4-STO-03's).
     Result<ReplayResult> replayed{ReplayDecisions(base, records)};
     if (!replayed.has_value()) return replayed.error();
-    if (!(replayed->decided_head.Header() == replayed->head.Header())) {
-        // A decided slot without APPLIED: check 3 must run again under the current authority before it is applied.
-        return NotImplemented("M4-STO-03"); // TODO(rebirth:M4-STO-03) apply the decided-but-unapplied tail on restore
-    }
+    // The committed head (the last APPLIED slot) is installed. Decided slots after it are the seat node's: it re-executes
+    // them and runs check 3 under the current authority before APPLIED is written (SeatNode::ApplyUnappliedTail; review
+    // of 2026-11-16, defect 8). Until then they are visible through the commit log, not through this head.
     std::shared_ptr<const HeadView> installed{std::make_shared<const HeadView>(replayed->head)};
     LOCK(m_mutex);
     if (m_head->Header().height != 0) return Error{ErrorCode::ORDER_VIOLATION, RESTORE_NOT_FRESH};

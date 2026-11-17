@@ -148,8 +148,9 @@ public:
     virtual bool Withhold(const ActionV2& /*action*/) { return false; }
     //! Step 4: after Preview, before Propose; an error fences as the sealing rules say.
     virtual Result<void> AfterPreview(uint64_t /*height*/) { return Ok(); }
-    //! k = 1: after the decision is durable, before Apply.
-    virtual void AfterDecision(uint64_t /*height*/) {}
+    //! k = 1: after the decision is durable, before Apply. An error fences the node there (the simulator's crash
+    //! between B-DECISION and B-APPLIED: what a restart must then recover from).
+    virtual Result<void> AfterDecision(uint64_t /*height*/) { return Ok(); }
     //! Every slot this node applied, after step 9 (the simulator keeps them).
     virtual void OnSealed(SealedSlot&& /*sealed*/) {}
 };
@@ -325,6 +326,9 @@ private:
     Result<SealReport> Finish(uint64_t height, state::Candidate candidate, agreement::Decision decision, std::vector<ActionId> taken);
     //! Build (or rebuild, on restart) every component after the journals and the chain.
     Result<void> BuildComponents(bool restart);
+    //! A restart's decided-but-unapplied DECISIONs after the committed head, re-executed and applied in order
+    //! (check 3 under the current authority, B-APPLIED, publication); a refusal fences and keeps the head (O-89).
+    Result<void> ApplyUnappliedTail();
     //! Fence admission (once; the hooks see node.fence with the code).
     void Fence(const Error& error);
     /** Before the head moves: fence after `error` if it is STORAGE_FATAL,

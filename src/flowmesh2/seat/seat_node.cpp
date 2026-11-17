@@ -124,6 +124,17 @@ Result<void> SeatNode::BuildComponents(bool restart)
     if (!api.has_value()) return api.error();
     m_api = std::move(api).value();
 
+    // A restart's decided-but-unapplied tail (review 2026-11-16, defect 8; the first half of M4-STO-03): every DECISION
+    // after the committed head is re-executed and applied under the current authority before the agreement starts. A
+    // refusal keeps the head where it is and fences the node, which then starts and serves reads (O-89: that height is
+    // never re-decided with another header); a storage failure is the restart's error.
+    if (restart) {
+        if (const Result<void> tail{ApplyUnappliedTail()}; !tail.has_value()) {
+            Hooks().Record("restart.tail", std::string{ToString(tail.error().code)} + "," + std::string{tail.error().detail});
+            if (tail.error().code == ErrorCode::STORAGE_FATAL || tail.error().code == ErrorCode::INVARIANT) return tail.error();
+        }
+    }
+
     // The agreement: the caller's k = 1 certifier, or PBFT over the mesh.
     m_certifier.reset();
     m_pbft.reset();
@@ -191,8 +202,9 @@ Result<SealReport> SeatNode::SealNext(const std::shared_ptr<const state::HeadVie
     std::optional<agreement::Decision> decision{m_certifier->TakeDecision()};
     if (!decision.has_value()) return FenceOn(Error{ErrorCode::INVARIANT, SEAT_NO_DECISION});
 
-    // The hooks' step after the decision is durable (the simulator's authority bump; check 3 refuses it, O-89).
-    Hooks().AfterDecision(height);
+    // The hooks' step after the decision is durable (the simulator's authority bump, which check 3 refuses, O-89; or its
+    // crash, which fences the node with the DECISION durable and nothing applied: a restart recovers that).
+    if (const Result<void> after{Hooks().AfterDecision(height)}; !after.has_value()) return FenceOn(after.error());
     return Finish(height, std::move(candidate), std::move(*decision), std::move(prepared->second));
 }
 
@@ -246,6 +258,32 @@ Result<std::pair<state::Candidate, std::vector<ActionId>>> SeatNode::Prepare(con
     // 4. The hooks' step between Preview and Propose (the simulator's authority bump and fault mapping check).
     if (const Result<void> after{Hooks().AfterPreview(height)}; !after.has_value()) return FenceOn(after.error());
     return Ok(std::pair{std::move(candidate).value(), taken->ids});
+}
+
+Result<void> SeatNode::ApplyUnappliedTail()
+{
+    for (;;) {
+        const std::shared_ptr<const state::HeadView> head{m_owner->Head()};
+        const uint64_t height{head->Header().height + 1};
+        const std::optional<std::vector<unsigned char>> bytes{m_commit_log->DecisionRecordAt(height)};
+        if (!bytes.has_value()) return Ok(); // the tail ends where the decisions end
+        Result<storage::DecisionRecord> record{storage::DecisionRecord::Decode(*bytes, m_config.profile)};
+        if (!record.has_value()) return FenceOn(record.error());
+        if (record->header.parent_hash != head->HeaderHash()) return FenceOn(Error{ErrorCode::STALE_PARENT, SEAT_SYNC_PARENT});
+        Result<state::Candidate> candidate{m_owner->Reexecute(record->header, record->body)};
+        if (!candidate.has_value()) return FenceOn(candidate.error());
+        // The decision token: the DECISION record is durable already, and AppendDecision names it again (idempotent).
+        Result<storage::PendingDecision> pending{m_commit_log->AppendDecision(record->header, record->certificate, record->body)};
+        if (!pending.has_value()) return FenceOn(pending.error());
+        Result<DurableDecision> durable{m_commit_log->Confirm(*pending)};
+        if (!durable.has_value()) return FenceOn(durable.error());
+        agreement::Decision decision{std::move(durable).value(), record->certificate, record->body, record->header};
+        Hooks().BeginSlot(height);
+        Hooks().Record("restart.apply", "slot=" + std::to_string(height) + ",header=" + record->header.Hash().GetHex());
+        Result<SealReport> finished{Finish(height, std::move(candidate).value(), std::move(decision), {})};
+        Hooks().EndSlot(height, finished.has_value() ? std::string_view{"OK"} : ToString(finished.error().code));
+        if (!finished.has_value()) return finished.error();
+    }
 }
 
 Result<SealReport> SeatNode::Finish(uint64_t height, state::Candidate candidate, agreement::Decision decision, std::vector<ActionId> taken)

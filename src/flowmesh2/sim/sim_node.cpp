@@ -89,6 +89,7 @@ Result<std::unique_ptr<SimNode>> SimNode::Create(const SimNodeConfig& config, Tr
     if ((config.faults.fail_commit_barrier_at.has_value() && *config.faults.fail_commit_barrier_at == 0) ||
         (config.faults.bump_authority_at.has_value() && *config.faults.bump_authority_at == 0) ||
         (config.faults.bump_authority_before_apply_at.has_value() && *config.faults.bump_authority_before_apply_at == 0) ||
+        (config.faults.crash_after_decision_at.has_value() && *config.faults.crash_after_decision_at == 0) ||
         (config.faults.crash_before_slot.has_value() && *config.faults.crash_before_slot == 0)) {
         return Error{ErrorCode::INVALID_INPUT, SIM_FAULT_SLOT};
     }
@@ -210,13 +211,19 @@ Result<void> SimNode::Hooks::AfterPreview(uint64_t height)
     return Ok();
 }
 
-void SimNode::Hooks::AfterDecision(uint64_t height)
+Result<void> SimNode::Hooks::AfterDecision(uint64_t height)
 {
     // The plan's authority bump after the decision is durable (check 3 refuses it, O-89).
     if (m_node.m_faults.bump_authority_before_apply_at == height) {
         const AuthorityVersion bumped{m_node.m_fake->BumpAuthority()};
         m_node.m_trace.Record("fault.bump_authority_before_apply", "epoch=" + std::to_string(bumped.epoch));
     }
+    // The plan's crash: the DECISION is durable, nothing is applied, the node stops (a restart recovers it).
+    if (m_node.m_faults.crash_after_decision_at == height) {
+        m_node.m_trace.Record("fault.crash_after_decision", "slot=" + std::to_string(height));
+        return Error{ErrorCode::STORAGE_FATAL, SIM_CRASH_AFTER_DECISION};
+    }
+    return Ok();
 }
 
 void SimNode::Hooks::OnSealed(SealedSlot&& sealed) { m_node.m_sealed.push_back(std::move(sealed)); }
