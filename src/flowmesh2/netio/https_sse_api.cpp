@@ -370,9 +370,16 @@ void HttpsSseApi::Impl::OnTimer(evutil_socket_t, short, void* arg) NO_THREAD_SAF
 void HttpsSseApi::Impl::OnClose(evhttp_connection* conn, void* arg) NO_THREAD_SAFETY_ANALYSIS
 {
     auto* self{static_cast<Impl*>(arg)};
+    // libevent frees the requests still attached to the connection it closes. A request whose reply had not been sent
+    // (pending) or had only started (a stream) when the client left is detached first, its connection null, and is this
+    // side's to free: it leaked before (review of 2026-11-16, the LSan report the asan CI job was predicted to raise).
+    const auto drop{[](evhttp_request*& req) {
+        if (req != nullptr && evhttp_request_get_connection(req) == nullptr) evhttp_request_free(req);
+        req = nullptr;
+    }};
     for (auto& [id, item] : self->pending) {
         if (item.conn == conn && item.req != nullptr) {
-            item.req = nullptr; // the reply is still taken when it comes (no reservation leaks)
+            drop(item.req); // the reply is still taken when it comes (no reservation leaks)
             self->Release(item.ip);
             item.conn = nullptr;
         }
@@ -381,6 +388,7 @@ void HttpsSseApi::Impl::OnClose(evhttp_connection* conn, void* arg) NO_THREAD_SA
         if (it->second.conn == conn) {
             (void)self->backend.Unsubscribe(it->second.id);
             self->Release(it->second.ip);
+            drop(it->second.req);
             it = self->streams.erase(it);
         } else {
             ++it;
