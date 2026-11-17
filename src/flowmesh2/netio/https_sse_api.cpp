@@ -25,7 +25,9 @@
 #include <openssl/x509.h>
 #include <openssl/x509v3.h>
 
+#include <fcntl.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 #include <atomic>
 #include <chrono>
@@ -232,10 +234,12 @@ Result<void> HttpsSseApi::Impl::MakeSelfSigned()
         FILE* cf{std::fopen(cert_path.c_str(), "wb")};
         ok = cf != nullptr && PEM_write_X509(cf, cert) == 1;
         if (cf != nullptr) std::fclose(cf);
-        FILE* kf{std::fopen(key_path.c_str(), "wb")};
+        // The key file is private from its creation (mode 0600 at open), not world-readable until a chmod (review 2026-11-16, R11).
+        const int kfd{::open(key_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600)};
+        FILE* kf{kfd < 0 ? nullptr : ::fdopen(kfd, "wb")};
+        if (kf == nullptr && kfd >= 0) ::close(kfd);
         ok = ok && kf != nullptr && PEM_write_PrivateKey(kf, key, nullptr, nullptr, 0, nullptr, nullptr) == 1;
         if (kf != nullptr) std::fclose(kf);
-        ::chmod(key_path.c_str(), 0600);
     }
     if (ok) {
         ok = SSL_CTX_use_certificate(ctx, cert) == 1 && SSL_CTX_use_PrivateKey(ctx, key) == 1 && SSL_CTX_check_private_key(ctx) == 1;

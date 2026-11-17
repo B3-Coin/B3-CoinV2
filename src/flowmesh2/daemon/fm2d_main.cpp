@@ -341,8 +341,16 @@ int main(int argc, char** argv)
         ready.pushKV("pid", UniValue{static_cast<int64_t>(::getpid())});
         ready.pushKV("restart", UniValue{restart});
         ready.pushKV("head", UniValue{(*node)->Owner().Head()->Header().height});
-        std::ofstream out{fs::PathToString(opt.datadir / fs::u8path("fm2d.ready"))};
-        out << ready.write() << "\n";
+        // Written whole under a temporary name and renamed into place: a reader never sees a partial file (review 2026-11-16).
+        const fs::path ready_path{opt.datadir / fs::u8path("fm2d.ready")};
+        const fs::path ready_tmp{opt.datadir / fs::u8path("fm2d.ready.tmp")};
+        {
+            std::ofstream out{fs::PathToString(ready_tmp)};
+            out << ready.write() << "\n";
+        }
+        std::error_code rename_ec;
+        fs::rename(ready_tmp, ready_path, rename_ec);
+        if (rename_ec) return Fail("ready file", Error{ErrorCode::STORAGE_FATAL, "could not rename fm2d.ready into place"});
     }
     LogInfo("fm2d seat %u ready: mesh %s:%u api %s:%u head %u%s", opt.seat, opt.listen, (*mesh)->ListenPort(), opt.api_bind, (*api)->Port(),
             (*node)->Owner().Head()->Header().height, restart ? " (restarted)" : "");
@@ -355,6 +363,7 @@ int main(int argc, char** argv)
     constexpr uint64_t PROPOSE_RETRY_MS{50}; // a refused proposal is retried after this pause, not every loop
     uint64_t last_propose_refused_ms{0};
     std::string last_propose_reason;
+    bool fenced_logged{false};
     uint64_t last_chain_poll_ms{0};
     int exit_code{0};
     while (!interrupt) {
@@ -407,8 +416,9 @@ int main(int argc, char** argv)
             (*node)->OnLocalWork();
             (*api)->Notify();
         }
-        if ((*node)->Fenced()) {
-            LogError("fm2d: the node is fenced; it serves reads only");
+        if ((*node)->Fenced() && !fenced_logged) {
+            LogError("fm2d: the node is fenced; it serves reads only"); // once, not once per loop (review 2026-11-16, R9)
+            fenced_logged = true;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds{1});
     }

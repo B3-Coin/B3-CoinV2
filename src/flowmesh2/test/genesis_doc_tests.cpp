@@ -134,6 +134,17 @@ BOOST_AUTO_TEST_CASE(malformed_documents_are_refused)
     GenesisDoc bad_pop{doc};
     bad_pop.seats[1].pop[5] ^= 0x01;
     BOOST_CHECK(!GenesisDoc::Parse(bad_pop.Json()).value().SeatSetOf().has_value());
+    // Numbers that are not unsigned integers are decode errors, not crashes (review 2026-11-16, R3): the base height
+    // negative, fractional, or above 2^64.
+    const std::string json{doc.Json()};
+    const std::string height{"\"height\": " + std::to_string(doc.base.height)}; // UniValue pretty-prints with a space
+    BOOST_REQUIRE(json.find(height) != std::string::npos);
+    for (const char* bad : {"\"height\": -1", "\"height\": 1.5", "\"height\": 99999999999999999999", "\"height\": 1e3"}) {
+        std::string mutated{json};
+        mutated.replace(mutated.find(height), height.size(), bad);
+        const Result<GenesisDoc> parsed{GenesisDoc::Parse(mutated)};
+        BOOST_CHECK_MESSAGE(!parsed.has_value() && parsed.error().code == ErrorCode::DECODE, std::string{"accepted "} + bad);
+    }
 }
 
 BOOST_AUTO_TEST_CASE(the_dev_chain_file_appends_tails_and_refuses_corruption)

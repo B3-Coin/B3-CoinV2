@@ -4,6 +4,8 @@
 
 #include <flowmesh2/netio/genesis_doc.h>
 
+#include <charconv>
+
 #include <crypto/bls.h>
 #include <flowmesh2/netio/api_json.h>
 #include <univalue.h>
@@ -34,10 +36,20 @@ bool HashInto(const UniValue& value, uint256& out)
     return true;
 }
 
+//! An unsigned integer written as a JSON number: digits only (no sign, fraction or exponent), in range. UniValue's getInt
+//! throws on anything else, which crashed the tools on a malformed document (review 2026-11-16, R3).
 bool U64Into(const UniValue& value, uint64_t& out)
 {
     if (!value.isNum()) return false;
-    out = value.getInt<uint64_t>();
+    const std::string& text{value.getValStr()};
+    if (text.empty() || text.size() > 20) return false;
+    for (const char c : text) {
+        if (c < '0' || c > '9') return false;
+    }
+    uint64_t parsed{0};
+    const auto [end, error]{std::from_chars(text.data(), text.data() + text.size(), parsed)};
+    if (error != std::errc{} || end != text.data() + text.size()) return false;
+    out = parsed;
     return true;
 }
 
