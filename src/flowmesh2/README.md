@@ -126,9 +126,10 @@ batch must pass `CheckBatch`), the capped agreement messages and the
 `Agreement` and `SafetyRules` interfaces in `agreement/`, and the new
 REGTEST-only `fm2_dev` library with a scripted fake chain and the k = 1
 dev certifier, which writes `ACCEPTED_PROPOSAL`, `INTENT`, `SIGNED_VOTE`
-and `DECISION` in barrier order with both authority checks; inclusion lists, the restart fence, the evidence
-store and the b3d adapters are typed stubs (PBFT over k seats and the
-leader schedule landed with M4-AGR-01/02/03); and **R11**, certified reads in
+and `DECISION` in barrier order with both authority checks; inclusion lists, the restart fence and
+the trusted-facts b3d adapter are typed stubs (PBFT over k seats, the
+leader schedule and the evidence store landed with M4-AGR-01/02/03/07; the
+finalized b3d adapter landed with M7-ADP-01, stage 3); and **R11**, certified reads in
 `read/`: an immutable `SlotView` per committed slot (header, certificate,
 outcomes, v0 account leaves with their tree levels, action and order-fill
 indexes), and the `ReadService`, which publishes only after B-APPLIED

@@ -46,8 +46,8 @@
  * Preview over an uncommitted candidate (M4-AGR-10), and extends M4-STO-03
  * to probe StateOwner::Restore and the replay of a SNAPSHOT_MARK record and
  * M4-STO-07 to probe the replay of a PREPARED_QC record as well. Slice
- * R10 adds the b3d chain adapters: trusted facts on REGTEST (MB1-ADP-06)
- * and the finalized adapter (M7-ADP-01); PBFT safety (M4-AGR-01; the probe
+ * R10 adds the b3d chain adapters: trusted facts on REGTEST (MB1-ADP-06;
+ * the finalized adapter M7-ADP-01 was a stub here until it landed); PBFT safety (M4-AGR-01; the probe
  * checks MayPrepare, MayCommit and OnViewChange), the PBFT agreement
  * (M4-AGR-02; the probe also checks the dev certifier's OnMessage, which
  * returns Unsupported), the leader schedule (M4-AGR-03), inclusion lists (M4-AGR-04;
@@ -549,11 +549,6 @@ NetworkId StubRegtestNetwork()
 FM2_STUB_CASE(MB1_ADP_06, "MB1-ADP-06")
 {
     return Observe(chain::B3dTrustedFactsAdapter::Create(StubRegtestNetwork(), chain::B3dAdapterConfig{}));
-}
-
-FM2_STUB_CASE(M7_ADP_01, "M7-ADP-01")
-{
-    return Observe(chain::B3dFinalizedAdapter::Create(StubRegtestNetwork(), chain::B3dAdapterConfig{30}));
 }
 
 // ---- Slice R10: agreement ----

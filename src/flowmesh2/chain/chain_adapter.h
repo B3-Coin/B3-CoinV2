@@ -27,7 +27,9 @@
  * adapter method takes cs_main or any node lock on the caller's thread:
  * guard rule 1 keeps validation.h, node/ and chainparams.h out of every fm2
  * library, so a b3d adapter can only ever be a narrow link the node
- * implements (MB1-ADP-06, M7-ADP-01, owner-gated).
+ * implements: since M7-ADP-01 the finalized adapter is real and b3d feeds
+ * it (`OnConnected`, `OnDisconnected`, `OnFinalized`); the node side
+ * (MB1-ADP-07) and the trusted-facts mode (MB1-ADP-06) are owner-gated.
  *
  * The contract every caller relies on:
  *
@@ -91,8 +93,9 @@
  *
  * Threading: Network, CurrentAuthority, CheckAuthority, VerifyAnchor and
  * SeatSetAt may be called from any thread; Poll is called by the sealing
- * thread only. Implementations: dev/fake_chain.h (REGTEST only, fm2_dev) and
- * the b3d stubs of chain/b3d_adapter.h.
+ * thread only. Implementations: dev/fake_chain.h (REGTEST only, fm2_dev),
+ * B3dFinalizedAdapter (chain/b3d_adapter.h, since M7-ADP-01) and the
+ * trusted-facts stub of chain/b3d_adapter.h.
  */
 namespace flowmesh2::chain {
 

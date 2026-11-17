@@ -53,6 +53,7 @@ if(BUILD_FLOWMESH2)
     core/account_leaf.cpp
     core/action.cpp
     core/amount.cpp
+    core/anchor_proof.cpp
     core/body.cpp
     core/certificate.cpp
     core/codes.cpp
@@ -340,6 +341,7 @@ if(BUILD_FLOWMESH2)
     test/agreement_tests.cpp
     test/amount_tests.cpp
     test/authority_tests.cpp
+    test/b3d_adapter_tests.cpp
     test/body_tests.cpp
     test/book_tests.cpp
     test/budget_tests.cpp
