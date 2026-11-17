@@ -437,10 +437,34 @@ if(BUILD_FLOWMESH2)
 
   set(FM2_CONTRIB ${PROJECT_SOURCE_DIR}/contrib/flowmesh2)
 
+  # Every CTest TIMEOUT below is a plain-build figure times FM2_TEST_TIMEOUT_SCALE.
+  # A sanitizer build runs the same tests several times slower (TSan 5 to 15
+  # times), and the CI runner is slower than a developer machine: the first
+  # sanitizer jobs on the branch (runs 44057193801 and 44089611835) failed
+  # `ctest -L flowmesh2` with no sanitizer report, test_flowmesh2 alone taking
+  # 95 s under TSan on an Apple M-series against the 120 s limit (review of
+  # 2026-11-16, item 11). The CI job's own 30-minute step stays the outer bound.
+  if(SANITIZERS)
+    set(fm2_default_timeout_scale 6)
+  else()
+    set(fm2_default_timeout_scale 1)
+  endif()
+  set(FM2_TEST_TIMEOUT_SCALE ${fm2_default_timeout_scale} CACHE STRING
+    "Multiplier of every flowmesh2 CTest TIMEOUT (1 for a plain build, 6 when SANITIZERS is set)")
+  if(NOT FM2_TEST_TIMEOUT_SCALE MATCHES "^[1-9][0-9]*$")
+    message(FATAL_ERROR "FM2_TEST_TIMEOUT_SCALE must be a positive integer (got '${FM2_TEST_TIMEOUT_SCALE}')")
+  endif()
+  function(fm2_test_timeout test_name plain_seconds)
+    math(EXPR fm2_scaled "${plain_seconds} * ${FM2_TEST_TIMEOUT_SCALE}")
+    set_tests_properties(${test_name} PROPERTIES TIMEOUT ${fm2_scaled})
+  endfunction()
+  message(STATUS "flowmesh2 CTest timeouts scaled by ${FM2_TEST_TIMEOUT_SCALE}")
+
   # The simulator (slice R14): every variant for seeds 1..32 must pass its
   # manifest, and two CLI runs must print the same bytes.
   add_test(NAME flowmesh2_sim COMMAND fm2_sim_cli --scenario all --seeds 1-32)
-  set_tests_properties(flowmesh2_sim PROPERTIES TIMEOUT 600 LABELS "flowmesh2;isolated;outline;sim")
+  set_tests_properties(flowmesh2_sim PROPERTIES LABELS "flowmesh2;isolated;outline;sim")
+  fm2_test_timeout(flowmesh2_sim 600)
   add_test(NAME flowmesh2_sim_cli_determinism
     COMMAND ${CMAKE_COMMAND}
       -DSIM=$<TARGET_FILE:fm2_sim_cli>
@@ -448,10 +472,12 @@ if(BUILD_FLOWMESH2)
       "-DSIM_ARGS=--scenario;all;--seeds;1-8"
       -P ${FM2_CONTRIB}/sim_determinism.cmake
   )
-  set_tests_properties(flowmesh2_sim_cli_determinism PROPERTIES TIMEOUT 600 LABELS "flowmesh2;isolated;outline;sim")
+  set_tests_properties(flowmesh2_sim_cli_determinism PROPERTIES LABELS "flowmesh2;isolated;outline;sim")
+  fm2_test_timeout(flowmesh2_sim_cli_determinism 600)
 
   add_test(NAME flowmesh2_unit COMMAND test_flowmesh2 --log_level=test_suite)
-  set_tests_properties(flowmesh2_unit PROPERTIES TIMEOUT 120 LABELS "flowmesh2;isolated;outline")
+  set_tests_properties(flowmesh2_unit PROPERTIES LABELS "flowmesh2;isolated;outline")
+  fm2_test_timeout(flowmesh2_unit 120)
 
   add_test(NAME flowmesh2_inventory
     COMMAND ${Python3_EXECUTABLE} -I -B ${FM2_CONTRIB}/check_inventory.py
@@ -460,7 +486,8 @@ if(BUILD_FLOWMESH2)
       --workdir ${FM2_TEST_TMP}/inventory
       --selftest
   )
-  set_tests_properties(flowmesh2_inventory PROPERTIES TIMEOUT 300 LABELS "flowmesh2;isolated;outline;lint")
+  set_tests_properties(flowmesh2_inventory PROPERTIES LABELS "flowmesh2;isolated;outline;lint")
+  fm2_test_timeout(flowmesh2_inventory 300)
 
   # Four fm2d on regtest (M5-NODE-01): keygen, the dev chain faucet, four seats
   # that heartbeat and agree, a deposit seen on every seat, a seat killed and
@@ -473,7 +500,8 @@ if(BUILD_FLOWMESH2)
       --cli $<TARGET_FILE:fm2_cli>
       --workdir ${FM2_TEST_TMP}/e2e
   )
-  set_tests_properties(flowmesh2_e2e_regtest PROPERTIES TIMEOUT 300 LABELS "flowmesh2;isolated;outline;e2e")
+  set_tests_properties(flowmesh2_e2e_regtest PROPERTIES LABELS "flowmesh2;isolated;outline;e2e")
+  fm2_test_timeout(flowmesh2_e2e_regtest 300)
 
   add_test(NAME flowmesh2_todo_lint
     COMMAND ${Python3_EXECUTABLE} -I -B ${FM2_CONTRIB}/check_todo.py
@@ -481,7 +509,8 @@ if(BUILD_FLOWMESH2)
       --workdir ${FM2_TEST_TMP}/todo_lint
       --selftest
   )
-  set_tests_properties(flowmesh2_todo_lint PROPERTIES TIMEOUT 60 LABELS "flowmesh2;isolated;outline;lint")
+  set_tests_properties(flowmesh2_todo_lint PROPERTIES LABELS "flowmesh2;isolated;outline;lint")
+  fm2_test_timeout(flowmesh2_todo_lint 60)
 
   # -------------------------------------------------------------------------
   # Guards (slice R2): contrib/flowmesh2/check_guards.py, seven rules.
@@ -495,7 +524,8 @@ if(BUILD_FLOWMESH2)
       --source
       --nm ${CMAKE_BINARY_DIR} --config $<CONFIG> --nm-tool ${CMAKE_NM}
   )
-  set_tests_properties(flowmesh2_guards PROPERTIES TIMEOUT 300 LABELS "flowmesh2;isolated;outline;lint;guards")
+  set_tests_properties(flowmesh2_guards PROPERTIES LABELS "flowmesh2;isolated;outline;lint;guards")
+  fm2_test_timeout(flowmesh2_guards 300)
 
   add_test(NAME flowmesh2_guards_selftest
     COMMAND ${Python3_EXECUTABLE} -I -B ${FM2_CONTRIB}/test_check_guards.py
@@ -503,14 +533,16 @@ if(BUILD_FLOWMESH2)
       --workdir ${FM2_TEST_TMP}/guards_selftest
       --cxx ${CMAKE_CXX_COMPILER} --ar ${CMAKE_AR} --nm-tool ${CMAKE_NM}
   )
-  set_tests_properties(flowmesh2_guards_selftest PROPERTIES TIMEOUT 300 LABELS "flowmesh2;isolated;outline;lint;guards")
+  set_tests_properties(flowmesh2_guards_selftest PROPERTIES LABELS "flowmesh2;isolated;outline;lint;guards")
+  fm2_test_timeout(flowmesh2_guards_selftest 300)
 
   # Evidence tool (slice R2): contrib/flowmesh2/evidence.py run/verify.
   add_test(NAME flowmesh2_evidence_selftest
     COMMAND ${Python3_EXECUTABLE} -I -B ${FM2_CONTRIB}/test_evidence.py
       --workdir ${FM2_TEST_TMP}/evidence_selftest
   )
-  set_tests_properties(flowmesh2_evidence_selftest PROPERTIES TIMEOUT 300 LABELS "flowmesh2;isolated;outline;lint;evidence")
+  set_tests_properties(flowmesh2_evidence_selftest PROPERTIES LABELS "flowmesh2;isolated;outline;lint;evidence")
+  fm2_test_timeout(flowmesh2_evidence_selftest 300)
 
   # Compile-fail controls (slice R2), Clang only: the lock control needs
   # Clang's thread-safety analysis. Each negative control is built twice, as
@@ -545,8 +577,9 @@ if(BUILD_FLOWMESH2)
     )
     # RUN_SERIAL: the test drives the build system of this build directory.
     set_tests_properties(flowmesh2_negative_compile PROPERTIES
-      TIMEOUT 900 RUN_SERIAL TRUE LABELS "flowmesh2;isolated;outline;negative_compile"
+      RUN_SERIAL TRUE LABELS "flowmesh2;isolated;outline;negative_compile"
     )
+    fm2_test_timeout(flowmesh2_negative_compile 900)
   endif()
 
   # Sanitizer canaries (slice R2), default OFF. One deliberately defective
