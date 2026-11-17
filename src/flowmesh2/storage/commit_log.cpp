@@ -126,9 +126,9 @@ Result<CommitLog> CommitLog::Recover(Journal& journal, const ProfileParams& prof
             if (decoded->certificate.header_hash != header_hash || !BodyMatchesHeader(decoded->header, decoded->body)) return inconsistent;
             const auto [it, inserted]{log.m_decisions.emplace(
                 decoded->header.height,
-                DecisionEntry{header_hash, decoded->certificate.Hash(), decoded->certificate, decoded->header.state_root, record.seq, std::nullopt})};
+                DecisionEntry{header_hash, decoded->certificate.Hash(), decoded->certificate, decoded->header.state_root, record.seq, std::nullopt,
+                              record.payload})};
             if (!inserted) return inconsistent; // one DECISION record per slot
-            log.Remember(decoded->header.height, record.payload);
             break;
         }
         case RecordType::APPLIED: {
@@ -173,18 +173,11 @@ Result<CommitLog> CommitLog::Recover(Journal& journal, const ProfileParams& prof
     return Ok(std::move(log));
 }
 
-void CommitLog::Remember(uint64_t slot, std::vector<unsigned char> payload)
+std::optional<std::vector<unsigned char>> CommitLog::DecisionRecordAt(uint64_t slot) const
 {
-    m_recent.emplace_back(slot, std::move(payload));
-    while (m_recent.size() > RECENT_DECISION_RECORDS) m_recent.pop_front();
-}
-
-std::optional<std::vector<unsigned char>> CommitLog::RecentDecisionRecord(uint64_t slot) const
-{
-    for (const auto& [s, payload] : m_recent) {
-        if (s == slot) return payload;
-    }
-    return std::nullopt;
+    const auto it{m_decisions.find(slot)};
+    if (it == m_decisions.end()) return std::nullopt;
+    return it->second.record;
 }
 
 Result<uint64_t> CommitLog::AppendEvidence(std::span<const unsigned char> payload)
@@ -213,8 +206,7 @@ Result<PendingDecision> CommitLog::AppendDecision(const SlotHeaderV2& header, co
     const std::vector<unsigned char> payload{DecisionRecord{header, certificate, body}.Encode()};
     Result<uint64_t> seq{m_journal->Append(RecordType::DECISION, payload)};
     if (!seq.has_value()) return seq.error();
-    m_decisions.emplace(header.height, DecisionEntry{header_hash, cert_hash, certificate, header.state_root, *seq, std::nullopt});
-    Remember(header.height, payload);
+    m_decisions.emplace(header.height, DecisionEntry{header_hash, cert_hash, certificate, header.state_root, *seq, std::nullopt, payload});
     return Ok(PendingDecision{m_journal->InstanceId(), *seq, DecisionRef{header.height, header_hash, cert_hash}});
 }
 

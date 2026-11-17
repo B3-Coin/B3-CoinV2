@@ -17,7 +17,6 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <deque>
 #include <map>
 #include <optional>
 #include <span>
@@ -208,13 +207,16 @@ public:
     Result<uint64_t> AppendEvidence(std::span<const unsigned char> payload);
     const std::vector<std::vector<unsigned char>>& EvidenceRecords() const { return m_evidence; }
 
-    /** The encoded DECISION record of `slot` if it is among the last
-     * RECENT_DECISION_RECORDS this log appended or recovered (the catch-up
-     * replies of O-101 come from memory, never from a journal read on the
-     * sealing thread); nullopt otherwise.
+    /** The encoded DECISION record of `slot` if this log appended or
+     * recovered it; nullopt otherwise. The catch-up replies of O-101 come
+     * from memory, never from a journal read on the sealing thread, and
+     * every decision the log holds is served (it was a ring of the last 16,
+     * which left a seat further behind unable to rejoin: review of
+     * 2026-11-16, defect 2). What bounds the resident payloads is what
+     * bounds the journal: the snapshot of M4-STO-03 (PROVISIONAL until it
+     * lands; a per-segment index would be the alternative).
      */
-    std::optional<std::vector<unsigned char>> RecentDecisionRecord(uint64_t slot) const;
-    static constexpr size_t RECENT_DECISION_RECORDS{16};
+    std::optional<std::vector<unsigned char>> DecisionRecordAt(uint64_t slot) const;
 
 private:
     explicit CommitLog(Journal& journal) : m_journal{&journal} {}
@@ -226,6 +228,7 @@ private:
         uint256 state_root;
         uint64_t seq{0};
         std::optional<uint64_t> applied_seq;
+        std::vector<unsigned char> record; //!< the encoded DECISION payload, served to catching-up seats (O-101)
     };
 
     struct PreparedEntry {
@@ -238,8 +241,6 @@ private:
     uint64_t m_last_applied_slot{0};               //!< 0 before the first application (the genesis height)
     std::map<ProposalKey, PreparedEntry> m_prepared; //!< by (epoch, slot, view)
     std::vector<std::vector<unsigned char>> m_evidence; //!< EVIDENCE payloads in journal order (M4-AGR-07)
-    std::deque<std::pair<uint64_t, std::vector<unsigned char>>> m_recent; //!< (slot, DECISION payload) of the last RECENT_DECISION_RECORDS
-    void Remember(uint64_t slot, std::vector<unsigned char> payload);
 };
 
 } // namespace flowmesh2::storage

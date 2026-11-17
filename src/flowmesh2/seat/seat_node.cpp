@@ -376,7 +376,8 @@ Result<void> SeatNode::Tick(uint64_t now_ms)
     if (behind) {
         m_sync.pending_proposal = false;
         Hooks().Record("sync.request", "slot=" + std::to_string(next) + ",to=" + std::to_string(peer) + ",hint=" + std::to_string(status.ahead_hint));
-        return SendSync(peer, net::DecisionsRequest{next, 1});
+        m_sync.pending_max = net::MAX_SYNC_DECISIONS;
+        return SendSync(peer, net::DecisionsRequest{next, net::MAX_SYNC_DECISIONS});
     }
     m_sync.pending_proposal = true;
     const uint256 selected{m_pbft->SelectedHeader().value_or(uint256{})};
@@ -415,8 +416,8 @@ Result<void> SeatNode::PushDecision(uint32_t peer, uint64_t slot)
 {
     std::pair<uint64_t, uint64_t>& last{m_sync.pushed[peer]};
     if (last.first == slot && last.second != 0 && m_now_ms - last.second < m_config.sync_backoff_ms) return Ok();
-    const std::optional<std::vector<unsigned char>> record{m_commit_log->RecentDecisionRecord(slot)};
-    if (!record.has_value()) return Ok(); // older than the commit log's ring: the peer's own request path remains
+    const std::optional<std::vector<unsigned char>> record{m_commit_log->DecisionRecordAt(slot)};
+    if (!record.has_value()) return Ok(); // this seat does not hold it either: the peer's own request path remains
     last = std::pair<uint64_t, uint64_t>{slot, m_now_ms == 0 ? 1 : m_now_ms};
     Hooks().Record("sync.push", "slot=" + std::to_string(slot) + ",to=" + std::to_string(peer));
     return SendSync(peer, net::DecisionsReply{slot, *record});
@@ -431,7 +432,7 @@ Result<void> SeatNode::OnBulk(const net::InboundFrame& frame)
     }
     if (const auto* request{std::get_if<net::DecisionsRequest>(&*decoded)}) {
         for (uint64_t slot{request->from_slot}; slot < request->from_slot + request->max; ++slot) {
-            const std::optional<std::vector<unsigned char>> record{m_commit_log->RecentDecisionRecord(slot)};
+            const std::optional<std::vector<unsigned char>> record{m_commit_log->DecisionRecordAt(slot)};
             if (const Result<void> sent{SendSync(frame.from_seat, net::DecisionsReply{slot, record.value_or(std::vector<unsigned char>{})})};
                 !sent.has_value()) {
                 return sent.error();
@@ -442,17 +443,24 @@ Result<void> SeatNode::OnBulk(const net::InboundFrame& frame)
     }
     if (const auto* reply{std::get_if<net::DecisionsReply>(&*decoded)}) {
         const uint64_t next{m_owner->Head()->Header().height + 1};
+        // The request in flight asked for pending_max slots from pending_slot: each reply in that range answers it, and the
+        // request stays pending until the last one (or until the retry period, when a peer stops short or stays silent).
         const bool solicited{m_sync.pending_peer.has_value() && *m_sync.pending_peer == frame.from_seat && !m_sync.pending_proposal &&
-                             reply->slot == m_sync.pending_slot};
-        if (solicited) m_sync.pending_peer.reset();
-        // A reply for a slot applied already (a push got there first) is late and ignored, asked for or not.
-        if (reply->slot < next) return Ok();
+                             reply->slot >= m_sync.pending_slot && reply->slot < m_sync.pending_slot + m_sync.pending_max};
+        const bool last_of_batch{solicited && reply->slot + 1 == m_sync.pending_slot + m_sync.pending_max};
+        // A reply for a slot applied already (a push or an earlier reply got there first) is late and ignored, asked for or not.
+        if (reply->slot < next) {
+            if (last_of_batch) m_sync.pending_peer.reset();
+            return Ok();
+        }
         if (!solicited && (reply->slot != next || reply->record.empty())) {
             // A pushed decision for the slot after the head is welcome (O-105 (10)); anything else nobody asked for is refused.
             Hooks().Record("sync.refuse", "from=" + std::to_string(frame.from_seat) + ",unsolicited");
             return Error{ErrorCode::INVALID_INPUT, SEAT_SYNC_UNSOLICITED};
         }
         if (reply->record.empty()) {
+            // The peer holds nothing from this slot on. The request stays pending: the retry period (doubling) holds the next
+            // request back and the next peer gets it (review of 2026-11-16: an empty reply used to free the driver at once).
             m_pbft->ResetClaim(frame.from_seat);
             Hooks().Record("sync.reply", "from=" + std::to_string(frame.from_seat) + ",slot=" + std::to_string(reply->slot) + ",none");
             return Ok();
@@ -470,7 +478,11 @@ Result<void> SeatNode::OnBulk(const net::InboundFrame& frame)
             return applied.error();
         }
         m_sync.backoff_ms = m_config.sync_backoff_ms;
-        if (!solicited && m_sync.pending_peer.has_value() && m_sync.pending_slot == reply->slot) m_sync.pending_peer.reset(); // the request is moot
+        if (last_of_batch) {
+            m_sync.pending_peer.reset(); // the batch is complete: the driver asks for the next one at the next tick
+        } else if (!solicited && m_sync.pending_peer.has_value() && m_sync.pending_slot == reply->slot) {
+            m_sync.pending_peer.reset(); // a push answered the pending request: it is moot
+        }
         return Ok();
     }
     if (const auto* request{std::get_if<net::ProposalRequest>(&*decoded)}) {
@@ -518,7 +530,7 @@ Result<void> SeatNode::ApplyFetched(const storage::DecisionRecord& record)
     if (const std::optional<storage::DecisionRef> local{m_commit_log->DecisionAt(height)}) {
         if (local->header_hash == hash) return Ok(); // decided here already; Complete (or the restart) applies it
         // Two certified headers for one height: evidence, then the halt (M4-AGR-07).
-        if (const std::optional<std::vector<unsigned char>> mine{m_commit_log->RecentDecisionRecord(height)}) {
+        if (const std::optional<std::vector<unsigned char>> mine{m_commit_log->DecisionRecordAt(height)}) {
             if (const Result<storage::DecisionRecord> ours{storage::DecisionRecord::Decode(*mine, m_config.profile)}) {
                 agreement::CertifiedHeader a{ours->header, ours->certificate};
                 agreement::CertifiedHeader b{record.header, record.certificate};

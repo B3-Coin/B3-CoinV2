@@ -367,4 +367,33 @@ BOOST_AUTO_TEST_CASE(record_codecs_golden_and_exact)
     BOOST_CHECK(DecisionRecord::MaxEncodedSize(Profile()) <= MAX_RECORD_PAYLOAD_BYTES);
 }
 
+BOOST_AUTO_TEST_CASE(every_decision_record_is_served_from_memory_also_after_a_recovery)
+{
+    // Review of 2026-11-16, confirmed defect 2: the catch-up replies of O-101 come from the log's memory, which
+    // used to hold only the last sixteen decisions. Every DECISION this log appended or recovered is served.
+    CommitFixture f{21};
+    constexpr uint64_t SLOTS{40};
+    for (uint64_t height{1}; height <= SLOTS; ++height) {
+        const StorageSlot slot{MakeStorageSlot(height, 0, "slot-" + std::to_string(height))};
+        RequireStorageOk(f.log.AppendDecision(slot.header, slot.certificate, slot.body), "AppendDecision");
+    }
+    RequireStorageOk(f.log.Barrier(), "barrier");
+    BOOST_CHECK(!f.log.DecisionRecordAt(0).has_value());
+    BOOST_CHECK(!f.log.DecisionRecordAt(SLOTS + 1).has_value());
+    for (const uint64_t height : {uint64_t{1}, uint64_t{17}, SLOTS}) {
+        const std::optional<std::vector<unsigned char>> record{f.log.DecisionRecordAt(height)};
+        BOOST_REQUIRE_MESSAGE(record.has_value(), "slot " << height);
+        const DecisionRecord decoded{DecisionRecord::Decode(*record, Profile()).value()};
+        BOOST_CHECK_EQUAL(decoded.header.height, height);
+        BOOST_CHECK(decoded.header.Hash() == f.log.DecisionAt(height)->header_hash);
+    }
+    // A recovered log serves the same bytes for every slot.
+    Result<CommitLog> recovered{CommitLog::Recover(*f.journal, Profile())};
+    RequireStorageOk(recovered, "Recover");
+    for (uint64_t height{1}; height <= SLOTS; ++height) {
+        BOOST_CHECK_MESSAGE(recovered->DecisionRecordAt(height) == f.log.DecisionRecordAt(height), "slot " << height);
+    }
+    BOOST_CHECK(!recovered->DecisionRecordAt(SLOTS + 1).has_value());
+}
+
 BOOST_AUTO_TEST_SUITE_END()

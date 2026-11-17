@@ -12,8 +12,10 @@ checks the balances on EVERY seat, trades through fm2-cli (bob's ask rests,
 alice's bid fills it, both verified with b3verify by the client and settled
 on every seat; a resend answers DUPLICATE everywhere; the outbox and a
 verified slot stream agree), stops seat 3, faucets another deposit while it
-is down, restarts seat 3 on its datadir and checks that it catches up to the
-others' head and shows the deposit and the trade, then stops everything. Exit
+is down, lets the others decide twenty more slots (more than the old
+catch-up ring held), restarts seat 3 on its datadir and checks that it
+catches up to the others' head and shows the deposit and the trade, then
+stops everything. Exit
 code 0 only if every step held.
 
 REGTEST only: the dev chain file replaces the b3d adapter (stage 3). This
@@ -284,10 +286,13 @@ def main():
         steps.append("seat 3 stopped cleanly")
         cluster.deposit([(alice, "rUSD", 5)])
 
+        # More slots than the old sixteen-record catch-up ring could serve (review of 2026-11-16, defect 2).
+        gap = 20
+
         def others_advance():
             hs = [cluster.health(i)["published_height"] for i in range(3)]
-            return hs if all(h >= head_before + 3 for h in hs) else None
-        hs = cluster.wait(others_advance, "the three remaining seats to decide three more slots", timeout=60)
+            return hs if all(h >= head_before + gap for h in hs) else None
+        hs = cluster.wait(others_advance, f"the three remaining seats to decide {gap} more slots", timeout=90)
         steps.append(f"three seats went on without seat 3: heights {hs}")
         # Seat 3 restarts on its datadir: recovery, replay of the dev chain, catch-up to the others' head.
         info = cluster.start(3)
@@ -297,7 +302,7 @@ def main():
 
         def caught_up():
             hs = [cluster.health(i)["published_height"] for i in range(cluster.k)]
-            return hs if hs[3] >= max(hs[:3]) - 1 and hs[3] >= head_before + 3 else None
+            return hs if hs[3] >= max(hs[:3]) - 1 and hs[3] >= head_before + gap else None
         hs = cluster.wait(caught_up, "seat 3 to catch up", timeout=90)
         steps.append(f"seat 3 caught up: heights {hs}")
         if balance_of(cluster.state(3, alice), rusd) != 1_000_000_000 - 500 + 5:

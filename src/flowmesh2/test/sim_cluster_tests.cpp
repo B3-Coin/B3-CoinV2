@@ -224,8 +224,8 @@ BOOST_AUTO_TEST_CASE(a_seat_alone_behind_a_partition_catches_up_by_fetching_deci
     // the real record of slot 1 applies.
     seat::SeatNode& behind{cluster.Node(3).Seat()};
     const ProfileParams& profile{cluster.Node(0).Profile()};
-    const std::optional<std::vector<unsigned char>> two{cluster.Node(0).CommitLog().RecentDecisionRecord(2)};
-    const std::optional<std::vector<unsigned char>> one{cluster.Node(0).CommitLog().RecentDecisionRecord(1)};
+    const std::optional<std::vector<unsigned char>> two{cluster.Node(0).CommitLog().DecisionRecordAt(2)};
+    const std::optional<std::vector<unsigned char>> one{cluster.Node(0).CommitLog().DecisionRecordAt(1)};
     BOOST_REQUIRE(two.has_value() && one.has_value());
     const storage::DecisionRecord record_two{storage::DecisionRecord::Decode(*two, profile).value()};
     storage::DecisionRecord record_one{storage::DecisionRecord::Decode(*one, profile).value()};
@@ -350,6 +350,40 @@ BOOST_AUTO_TEST_CASE(a_seat_that_decided_pushes_the_decision_to_peers_stuck_in_a
         BOOST_CHECK(cluster.Node(i).Owner().Head()->HeaderHash() == cluster.Node(0).Owner().Head()->HeaderHash());
         BOOST_CHECK(!cluster.Node(i).Fenced());
     }
+}
+
+BOOST_AUTO_TEST_CASE(a_seat_behind_by_more_than_sixteen_slots_catches_up)
+{
+    // Review of 2026-11-16, confirmed defect 2: catch-up served only the last sixteen decisions, so a seat that
+    // missed more than that (about sixteen seconds of heartbeats) never rejoined. Seat 3 is alone behind a
+    // partition while the majority decides twenty slots; after the heal it fetches every one of them, several
+    // per request, and takes part in the next slot.
+    TraceRecorder trace;
+    SimNodeConfig config;
+    config.faults.partition = {{0, 1, 2}, {3}};
+    Result<std::unique_ptr<SimCluster>> created{SimCluster::Create(4, config, trace)};
+    RequireOk(created, "SimCluster::Create(4)");
+    SimCluster& cluster{**created};
+    for (size_t i{0}; i < 4; ++i) RequireOk(cluster.Node(i).Chain().AppendBlock(SimBlockHash(SIM_BASE_HEIGHT + 1), {}), "AppendBlock");
+    constexpr uint64_t MISSED{20};
+    uint64_t now{1};
+    now = DriveUntil(cluster, now, MISSED, {0, 1, 2}, 120'000);
+    for (uint32_t i{0}; i < 3; ++i) BOOST_REQUIRE_EQUAL(cluster.Node(i).Owner().Head()->Header().height, MISSED);
+    BOOST_CHECK_EQUAL(cluster.Node(3).Owner().Head()->Header().height, 0U);
+    BOOST_CHECK_EQUAL(CountEvents(trace, "sync.apply"), 0U);
+    cluster.HealPartition();
+    now = DriveUntil(cluster, now, MISSED + 1, {0, 1, 2, 3}, 120'000);
+    for (uint32_t i{0}; i < 4; ++i) {
+        BOOST_CHECK_MESSAGE(cluster.Node(i).Owner().Head()->Header().height >= MISSED + 1,
+                            "seat " << i << " is at " << cluster.Node(i).Owner().Head()->Header().height);
+        BOOST_CHECK(cluster.Node(i).Owner().Head()->HeaderHash() == cluster.Node(0).Owner().Head()->HeaderHash());
+    }
+    // Every missed slot was fetched and applied, in far fewer requests than slots (several decisions per request).
+    BOOST_CHECK_GE(CountEvents(trace, "sync.apply"), MISSED);
+    BOOST_CHECK_EQUAL(CountEvents(trace, "sync.apply", "slot=1,"), 1U);
+    BOOST_CHECK_EQUAL(CountEvents(trace, "sync.apply", "slot=20,"), 1U);
+    BOOST_CHECK_LT(CountEvents(trace, "sync.request"), MISSED);
+    BOOST_CHECK(!cluster.Node(3).Fenced());
 }
 
 BOOST_AUTO_TEST_SUITE_END()
