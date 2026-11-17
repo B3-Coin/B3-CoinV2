@@ -367,6 +367,9 @@ private:
 
     // View change.
     Result<void> EnterChanging(uint64_t target);
+    //! The tail of EnterChanging: sign the report for `target` (SignStatement), keep and send it, count it. Also the
+    //! restart whose VIEW_STATE is durable but whose report was never signed (ResumeViewState).
+    Result<void> SignReport(uint64_t target);
     Result<void> OnViewChangeReport(uint32_t from, const ViewChange& report);
     Result<void> BuildNewView(uint64_t target);
     Result<void> OnNewView(uint32_t from, NewView message, std::span<const unsigned char> bytes);

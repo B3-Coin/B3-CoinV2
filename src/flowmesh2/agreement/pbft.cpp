@@ -230,9 +230,14 @@ Result<void> PbftAgreement::ProposeSelected(const SlotHeaderV2& header, const Sl
 
 Result<void> PbftAgreement::ResumeViewState(const state::HeadView& head)
 {
+    (void)head;
     const std::optional<storage::ViewStateRecord> state{m_signer_log.ViewState()};
     if (!state.has_value() || state->slot != m_slot.slot || state->epoch != m_slot.epoch) return Ok();
     m_slot.view = state->view;
+    if (const std::optional<storage::PreparedQcRecord> prepared{m_commit_log.HighestPrepared(m_slot.slot)}) {
+        const Result<SlotCertificate> cert{SlotCertificate::Decode(prepared->qc)};
+        if (cert.has_value()) m_slot.prepared = PreparedCert{prepared->view, *cert};
+    }
     const std::optional<std::vector<unsigned char>> new_view{m_signer_log.NewViewAccepted(state->epoch, state->slot, state->view)};
     if (state->view == 0 || new_view.has_value()) {
         m_slot.changing = false;
@@ -242,55 +247,57 @@ Result<void> PbftAgreement::ResumeViewState(const state::HeadView& head)
                 if (const auto* nv{std::get_if<NewView>(&*decoded)}) m_slot.selected = nv->selected;
             }
         }
-    } else {
-        // Durable VIEW_STATE without its NEW_VIEW: the seat was CHANGING. Its report, if signed, is in the signer log as
-        // the digest it signed and the signature. The report is rebuilt from the durable preparations of this slot and
-        // must reproduce that digest exactly: a preparation learnt after the signature never rewrites a signed report
-        // (PROTOCOL.md), and the highest one is not necessarily the one signed. Rebuilt with its statement, the retry
-        // timer resends it like any report (review of 2026-11-16, R5: a restarted seat never resent its report, and the
-        // report it rebuilt from the highest preparation could no longer match its signature).
-        m_slot.changing = true;
-        // CHANGING waits for q reports before its timer runs (EnterChanging): the slot's timer that StartSlot armed would
-        // otherwise move a restarted seat to the next view after one timeout, alone.
-        m_slot.timer_running = false;
-        const storage::VoteKey key{m_domain, m_slot.epoch, m_slot.slot, m_slot.view, storage::VotePhase::VIEW_CHANGE};
-        if (const std::optional<storage::SignedVoteRecord> signed_report{m_signer_log.SignedVote(key)}) {
-            ViewChange report;
-            report.epoch = m_slot.epoch;
-            report.slot = m_slot.slot;
-            report.new_view = m_slot.view;
-            report.seat = m_config.self_seat;
-            report.signature = signed_report->signature;
-            // The candidates: no preparation, then every durable preparation below the target.
-            std::vector<std::optional<PreparedCert>> candidates{std::nullopt};
-            for (const storage::PreparedQcRecord& prepared : m_commit_log.PreparedAt(m_slot.slot)) {
-                if (prepared.view >= m_slot.view) continue;
-                const Result<SlotCertificate> cert{SlotCertificate::Decode(prepared.qc)};
-                if (cert.has_value()) candidates.emplace_back(PreparedCert{prepared.view, *cert});
-            }
-            bool matched{false};
-            for (const std::optional<PreparedCert>& candidate : candidates) {
-                report.prepared = candidate;
-                if (ViewChangeDigest(m_domain, report) == signed_report->digest) {
-                    matched = true;
-                    break;
-                }
-            }
-            // The signer log signed a digest no durable preparation reproduces: the two logs disagree about the past.
-            if (!matched) return Error{ErrorCode::VERIFY_FAILED, PBFT_REPORT_RECOVERY};
-            Result<std::vector<unsigned char>> bytes{EncodeMessage(Message{report}, m_profile)};
-            if (!bytes.has_value()) return bytes.error();
-            m_slot.own_report = std::move(bytes).value();
-            m_slot.own_report_statement = OutboundVote::Recovered(*signed_report);
-            m_slot.reports[m_slot.view].emplace(m_config.self_seat, report);
+        Tell();
+        return Ok();
+    }
+    // Durable VIEW_STATE without its NEW_VIEW: the seat was CHANGING. Its report, if signed, is in the signer log as
+    // the digest it signed and the signature. The report is rebuilt from the durable preparations of this slot and
+    // must reproduce that digest exactly: a preparation learnt after the signature never rewrites a signed report
+    // (PROTOCOL.md), and the highest one is not necessarily the one signed. Rebuilt with its statement, the retry
+    // timer resends it like any report (review of 2026-11-16, R5: a restarted seat never resent its report, and the
+    // report it rebuilt from the highest preparation could no longer match its signature).
+    m_slot.changing = true;
+    // CHANGING waits for q reports before its timer runs (EnterChanging): the slot's timer that StartSlot armed would
+    // otherwise move a restarted seat to the next view after one timeout, alone.
+    m_slot.timer_running = false;
+    Tell();
+    const storage::VoteKey key{m_domain, m_slot.epoch, m_slot.slot, m_slot.view, storage::VotePhase::VIEW_CHANGE};
+    const std::optional<storage::SignedVoteRecord> signed_report{m_signer_log.SignedVote(key)};
+    if (!signed_report.has_value()) {
+        // The crash came between the view entry and the report's signature (B-INTENT, Sign, B-VOTE): the report is
+        // signed and sent now, as EnterChanging would have (an INTENT already written names the same digest, since
+        // nothing durable changed in between, and the intent is idempotent). Without a report of its own the seat
+        // would wait for a quorum it never asks for (review workflow of 2026-11-17 on 17.3 item 11).
+        return SignReport(m_slot.view);
+    }
+    ViewChange report;
+    report.epoch = m_slot.epoch;
+    report.slot = m_slot.slot;
+    report.new_view = m_slot.view;
+    report.seat = m_config.self_seat;
+    report.signature = signed_report->signature;
+    // The candidates: no preparation, then every durable preparation below the target.
+    std::vector<std::optional<PreparedCert>> candidates{std::nullopt};
+    for (const storage::PreparedQcRecord& prepared : m_commit_log.PreparedAt(m_slot.slot)) {
+        if (prepared.view >= m_slot.view) continue;
+        const Result<SlotCertificate> cert{SlotCertificate::Decode(prepared.qc)};
+        if (cert.has_value()) candidates.emplace_back(PreparedCert{prepared.view, *cert});
+    }
+    bool matched{false};
+    for (const std::optional<PreparedCert>& candidate : candidates) {
+        report.prepared = candidate;
+        if (ViewChangeDigest(m_domain, report) == signed_report->digest) {
+            matched = true;
+            break;
         }
     }
-    if (const std::optional<storage::PreparedQcRecord> prepared{m_commit_log.HighestPrepared(m_slot.slot)}) {
-        const Result<SlotCertificate> cert{SlotCertificate::Decode(prepared->qc)};
-        if (cert.has_value()) m_slot.prepared = PreparedCert{prepared->view, *cert};
-    }
-    (void)head;
-    Tell();
+    // The signer log signed a digest no durable preparation reproduces: the two logs disagree about the past.
+    if (!matched) return Error{ErrorCode::VERIFY_FAILED, PBFT_REPORT_RECOVERY};
+    Result<std::vector<unsigned char>> bytes{EncodeMessage(Message{report}, m_profile)};
+    if (!bytes.has_value()) return bytes.error();
+    m_slot.own_report = std::move(bytes).value();
+    m_slot.own_report_statement = OutboundVote::Recovered(*signed_report);
+    m_slot.reports[m_slot.view].emplace(m_config.self_seat, report);
     return Ok();
 }
 
@@ -891,6 +898,11 @@ Result<void> PbftAgreement::EnterChanging(uint64_t target)
     m_slot.new_view_built = false;
     m_slot.timer_running = false; // runs again once q reports for the target are in
     Tell();
+    return SignReport(target);
+}
+
+Result<void> PbftAgreement::SignReport(uint64_t target)
+{
     // The report: the highest durable preparation below the target.
     ViewChange report;
     report.epoch = m_slot.epoch;

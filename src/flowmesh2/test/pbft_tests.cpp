@@ -935,6 +935,39 @@ BOOST_AUTO_TEST_CASE(a_restarted_seat_resends_the_report_it_signed)
     }
 }
 
+BOOST_AUTO_TEST_CASE(a_seat_restarted_before_signing_its_report_signs_and_sends_it)
+{
+    // Review workflow of 2026-11-17 on 17.3 item 11: a crash between the durable VIEW_STATE and the report's signature
+    // left a restarted seat CHANGING with no report and, since R5, no timer: with f faulty seats every honest seat would
+    // wait for a quorum nobody asks for. The crash is staged by writing the VIEW_STATE the seat would have written.
+    Cluster c{4};
+    const uint32_t restarted{1};
+    Seat& seat{c.At(restarted)};
+    RequireOk(seat.rig->signer_log.AppendViewState(storage::ViewStateRecord{0, 1, 1}), "VIEW_STATE");
+    RequireOk(seat.rig->signer_log.Barrier(), "barrier");
+    const storage::VoteKey key{c.Domain(), 0, 1, 1, storage::VotePhase::VIEW_CHANGE};
+    BOOST_REQUIRE(!seat.rig->signer_log.SignedStatement(key).has_value());
+    Restart(c, restarted);
+    {
+        const PbftStatus status{seat.pbft->Status()};
+        BOOST_CHECK_EQUAL(status.view, 1U);
+        BOOST_CHECK(status.changing);
+        BOOST_CHECK_EQUAL(status.reports_held, 1U); // its own report, signed at the restart
+    }
+    BOOST_CHECK(seat.rig->signer_log.SignedStatement(key).has_value());
+    // The report went out at the restart; the others, still in view 0, hold it above their view. The retry resends it
+    // and the replay is dropped.
+    c.Deliver();
+    BOOST_CHECK(c.refusals.empty());
+    for (uint32_t i{0}; i < 4; ++i) BOOST_CHECK_EQUAL(c.At(i).pbft->Status().reports_held, 1U);
+    c.Tick(PbftConfig{}.retry_ms);
+    BOOST_CHECK(c.refusals.empty());
+    for (uint32_t i{0}; i < 4; ++i) {
+        BOOST_CHECK_EQUAL(c.At(i).pbft->Status().reports_held, 1U);
+        BOOST_CHECK_EQUAL(c.At(i).pbft->Status().view, i == restarted ? 1U : 0U);
+    }
+}
+
 BOOST_AUTO_TEST_CASE(reports_are_bounded_per_seat_and_replays_are_dropped_before_verification)
 {
     // Review of 2026-11-16, R6: reports were kept per attacker-chosen target view with no cap, and every report and vote

@@ -444,13 +444,15 @@ if(BUILD_FLOWMESH2)
   # `ctest -L flowmesh2` with no sanitizer report, test_flowmesh2 alone taking
   # 95 s under TSan on an Apple M-series against the 120 s limit (review of
   # 2026-11-16, item 11). The CI job's own 30-minute step stays the outer bound.
-  if(SANITIZERS)
-    set(fm2_default_timeout_scale 6)
-  else()
-    set(fm2_default_timeout_scale 1)
+  # Not a cache entry of its own: a cached default would survive a later -DSANITIZERS on the same build directory
+  # (review workflow of 2026-11-17 on 17.3 item 14). -DFM2_TEST_TIMEOUT_SCALE=<n> on the command line overrides it.
+  if(NOT DEFINED FM2_TEST_TIMEOUT_SCALE)
+    if(SANITIZERS)
+      set(FM2_TEST_TIMEOUT_SCALE 6)
+    else()
+      set(FM2_TEST_TIMEOUT_SCALE 1)
+    endif()
   endif()
-  set(FM2_TEST_TIMEOUT_SCALE ${fm2_default_timeout_scale} CACHE STRING
-    "Multiplier of every flowmesh2 CTest TIMEOUT (1 for a plain build, 6 when SANITIZERS is set)")
   if(NOT FM2_TEST_TIMEOUT_SCALE MATCHES "^[1-9][0-9]*$")
     message(FATAL_ERROR "FM2_TEST_TIMEOUT_SCALE must be a positive integer (got '${FM2_TEST_TIMEOUT_SCALE}')")
   endif()
