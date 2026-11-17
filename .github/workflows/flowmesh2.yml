@@ -15,7 +15,7 @@ run-name: FlowMesh2 guards and sanitizers — ${{ github.sha }}
 on:
   workflow_dispatch:
   push:
-    branches: [rebirth]
+    branches: [rebirth, 'rebirth-*'] # rebirth-* since the review of 2026-11-16 (its question 3): the gates run before a merge
     paths:
       - '.github/workflows/flowmesh2.yml'
       - 'src/flowmesh2/**'

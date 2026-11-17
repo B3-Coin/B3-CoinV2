@@ -182,7 +182,8 @@ build-rebirth/bin/fm2-sim --scenario all --seeds 1-32   # JSON on stdout; exit 0
 
 Expected after stage 2 step 6 (M5-CLI-01, 2026-11-14): 11 CTests pass
 (`flowmesh2_foundations` with its 19 C1 cases, `flowmesh2_sim`,
-`flowmesh2_sim_cli_determinism`, `flowmesh2_unit` with 551 cases,
+`flowmesh2_sim_cli_determinism`, `flowmesh2_unit` with 567 cases (551 after
+stage 2 step 6; the review fixes of 2026-11-17, ARCHITECTURE 17.3, added 16),
 `flowmesh2_inventory`, `flowmesh2_todo_lint`, `flowmesh2_guards`,
 `flowmesh2_guards_selftest`, `flowmesh2_evidence_selftest`, with Clang
 `flowmesh2_negative_compile` with six negative controls and a positive one, and

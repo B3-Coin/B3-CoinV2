@@ -1840,7 +1840,30 @@ seat stopped and restarted in the middle.
   are in the stage 2 report; the executables in `fm2_all` are inspected by
   rule 3 already.
 - **The simulator suite's bytes** changed once (O-105 (10)); its sha256 is
-  recorded there.
+  recorded there, and once more with the review fix 17.3 item 02 (the
+  prepare digest binds domain, epoch and slot): `f943718f…` since then.
+- **Review of 2026-11-16, decisions taken while fixing (17.3):** every
+  DECISION payload the commit log holds stays resident for catch-up until
+  the snapshot of M4-STO-03 prunes it (item 03; a per-segment index is the
+  alternative); a journal directory is locked with `flock` on `<dir>/.lock`
+  (item 04); `TcpMeshLimits` gains `read_bytes_per_step`,
+  `write_buffer_bytes` and `send_stall_ms` with the defaults named in
+  item 05; `HttpsSseConfig::stream_output_bytes` defaults to 1 MiB (item
+  06); a seat whose decided-but-unapplied slot fails check 3 on a restart
+  starts fenced instead of refusing to start (item 07); `fm2-cli` prints an
+  uncertified FAILED but never records it (item 08a); every `fm2-keygen`
+  run is its own network (item 08b). The review's questions stay the
+  owner's: whether one seat's double vote halts the cluster (O-100,
+  untouched), which PBFT/mesh/recovery line continues (`origin/rebirth`
+  against `rebirth-stage2`), and CI: the workflow now also triggers on
+  `rebirth-*` pushes (an addition to the owner-protected file, so the
+  Linux and sanitizer gates run on this branch; the owner may remove it).
+- **Left from the review, by severity:** R1 (half-open HTTPS connections
+  are not counted against the limits), R6 (reports stored per attacker-chosen
+  target view without a cap; BLS verification before the duplicate check),
+  R5 (a seat restarted mid view change does not resend its report), R4 (the
+  proposal leaves before ACCEPTED_PROPOSAL is durable), and the LeakSanitizer
+  report of libevent request objects at exit, which needs a Linux run.
 
 ### 17.2 Still open after stage 2
 
