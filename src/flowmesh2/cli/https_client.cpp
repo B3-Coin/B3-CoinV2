@@ -27,6 +27,9 @@ namespace flowmesh2::cli {
 
 namespace {
 
+//! The host as it goes into a URL authority or a Host header: an IPv6 literal in brackets (review 2026-11-16).
+std::string HostForUrl(const std::string& host) { return host.find(':') != std::string::npos ? "[" + host + "]" : host; }
+
 using Clock = std::chrono::steady_clock;
 
 std::string Lower(std::string_view text)
@@ -174,7 +177,7 @@ Result<void> HttpsClient::Connect(Clock::time_point deadline, uint32_t receive_t
     }
     SSL_CTX_set_verify(m_ctx, SSL_VERIFY_NONE, nullptr); // the pin below replaces the CA check (O-104 (2))
     // The TCP connect, non-blocking against the deadline.
-    const std::string target{m_host + ":" + std::to_string(m_port)};
+    const std::string target{HostForUrl(m_host) + ":" + std::to_string(m_port)};
     BIO* tcp{BIO_new_connect(target.c_str())};
     if (tcp == nullptr) {
         Disconnect();
@@ -290,7 +293,7 @@ Result<HttpResponse> HttpsClient::Request(std::string_view method, std::string_v
 {
     const Clock::time_point deadline{Clock::now() + std::chrono::milliseconds{m_timeout_ms}};
     if (const Result<void> connected{Connect(deadline, m_timeout_ms)}; !connected.has_value()) return connected.error();
-    std::string request{std::string{method} + " " + std::string{path} + " HTTP/1.1\r\nHost: " + m_host + "\r\nConnection: close\r\n"};
+    std::string request{std::string{method} + " " + std::string{path} + " HTTP/1.1\r\nHost: " + HostForUrl(m_host) + "\r\nConnection: close\r\n"};
     if (!body.empty() || method == "POST") {
         request += "Content-Type: " + std::string{content_type} + "\r\nContent-Length: " + std::to_string(body.size()) + "\r\n";
     }
@@ -359,7 +362,7 @@ Result<HttpResponse> HttpsClient::Stream(std::string_view path, const std::funct
         !connected.has_value()) {
         return connected.error();
     }
-    const std::string request{"GET " + std::string{path} + " HTTP/1.1\r\nHost: " + m_host +
+    const std::string request{"GET " + std::string{path} + " HTTP/1.1\r\nHost: " + HostForUrl(m_host) +
                               "\r\nAccept: text/event-stream\r\nConnection: close\r\n\r\n"};
     if (const Result<void> written{Write(request)}; !written.has_value()) {
         Disconnect();

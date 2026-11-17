@@ -470,19 +470,20 @@ int Wait(const Context& ctx, Outbox& outbox, const std::string& label, const Out
                 return 2;
             }
         }
-        if (answering == ctx.endpoints.size() && terminal == answering) {
-            // EVERY selected seat answers and says its pool dropped the action for a nonce reason. Nothing certifies that (the
-            // lease proves nothing, net/client_api.h), so it is recorded as FAILED, not as a certified end; a seat that is
-            // silent or merely behind keeps the client polling instead.
+        if (answering == ctx.genesis.seats.size() && terminal == answering) {
+            // EVERY seat of the genesis (not only the ones --seat selected: one seat's word is never decisive) answers and says
+            // its pool dropped the action for a nonce reason. Nothing certifies that (the lease proves nothing,
+            // net/client_api.h), so it is printed as FAILED and NOT recorded: the outbox keeps only certified ends, and a
+            // later `resend --wait` polls again (review 2026-11-16, defect 9). A seat that is silent or merely behind keeps
+            // the client polling instead.
             UniValue result{UniValue::VOBJ};
             result.pushKV("status", Str("FAILED"));
             result.pushKV("reason", Str(CLI_WAIT_FAILED));
             result.pushKV("seats_answering", U64(answering));
             result.pushKV("height", U64(terminal_height));
             result.pushKV("verified", UniValue{false});
+            result.pushKV("recorded", UniValue{false});
             out.pushKV("result", result);
-            const OutboxResult recorded{OutboxOutcome::FAILED, terminal_height, 0, std::string{CLI_WAIT_FAILED}};
-            if (const Result<void> ok{outbox.Record(label, recorded)}; !ok.has_value()) return Fail(ok.error());
             Print(out);
             return 2;
         }
