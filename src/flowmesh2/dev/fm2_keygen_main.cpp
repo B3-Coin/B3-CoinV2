@@ -13,6 +13,7 @@
 #include <pubkey.h>
 #include <random.h>
 #include <util/fs.h>
+#include <util/translation.h>
 
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -38,6 +39,10 @@
  * <dir>/seat<index>/transport.key (the secp256k1 transport secret, 32 bytes hex),
  * both 0600. Real key custody is not part of this tool.
  */
+// Core's clientversion.cpp (bitcoin_common) refers to this; every executable
+// defines it, as bitcoind and bitcoin-cli do. Nothing here is translated.
+const TranslateFn G_TRANSLATION_FUN{nullptr};
+
 namespace {
 
 using namespace flowmesh2;

@@ -20,6 +20,7 @@
 #include <util/fs.h>
 #include <util/signalinterrupt.h>
 #include <util/threadnames.h>
+#include <util/translation.h>
 
 #include <csignal>
 #include <unistd.h>
@@ -62,6 +63,10 @@
  * heartbeat is due, the API pumped. SIGINT/SIGTERM stop it; the API and the
  * mesh are stopped and the journals closed in that order.
  */
+// Core's clientversion.cpp (bitcoin_common) refers to this; every executable
+// defines it, as bitcoind and bitcoin-cli do. Nothing here is translated.
+const TranslateFn G_TRANSLATION_FUN{nullptr};
+
 namespace {
 
 using namespace flowmesh2;

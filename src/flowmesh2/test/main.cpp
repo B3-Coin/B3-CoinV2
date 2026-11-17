@@ -18,6 +18,11 @@
 #include <boost/test/included/unit_test.hpp>
 
 #include <key.h>
+#include <util/translation.h>
+
+// Core's clientversion.cpp (bitcoin_common) refers to this; every executable
+// defines it, as bitcoind and bitcoin-cli do. Nothing here is translated.
+const TranslateFn G_TRANSLATION_FUN{nullptr};
 
 namespace {
 struct Fm2EccFixture {

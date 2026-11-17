@@ -165,6 +165,8 @@ Result<CommitLog> CommitLog::Recover(Journal& journal, const ProfileParams& prof
         case RecordType::ACCEPTED_PROPOSAL:
         case RecordType::VIEW_STATE:
         case RecordType::NEW_VIEW_ACCEPTED:
+        case RecordType::OUTBOX_ACTION:
+        case RecordType::OUTBOX_RESULT:
             return Error{ErrorCode::ORDER_VIOLATION, RECORD_ROLE};
         }
     }

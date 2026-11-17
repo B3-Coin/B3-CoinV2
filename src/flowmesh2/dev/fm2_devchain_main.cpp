@@ -6,6 +6,7 @@
 #include <flowmesh2/dev/dev_chain_file.h>
 #include <flowmesh2/netio/genesis_doc.h>
 #include <util/fs.h>
+#include <util/translation.h>
 
 #include <charconv>
 #include <fstream>
@@ -28,6 +29,10 @@
  * prints every block. The deposit is a regtest convenience, not a chain
  * fact anyone verified: stage 3 replaces this file with the b3d adapter.
  */
+// Core's clientversion.cpp (bitcoin_common) refers to this; every executable
+// defines it, as bitcoind and bitcoin-cli do. Nothing here is translated.
+const TranslateFn G_TRANSLATION_FUN{nullptr};
+
 namespace {
 
 using namespace flowmesh2;

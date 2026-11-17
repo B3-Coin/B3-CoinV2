@@ -22,6 +22,7 @@
 
 #include <flowmesh2/sim/scenario.h>
 #include <key.h>
+#include <util/translation.h>
 
 #include <charconv>
 #include <cstdint>
@@ -31,6 +32,10 @@
 #include <string_view>
 #include <system_error>
 #include <vector>
+
+// Core's clientversion.cpp (bitcoin_common) refers to this; every executable
+// defines it, as bitcoind and bitcoin-cli do. Nothing here is translated.
+const TranslateFn G_TRANSLATION_FUN{nullptr};
 
 namespace {
 

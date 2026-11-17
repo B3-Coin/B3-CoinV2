@@ -15,6 +15,7 @@
 #include <key.h>
 #include <univalue.h>
 #include <util/fs.h>
+#include <util/translation.h>
 
 #include <arpa/inet.h>
 
@@ -71,6 +72,10 @@
  * b3verify: an UNKNOWN account is a seat's claim (v0 has no absence proof)
  * and is printed as not verified. REGTEST only (the genesis document is).
  */
+// Core's clientversion.cpp (bitcoin_common) refers to this; every executable
+// defines it, as bitcoind and bitcoin-cli do. Nothing here is translated.
+const TranslateFn G_TRANSLATION_FUN{nullptr};
+
 namespace {
 
 using namespace flowmesh2;

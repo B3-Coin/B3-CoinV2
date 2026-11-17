@@ -202,6 +202,8 @@ Result<SignerLog> SignerLog::Recover(Journal& journal, const ProfileParams& prof
         case RecordType::SNAPSHOT_MARK:
         case RecordType::PREPARED_QC:
         case RecordType::EVIDENCE:
+        case RecordType::OUTBOX_ACTION:
+        case RecordType::OUTBOX_RESULT:
             return Error{ErrorCode::ORDER_VIOLATION, RECORD_ROLE};
         }
     }

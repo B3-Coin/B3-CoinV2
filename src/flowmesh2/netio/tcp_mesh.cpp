@@ -242,7 +242,10 @@ void TcpSeatMesh::Impl::Wake()
 {
     if (wake_write < 0) return;
     const unsigned char byte{1};
-    (void)::write(wake_write, &byte, 1);
+    // Best effort: the pipe is non-blocking, and a full pipe means the loop is awake
+    // already. glibc marks write() warn_unused_result and GCC does not accept a (void)
+    // cast as a use, so the result is kept (fm2_warnings makes it an error).
+    [[maybe_unused]] const ssize_t written{::write(wake_write, &byte, 1)};
 }
 
 void TcpSeatMesh::Impl::Run()

@@ -1851,3 +1851,18 @@ crossing orders), M4-STO-03 (snapshots and the decided-but-unapplied tail
 on restore), M4-NET-05 (crypto review), the gates of section 0 (G-1 above
 all). Stage 3 (chain assets on regtest) starts with the b3d adapter
 (M7-ADP-01) replacing the dev chain file, then MB1.
+
+### 17.3 The review of 2026-11-16 and its fixes
+
+Mohamed Ibrahim reviewed `rebirth-stage2` at f5b010de (two Linux build
+blockers, two defects confirmed by tests, eight read in the code, eleven
+leads). Every finding was re-traced in the source on 2026-11-17 before any
+fix; the triage is in the shared notes. Fixes land one per commit, each with
+a failing-first and a verified evidence bundle under
+`REVIEW-20261116/<item>/` of the evidence root. The questions the review
+asks the owner (which PBFT/mesh/recovery implementation continues, the
+double-vote halt of O-100, CI on `rebirth-*`) stay the owner's.
+
+| Item | Finding | Fix as landed | Evidence |
+|---|---|---|---|
+| 01 | GCC refuses `(void)::write` under `-Werror=unused-result`; `G_TRANSLATION_FUN` undefined in every fm2 main; `-Wswitch` on the OUTBOX record types in `signer_log.cpp` and `commit_log.cpp`; `-Wreorder` in `PbftAgreement`'s constructor | the write's result is kept in a `[[maybe_unused]]` local; the six executables (fm2d, fm2-keygen, fm2-devchain, fm2-cli, fm2-sim, test_flowmesh2) define `G_TRANSLATION_FUN{nullptr}` as bitcoind does; both role switches name the OUTBOX types (still no `default`, so the next record type warns again); members initialised in declaration order. No GCC here: `-Werror=switch`/`-Werror=reorder` under Apple clang fail before and pass after, the unused-result and link blockers are shown by grep and `nm` and rest on the review's GCC 15 run | `REVIEW-20261116/01-linux-build/20261117-newmac-01/` |
