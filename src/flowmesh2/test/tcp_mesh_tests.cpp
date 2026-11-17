@@ -388,4 +388,190 @@ BOOST_AUTO_TEST_CASE(outboxes_are_bounded_and_dedupe)
     (*m0)->Stop();
 }
 
+BOOST_AUTO_TEST_CASE(an_unanswered_connection_does_not_block_the_peers_fresh_one)
+{
+    // Review of 2026-11-16, defect 4c: outbound frames used to refresh a connection's liveness, so a connection whose
+    // peer had gone silent looked live to the seat writing to it, and the peer's fresh, authenticated redial was
+    // refused as a duplicate for as long as the writes went on. Liveness comes from received frames only. The lower
+    // seat dials, so the acceptor (seat 1) is the one that must let a fresh seat 0 in: seat 1 keeps sending to a
+    // silent seat 0 for longer than duplicate_grace_ms, then a fresh instance of seat 0 dials and is accepted.
+    Rig rig;
+    TcpMeshConfig c1{rig.ConfigFor(1)};
+    c1.limits.duplicate_grace_ms = 300;
+    Result<std::unique_ptr<TcpSeatMesh>> m1{TcpSeatMesh::Create(c1)};
+    RequireOk(m1, "mesh 1 (the acceptor)");
+    Result<std::unique_ptr<TcpSeatMesh>> m0{TcpSeatMesh::Create(rig.ConfigFor(0))};
+    RequireOk(m0, "mesh 0 (dials seat 1)");
+    RequireOk((*m0)->Send(1, Lane::ACTION, std::vector<unsigned char>{1}), "seat 0 sends once");
+    BOOST_REQUIRE(WaitFrame(**m1).has_value());
+    // Seat 1 talks, seat 0 stays silent (it drains what it gets).
+    for (int i{0}; i < 30; ++i) {
+        RequireOk((*m1)->Send(0, Lane::ACTION, std::vector<unsigned char>{static_cast<unsigned char>(i)}), "seat 1 sends");
+        std::this_thread::sleep_for(std::chrono::milliseconds{20});
+        while (WaitFrame(**m0, std::chrono::milliseconds{1}).has_value()) {
+        }
+    }
+    // A fresh instance of seat 0 (its keys, its own listening port) dials seat 1 and is accepted at once.
+    TcpMeshConfig fresh_config{rig.ConfigFor(0)};
+    fresh_config.listen_port = FreePort();
+    Result<std::unique_ptr<TcpSeatMesh>> fresh{TcpSeatMesh::Create(fresh_config)};
+    RequireOk(fresh, "the fresh seat 0");
+    const std::vector<unsigned char> fresh_bytes{0xf0, 0xe5};
+    RequireOk((*fresh)->Send(1, Lane::ACTION, fresh_bytes), "the fresh seat 0 sends");
+    bool delivered{false};
+    const auto deadline{std::chrono::steady_clock::now() + std::chrono::seconds{5}};
+    while (!delivered && std::chrono::steady_clock::now() < deadline) {
+        const std::optional<InboundFrame> frame{WaitFrame(**m1, std::chrono::milliseconds{200})};
+        if (frame.has_value() && frame->bytes == fresh_bytes) delivered = true;
+    }
+    BOOST_CHECK(delivered);
+    (*fresh)->Stop();
+    (*m0)->Stop();
+    (*m1)->Stop();
+}
+
+BOOST_AUTO_TEST_CASE(a_peer_that_does_not_read_holds_frames_in_the_outbox)
+{
+    // Review of 2026-11-16, defect 4b: the whole outbox used to move into the socket buffer every step, so a peer
+    // that authenticated and stopped reading grew this process's memory without bound. Queued bytes are capped per
+    // connection: the frames wait in the outbox, whose cap tells the sender BUSY, and a connection whose bytes make
+    // no progress for send_stall_ms is closed (TcpPeerStatus::stalls counts those closes).
+    Rig rig;
+    TcpMeshConfig c0{rig.ConfigFor(0)};
+    c0.limits.write_buffer_bytes = 256 * 1024;
+    c0.limits.send_stall_ms = 800;
+    c0.limits.outbox_frames = 8;
+    Result<std::unique_ptr<TcpSeatMesh>> m0{TcpSeatMesh::Create(c0)};
+    RequireOk(m0, "mesh 0");
+    TcpMeshConfig c1{rig.ConfigFor(1)};
+    c1.limits.inbox_frames_per_peer = 4; // seat 1 never polls: it stops reading after four frames
+    Result<std::unique_ptr<TcpSeatMesh>> m1{TcpSeatMesh::Create(c1)};
+    RequireOk(m1, "mesh 1");
+    RequireOk((*m0)->Send(1, Lane::BULK, std::vector<unsigned char>{1}), "seat 0 sends once");
+    std::this_thread::sleep_for(std::chrono::milliseconds{300}); // connected (seat 1 keeps the frame unread)
+    std::vector<unsigned char> frame(60 * 1024, 0xab);
+    bool busy{false};
+    bool closed{false};
+    uint64_t most_pending{0};
+    const auto deadline{std::chrono::steady_clock::now() + std::chrono::seconds{15}};
+    for (unsigned i{0}; !closed && std::chrono::steady_clock::now() < deadline; ++i) {
+        frame[0] = static_cast<unsigned char>(i);
+        frame[1] = static_cast<unsigned char>(i >> 8);
+        frame[2] = static_cast<unsigned char>(i >> 16);
+        const Result<void> sent{(*m0)->Send(1, Lane::BULK, frame)};
+        if (!sent.has_value()) {
+            RequireRefusal(sent, ErrorCode::BUSY, LANE_FULL, "the outbox holds frames back");
+            busy = true;
+        }
+        for (const TcpPeerStatus& peer : (*m0)->Status().peers) {
+            if (peer.seat != 1) continue;
+            most_pending = std::max(most_pending, peer.pending_bytes);
+            if (peer.stalls > 0) closed = true; // seat 0 redials at once, so the closed moment itself is easy to miss: the count is not
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds{1});
+    }
+    BOOST_CHECK(busy);
+    BOOST_CHECK(closed);
+    BOOST_CHECK_LE(most_pending, c0.limits.write_buffer_bytes + frame.size() + 1024);
+    (*m1)->Stop();
+    (*m0)->Stop();
+}
+
+BOOST_AUTO_TEST_CASE(a_transmit_does_not_leave_the_network_thread_spinning)
+{
+    // Found on 2026-11-17 by the step counter of the review fixes: Wake() wrote a byte to the wake pipe that the loop
+    // tried to drain with recv(), which fails on a pipe, so the pipe stayed readable and the network thread spun from
+    // the first Transmit on. After a frame is sent and delivered, an idle second costs about poll_interval steps.
+    Rig rig;
+    TcpMeshConfig c0{rig.ConfigFor(0)};
+    c0.limits.poll_interval_ms = 50;
+    Result<std::unique_ptr<TcpSeatMesh>> m0{TcpSeatMesh::Create(c0)};
+    RequireOk(m0, "mesh 0");
+    Result<std::unique_ptr<TcpSeatMesh>> m1{TcpSeatMesh::Create(rig.ConfigFor(1))};
+    RequireOk(m1, "mesh 1");
+    RequireOk((*m0)->Send(1, Lane::ACTION, std::vector<unsigned char>{7}), "one frame");
+    BOOST_REQUIRE(WaitFrame(**m1).has_value());
+    std::this_thread::sleep_for(std::chrono::milliseconds{300});
+    const uint64_t before{(*m0)->Status().steps};
+    std::this_thread::sleep_for(std::chrono::seconds{1});
+    const uint64_t steps{(*m0)->Status().steps - before};
+    BOOST_CHECK_MESSAGE(steps < 200, "the network thread stepped " << steps << " times in an idle second after a transmit");
+    (*m1)->Stop();
+    (*m0)->Stop();
+}
+
+BOOST_AUTO_TEST_CASE(strangers_at_the_cap_do_not_spin_the_network_thread)
+{
+    // Review of 2026-11-16 (a reviewer's lead, confirmed): at max_unauthenticated the listener stayed in the poll
+    // set while nothing was accepted, so the network thread woke at once, over and over. The listener leaves the
+    // poll set at the cap and the thread sleeps its poll interval; the pending connections wait in the backlog.
+    Rig rig;
+    TcpMeshConfig c0{rig.ConfigFor(0)};
+    c0.limits.max_unauthenticated = 2;
+    c0.limits.poll_interval_ms = 50;
+    c0.limits.handshake_timeout_ms = 60'000;
+    Result<std::unique_ptr<TcpSeatMesh>> m0{TcpSeatMesh::Create(c0)};
+    RequireOk(m0, "mesh 0");
+    std::vector<int> strangers;
+    for (int i{0}; i < 4; ++i) {
+        const int fd{::socket(AF_INET, SOCK_STREAM, 0)};
+        BOOST_REQUIRE(fd >= 0);
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        addr.sin_port = htons((*m0)->ListenPort());
+        BOOST_REQUIRE(::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0);
+        strangers.push_back(fd);
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds{300});
+    BOOST_CHECK_LE((*m0)->Status().connections, 2U);
+    const uint64_t before{(*m0)->Status().steps};
+    std::this_thread::sleep_for(std::chrono::seconds{1});
+    const uint64_t steps{(*m0)->Status().steps - before};
+    BOOST_CHECK_MESSAGE(steps < 200, "the network thread stepped " << steps << " times in a second at the stranger cap");
+    for (const int fd : strangers) ::close(fd);
+    (*m0)->Stop();
+}
+
+BOOST_AUTO_TEST_CASE(a_flood_of_frames_stops_at_the_peers_inbox_cap)
+{
+    // Review of 2026-11-16, defect 4a: the inbox cap was checked only when the poll set was built, so every frame
+    // already read was pushed past it, and a peer streaming tiny frames kept the thread reading it. The cap holds
+    // while reading and processing; the rest waits in the connection's buffer and nothing is lost.
+    Rig rig;
+    TcpMeshConfig c0{rig.ConfigFor(0)};
+    c0.limits.inbox_frames_per_peer = 8;
+    Result<std::unique_ptr<TcpSeatMesh>> m0{TcpSeatMesh::Create(c0)};
+    RequireOk(m0, "mesh 0");
+    Result<std::unique_ptr<TcpSeatMesh>> m1{TcpSeatMesh::Create(rig.ConfigFor(1))};
+    RequireOk(m1, "mesh 1");
+    RequireOk((*m1)->Send(0, Lane::ACTION, std::vector<unsigned char>{0, 0}), "seat 1 sends once");
+    BOOST_REQUIRE(WaitFrame(**m0).has_value());
+    constexpr unsigned FLOOD{200};
+    for (unsigned i{1}; i <= FLOOD; ++i) {
+        const std::vector<unsigned char> bytes{static_cast<unsigned char>(i), static_cast<unsigned char>(i >> 8)};
+        for (;;) {
+            const Result<void> sent{(*m1)->Send(0, Lane::ACTION, bytes)};
+            if (sent.has_value()) break;
+            RequireRefusal(sent, ErrorCode::BUSY, LANE_FULL, "the sender's own outbox cap");
+            std::this_thread::sleep_for(std::chrono::milliseconds{2});
+        }
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds{400});
+    uint64_t waiting{0};
+    for (const TcpPeerStatus& peer : (*m0)->Status().peers) {
+        if (peer.seat == 1) waiting = peer.inbox_frames;
+    }
+    BOOST_CHECK_LE(waiting, c0.limits.inbox_frames_per_peer);
+    // Everything arrives once seat 0 polls.
+    unsigned received{0};
+    const auto deadline{std::chrono::steady_clock::now() + std::chrono::seconds{10}};
+    while (received < FLOOD && std::chrono::steady_clock::now() < deadline) {
+        if (WaitFrame(**m0, std::chrono::milliseconds{200}).has_value()) ++received;
+    }
+    BOOST_CHECK_EQUAL(received, FLOOD);
+    (*m1)->Stop();
+    (*m0)->Stop();
+}
+
 BOOST_AUTO_TEST_SUITE_END()

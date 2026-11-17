@@ -36,7 +36,6 @@ using Ms = std::chrono::milliseconds;
 constexpr size_t READ_CHUNK{64 * 1024};
 constexpr int LISTEN_BACKLOG{32};
 
-size_t LaneIndex(Lane lane) { return static_cast<size_t>(lane) - 1; }
 
 enum class ConnState : uint8_t {
     CONNECTING,   //!< the dialer waits for the TCP connect to finish
@@ -58,7 +57,8 @@ struct Conn {
     std::optional<uint32_t> pending_len; //!< the decrypted length of the packet being read
     Clock::time_point opened_at;
     Clock::time_point deadline;         //!< the handshake deadline
-    Clock::time_point last_frame_at;    //!< the last authenticated frame in either direction
+    Clock::time_point last_frame_at;    //!< the last authenticated frame RECEIVED (outbound frames prove nothing about the peer)
+    Clock::time_point last_progress_at; //!< the last time queued bytes left for the socket (the send-stall clock)
     bool closed{false};
     std::string why;
 };
@@ -92,6 +92,7 @@ struct TcpSeatMesh::Impl {
     std::shared_ptr<Sock> listener;
     uint16_t listen_port{0};
     std::shared_ptr<Sock> wake_read;
+    int wake_read_fd{-1}; //!< the pipe's read end, drained with read() (recv fails on a pipe)
     int wake_write{-1};
 
     // The network thread's own state (no lock: only it touches these).
@@ -105,6 +106,7 @@ struct TcpSeatMesh::Impl {
     std::vector<size_t> inbox_per_peer GUARDED_BY(mutex);
     std::vector<TcpPeerStatus> peer_status GUARDED_BY(mutex);
     size_t connection_count GUARDED_BY(mutex){0};
+    uint64_t steps GUARDED_BY(mutex){0};
     bool drop_all GUARDED_BY(mutex){false};
     std::atomic<bool> stop{false};
     std::atomic<bool> running{false};
@@ -203,6 +205,7 @@ Result<void> TcpSeatMesh::Impl::Start()
     int fds[2];
     if (::pipe(fds) != 0) return Error{ErrorCode::STORAGE_FATAL, TCP_MESH_WAKE};
     wake_read = std::make_shared<Sock>(static_cast<SOCKET>(fds[0]));
+    wake_read_fd = fds[0];
     wake_write = fds[1];
     if (!wake_read->SetNonBlocking()) return Error{ErrorCode::STORAGE_FATAL, TCP_MESH_WAKE};
 
@@ -269,8 +272,14 @@ void TcpSeatMesh::Impl::Step()
     Reap();
     PumpOutboxes();
 
+    // At the stranger cap the listener leaves the poll set: pending connections wait in the kernel's backlog instead of
+    // waking the thread at once, over and over (review 2026-11-16: the cap used to spin the network thread).
+    size_t unauthenticated{0};
+    for (const auto& conn : conns) {
+        if (!conn->closed && conn->state != ConnState::OPEN && !conn->initiator) ++unauthenticated;
+    }
     Sock::EventsPerSock events;
-    events.emplace(listener, Sock::Events{Sock::RECV});
+    if (unauthenticated < cfg.limits.max_unauthenticated) events.emplace(listener, Sock::Events{Sock::RECV});
     events.emplace(wake_read, Sock::Events{Sock::RECV});
     const Clock::time_point now{Clock::now()};
     Clock::time_point next_wake{now + Ms{static_cast<int64_t>(cfg.limits.poll_interval_ms)}};
@@ -293,10 +302,12 @@ void TcpSeatMesh::Impl::Step()
     const Ms timeout{std::max<int64_t>(1, std::chrono::duration_cast<Ms>(next_wake - now).count())};
     (void)listener->WaitMany(timeout, events);
 
-    // The wake pipe: drain it.
+    // The wake pipe: drain it with read(), not recv(): recv fails on a pipe (ENOTSOCK), so the byte Wake() wrote was never
+    // taken out, the pipe stayed readable and the thread spun from the first Transmit on (found by the step counter the
+    // review fixes added, 2026-11-17).
     if (const auto it{events.find(wake_read)}; it != events.end() && (it->second.occurred & Sock::RECV) != 0) {
         unsigned char buf[64];
-        while (wake_read->Recv(buf, sizeof(buf), 0) > 0) {
+        while (::read(wake_read_fd, buf, sizeof(buf)) > 0) {
         }
     }
     if (const auto it{events.find(listener)}; it != events.end() && (it->second.occurred & Sock::RECV) != 0) AcceptAll();
@@ -327,6 +338,20 @@ void TcpSeatMesh::Impl::Step()
             if ((occurred & Sock::SEND) != 0 || conn->wpos < conn->wbuf.size()) OnWritable(*conn);
         }
         if (!conn->closed && conn->state != ConnState::OPEN && after > conn->deadline) Close(*conn, "handshake timeout");
+        // Queued bytes that make no progress for send_stall_ms: the peer does not read (or the connection is dead).
+        if (!conn->closed && conn->wpos < conn->wbuf.size() && after > conn->last_progress_at + Ms{static_cast<int64_t>(cfg.limits.send_stall_ms)}) {
+            if (conn->peer.has_value()) {
+                LOCK(mutex);
+                for (TcpPeerStatus& status : peer_status) {
+                    if (status.seat == *conn->peer) ++status.stalls;
+                }
+            }
+            Close(*conn, "peer does not read");
+        }
+    }
+    // Bytes read earlier but left unprocessed because the peer's inbox was full: the inbox may have drained since.
+    for (auto& conn : conns) {
+        if (!conn->closed && conn->state == ConnState::OPEN && !conn->rbuf.empty() && conn->peer.has_value() && !InboxFull(*conn->peer)) Process(*conn);
     }
     Reap();
     DialDue();
@@ -335,6 +360,18 @@ void TcpSeatMesh::Impl::Step()
         if (!conn->closed && conn->wpos < conn->wbuf.size()) OnWritable(*conn);
     }
     Reap();
+    // Status samples (one lock per step): queued bytes per peer, inbox depth per peer, the step count.
+    {
+        LOCK(mutex);
+        ++steps;
+        for (TcpPeerStatus& status : peer_status) {
+            status.pending_bytes = 0;
+            for (const auto& conn : conns) {
+                if (!conn->closed && conn->peer == status.seat) status.pending_bytes += conn->wbuf.size() - conn->wpos;
+            }
+            status.inbox_frames = inbox_per_peer[status.seat];
+        }
+    }
 }
 
 void TcpSeatMesh::Impl::AcceptAll()
@@ -416,9 +453,17 @@ void TcpSeatMesh::Impl::DialDue()
 void TcpSeatMesh::Impl::OnReadable(Conn& conn)
 {
     unsigned char buf[READ_CHUNK];
+    // This connection's share of the step: once the budget is spent the socket stays readable and the next step comes
+    // back to it, after every other connection, dial and deadline had its turn (review 2026-11-16, defect 4a). A full
+    // inbox holds the socket back here too, not only when the poll set is built.
+    size_t budget{cfg.limits.read_bytes_per_step};
     for (;;) {
-        const ssize_t n{conn.sock->Recv(buf, sizeof(buf), 0)};
+        if (budget == 0) return;
+        if (conn.state == ConnState::OPEN && conn.peer.has_value() && InboxFull(*conn.peer)) return;
+        const size_t want{std::min(sizeof(buf), budget)};
+        const ssize_t n{conn.sock->Recv(buf, want, 0)};
         if (n > 0) {
+            budget -= static_cast<size_t>(n);
             conn.rbuf.insert(conn.rbuf.end(), buf, buf + n);
             if (conn.rbuf.size() > cfg.mesh.max_frame_bytes + netio::SecureChannel::EXPANSION + READ_CHUNK) {
                 Close(conn, "peer sends faster than we read");
@@ -426,7 +471,7 @@ void TcpSeatMesh::Impl::OnReadable(Conn& conn)
             }
             Process(conn);
             if (conn.closed) return;
-            if (static_cast<size_t>(n) < sizeof(buf)) return;
+            if (static_cast<size_t>(n) < want) return;
             continue;
         }
         if (n == 0) {
@@ -446,6 +491,7 @@ void TcpSeatMesh::Impl::OnWritable(Conn& conn)
         const ssize_t n{conn.sock->Send(conn.wbuf.data() + conn.wpos, conn.wbuf.size() - conn.wpos, MSG_NOSIGNAL)};
         if (n > 0) {
             conn.wpos += static_cast<size_t>(n);
+            conn.last_progress_at = Clock::now();
             continue;
         }
         const int err{WSAGetLastError()};
@@ -462,7 +508,11 @@ void TcpSeatMesh::Impl::OnWritable(Conn& conn)
     }
 }
 
-void TcpSeatMesh::Impl::Queue(Conn& conn, std::span<const unsigned char> bytes) { conn.wbuf.insert(conn.wbuf.end(), bytes.begin(), bytes.end()); }
+void TcpSeatMesh::Impl::Queue(Conn& conn, std::span<const unsigned char> bytes)
+{
+    if (conn.wpos == conn.wbuf.size()) conn.last_progress_at = Clock::now(); // nothing was pending: the stall clock starts now
+    conn.wbuf.insert(conn.wbuf.end(), bytes.begin(), bytes.end());
+}
 
 void TcpSeatMesh::Impl::QueuePacket(Conn& conn, std::span<const unsigned char> contents)
 {
@@ -524,12 +574,17 @@ void TcpSeatMesh::Impl::Process(Conn& conn)
         }
         // OPEN: one frame of the connection's lane from its authenticated peer.
         conn.last_frame_at = Clock::now();
-        LOCK(mutex);
-        inboxes[LaneIndex(conn.lane)].push_back(InboundFrame{*conn.peer, conn.lane, std::move(contents)});
-        ++inbox_per_peer[*conn.peer];
-        for (TcpPeerStatus& status : peer_status) {
-            if (status.seat == *conn.peer) ++status.frames_in;
+        bool full{false};
+        {
+            LOCK(mutex);
+            inboxes[LaneIndex(conn.lane)].push_back(InboundFrame{*conn.peer, conn.lane, std::move(contents)});
+            ++inbox_per_peer[*conn.peer];
+            full = inbox_per_peer[*conn.peer] >= cfg.limits.inbox_frames_per_peer;
+            for (TcpPeerStatus& status : peer_status) {
+                if (status.seat == *conn.peer) ++status.frames_in;
+            }
         }
+        if (full) return; // the rest of rbuf waits until Poll drains the peer's share (Step comes back to it)
     }
 }
 
@@ -593,19 +648,24 @@ void TcpSeatMesh::Impl::PumpOutboxes()
             if (queue.empty()) continue;
             Conn* conn{OpenConn(route.first, route.second)};
             if (conn == nullptr) continue;
-            while (!queue.empty()) {
+            // A socket with write_buffer_bytes queued takes nothing more: the frames wait in the outbox, whose cap tells the
+            // sender BUSY, instead of growing this process's memory for a peer that does not read (review 2026-11-16, 4b).
+            size_t pending{conn->wbuf.size() - conn->wpos};
+            size_t moved{0};
+            while (!queue.empty() && pending < cfg.limits.write_buffer_bytes) {
+                pending += queue.front().size() + netio::SecureChannel::EXPANSION;
                 out.emplace_back(conn, std::move(queue.front()));
                 queue.pop_front();
+                ++moved;
             }
             for (TcpPeerStatus& status : peer_status) {
-                if (status.seat == route.first) status.frames_out += out.size();
+                if (status.seat == route.first) status.frames_out += moved; // this route's frames, not the step's total
             }
         }
     }
-    for (auto& [conn, frame] : out) {
-        conn->last_frame_at = Clock::now();
-        QueuePacket(*conn, frame);
-    }
+    // Outbound frames say nothing about the peer: last_frame_at moves on received frames only, so a dead connection
+    // ages out of duplicate_grace_ms and the peer's fresh, authenticated one replaces it (review 2026-11-16, 4c).
+    for (auto& [conn, frame] : out) QueuePacket(*conn, frame);
 }
 
 void TcpSeatMesh::Impl::Close(Conn& conn, std::string why)
@@ -696,6 +756,7 @@ TcpMeshStatus TcpSeatMesh::Status() const
     status.listen_port = m_impl->listen_port;
     LOCK(m_impl->mutex);
     status.connections = m_impl->connection_count;
+    status.steps = m_impl->steps;
     status.peers = m_impl->peer_status;
     return status;
 }

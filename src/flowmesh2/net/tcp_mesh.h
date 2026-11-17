@@ -111,6 +111,9 @@ struct TcpMeshLimits {
     size_t outbox_frames{64};             //!< distinct frames queued per (seat, lane) before BUSY
     size_t inbox_frames_per_peer{256};    //!< frames waiting in Poll per peer before the mesh stops reading it
     size_t max_unauthenticated{64};       //!< accepted connections that have not completed a HELLO
+    size_t read_bytes_per_step{256 * 1024}; //!< bytes read from one connection per network-thread step before the others are served
+    size_t write_buffer_bytes{1024 * 1024}; //!< bytes queued to one socket before its outbox holds frames back (the outbox cap then says BUSY)
+    uint64_t send_stall_ms{10'000};       //!< a connection whose queued bytes make no progress for this long is closed
 };
 
 struct TcpMeshConfig {
@@ -126,16 +129,23 @@ struct TcpMeshConfig {
     TcpMeshLimits limits;
 };
 
+//! The index of `lane` in TcpPeerStatus::open (lanes are numbered from 1).
+inline size_t LaneIndex(Lane lane) { return static_cast<size_t>(lane) - 1; }
+
 struct TcpPeerStatus {
     uint32_t seat{0};
     std::array<bool, LANE_COUNT> open{}; //!< by lane index (LANES_BY_PRIORITY order is not implied; index = IndexOf(lane))
     uint64_t frames_in{0};
     uint64_t frames_out{0};
     uint64_t refused{0}; //!< handshakes or packets this seat refused from that peer
+    uint64_t pending_bytes{0}; //!< bytes queued to the peer's sockets and not yet sent (sampled once per step)
+    uint64_t inbox_frames{0};  //!< frames from the peer waiting in Poll (sampled once per step)
+    uint64_t stalls{0};        //!< connections to the peer closed because queued bytes made no progress for send_stall_ms
 };
 
 struct TcpMeshStatus {
     uint16_t listen_port{0};
+    uint64_t steps{0};     //!< network-thread iterations so far (a spinning thread shows here)
     size_t connections{0}; //!< every connection, open or not
     std::vector<TcpPeerStatus> peers; //!< one per other seat, by seat
 };
