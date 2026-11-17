@@ -27,9 +27,17 @@
  *   (INVALID_INPUT), and a segment size that is not a multiple of
  *   SEGMENT_PAGE_BYTES in [SEGMENT_PAGE_BYTES, MAX_SEGMENT_BYTES]
  *   (INVALID_INPUT);
+ * - takes the directory lock: an exclusive flock on `<dir>/.lock`, held for
+ *   the journal's lifetime, so a second FileJournal on the directory (a
+ *   second fm2d on a datadir, a second fm2-cli on an outbox, in any
+ *   process) is refused with BUSY (JOURNAL_DIR_LOCKED) before it reads,
+ *   repairs or writes anything (review of 2026-11-16, defect 6);
  * - creates `<dir>/00000000.seg` (exclusive create, mode 0600) and writes
  *   explicit zero pages for the whole segment, so the file is allocated and
- *   its tail scans as the zero tail of ScanRecords;
+ *   its tail scans as the zero tail of ScanRecords. Every segment is
+ *   filled and committed under `<name>.tmp` and renamed into place, so a
+ *   crash during the fill leaves a `.tmp` (removed by the next
+ *   OpenExisting), never a short segment (R7 of the same review);
  * - then JournalCommit(segment) and CommitDirectory(dir). Any I/O error on
  *   the way is STORAGE_FATAL and no journal is returned.
  *
@@ -95,11 +103,18 @@
  *   STORAGE_FATAL (SIGNER_KEY_RETIRED): the seat may have signed what the
  *   journal no longer shows, so its key must never sign again (the restart
  *   statements of M4-AGR-06 are how the seat rejoins with a new key).
- * A missing directory is INVALID_INPUT (JOURNAL_DIR_MISSING), one without
- * `00000000.seg` or with a gap in the numbering JOURNAL_SEGMENT_MISSING, a
- * segment whose size is not the first's or not a whole-page size in range
- * STORAGE_FATAL (JOURNAL_SEGMENT_SIZE). After a reopen the spare segment
- * exists, as after a barrier. The logs rebuild their indexes from ReadAll
+ * OpenExisting takes the directory lock first (BUSY JOURNAL_DIR_LOCKED while
+ * another FileJournal holds it) and removes the `.tmp` leftovers of a crash
+ * during a segment's creation. A missing directory is INVALID_INPUT
+ * (JOURNAL_DIR_MISSING); one without `00000000.seg`, or with a gap in the
+ * numbering (a `.seg` numbered beyond the first missing index: the records
+ * after the gap would be forgotten silently, for a signer journal the votes
+ * it signed), INVALID_INPUT JOURNAL_SEGMENT_MISSING; a segment whose size is
+ * not the first's or not a whole-page size in range STORAGE_FATAL
+ * (JOURNAL_SEGMENT_SIZE); a stat error STORAGE_FATAL (JOURNAL_SEGMENT_READ),
+ * never the end of the numbering. A missing spare (the empty segment after
+ * the last record) is not a gap. After a reopen the spare segment exists,
+ * as after a barrier. The logs rebuild their indexes from ReadAll
  * (SignerLog::Recover, CommitLog::Recover); state replays the DECISION
  * bodies (state::ReplayDecisions).
  *
@@ -123,6 +138,8 @@ inline constexpr std::string_view JOURNAL_SEGMENT_READ{"JOURNAL_SEGMENT_READ"}; 
 inline constexpr std::string_view JOURNAL_SEGMENT_FULL{"JOURNAL_SEGMENT_FULL"};                     //!< (BUSY) the next segment does not exist yet: Barrier or Rollover first
 inline constexpr std::string_view JOURNAL_RECORD_EXCEEDS_SEGMENT{"JOURNAL_RECORD_EXCEEDS_SEGMENT"}; //!< (OVERSIZE) a record longer than a segment
 inline constexpr std::string_view JOURNAL_SEGMENT_MISSING{"JOURNAL_SEGMENT_MISSING"};               //!< (INVALID_INPUT) no first segment, or a gap in the numbering
+inline constexpr std::string_view JOURNAL_DIR_LOCKED{"JOURNAL_DIR_LOCKED"};                         //!< (BUSY) another FileJournal (in another process or this one) holds the directory's lock file
+inline constexpr std::string_view JOURNAL_DIR_LOCK{"JOURNAL_DIR_LOCK"};                             //!< (STORAGE_FATAL) the directory's lock file could not be created or locked
 inline constexpr std::string_view JOURNAL_IDENTITY_MISMATCH{"JOURNAL_IDENTITY_MISMATCH"};           //!< (VERIFY_FAILED) the first record is not this role's and instance's
 inline constexpr std::string_view JOURNAL_CORRUPT{"JOURNAL_CORRUPT"};                               //!< (STORAGE_FATAL) a commit journal with a bad record before its tail
 inline constexpr std::string_view SIGNER_KEY_RETIRED{"SIGNER_KEY_RETIRED"};                         //!< (STORAGE_FATAL) a signer journal with a gap or CRC break: the key must retire
@@ -180,17 +197,21 @@ public:
     uint64_t CurrentSegment() const EXCLUSIVE_LOCKS_REQUIRED(!m_segments_mutex);
 
 private:
-    FileJournal(JournalRole role, uint64_t instance_id, BarrierObserver* observer, fs::path dir, int first_fd,
+    FileJournal(JournalRole role, uint64_t instance_id, BarrierObserver* observer, fs::path dir, int lock_fd, int first_fd,
                 uint64_t segment_bytes, SegmentCommitHook commit);
-    FileJournal(JournalRole role, uint64_t instance_id, BarrierObserver* observer, fs::path dir, std::vector<int> fds,
+    FileJournal(JournalRole role, uint64_t instance_id, BarrierObserver* observer, fs::path dir, int lock_fd, std::vector<int> fds,
                 uint64_t segment_bytes, const RecoveredState& recovered, const RecoveryReport& report);
+    //! OpenExisting once the directory lock `lock_fd` is held; the caller releases it on an error.
+    static Result<std::unique_ptr<FileJournal>> OpenLocked(const fs::path& dir, JournalRole role, uint64_t instance_id,
+                                                           BarrierObserver* observer, int lock_fd);
 
     Result<uint64_t> AdmitAppend(uint64_t append_number, uint64_t offset, size_t size) override
         EXCLUSIVE_LOCKS_REQUIRED(!m_segments_mutex);
     Result<void> Persist(uint64_t barrier_number, uint64_t offset, std::span<const unsigned char> bytes) override
         EXCLUSIVE_LOCKS_REQUIRED(!m_segments_mutex);
 
-    //! Create `<dir>/<SegmentFileName(index)>` zero-filled and committed, and commit the directory; the open descriptor.
+    //! Create `<dir>/<SegmentFileName(index)>` zero-filled and committed under a temporary name, renamed into place, and
+    //! commit the directory; the open descriptor.
     static Result<int> CreateSegment(const fs::path& dir, uint64_t index, uint64_t segment_bytes);
     //! Create every missing segment up to `index` (no lock during the I/O; takes the table lock only to update it).
     Result<void> EnsureSegments(uint64_t index) EXCLUSIVE_LOCKS_REQUIRED(!m_segments_mutex);
@@ -200,6 +221,7 @@ private:
     const uint64_t m_segment_bytes;
     const SegmentCommitHook m_commit;
     const RecoveryReport m_recovery;
+    const int m_lock_fd; //!< the exclusive lock on `<dir>/.lock`, released by the destructor
 
     //! Never held together with the base journal's lock across I/O: AdmitAppend
     //! takes it under the base lock without I/O; Persist, Rollover and ReadAll

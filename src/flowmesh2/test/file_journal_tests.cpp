@@ -51,6 +51,16 @@ Result<void> CommitOnClosedFd(int fd)
     return committed;
 }
 
+//! The `.seg` files in `dir` (the directory also holds the journal's `.lock` file since the review fix of 2026-11-17).
+size_t SegmentFiles(const fs::path& dir)
+{
+    size_t n{0};
+    for (const fs::directory_entry& entry : fs::directory_iterator{dir}) {
+        if (fs::PathToString(entry.path().filename()).ends_with(".seg")) ++n;
+    }
+    return n;
+}
+
 } // namespace
 
 BOOST_AUTO_TEST_SUITE(file_journal_tests)
@@ -97,7 +107,7 @@ BOOST_AUTO_TEST_CASE(fresh_segment_is_zero_filled_at_full_size)
     BOOST_CHECK_EQUAL(image.size(), segment);
     BOOST_CHECK(std::all_of(image.begin(), image.end(), [](unsigned char b) { return b == 0; }));
     // Exactly one file in the directory.
-    BOOST_CHECK_EQUAL(std::distance(fs::directory_iterator{root.path}, fs::directory_iterator{}), 1);
+    BOOST_CHECK_EQUAL(SegmentFiles(root.path), 1);
     const Result<ScanResult> scan{ScanRecords(image, JournalRole::COMMIT, 3)};
     RequireStorageOk(scan, "scan of the fresh segment");
     BOOST_CHECK(scan->records.empty());
@@ -228,7 +238,7 @@ BOOST_AUTO_TEST_CASE(append_past_the_segment_end_moves_to_the_next_segment)
     BOOST_CHECK_EQUAL(journal->SegmentCount(), 2U);
     BOOST_CHECK(fs::exists(journal->SegmentPathOf(1)));
     BOOST_CHECK_EQUAL(ReadFile(journal->SegmentPathOf(1)).size(), SEGMENT_PAGE_BYTES);
-    BOOST_CHECK_EQUAL(std::distance(fs::directory_iterator{root.path}, fs::directory_iterator{}), 2);
+    BOOST_CHECK_EQUAL(SegmentFiles(root.path), 2);
     // Now the append goes to byte 0 of segment 1.
     BOOST_CHECK_EQUAL(journal->Append(RecordType::APPLIED, Bytes("applied")).value(), 2U);
     BOOST_CHECK_EQUAL(journal->CurrentSegment(), 1U);
@@ -509,6 +519,110 @@ BOOST_AUTO_TEST_CASE(corruption_is_fatal_and_retires_the_signer_key)
         PatchFile(root.path / fs::u8path(SegmentFileName(1)), 100, {0x01});
         RequireRefusal(FileJournal::OpenExisting(root.path, role, 4), ErrorCode::STORAGE_FATAL, want, "bytes in the spare");
     }
+}
+
+BOOST_AUTO_TEST_CASE(a_missing_middle_segment_is_refused_on_reopen)
+{
+    // Review of 2026-11-16, defect 7: OpenExisting used to stop at the first missing segment and silently forget
+    // every record after it (for a signer journal: votes it signed). A gap in the numbering is the refusal the
+    // header promises, JOURNAL_SEGMENT_MISSING. A missing spare (the empty segment after the last record) is not
+    // a gap: the numbering just ends there and the reopen recreates it.
+    const TestDir root{"segment_gap"};
+    size_t segments{0};
+    uint64_t current{0};
+    {
+        auto journal{MustCreate(root.path, JournalRole::SIGNER, 3, SEGMENT_PAGE_BYTES)};
+        const std::vector<unsigned char> big(SEGMENT_PAGE_BYTES / 2, 0x33);
+        for (unsigned i{0}; i < 6; ++i) {
+            Result<uint64_t> seq{journal->Append(RecordType::INTENT, big)};
+            if (!seq.has_value()) {
+                RequireRefusal(seq, ErrorCode::BUSY, JOURNAL_SEGMENT_FULL, "append before the spare exists");
+                BOOST_CHECK_EQUAL(journal->Barrier().value(), journal->Status().appended_seq);
+                seq = journal->Append(RecordType::INTENT, big);
+            }
+            RequireStorageOk(seq, "append");
+            BOOST_CHECK_EQUAL(journal->Barrier().value(), i + 1);
+        }
+        segments = journal->SegmentCount();
+        current = journal->CurrentSegment();
+    }
+    BOOST_REQUIRE_GE(segments, 4U);
+    BOOST_REQUIRE_EQUAL(segments, current + 2); // the spare after the current segment
+    // The spare removed: no gap, the reopen recreates it and every record is there.
+    BOOST_REQUIRE(fs::remove(root.path / fs::u8path(SegmentFileName(segments - 1))));
+    {
+        Result<std::unique_ptr<FileJournal>> reopened{FileJournal::OpenExisting(root.path, JournalRole::SIGNER, 3)};
+        RequireStorageOk(reopened, "reopen without the spare");
+        BOOST_CHECK_EQUAL((*reopened)->Status().durable_seq, 6U);
+        BOOST_CHECK_EQUAL((*reopened)->SegmentCount(), segments);
+        BOOST_CHECK(fs::exists(root.path / fs::u8path(SegmentFileName(segments - 1))));
+    }
+    // A middle segment removed: a gap, refused before any record is trusted.
+    BOOST_REQUIRE(fs::remove(root.path / fs::u8path(SegmentFileName(1))));
+    RequireRefusal(FileJournal::OpenExisting(root.path, JournalRole::SIGNER, 3), ErrorCode::INVALID_INPUT, JOURNAL_SEGMENT_MISSING,
+                   "a gap in the segment numbering");
+}
+
+BOOST_AUTO_TEST_CASE(a_crash_while_creating_a_segment_leaves_no_short_segment)
+{
+    // Review of 2026-11-16, lead R7: a segment used to be created under its final name and zero-filled in place,
+    // so a crash during the fill left a short `.seg` that blocked every later open (JOURNAL_SEGMENT_SIZE). A
+    // segment is now filled and committed under `<name>.tmp` and renamed into place; a leftover `.tmp` is what
+    // such a crash leaves, and the reopen removes it.
+    const TestDir root{"segment_tmp"};
+    {
+        auto journal{MustCreate(root.path, JournalRole::COMMIT, 4, SEGMENT_PAGE_BYTES)};
+        BOOST_CHECK_EQUAL(journal->Append(RecordType::DECISION, Bytes("d")).value(), 1U);
+        BOOST_CHECK_EQUAL(journal->Barrier().value(), 1U);
+        BOOST_CHECK_EQUAL(journal->SegmentCount(), 2U); // the spare
+    }
+    // What a crash in the middle of creating segment 2 leaves: a short temporary file.
+    const fs::path leftover{root.path / fs::u8path(SegmentFileName(2) + ".tmp")};
+    {
+        std::ofstream out{static_cast<const std::filesystem::path&>(leftover), std::ios::binary};
+        out << std::string(100, '\0');
+    }
+    BOOST_REQUIRE(fs::exists(leftover));
+    Result<std::unique_ptr<FileJournal>> reopened{FileJournal::OpenExisting(root.path, JournalRole::COMMIT, 4)};
+    RequireStorageOk(reopened, "reopen with a leftover temporary segment");
+    BOOST_CHECK(!fs::exists(leftover));
+    BOOST_CHECK_EQUAL((*reopened)->Status().durable_seq, 1U);
+    BOOST_CHECK_EQUAL((*reopened)->SegmentCount(), 2U);
+    // Every segment on disk is a full one.
+    for (const fs::directory_entry& entry : fs::directory_iterator{root.path}) {
+        const std::string name{fs::PathToString(entry.path().filename())};
+        if (name.ends_with(".seg")) BOOST_CHECK_EQUAL(fs::file_size(entry.path()), SEGMENT_PAGE_BYTES);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(a_second_opener_of_a_journal_directory_is_refused)
+{
+    // Review of 2026-11-16, defect 6: nothing stopped a second process (or a second FileJournal in this one) from
+    // opening a live journal directory and signing or deciding beside it. A FileJournal holds an exclusive lock on
+    // `<dir>/.lock` for its lifetime; a second opener is refused with BUSY before it reads, repairs or writes anything.
+    const TestDir root{"dir_lock"};
+    auto journal{MustCreate(root.path, JournalRole::SIGNER, 2, SEGMENT_PAGE_BYTES)};
+    BOOST_CHECK(fs::exists(root.path / fs::u8path(".lock")));
+    BOOST_CHECK_EQUAL(journal->Append(RecordType::INTENT, Bytes("i")).value(), 1U);
+    BOOST_CHECK_EQUAL(journal->Barrier().value(), 1U);
+    RequireRefusal(FileJournal::OpenExisting(root.path, JournalRole::SIGNER, 2), ErrorCode::BUSY, JOURNAL_DIR_LOCKED, "a second opener");
+    RequireRefusal(FileJournal::CreateNew(root.path, JournalRole::SIGNER, 2, SEGMENT_PAGE_BYTES), ErrorCode::INVALID_INPUT, JOURNAL_DIR_NOT_EMPTY,
+                   "a second creator");
+    // The holder goes on; the lock lives as long as it does.
+    BOOST_CHECK_EQUAL(journal->Append(RecordType::INTENT, Bytes("j")).value(), 2U);
+    BOOST_CHECK_EQUAL(journal->Barrier().value(), 2U);
+    journal.reset();
+    Result<std::unique_ptr<FileJournal>> reopened{FileJournal::OpenExisting(root.path, JournalRole::SIGNER, 2)};
+    RequireStorageOk(reopened, "reopen once the holder is gone");
+    BOOST_CHECK_EQUAL((*reopened)->Status().durable_seq, 2U);
+    RequireRefusal(FileJournal::OpenExisting(root.path, JournalRole::SIGNER, 2), ErrorCode::BUSY, JOURNAL_DIR_LOCKED,
+                   "a second opener of the reopened journal");
+    // A directory holding only a stale lock file is not a journal.
+    const fs::path stale{root.Sub("stale")};
+    {
+        std::ofstream out{static_cast<const std::filesystem::path&>(stale / fs::u8path(".lock")), std::ios::binary};
+    }
+    RequireRefusal(FileJournal::OpenExisting(stale, JournalRole::SIGNER, 2), ErrorCode::INVALID_INPUT, JOURNAL_SEGMENT_MISSING, "a lock file alone");
 }
 
 BOOST_AUTO_TEST_SUITE_END()

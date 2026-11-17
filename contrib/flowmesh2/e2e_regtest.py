@@ -8,7 +8,8 @@ Runs fm2-keygen for four seats on free ports, starts four fm2d over one shared
 dev chain file, waits for every seat's ready file, checks that heartbeat slots
 are decided and that every seat publishes the same height, makes two client
 keys with fm2-cli, faucets deposits to their accounts through fm2-devchain and
-checks the balances on EVERY seat, trades through fm2-cli (bob's ask rests,
+checks the balances on EVERY seat, refuses a second fm2d on a live datadir
+at the journal's directory lock, trades through fm2-cli (bob's ask rests,
 alice's bid fills it, both verified with b3verify by the client and settled
 on every seat; a resend answers DUPLICATE everywhere; the outbox and a
 verified slot stream agree), stops seat 3, faucets another deposit while it
@@ -122,6 +123,16 @@ class Cluster:
             time.sleep(0.05)
         raise RuntimeError(f"seat {i} never became ready")
 
+    def start_duplicate(self, i, timeout=20):
+        """A second fm2d on seat i's live datadir: must exit non-zero at the journal lock, before touching anything.
+        Returns (exit code, output)."""
+        result = subprocess.run(
+            [self.args.fm2d, "--datadir", self.datadir(i), "--genesis", self.genesis, "--seat", str(i),
+             "--keys", os.path.join(self.keys, f"seat{i}"), "--devchain", self.devchain, "--log", "console",
+             "--heartbeat-ms", "300"],
+            capture_output=True, text=True, timeout=timeout)
+        return result.returncode, result.stdout + result.stderr
+
     def stop(self, i, timeout=20):
         proc = self.procs.pop(i, None)
         if proc is None:
@@ -219,6 +230,14 @@ def main():
             return hs if all(h is not None and h >= 3 for h in hs) else None
         hs = cluster.wait(heights, "three heartbeat slots on every seat", timeout=60)
         steps.append(f"heartbeats: heights {hs}")
+        # A second fm2d on seat 0's live datadir is refused at the signer journal's directory lock (review of
+        # 2026-11-16, defect 6), before it can read, repair or sign anything; seat 0 goes on undisturbed.
+        code, output = cluster.start_duplicate(0)
+        if code == 0 or "JOURNAL_DIR_LOCKED" not in output:
+            raise RuntimeError(f"a duplicate fm2d on seat 0's datadir: exit {code}, output {output[-600:]}")
+        if cluster.health(0).get("published_height", 0) < hs[0]:
+            raise RuntimeError("seat 0 lost height after the duplicate was refused")
+        steps.append("a second fm2d on seat 0's datadir was refused at the journal lock")
         # Two clients: their accounts follow their keys (AccountId::FromKey).
         alice = cluster.cli("alice", ["keygen"])["account"]
         bob = cluster.cli("bob", ["keygen"])["account"]

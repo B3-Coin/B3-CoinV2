@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cerrno>
 #include <limits>
 #include <optional>
 #include <system_error>
@@ -21,6 +22,7 @@
 #include <sys/stat.h>
 #else
 #include <fcntl.h>
+#include <sys/file.h>
 #include <sys/types.h>
 #include <unistd.h>
 #endif
@@ -109,6 +111,57 @@ void CloseFd(int fd)
 #endif
 }
 
+//! Whether `path` is a regular file. A stat error other than "it does not exist" stays in `ec`.
+bool RegularFileExists(const fs::path& path, std::error_code& ec)
+{
+    const std::filesystem::file_status status{std::filesystem::status(path, ec)};
+    if (ec == std::errc::no_such_file_or_directory || ec == std::errc::not_a_directory) ec.clear();
+    return !ec && std::filesystem::is_regular_file(status);
+}
+
+//! The directory's lock file: a FileJournal holds an exclusive advisory lock on it for its lifetime.
+constexpr std::string_view LOCK_FILE_NAME{".lock"};
+//! The name a segment is created and filled under before it is renamed into place.
+std::string TemporarySegmentName(uint64_t index) { return SegmentFileName(index) + ".tmp"; }
+//! The index of `<8 hex digits>.seg`, or nullopt for any other name.
+std::optional<uint64_t> SegmentIndexOf(std::string_view name)
+{
+    if (name.size() != 12 || !name.ends_with(".seg")) return std::nullopt;
+    uint64_t index{0};
+    for (const char c : name.substr(0, 8)) {
+        if (c >= '0' && c <= '9') {
+            index = index * 16 + static_cast<uint64_t>(c - '0');
+        } else if (c >= 'a' && c <= 'f') {
+            index = index * 16 + static_cast<uint64_t>(c - 'a' + 10);
+        } else {
+            return std::nullopt;
+        }
+    }
+    return index;
+}
+
+//! Create or open `<dir>/.lock` and take an exclusive, non-blocking lock on it (review of 2026-11-16, defect 6):
+//! BUSY JOURNAL_DIR_LOCKED while another FileJournal, in this process or another, holds it.
+Result<int> LockJournalDir(const fs::path& dir)
+{
+    const fs::path lock_path{dir / fs::u8path(std::string{LOCK_FILE_NAME})};
+#ifdef WIN32
+    const int fd{_wopen(lock_path.c_str(), _O_RDWR | _O_CREAT | _O_BINARY, _S_IREAD | _S_IWRITE)};
+    if (fd < 0) return Error{ErrorCode::STORAGE_FATAL, JOURNAL_DIR_LOCK};
+    return Ok(fd); // no advisory lock on this branch, which is not compiled on this host (O-24 pattern)
+#else
+    const int fd{open(lock_path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600)};
+    if (fd < 0) return Error{ErrorCode::STORAGE_FATAL, JOURNAL_DIR_LOCK};
+    if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
+        const int saved{errno};
+        close(fd);
+        if (saved == EWOULDBLOCK) return Error{ErrorCode::BUSY, JOURNAL_DIR_LOCKED};
+        return Error{ErrorCode::STORAGE_FATAL, JOURNAL_DIR_LOCK};
+    }
+    return Ok(fd);
+#endif
+}
+
 } // namespace
 
 std::string SegmentFileName(uint64_t index)
@@ -122,18 +175,19 @@ std::string SegmentFileName(uint64_t index)
     return name + ".seg";
 }
 
-FileJournal::FileJournal(JournalRole role, uint64_t instance_id, BarrierObserver* observer, fs::path dir, int first_fd,
+FileJournal::FileJournal(JournalRole role, uint64_t instance_id, BarrierObserver* observer, fs::path dir, int lock_fd, int first_fd,
                          uint64_t segment_bytes, SegmentCommitHook commit)
     : Journal(ImplKey{}, role, instance_id, observer),
       m_dir{std::move(dir)},
       m_first_segment_path{m_dir / fs::u8path(FIRST_SEGMENT_NAME)},
       m_segment_bytes{segment_bytes},
       m_commit{commit},
+      m_lock_fd{lock_fd},
       m_fds{first_fd}
 {
 }
 
-FileJournal::FileJournal(JournalRole role, uint64_t instance_id, BarrierObserver* observer, fs::path dir, std::vector<int> fds,
+FileJournal::FileJournal(JournalRole role, uint64_t instance_id, BarrierObserver* observer, fs::path dir, int lock_fd, std::vector<int> fds,
                          uint64_t segment_bytes, const RecoveredState& recovered, const RecoveryReport& report)
     : Journal(ImplKey{}, role, instance_id, observer, recovered),
       m_dir{std::move(dir)},
@@ -141,6 +195,7 @@ FileJournal::FileJournal(JournalRole role, uint64_t instance_id, BarrierObserver
       m_segment_bytes{segment_bytes},
       m_commit{&JournalCommit},
       m_recovery{report},
+      m_lock_fd{lock_fd},
       m_fds{std::move(fds)}
 {
 }
@@ -148,6 +203,7 @@ FileJournal::FileJournal(JournalRole role, uint64_t instance_id, BarrierObserver
 FileJournal::~FileJournal()
 {
     for (const int fd : m_fds) CloseFd(fd);
+    CloseFd(m_lock_fd); // releases the directory lock
 }
 
 fs::path FileJournal::SegmentPathOf(uint64_t index) const { return m_dir / fs::u8path(SegmentFileName(index)); }
@@ -170,7 +226,13 @@ uint64_t FileJournal::CurrentSegment() const
 Result<int> FileJournal::CreateSegment(const fs::path& dir, uint64_t index, uint64_t segment_bytes)
 {
     const fs::path segment_path{dir / fs::u8path(SegmentFileName(index))};
-    const int fd{OpenNewSegment(segment_path)};
+    // Filled and committed under a temporary name, then renamed into place: a crash during the fill leaves a `.tmp`
+    // that the next OpenExisting removes, never a short segment that blocks every later open (review 2026-11-16, R7).
+    const fs::path temporary_path{dir / fs::u8path(TemporarySegmentName(index))};
+    std::error_code ec;
+    if (RegularFileExists(segment_path, ec) || ec) return Error{ErrorCode::STORAGE_FATAL, JOURNAL_SEGMENT_CREATE}; // exists already
+    fs::remove(temporary_path, ec); // a leftover of an earlier crash, if any
+    const int fd{OpenNewSegment(temporary_path)};
     if (fd < 0) return Error{ErrorCode::STORAGE_FATAL, JOURNAL_SEGMENT_CREATE};
 
     // Explicit zero pages for the whole segment (plan section 3.7, S-9): the
@@ -188,6 +250,12 @@ Result<int> FileJournal::CreateSegment(const fs::path& dir, uint64_t index, uint
     if (const Result<void> committed{JournalCommit(fd)}; !committed.has_value()) {
         CloseFd(fd);
         return committed.error();
+    }
+    fs::rename(temporary_path, segment_path, ec);
+    if (ec) {
+        CloseFd(fd);
+        fs::remove(temporary_path, ec);
+        return Error{ErrorCode::STORAGE_FATAL, JOURNAL_SEGMENT_CREATE};
     }
     if (const Result<void> dir_committed{CommitDirectory(dir)}; !dir_committed.has_value()) {
         CloseFd(fd);
@@ -217,9 +285,15 @@ Result<std::unique_ptr<FileJournal>> FileJournal::CreateNewWithCommitHook(const 
     if (ec) return Error{ErrorCode::INVALID_INPUT, JOURNAL_DIR_MISSING};
     if (first != fs::directory_iterator{}) return Error{ErrorCode::INVALID_INPUT, JOURNAL_DIR_NOT_EMPTY};
 
+    const Result<int> lock{LockJournalDir(empty_dir)};
+    if (!lock.has_value()) return lock.error();
     const Result<int> fd{CreateSegment(empty_dir, 0, segment_bytes)};
-    if (!fd.has_value()) return fd.error();
-    return Ok(std::unique_ptr<FileJournal>{new FileJournal{role, instance_id, observer, empty_dir, *fd, segment_bytes, commit}});
+    if (!fd.has_value()) {
+        CloseFd(*lock);
+        fs::remove(empty_dir / fs::u8path(std::string{LOCK_FILE_NAME}), ec); // the directory is empty again
+        return fd.error();
+    }
+    return Ok(std::unique_ptr<FileJournal>{new FileJournal{role, instance_id, observer, empty_dir, *lock, *fd, segment_bytes, commit}});
 }
 
 namespace {
@@ -246,6 +320,31 @@ Result<std::unique_ptr<FileJournal>> FileJournal::OpenExisting(const fs::path& d
     if (!IsKnown(role)) return Error{ErrorCode::INVALID_INPUT, "unknown journal role"};
     std::error_code ec;
     if (!fs::is_directory(dir, ec) || ec) return Error{ErrorCode::INVALID_INPUT, JOURNAL_DIR_MISSING};
+    // The lock first: nothing is read, repaired or written on a directory another journal holds.
+    const Result<int> lock{LockJournalDir(dir)};
+    if (!lock.has_value()) return lock.error();
+    Result<std::unique_ptr<FileJournal>> opened{OpenLocked(dir, role, instance_id, observer, *lock)};
+    if (!opened.has_value()) CloseFd(*lock);
+    return opened;
+}
+
+Result<std::unique_ptr<FileJournal>> FileJournal::OpenLocked(const fs::path& dir, JournalRole role, uint64_t instance_id,
+                                                             BarrierObserver* observer, int lock_fd)
+{
+    std::error_code ec;
+    // Leftovers of a crash during a segment's creation are removed; the highest segment number present decides below
+    // whether the numbering has a gap.
+    std::vector<fs::path> leftovers;
+    std::optional<uint64_t> highest_index;
+    for (fs::directory_iterator it{dir, ec}; !ec && it != fs::directory_iterator{}; it.increment(ec)) {
+        const std::string name{fs::PathToString(it->path().filename())};
+        if (name.ends_with(".seg.tmp")) leftovers.push_back(it->path());
+        if (const std::optional<uint64_t> index{SegmentIndexOf(name)}) highest_index = std::max(highest_index.value_or(0), *index);
+    }
+    if (ec) return Error{ErrorCode::STORAGE_FATAL, JOURNAL_SEGMENT_READ};
+    for (const fs::path& leftover : leftovers) {
+        if (!fs::remove(leftover, ec) || ec) return Error{ErrorCode::STORAGE_FATAL, JOURNAL_SEGMENT_CREATE};
+    }
     const fs::path first{dir / fs::u8path(FIRST_SEGMENT_NAME)};
     if (!fs::is_regular_file(first, ec) || ec) return Error{ErrorCode::INVALID_INPUT, JOURNAL_SEGMENT_MISSING};
     const uint64_t segment_bytes{fs::file_size(first, ec)};
@@ -256,13 +355,18 @@ Result<std::unique_ptr<FileJournal>> FileJournal::OpenExisting(const fs::path& d
     std::vector<std::vector<unsigned char>> images;
     for (uint64_t index{0};; ++index) {
         const fs::path path{dir / fs::u8path(SegmentFileName(index))};
-        if (!fs::is_regular_file(path, ec) || ec) break; // the numbering ends here (a gap: the rest is ignored and refused on write)
+        const bool present{RegularFileExists(path, ec)};
+        if (ec) return Error{ErrorCode::STORAGE_FATAL, JOURNAL_SEGMENT_READ}; // a stat error is not the end of the numbering
+        if (!present) break;                                                     // the numbering ends here
         if (fs::file_size(path, ec) != segment_bytes || ec) return Error{ErrorCode::STORAGE_FATAL, JOURNAL_SEGMENT_SIZE};
         Result<std::vector<unsigned char>> image{ReadWholeFile(path, segment_bytes)};
         if (!image.has_value()) return image.error();
         if (image->size() != segment_bytes) return Error{ErrorCode::STORAGE_FATAL, JOURNAL_SEGMENT_SIZE};
         images.push_back(std::move(image).value());
     }
+    // A segment numbered beyond the first missing one: a gap. The records after it would be forgotten silently (for a
+    // signer journal: votes it signed), so the journal is refused as the file comment promises (review 2026-11-16, defect 7).
+    if (highest_index.has_value() && *highest_index >= images.size()) return Error{ErrorCode::INVALID_INPUT, JOURNAL_SEGMENT_MISSING};
     // Scan in order, the chain continued across segments; the first refusal ends the journal.
     RecoveredState recovered;
     recovered.last_chain = JournalGenesisChain(role, instance_id);
@@ -350,7 +454,7 @@ Result<std::unique_ptr<FileJournal>> FileJournal::OpenExisting(const fs::path& d
         }
         fds.push_back(*fd);
     }
-    return Ok(std::unique_ptr<FileJournal>{new FileJournal{role, instance_id, observer, dir, std::move(fds), segment_bytes, recovered, report}});
+    return Ok(std::unique_ptr<FileJournal>{new FileJournal{role, instance_id, observer, dir, lock_fd, std::move(fds), segment_bytes, recovered, report}});
 }
 
 Result<std::vector<JournalRecord>> FileJournal::ReadAll() const
