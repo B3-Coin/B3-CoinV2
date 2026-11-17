@@ -501,7 +501,8 @@ As landed in R1 (`core/result.h`, `core/codes.h`):
   `return 5;`, a runtime `const char*` task ID and a malformed task ID literal
   each fail to compile with the fm2 flags; a positive control compiles. The R2
   CTest `flowmesh2_negative_compile` (Clang) makes the missing-`LOCK`, ignored
-  `Result` and forged-token controls permanent (section 13.3).
+  `Result` and forged-token controls permanent (section 13.3), and since 17.3
+  item 10 the malformed task ID literal too.
 - Code integers. `OutcomeCode`: 1-63 executed (`DEPOSIT_CREDITED=1` ..
   `FEES_DISTRIBUTED=8`), 64-95 rule rejections (`REJ_INSUFFICIENT_AVAILABLE=64`
   .. `REJ_NO_RECIPIENT=76`), 96-127 certified typed refusals of features not
@@ -1397,8 +1398,10 @@ Clang only), `flowmesh2_evidence_selftest` (R2), `flowmesh2_sim` (R14),
   rule.
 - **Negative compile** (`check_negative_compile.py`, Clang only): a missing
   `LOCK`, an ignored `Result`, a forged `Durable*` token, (since R8)
-  `SeatSigner::Sign` called with a `PendingIntent` and (since O-92) a forged
-  `ApplyReceipt` and `CommitLog::AppendApplied` without one each fail to compile
+  `SeatSigner::Sign` called with a `PendingIntent`, (since O-92) a forged
+  `ApplyReceipt` and `CommitLog::AppendApplied` without one, and (since 17.3
+  item 10) a malformed `TaskId` literal converted implicitly in a
+  namespace-scope initialiser each fail to compile
   with the diagnostic named on the file's `FM2_EXPECT_ERROR` line; each file
   built with `FM2_COMPILE_FAIL_FIXED` (the violation removed) compiles, so the
   failure is exactly the violation; a positive control with identical flags
@@ -1858,6 +1861,7 @@ seat stopped and restarted in the middle.
   against `rebirth-stage2`), and CI: the workflow now also triggers on
   `rebirth-*` pushes (an addition to the owner-protected file, so the
   Linux and sanitizer gates run on this branch; the owner may remove it).
+  Its first run found the Clang 18 link failure of 17.3 item 10.
 - **Left from the review, by severity:** R1 (half-open HTTPS connections
   are not counted against the limits), R6 (reports stored per attacker-chosen
   target view without a cap; BLS verification before the duplicate check),
@@ -1898,3 +1902,4 @@ double-vote halt of O-100, CI on `rebirth-*`) stay the owner's.
 | 08a | Defect 9 (Medium-low): `fm2-cli ... --wait` recorded FAILED in the outbox when every SELECTED seat (with `--seat N`, one) reported a terminal pool state nobody certified; the result is write-once and `resend --wait` never polled again. IPv6 API addresses were written unbracketed into the target and the Host header | FAILED is printed, never recorded (the outbox keeps certified ends only), and only when every seat of the genesis says so; `resend --wait` therefore polls again. An IPv6 literal is bracketed. No new test (the wait path is the CLI's main; the e2e exercises resend and the outbox) | `REVIEW-20261116/08a-client-failed-ipv6/20261117-newmac-01/` |
 | 08b | Defect 10 (Low–Medium-low): every `fm2-keygen` cluster shared one domain and mesh magic, so a client key's signed actions and a seat's handshakes were valid on every cluster. R8: a deposit above MAX_ATOMS wrote an undecodable dev-chain block that wedged every seat (the encode error was swallowed). R10: keygen overwrote keys and genesis. The e2e's port picker never probed its second window | the domain and the mesh magic derive from the seat set root of the run; `EncodeDevChainBlock` returns the fact's encode error and `AppendDevChainBlock` writes nothing; keys and genesis open with `O_EXCL`; the e2e probes the API window from 64 above the mesh window, runs keygen twice (the second is refused) and compares two clusters' domains and magics. `genesis_doc_tests` has the oversized deposit (failed first as a compile); the e2e's keygen checks failed first on the previous tools | `REVIEW-20261116/08b-tools-domain-devchain-keygen/20261117-newmac-01/` |
 | 08c | R3: `GenesisDoc::Parse` used UniValue's throwing `getInt`, so a negative, fractional or oversized number crashed fm2d, fm2-cli and fm2-devchain. R9: a fenced fm2d logged an error on every loop (about a thousand lines a second). R11: the self-signed TLS key was created world-readable and chmod-ed afterwards. The ready file was written in place | unsigned integers are parsed from their digits with `from_chars` (DECODE otherwise); the fenced message is logged once; the key file opens with mode 0600; `fm2d.ready` is written under a temporary name and renamed. `genesis_doc_tests` tries four malformed numbers (failed first at run time on the previous commit: the parser threw) | `REVIEW-20261116/08c-daemon-api-numbers-key-ready-log/20261117-newmac-01/` |
+| 10 | The first Linux CI run on the branch (Clang 18.1.3, run 44040372398) failed to link `test_flowmesh2` in all three jobs: `undefined reference to flowmesh2::detail::TaskIdMustMatchTheTodoLedgerFormat()` from `TaskId::TaskId` in `.text.startup` of `stub_inventory_tests.cpp`. The guard function was deliberately not constexpr, and declared without a definition, so that a malformed TaskId literal fails during constant evaluation; Clang 18 also emits the consteval constructor's body into the dynamic initialisers of the 36 `FM2_STUB_CASE` registrars and the symbol reaches the linker. GCC 15 and Apple clang 21 never emit the constructor's body (they use the constant result), so neither the reviewer's build nor the local one saw it | the function is defined inline and empty, still not constexpr, so constant evaluation of a malformed literal is still ill-formed and a compiler that emits the body links. The new compile-fail control `malformed_task_id.cpp` builds a TaskId by implicit conversion in a namespace-scope initialiser, the registrar's context: as is it must fail with "call to consteval function ... is not a constant expression" (Clang 18 and Apple clang 21 print the same words), with FM2_COMPILE_FAIL_FIXED it must compile. Failing-first is the CI log (kept in the bundle); the control fails on the old header as well, which is the point: the guard did not move. Known blind spot of Clang 18 alone (LLVM issue 82154, fixed in Clang 19): it does not diagnose a consteval constructor in a default member initialiser, so no `TaskId` member with a default initialiser should be added while CI is on Clang 18; none exists | `REVIEW-20261116/10-ci-clang18-consteval-link/20261117-newmac-01/` |

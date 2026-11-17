@@ -186,7 +186,7 @@ Expected after stage 2 step 6 (M5-CLI-01, 2026-11-14): 11 CTests pass
 stage 2 step 6; the review fixes of 2026-11-17, ARCHITECTURE 17.3, added 16),
 `flowmesh2_inventory`, `flowmesh2_todo_lint`, `flowmesh2_guards`,
 `flowmesh2_guards_selftest`, `flowmesh2_evidence_selftest`, with Clang
-`flowmesh2_negative_compile` with six negative controls and a positive one, and
+`flowmesh2_negative_compile` with seven negative controls and a positive one, and
 `flowmesh2_e2e_regtest`, four `fm2d` processes on loopback and a trade through
 `fm2-cli`). After R14 and the review fixes (O-89 to O-92) there were 10 CTests and
 526 cases.

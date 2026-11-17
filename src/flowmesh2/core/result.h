@@ -113,8 +113,13 @@ constexpr bool IsWellFormedTaskId(std::string_view id)
 
 namespace detail {
 //! Deliberately not constexpr: reaching it during constant evaluation makes a
-//! malformed TaskId a compile error. It is never defined or called at run time.
-void TaskIdMustMatchTheTodoLedgerFormat();
+//! malformed TaskId a compile error (test/compile_fail/malformed_task_id.cpp
+//! keeps that so). It is never called at run time. It is defined, and empty,
+//! because Clang 18 emits the body of the consteval constructor below into
+//! the dynamic initialisers of test/stub_inventory_tests.cpp and then wants
+//! the symbol at link time (the Linux CI run of 2026-11-17 failed on it);
+//! a definition costs nothing and keeps the compile-time check intact.
+inline void TaskIdMustMatchTheTodoLedgerFormat() {}
 } // namespace detail
 
 /** A TODO.md task ID that is a compile-time constant. The constructor is
