@@ -77,7 +77,7 @@ Result<void> SeatNode::BuildComponents(bool restart)
     if (!commit_log.has_value()) return commit_log.error();
     m_commit_log = std::make_unique<storage::CommitLog>(std::move(commit_log).value());
     // Recorded evidence (M4-AGR-07): a restarted node that recorded any stays halted.
-    Result<agreement::EvidenceStore> evidence{agreement::EvidenceStore::Create(m_config.profile, *m_chain, *m_commit_log)};
+    Result<agreement::EvidenceStore> evidence{agreement::EvidenceStore::Create(m_config.profile, m_genesis.Header().domain, *m_chain, *m_commit_log)};
     if (!evidence.has_value()) return evidence.error();
     m_evidence = std::make_unique<agreement::EvidenceStore>(std::move(evidence).value());
 

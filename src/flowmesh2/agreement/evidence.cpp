@@ -16,9 +16,10 @@
 
 namespace flowmesh2::agreement {
 
-Result<EvidenceStore> EvidenceStore::Create(const ProfileParams& profile, const chain::ChainAdapter& adapter, storage::CommitLog& log)
+Result<EvidenceStore> EvidenceStore::Create(const ProfileParams& profile, const uint256& domain, const chain::ChainAdapter& adapter,
+                                            storage::CommitLog& log)
 {
-    EvidenceStore store{profile, adapter, log};
+    EvidenceStore store{profile, domain, adapter, log};
     for (const std::vector<unsigned char>& payload : log.EvidenceRecords()) {
         Result<Message> decoded{DecodeMessage(payload, profile)};
         if (!decoded.has_value()) return decoded.error();
@@ -38,7 +39,7 @@ Result<void> EvidenceStore::Verify(const Evidence& evidence) const
         if (!seats.has_value()) return seats.error();
         for (const Vote* vote : {&dv->first, &dv->second}) {
             if (vote->seat >= seats->Size()) return Error{ErrorCode::INVALID_INPUT, EVIDENCE_SEAT};
-            const uint256 digest{PrepareDigest(vote->view, vote->header_hash)};
+            const uint256 digest{PrepareDigest(m_domain, vote->epoch, vote->slot, vote->view, vote->header_hash)};
             const std::optional<bls::Signature> signature{bls::Signature::Decode(vote->signature)};
             if (!signature.has_value() ||
                 !bls::Verify(seats->Keys()[vote->seat].Key(), std::span<const unsigned char>{digest.data(), digest.size()}, *signature)) {

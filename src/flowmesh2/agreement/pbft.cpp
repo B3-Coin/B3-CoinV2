@@ -576,7 +576,7 @@ Result<void> PbftAgreement::VotePrepare(const Proposal& proposal)
     if (m_slot.own_prepare.has_value()) return Ok();
     const uint256 hash{proposal.header.Hash()};
     const storage::VoteKey key{m_domain, m_slot.epoch, m_slot.slot, m_slot.view, storage::VotePhase::PREPARE};
-    Result<OutboundVote> vote{SignVote(key, PrepareDigest(m_slot.view, hash), *m_slot.accepted_pending, proposal.header.Authority())};
+    Result<OutboundVote> vote{SignVote(key, PrepareDigest(m_domain, m_slot.epoch, m_slot.slot, m_slot.view, hash), *m_slot.accepted_pending, proposal.header.Authority())};
     if (!vote.has_value()) return vote.error();
     m_slot.own_prepare = *vote;
     Vote own;
@@ -606,7 +606,8 @@ Result<void> PbftAgreement::OnVote(uint32_t from, const Vote& vote)
     const uint256 accepted{m_slot.accepted->header.Hash()};
     if (vote.phase == storage::VotePhase::PREPARE) {
         if (vote.view != m_slot.view) return Ok(); // another view's preparation
-        if (const Result<void> ok{VerifySeatSignature(vote.seat, PrepareDigest(vote.view, vote.header_hash), vote.signature, PBFT_VOTE_SIGNATURE)};
+        if (const Result<void> ok{VerifySeatSignature(vote.seat, PrepareDigest(m_domain, m_slot.epoch, m_slot.slot, vote.view, vote.header_hash), vote.signature,
+                                                     PBFT_VOTE_SIGNATURE)};
             !ok.has_value()) {
             return ok.error();
         }
@@ -656,7 +657,7 @@ Result<void> PbftAgreement::CountPrepare(const Vote& /*vote*/)
         if (vote.header_hash == hash && vote.view == m_slot.view) ++count;
     }
     if (count < m_seats.Quorum()) return Ok();
-    Result<SlotCertificate> cert{AggregateVotes(m_slot.prepares, hash, PrepareDigest(m_slot.view, hash))};
+    Result<SlotCertificate> cert{AggregateVotes(m_slot.prepares, hash, PrepareDigest(m_domain, m_slot.epoch, m_slot.slot, m_slot.view, hash))};
     if (!cert.has_value()) return cert.error();
     const PreparedCert prepared{m_slot.view, *cert};
     // The proof is durable before the COMMIT intent (PROTOCOL.md).
@@ -898,7 +899,8 @@ Result<void> PbftAgreement::OnViewChangeReport(uint32_t from, const ViewChange& 
             return ok.error();
         }
         if (report.prepared.has_value()) {
-            if (const Result<void> ok{VerifyCertificate(report.prepared->cert, PrepareDigest(report.prepared->view, report.prepared->cert.header_hash))};
+            if (const Result<void> ok{VerifyCertificate(report.prepared->cert, PrepareDigest(m_domain, m_slot.epoch, m_slot.slot, report.prepared->view,
+                                                                                                       report.prepared->cert.header_hash))};
                 !ok.has_value()) {
                 return ok.error();
             }
@@ -996,7 +998,8 @@ Result<void> PbftAgreement::OnNewView(uint32_t from, NewView message, std::span<
             return ok.error();
         }
         if (report.prepared.has_value()) {
-            if (const Result<void> ok{VerifyCertificate(report.prepared->cert, PrepareDigest(report.prepared->view, report.prepared->cert.header_hash))};
+            if (const Result<void> ok{VerifyCertificate(report.prepared->cert, PrepareDigest(m_domain, m_slot.epoch, m_slot.slot, report.prepared->view,
+                                                                                                       report.prepared->cert.header_hash))};
                 !ok.has_value()) {
                 return ok.error();
             }

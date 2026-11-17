@@ -18,7 +18,7 @@
  * 2026-11-14; SEC-11; plan 3.4.1 "two conflicting certificates mean evidence
  * plus halt"; ARCHITECTURE.md O-100).
  *
- * Create(profile, adapter, log) loads every EVIDENCE record the commit log
+ * Create(profile, domain, adapter, log) loads every EVIDENCE record the commit log
  * recovered (in recording order); a store that holds evidence is halted
  * from the start. Record(evidence) checks the shape (CheckEvidence), then
  * the proof:
@@ -26,8 +26,9 @@
  *   whole header, which the vote does not carry, so two COMMIT votes cannot
  *   be verified by a third party: EVIDENCE_UNVERIFIABLE; the recordable form
  *   of a committed conflict is CONFLICTING_CERTIFICATES), and both
- *   signatures verify over PrepareDigest(view, header_hash) with the seat's
- *   key of the epoch's seat set (EVIDENCE_SIGNATURE);
+ *   signatures verify over PrepareDigest(domain, epoch, slot, view,
+ *   header_hash), under the store's domain, with the seat's key of the
+ *   epoch's seat set (EVIDENCE_SIGNATURE);
  * - CONFLICTING_CERTIFICATES: each certificate carries at least a quorum of
  *   its header's epoch and its aggregate verifies over the header's
  *   CommitDigest (EVIDENCE_CERTIFICATE); the two epochs may differ (O-89: a
@@ -53,7 +54,8 @@ class EvidenceStore
 {
 public:
     //! Load the recorded evidence from `log` (its errors, DECODE EVIDENCE_RECORD for a foreign record); halted if any.
-    static Result<EvidenceStore> Create(const ProfileParams& profile, const chain::ChainAdapter& adapter, storage::CommitLog& log);
+    static Result<EvidenceStore> Create(const ProfileParams& profile, const uint256& domain, const chain::ChainAdapter& adapter,
+                                        storage::CommitLog& log);
 
     EvidenceStore(EvidenceStore&&) noexcept = default;
     EvidenceStore& operator=(EvidenceStore&&) noexcept = default;
@@ -69,13 +71,14 @@ public:
     size_t Size() const { return m_recorded.size(); }
 
 private:
-    EvidenceStore(const ProfileParams& profile, const chain::ChainAdapter& adapter, storage::CommitLog& log)
-        : m_profile{profile}, m_adapter{&adapter}, m_log{&log}
+    EvidenceStore(const ProfileParams& profile, const uint256& domain, const chain::ChainAdapter& adapter, storage::CommitLog& log)
+        : m_profile{profile}, m_domain{domain}, m_adapter{&adapter}, m_log{&log}
     {
     }
     Result<void> Verify(const Evidence& evidence) const;
 
     ProfileParams m_profile;
+    uint256 m_domain; //!< the instance domain every PREPARE digest is bound to
     const chain::ChainAdapter* m_adapter;
     storage::CommitLog* m_log;
     std::vector<Evidence> m_recorded;

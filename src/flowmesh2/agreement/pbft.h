@@ -50,7 +50,7 @@
  *     a difference is VERIFY_FAILED PBFT_FACTS_MISMATCH and no vote ever);
  *     StateOwner::Reexecute reproduces header and canonical body;
  *     SafetyRules::MayPrepare; ACCEPTED_PROPOSAL and the PREPARE intent
- *     (PrepareDigest(view, header hash)), B-INTENT, authority check 2, Sign,
+ *     (PrepareDigest(domain, epoch, slot, view, header hash)), B-INTENT, authority check 2, Sign,
  *     SIGNED_VOTE, B-VOTE, the vote to every other seat (VoteSink::SendVote).
  *  3. PREPARED (q PREPARE votes for the accepted header in this view, each
  *     verified against its seat's key): the PreparedQC {view, certificate}

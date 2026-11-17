@@ -28,7 +28,8 @@ using namespace flowmesh2::test;
 
 namespace {
 
-Vote PrepareVote(const std::string& seat_name, uint32_t seat, uint64_t epoch, uint64_t view, uint64_t slot, const uint256& header_hash)
+Vote PrepareVote(const uint256& domain, const std::string& seat_name, uint32_t seat, uint64_t epoch, uint64_t view, uint64_t slot,
+                 const uint256& header_hash)
 {
     Vote vote;
     vote.phase = storage::VotePhase::PREPARE;
@@ -37,7 +38,7 @@ Vote PrepareVote(const std::string& seat_name, uint32_t seat, uint64_t epoch, ui
     vote.slot = slot;
     vote.header_hash = header_hash;
     vote.seat = seat;
-    const uint256 digest{PrepareDigest(view, header_hash)};
+    const uint256 digest{PrepareDigest(domain, epoch, slot, view, header_hash)};
     vote.signature = BlsKeyFromLabel(SeatLabel(seat_name)).Sign(std::span<const unsigned char>{digest.data(), digest.size()}).Compressed();
     return vote;
 }
@@ -57,14 +58,15 @@ BOOST_AUTO_TEST_CASE(a_prepare_double_vote_is_verified_persisted_and_halts)
     RigOptions options;
     options.seat_names = {"s0", "s1", "s2", "s3"};
     AgreementRig rig{options};
-    Result<EvidenceStore> created{EvidenceStore::Create(rig.profile, *rig.adapter, rig.commit_log)};
+    const uint256 domain{rig.genesis.Header().domain};
+    Result<EvidenceStore> created{EvidenceStore::Create(rig.profile, domain, *rig.adapter, rig.commit_log)};
     RequireOk(created, "EvidenceStore::Create");
     EvidenceStore& store{*created};
     BOOST_CHECK(!store.Halted());
     BOOST_CHECK_EQUAL(store.Size(), 0U);
     const uint256 h1{LabelHash("fm2/test/evidence/h1")};
     const uint256 h2{LabelHash("fm2/test/evidence/h2")};
-    const Evidence doubled{Ordered(PrepareVote("s2", 2, 0, 0, 1, h1), PrepareVote("s2", 2, 0, 0, 1, h2))};
+    const Evidence doubled{Ordered(PrepareVote(domain, "s2", 2, 0, 0, 1, h1), PrepareVote(domain, "s2", 2, 0, 0, 1, h2))};
     // Wrong order, a forged signature, a seat outside the set, a COMMIT double vote: refused, nothing recorded.
     {
         const auto& dv{std::get<DoubleVote>(doubled.content)};
@@ -72,7 +74,7 @@ BOOST_AUTO_TEST_CASE(a_prepare_double_vote_is_verified_persisted_and_halts)
         Evidence forged{doubled};
         std::get<DoubleVote>(forged.content).second.signature[5] ^= 0x01;
         RequireRefusal(store.Record(forged), ErrorCode::VERIFY_FAILED, EVIDENCE_SIGNATURE, "forged");
-        Evidence impostor{Ordered(PrepareVote("s3", 2, 0, 0, 1, h1), PrepareVote("s2", 2, 0, 0, 1, h2))};
+        Evidence impostor{Ordered(PrepareVote(domain, "s3", 2, 0, 0, 1, h1), PrepareVote(domain, "s2", 2, 0, 0, 1, h2))};
         RequireRefusal(store.Record(impostor), ErrorCode::VERIFY_FAILED, EVIDENCE_SIGNATURE, "another seat's key");
         Evidence outside{doubled};
         std::get<DoubleVote>(outside.content).first.seat = 7;
@@ -106,7 +108,7 @@ BOOST_AUTO_TEST_CASE(a_prepare_double_vote_is_verified_persisted_and_halts)
     Result<storage::CommitLog> recovered{storage::CommitLog::Recover(*rig.commit_journal, rig.profile)};
     RequireOk(recovered, "Recover");
     BOOST_CHECK_EQUAL(recovered->EvidenceRecords().size(), 1U);
-    Result<EvidenceStore> again{EvidenceStore::Create(rig.profile, *rig.adapter, *recovered)};
+    Result<EvidenceStore> again{EvidenceStore::Create(rig.profile, domain, *rig.adapter, *recovered)};
     RequireOk(again, "Create after a recovery");
     BOOST_CHECK(again->Halted());
     BOOST_CHECK(again->Load().value() == std::vector<Evidence>{doubled});
@@ -119,7 +121,7 @@ BOOST_AUTO_TEST_CASE(conflicting_certificates_are_evidence_and_weak_ones_are_not
     RigOptions options;
     options.seat_names = {"s0", "s1", "s2", "s3"};
     AgreementRig rig{options};
-    EvidenceStore store{EvidenceStore::Create(rig.profile, *rig.adapter, rig.commit_log).value()};
+    EvidenceStore store{EvidenceStore::Create(rig.profile, rig.genesis.Header().domain, *rig.adapter, rig.commit_log).value()};
     const StateRootsV0 roots_a{LabelHash("fm2/test/evidence/a/accounts"), LabelHash("fm2/test/evidence/a/orders"),
                                LabelHash("fm2/test/evidence/a/markets"), LabelHash("fm2/test/evidence/a/nullifiers"),
                                LabelHash("fm2/test/evidence/a/totals")};

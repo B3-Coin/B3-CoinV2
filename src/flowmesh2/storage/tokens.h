@@ -57,7 +57,7 @@ class CommitLog;
 
 //! Vote phases. APPEND-ONLY.
 enum class VotePhase : uint8_t {
-    PREPARE = 1,     //!< PBFT prepare: signs agreement::PrepareDigest(view, header hash) (M4-AGR-02)
+    PREPARE = 1,     //!< PBFT prepare: signs agreement::PrepareDigest(domain, epoch, slot, view, header hash) (M4-AGR-02)
     COMMIT = 2,      //!< signs SlotHeaderV2::CommitDigest()
     VIEW_CHANGE = 3, //!< a statement, not a vote: signs agreement::ViewChangeDigest (M4-AGR-02)
     NEW_VIEW = 4,    //!< a statement: signs agreement::NewViewDigest (M4-AGR-02)

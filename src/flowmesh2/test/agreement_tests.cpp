@@ -105,11 +105,17 @@ BOOST_AUTO_TEST_CASE(leader_schedule_is_seeded_and_skips_slow_seats)
 BOOST_AUTO_TEST_CASE(agreement_digests_are_domain_separated)
 {
     // Every signed agreement statement has its own digest under the AGREEMENT
-    // tag, bound to the instance domain; the prepare digest binds the view.
+    // tag, bound to the instance domain; the prepare digest binds domain,
+    // epoch, slot and view (review of 2026-11-16, defect 1: a certificate of
+    // another slot must never verify as this slot's preparation).
     const uint256 domain{LabelHash("fm2/test/digest-domain")};
     const uint256 header{LabelHash("fm2/test/digest-header")};
-    BOOST_CHECK(PrepareDigest(0, header) != PrepareDigest(1, header));
-    BOOST_CHECK(PrepareDigest(0, header) != header);
+    const uint256 prepare{PrepareDigest(domain, 0, 5, 0, header)};
+    BOOST_CHECK(prepare != PrepareDigest(domain, 0, 5, 1, header));
+    BOOST_CHECK(prepare != PrepareDigest(domain, 0, 4, 0, header));
+    BOOST_CHECK(prepare != PrepareDigest(domain, 1, 5, 0, header));
+    BOOST_CHECK(prepare != PrepareDigest(LabelHash("other"), 0, 5, 0, header));
+    BOOST_CHECK(prepare != header);
     const PreparedCert prepared{2, SlotCertificate{header, {0x0f}, {}}};
     const uint256 vc{ViewChangeDigest(domain, 0, 5, 3, 1, prepared)};
     BOOST_CHECK(vc != ViewChangeDigest(domain, 0, 5, 3, 1, std::nullopt));
@@ -124,7 +130,7 @@ BOOST_AUTO_TEST_CASE(agreement_digests_are_domain_separated)
     const uint256 hw{HighWaterDigest(domain, 2, 0, 9, 1)};
     BOOST_CHECK(hw != HighWaterDigest(domain, 2, 0, 9, 2) && hw != HighWaterDigest(domain, 3, 0, 9, 1));
     // Statement digests never collide with a vote digest for the same numbers.
-    BOOST_CHECK(hw != PrepareDigest(1, header) && vc != PrepareDigest(3, header));
+    BOOST_CHECK(hw != PrepareDigest(domain, 0, 9, 1, header) && vc != PrepareDigest(domain, 0, 5, 3, header));
 }
 
 BOOST_AUTO_TEST_CASE(inclusion_fence_and_evidence_are_stubs)

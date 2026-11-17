@@ -11,10 +11,10 @@
 
 namespace flowmesh2::agreement {
 
-uint256 PrepareDigest(uint64_t view, const uint256& header_hash)
+uint256 PrepareDigest(const uint256& domain, uint64_t epoch, uint64_t slot, uint64_t view, const uint256& header_hash)
 {
     HashWriter writer{TaggedWriter(HashTag::PREPARE)};
-    writer << view << header_hash;
+    writer << domain << epoch << slot << view << header_hash;
     return writer.GetSHA256();
 }
 

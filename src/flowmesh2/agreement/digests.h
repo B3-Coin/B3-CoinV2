@@ -18,9 +18,14 @@
  * A seat's BLS key signs exactly these 32-byte digests, each under its own
  * domain separation, so no statement can be mistaken for another:
  * - COMMIT vote: SlotHeaderV2::CommitDigest() (core/slot.h; tag COMMIT).
- * - PREPARE vote: PrepareDigest(view, header_hash) = Tagged(PREPARE,
- *   u64 view ‖ header_hash). The header hash binds domain, epoch and height;
- *   the view makes a preparation a fact of its view (PreparedCert).
+ * - PREPARE vote: PrepareDigest(domain, epoch, slot, view, header_hash) =
+ *   Tagged(PREPARE, domain ‖ u64 epoch ‖ u64 slot ‖ u64 view ‖ header_hash).
+ *   The view makes a preparation a fact of its view (PreparedCert); domain,
+ *   epoch and slot are bound explicitly, not only through the header hash,
+ *   because a verifier of a carried certificate (a VIEW_CHANGE report, a
+ *   NEW_VIEW, evidence) holds the hash, not the header: a genuine
+ *   certificate of another slot must not verify as this slot's preparation
+ *   (review of 2026-11-16, defect 1).
  * - Statements under the tag AGREEMENT, as Tagged(AGREEMENT, u8 kind ‖ ...):
  *   VIEW_CHANGE (1): domain ‖ u64 epoch ‖ u64 slot ‖ u64 new_view ‖ u32 seat
  *     ‖ u8 has_prepared ‖ [u64 prepared view ‖ prepared certificate hash];
@@ -44,8 +49,8 @@ enum class StatementKind : uint8_t {
     LEADER_SEED = 4,
 };
 
-//! Tagged(PREPARE, u64 view ‖ header_hash): what a PREPARE vote signs.
-uint256 PrepareDigest(uint64_t view, const uint256& header_hash);
+//! Tagged(PREPARE, domain ‖ u64 epoch ‖ u64 slot ‖ u64 view ‖ header_hash): what a PREPARE vote signs.
+uint256 PrepareDigest(const uint256& domain, uint64_t epoch, uint64_t slot, uint64_t view, const uint256& header_hash);
 //! What a VIEW_CHANGE report signs (see the file comment).
 uint256 ViewChangeDigest(const uint256& domain, uint64_t epoch, uint64_t slot, uint64_t new_view, uint32_t seat,
                          const std::optional<PreparedCert>& prepared);

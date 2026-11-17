@@ -64,7 +64,7 @@ struct Cluster {
             options.self_seat = i;
             seat->rig = std::make_unique<AgreementRig>(options);
             seat->mesh = RecordingMesh::Make(TestMeshConfig(i, k));
-            Result<EvidenceStore> evidence{EvidenceStore::Create(seat->rig->profile, *seat->rig->adapter, seat->rig->commit_log)};
+            Result<EvidenceStore> evidence{EvidenceStore::Create(seat->rig->profile, seat->rig->genesis.Header().domain, *seat->rig->adapter, seat->rig->commit_log)};
             RequireOk(evidence, "EvidenceStore::Create");
             seat->evidence = std::make_unique<EvidenceStore>(std::move(evidence).value());
             const PbftContext context{*seat->rig->adapter, *seat->rig->owner, seat->rig->signer, seat->rig->signer_log,
@@ -79,6 +79,8 @@ struct Cluster {
     }
 
     Seat& At(uint32_t i) { return *seats.at(i); }
+    //! The instance domain (every seat shares the genesis).
+    uint256 Domain() const { return seats.front()->rig->genesis.Header().domain; }
     const AuthorityVersion& Authority() const { return seats.front()->rig->authority; }
 
     //! The seat that leads the current view, or k when none says so.
@@ -432,7 +434,7 @@ BOOST_AUTO_TEST_CASE(forged_wrong_seat_and_double_votes_are_refused)
     const uint32_t other{(leader + 2) % 4};
     PbftAgreement& pbft{*c.At(target).pbft};
     const uint256 hash{candidate.Header().Hash()};
-    const uint256 prepare_digest{PrepareDigest(0, hash)};
+    const uint256 prepare_digest{PrepareDigest(c.Domain(), 0, 1, 0, hash)};
     // A vote whose signature is another seat's.
     Vote forged{SignedVote("s" + std::to_string(leader), other, storage::VotePhase::PREPARE, 0, 0, 1, hash, prepare_digest)};
     RequireRefusal(pbft.OnMessage(other, EncodeMessage(Message{forged}, c.At(target).rig->profile).value()), ErrorCode::VERIFY_FAILED,
@@ -463,7 +465,7 @@ BOOST_AUTO_TEST_CASE(forged_wrong_seat_and_double_votes_are_refused)
                    PBFT_VOTE_SEAT, "a message from itself");
     // A second vote from the same seat for another header: a double vote, refused, recorded, spread, and the seat halts (M4-AGR-07).
     const uint256 other_hash{LabelHash("fm2/test/pbft/other-header")};
-    Vote doubled{SignedVote("s" + std::to_string(other), other, storage::VotePhase::PREPARE, 0, 0, 1, other_hash, PrepareDigest(0, other_hash))};
+    Vote doubled{SignedVote("s" + std::to_string(other), other, storage::VotePhase::PREPARE, 0, 0, 1, other_hash, PrepareDigest(c.Domain(), 0, 1, 0, other_hash))};
     BOOST_CHECK(!pbft.Status().halted);
     RequireRefusal(pbft.OnMessage(other, EncodeMessage(Message{doubled}, c.At(target).rig->profile).value()), ErrorCode::EQUIVOCATION_REFUSED,
                    PBFT_DOUBLE_VOTE, "double vote");
@@ -487,8 +489,9 @@ BOOST_AUTO_TEST_CASE(a_double_vote_halts_the_seat_and_spreads_as_evidence)
     const uint32_t other{(leader + 2) % 4};
     const uint256 hash{candidate.Header().Hash()};
     const uint256 other_hash{LabelHash("fm2/test/pbft/evidence-header")};
-    const Vote honest{SignedVote("s" + std::to_string(other), other, storage::VotePhase::PREPARE, 0, 0, 1, hash, PrepareDigest(0, hash))};
-    const Vote doubled{SignedVote("s" + std::to_string(other), other, storage::VotePhase::PREPARE, 0, 0, 1, other_hash, PrepareDigest(0, other_hash))};
+    const Vote honest{SignedVote("s" + std::to_string(other), other, storage::VotePhase::PREPARE, 0, 0, 1, hash, PrepareDigest(c.Domain(), 0, 1, 0, hash))};
+    const Vote doubled{SignedVote("s" + std::to_string(other), other, storage::VotePhase::PREPARE, 0, 0, 1, other_hash,
+                                  PrepareDigest(c.Domain(), 0, 1, 0, other_hash))};
     const ProfileParams& profile{c.At(target).rig->profile};
     RequireOk(c.At(target).pbft->OnMessage(other, EncodeMessage(Message{honest}, profile).value()), "the honest vote");
     RequireRefusal(c.At(target).pbft->OnMessage(other, EncodeMessage(Message{doubled}, profile).value()), ErrorCode::EQUIVOCATION_REFUSED,
@@ -522,7 +525,7 @@ BOOST_AUTO_TEST_CASE(a_double_vote_halts_the_seat_and_spreads_as_evidence)
     // A recovered commit log carries the evidence: the store stays halted after a restart.
     Result<storage::CommitLog> recovered{storage::CommitLog::Recover(*c.At(target).rig->commit_journal, profile)};
     RequireOk(recovered, "CommitLog::Recover");
-    Result<EvidenceStore> again{EvidenceStore::Create(profile, *c.At(target).rig->adapter, *recovered)};
+    Result<EvidenceStore> again{EvidenceStore::Create(profile, c.Domain(), *c.At(target).rig->adapter, *recovered)};
     RequireOk(again, "EvidenceStore::Create after a restart");
     BOOST_CHECK(again->Halted());
     BOOST_CHECK(again->Load().value() == *recorded);
@@ -536,7 +539,7 @@ BOOST_AUTO_TEST_CASE(create_checks_the_seat_and_the_key)
     AgreementRig rig{options};
     PbftSafetyRules rules;
     auto mesh{RecordingMesh::Make(TestMeshConfig(1, 4))};
-    EvidenceStore evidence{EvidenceStore::Create(rig.profile, *rig.adapter, rig.commit_log).value()};
+    EvidenceStore evidence{EvidenceStore::Create(rig.profile, rig.genesis.Header().domain, *rig.adapter, rig.commit_log).value()};
     const PbftContext context{*rig.adapter, *rig.owner, rig.signer, rig.signer_log, rig.commit_log, rules, *mesh, *mesh, evidence};
     PbftConfig config;
     config.self_seat = 4;
@@ -617,16 +620,16 @@ BOOST_AUTO_TEST_CASE(claims_from_f_plus_one_peers_give_the_ahead_hint)
     BOOST_CHECK_EQUAL(pbft.Status().ahead_hint, 0U);
     // One peer's claim is not a hint (one Byzantine seat cannot drive a fetch); the vote itself is for another slot and ignored.
     const uint256 h{LabelHash("fm2/test/pbft/ahead")};
-    const Vote far{SignedVote("s1", 1, storage::VotePhase::PREPARE, 0, 0, 5, h, PrepareDigest(0, h))};
+    const Vote far{SignedVote("s1", 1, storage::VotePhase::PREPARE, 0, 0, 5, h, PrepareDigest(c.Domain(), 0, 5, 0, h))};
     RequireOk(pbft.OnMessage(1, EncodeMessage(Message{far}, profile).value()), "a vote for slot 5");
     BOOST_CHECK(!pbft.AheadHint().has_value());
     // A second peer claiming slot 7: the f + 1 = 2 claims give the lower one, slot 5.
-    const Vote further{SignedVote("s2", 2, storage::VotePhase::PREPARE, 0, 0, 7, h, PrepareDigest(0, h))};
+    const Vote further{SignedVote("s2", 2, storage::VotePhase::PREPARE, 0, 0, 7, h, PrepareDigest(c.Domain(), 0, 7, 0, h))};
     RequireOk(pbft.OnMessage(2, EncodeMessage(Message{further}, profile).value()), "a vote for slot 7");
     BOOST_CHECK(pbft.AheadHint() == std::optional<uint64_t>{5});
     BOOST_CHECK_EQUAL(pbft.Status().ahead_hint, 5U);
     // A claim for the current slot (or below) is none; a reset forgets a peer's claim.
-    const Vote current{SignedVote("s3", 3, storage::VotePhase::PREPARE, 0, 0, 1, h, PrepareDigest(0, h))};
+    const Vote current{SignedVote("s3", 3, storage::VotePhase::PREPARE, 0, 0, 1, h, PrepareDigest(c.Domain(), 0, 1, 0, h))};
     (void)pbft.OnMessage(3, EncodeMessage(Message{current}, profile).value());
     BOOST_CHECK(pbft.AheadHint() == std::optional<uint64_t>{5});
     pbft.ResetClaim(2);
@@ -749,6 +752,67 @@ BOOST_AUTO_TEST_CASE(a_reproposal_carries_the_selections_parent_certificate)
     for (uint32_t i{0}; i < 4; ++i) BOOST_CHECK_MESSAGE(c.At(i).pbft->Status().decided, "seat " << i << " undecided at slot 2");
     BOOST_CHECK(c.ApplyDecisions() == hash);
     for (uint32_t i{0}; i < 4; ++i) BOOST_CHECK_EQUAL(c.At(i).rig->owner->Head()->Header().height, 2U);
+}
+
+BOOST_AUTO_TEST_CASE(a_prepared_certificate_from_another_slot_is_refused)
+{
+    // Review of 2026-11-16, confirmed defect 1. Slot 1 decides in view 0, so every seat holds slot 1's genuine
+    // prepare certificate. Before slot 2 prepares, one seat reports a view change for slot 2 that carries that
+    // certificate as its "prepared" value. The prepare digest binds domain, epoch and slot, so a certificate of
+    // slot 1 never verifies as a preparation of slot 2: the report is refused, nothing is written as slot 2's
+    // PreparedQC, and slot 2 decides its own header in view 0. (Before the fix the three honest seats stored
+    // slot 1's header as slot 2's preparation and the slot never decided again, through every view change.)
+    Cluster c{4};
+    c.AppendBlock(130, {Fact{DepositAtCursor(FactCursor{130, 0}, "d0")}});
+    const uint32_t leader{c.Leader()};
+    BOOST_REQUIRE_LT(leader, 4U);
+    const state::Candidate first{c.At(leader).rig->Preview(c.InputsFromChain(leader))};
+    RequireOk(c.At(leader).pbft->Propose(first, c.Authority()), "Propose slot 1");
+    c.Deliver();
+    BOOST_REQUIRE(c.refusals.empty());
+    BOOST_CHECK(c.ApplyDecisions(first, leader) == first.Header().Hash());
+    // Slot 1's prepare certificate, as every seat recorded it.
+    const std::optional<storage::PreparedQcRecord> qc{c.At(leader).rig->commit_log.HighestPrepared(1)};
+    BOOST_REQUIRE(qc.has_value());
+    BOOST_CHECK(qc->header_hash == first.Header().Hash());
+    const Result<SlotCertificate> cert{SlotCertificate::Decode(qc->qc)};
+    RequireOk(cert, "decode slot 1's prepare certificate");
+    // A seat that is not the leader signs a report for slot 2, target view 1, carrying it.
+    const uint32_t byzantine{(leader + 3) % 4};
+    ViewChange report;
+    report.epoch = 0;
+    report.slot = 2;
+    report.new_view = 1;
+    report.seat = byzantine;
+    report.prepared = PreparedCert{qc->view, *cert};
+    const uint256 domain{c.At(byzantine).rig->owner->Head()->Header().domain};
+    const uint256 digest{ViewChangeDigest(domain, report)};
+    report.signature = BlsKeyFromLabel(SeatLabel("s" + std::to_string(byzantine)))
+                           .Sign(std::span<const unsigned char>{digest.data(), digest.size()})
+                           .Compressed();
+    const ProfileParams& profile{c.At(leader).rig->profile};
+    const std::vector<unsigned char> bytes{EncodeMessage(Message{report}, profile).value()};
+    for (uint32_t i{0}; i < 4; ++i) {
+        if (i == byzantine) continue;
+        RequireRefusal(c.At(i).pbft->OnMessage(byzantine, bytes), ErrorCode::VERIFY_FAILED, PBFT_PREPARED_CERT,
+                       "slot 1's certificate as slot 2's preparation");
+        BOOST_CHECK(!c.At(i).rig->commit_log.HighestPrepared(2).has_value());
+        BOOST_CHECK(!c.At(i).pbft->Status().prepared);
+    }
+    // Slot 2 decides its own header in view 0.
+    const state::Candidate second{c.At(leader).rig->Preview(c.InputsFromChain(leader))};
+    BOOST_CHECK_EQUAL(second.Header().height, 2U);
+    RequireOk(c.At(leader).pbft->Propose(second, c.Authority()), "Propose slot 2");
+    c.Deliver();
+    BOOST_CHECK(c.refusals.empty());
+    for (uint32_t i{0}; i < 4; ++i) {
+        const PbftStatus status{c.At(i).pbft->Status()};
+        BOOST_CHECK_EQUAL(status.slot, 2U);
+        BOOST_CHECK_EQUAL(status.view, 0U);
+        BOOST_CHECK(status.decided);
+    }
+    BOOST_CHECK(c.ApplyDecisions(second, leader) == second.Header().Hash());
+    for (uint32_t i{0}; i < 4; ++i) BOOST_CHECK(c.At(i).rig->commit_log.HighestPrepared(2)->header_hash == second.Header().Hash());
 }
 
 BOOST_AUTO_TEST_SUITE_END()
