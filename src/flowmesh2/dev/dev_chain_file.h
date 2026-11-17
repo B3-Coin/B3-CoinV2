@@ -53,7 +53,8 @@ uint256 DevChainBlockHash(uint32_t height);
 //! The outpoint of deposit `index` of block `height`: SHA256("fm2/devchain/deposit/<height>/<index>"):0.
 Outpoint DevChainOutpoint(uint32_t height, uint32_t index);
 
-std::vector<unsigned char> EncodeDevChainBlock(const DevChainBlock& block);
+//! INVALID_INPUT when a fact does not encode (a deposit outside [0, MAX_ATOMS]): nothing a reader could not decode is ever written.
+Result<std::vector<unsigned char>> EncodeDevChainBlock(const DevChainBlock& block);
 Result<DevChainBlock> DecodeDevChainBlock(std::span<const unsigned char> payload);
 
 //! Append one block (creating the file), fsync'd before returning.

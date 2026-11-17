@@ -71,7 +71,7 @@ uint256 Label(const std::string& label)
 
 bool WriteSecret(const fs::path& path, const std::string& text)
 {
-    const int fd{::open(fs::PathToString(path).c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600)};
+    const int fd{::open(fs::PathToString(path).c_str(), O_WRONLY | O_CREAT | O_EXCL, 0600)}; // never over an existing key
     if (fd < 0) return false;
     const std::string line{text + "\n"};
     const bool ok{::write(fd, line.data(), line.size()) == static_cast<ssize_t>(line.size())};
@@ -81,7 +81,7 @@ bool WriteSecret(const fs::path& path, const std::string& text)
 
 bool WritePublic(const fs::path& path, const std::string& text)
 {
-    const int fd{::open(fs::PathToString(path).c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644)};
+    const int fd{::open(fs::PathToString(path).c_str(), O_WRONLY | O_CREAT | O_EXCL, 0644)}; // never over an existing document
     if (fd < 0) return false;
     const bool ok{::write(fd, text.data(), text.size()) == static_cast<ssize_t>(text.size())};
     ::close(fd);
@@ -131,8 +131,8 @@ int main(int argc, char** argv)
     netio::GenesisDoc doc;
     doc.network.chain = ChainType::REGTEST;
     doc.network.magic = {0xf2, 0x51, 0x4d, 0x10};
-    doc.network.modern_chain_domain = Label("fm2/regtest/domain");
-    doc.mesh_magic = {0xf2, 0x51, 0x4d, 0x11};
+    // The domain and the mesh magic are set below, from the seat set this run generates: every cluster keygen makes is its
+    // own network, so a client key's signed actions and a seat's handshakes are valid on no other (review 2026-11-16, 10).
     doc.base = Anchor{129, Label("fm2/devchain/block/129")};
     doc.facts_start = FactCursor{130, 0};
     doc.assets.emplace("B3", AssetId::Native());
@@ -142,8 +142,6 @@ int main(int argc, char** argv)
     }
     doc.markets.push_back(netio::GenesisMarket{"B3", "rUSD", 1'000'000, 1});
     doc.markets.push_back(netio::GenesisMarket{"TOK", "rUSD", 1, 10});
-    const uint256 domain{doc.Domain()};
-
     struct SeatSecrets {
         std::string ikm_hex;
         std::string transport_hex;
@@ -174,20 +172,29 @@ int main(int argc, char** argv)
         seat.endpoint.counter = 1;
         const XOnlyPubKey xonly{transport.GetPubKey()};
         std::copy(xonly.begin(), xonly.end(), seat.endpoint.transport_key.begin());
-        const uint256 digest{netio::EndpointDigest(seat.endpoint, domain)};
-        seat.endpoint.signature = key->Sign(std::span<const unsigned char>{digest.data(), digest.size()}).Compressed();
-        doc.seats.push_back(seat);
+        doc.seats.push_back(seat); // the endpoint record is signed once the domain is known (below)
         std::array<unsigned char, 32> transport_bytes{};
         std::copy(transport.begin(), transport.end(), reinterpret_cast<std::byte*>(transport_bytes.data()));
         secrets.push_back(SeatSecrets{netio::ToHex(ikm), netio::ToHex(transport_bytes)});
         bls_keys.push_back(*key);
     }
-    // The document must verify as a reader would see it.
+    // The seat set root names this cluster: domain and mesh magic derive from it, then the endpoint records are signed.
     const Result<SeatSet> seat_set{doc.SeatSetOf()};
     if (!seat_set.has_value()) {
         std::cerr << "fm2-keygen: the seat set does not verify: " << seat_set.error().detail << "\n";
         return 1;
     }
+    const std::string cluster{seat_set->Root().GetHex()};
+    doc.network.modern_chain_domain = Label("fm2/regtest/domain/" + cluster);
+    const uint256 mesh_label{Label("fm2/regtest/mesh-magic/" + cluster)};
+    std::copy(mesh_label.begin(), mesh_label.begin() + 4, doc.mesh_magic.begin());
+    const uint256 domain{doc.Domain()};
+    for (uint64_t i{0}; i < seats; ++i) {
+        netio::GenesisSeat& seat{doc.seats[i]};
+        const uint256 digest{netio::EndpointDigest(seat.endpoint, domain)};
+        seat.endpoint.signature = bls_keys[i].Sign(std::span<const unsigned char>{digest.data(), digest.size()}).Compressed();
+    }
+    // The document must verify as a reader would see it.
     for (const netio::GenesisSeat& seat : doc.seats) {
         if (const Result<void> ok{netio::VerifyEndpointRecord(seat.endpoint, *seat_set, domain)}; !ok.has_value()) {
             std::cerr << "fm2-keygen: an endpoint record does not verify: " << ok.error().detail << "\n";
@@ -195,7 +202,7 @@ int main(int argc, char** argv)
         }
     }
     if (!WritePublic(out / fs::u8path("genesis.json"), doc.Json())) {
-        std::cerr << "fm2-keygen: could not write genesis.json\n";
+        std::cerr << "fm2-keygen: could not write genesis.json (it exists already? this tool never overwrites)\n";
         return 1;
     }
     for (uint64_t i{0}; i < seats; ++i) {

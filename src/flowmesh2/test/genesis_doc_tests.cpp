@@ -156,6 +156,14 @@ BOOST_AUTO_TEST_CASE(the_dev_chain_file_appends_tails_and_refuses_corruption)
     RequireOk(dev::AppendDevChainBlock(file, first), "append 130");
     RequireRefusal(dev::AppendDevChainBlock(file, dev::DevChainBlock{133, dev::DevChainBlockHash(133), {}}), ErrorCode::INVALID_INPUT,
                    dev::DEVCHAIN_HEIGHT, "a gap");
+    // A deposit above MAX_ATOMS does not encode: it is refused and nothing is written, where it used to become an undecodable
+    // block that wedged every seat (review 2026-11-16, R8).
+    DepositFact oversized{deposit};
+    oversized.cursor = FactCursor{131, 0};
+    oversized.amount = MAX_ATOMS + 1;
+    RequireCode(dev::AppendDevChainBlock(file, dev::DevChainBlock{131, dev::DevChainBlockHash(131), {Fact{oversized}}}), ErrorCode::INVALID_INPUT,
+                "a deposit outside the atom range");
+    BOOST_CHECK_EQUAL(dev::ReadDevChain(file).value().size(), 1U);
     RequireOk(dev::AppendDevChainBlock(file, second), "append 131");
     const Result<std::vector<dev::DevChainBlock>> all{dev::ReadDevChain(file)};
     RequireOk(all, "ReadDevChain");
@@ -167,7 +175,7 @@ BOOST_AUTO_TEST_CASE(the_dev_chain_file_appends_tails_and_refuses_corruption)
     BOOST_CHECK_EQUAL(polled->size(), 2U);
     BOOST_CHECK(tail.Poll().value().empty());
     // A partial record at the tail waits; completed, it arrives once.
-    const std::vector<unsigned char> payload{dev::EncodeDevChainBlock(dev::DevChainBlock{132, dev::DevChainBlockHash(132), {}})};
+    const std::vector<unsigned char> payload{dev::EncodeDevChainBlock(dev::DevChainBlock{132, dev::DevChainBlockHash(132), {}}).value()};
     {
         std::ofstream out{fs::PathToString(file), std::ios::binary | std::ios::app};
         const uint32_t len{static_cast<uint32_t>(payload.size())};

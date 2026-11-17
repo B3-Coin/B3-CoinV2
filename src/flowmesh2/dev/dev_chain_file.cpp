@@ -85,7 +85,7 @@ Outpoint DevChainOutpoint(uint32_t height, uint32_t index)
     return Outpoint{Label("fm2/devchain/deposit/" + std::to_string(height) + "/" + std::to_string(index)), 0};
 }
 
-std::vector<unsigned char> EncodeDevChainBlock(const DevChainBlock& block)
+Result<std::vector<unsigned char>> EncodeDevChainBlock(const DevChainBlock& block)
 {
     std::vector<unsigned char> out;
     PutU32(out, block.height);
@@ -93,11 +93,11 @@ std::vector<unsigned char> EncodeDevChainBlock(const DevChainBlock& block)
     PutU32(out, static_cast<uint32_t>(block.facts.size()));
     for (const Fact& fact : block.facts) {
         const Result<std::vector<unsigned char>> bytes{EncodeFact(fact)};
-        const std::vector<unsigned char> encoded{bytes.has_value() ? *bytes : std::vector<unsigned char>{}};
-        PutU32(out, static_cast<uint32_t>(encoded.size()));
-        out.insert(out.end(), encoded.begin(), encoded.end());
+        if (!bytes.has_value()) return bytes.error(); // a block no reader could decode is never written (review 2026-11-16, R8)
+        PutU32(out, static_cast<uint32_t>(bytes->size()));
+        out.insert(out.end(), bytes->begin(), bytes->end());
     }
-    return out;
+    return Ok(std::move(out));
 }
 
 Result<DevChainBlock> DecodeDevChainBlock(std::span<const unsigned char> payload)
@@ -132,11 +132,12 @@ Result<void> AppendDevChainBlock(const fs::path& file, const DevChainBlock& bloc
     Result<std::vector<DevChainBlock>> existing{ReadDevChain(file)};
     if (!existing.has_value()) return existing.error();
     if (!existing->empty() && existing->back().height + 1 != block.height) return Error{ErrorCode::INVALID_INPUT, DEVCHAIN_HEIGHT};
-    const std::vector<unsigned char> payload{EncodeDevChainBlock(block)};
+    const Result<std::vector<unsigned char>> payload{EncodeDevChainBlock(block)};
+    if (!payload.has_value()) return payload.error();
     std::vector<unsigned char> record;
-    PutU32(record, static_cast<uint32_t>(payload.size()));
-    PutU32(record, crc32c::Crc32c(payload.data(), payload.size()));
-    record.insert(record.end(), payload.begin(), payload.end());
+    PutU32(record, static_cast<uint32_t>(payload->size()));
+    PutU32(record, crc32c::Crc32c(payload->data(), payload->size()));
+    record.insert(record.end(), payload->begin(), payload->end());
     const int fd{::open(fs::PathToString(file).c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644)};
     if (fd < 0) return Error{ErrorCode::STORAGE_FATAL, DEVCHAIN_OPEN};
     size_t written{0};

@@ -37,8 +37,9 @@ import sys
 import time
 
 
-def free_port_base(count):
-    for base in range(20000, 60000, 64):
+def free_port_base(count, start=20000):
+    """The first 64-aligned base at or above `start` whose `count` ports bind."""
+    for base in range(start, 60000, 64):
         ok = True
         for p in range(base, base + count):
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -79,15 +80,25 @@ class Cluster:
         self.logs = {}
         shutil.rmtree(self.work, ignore_errors=True)
         os.makedirs(self.work)
+        # Two probed windows (the second search starts past the first: the old picker added 64 unprobed, review 2026-11-16).
         self.mesh_base = free_port_base(k)
-        self.api_base = free_port_base(k)
-        while self.api_base == self.mesh_base:
-            self.api_base = free_port_base(k) + 64
+        self.api_base = free_port_base(k, start=self.mesh_base + 64)
         self.keys = os.path.join(self.work, "keys")
         self.devchain = os.path.join(self.work, "devchain.log")
         run([args.keygen, "--out", self.keys, "--seats", str(k), "--mesh-port-base", str(self.mesh_base),
              "--api-port-base", str(self.api_base)])
         self.genesis = os.path.join(self.keys, "genesis.json")
+        # keygen never overwrites keys or a genesis (review 2026-11-16, R10) ...
+        again = subprocess.run([args.keygen, "--out", self.keys, "--seats", str(k)], capture_output=True, text=True)
+        if again.returncode == 0 or "never overwrites" not in again.stdout + again.stderr:
+            raise RuntimeError(f"a second fm2-keygen over the same directory: exit {again.returncode}: {again.stdout} {again.stderr}")
+        # ... and every cluster it makes is its own network: another run gives another domain and mesh magic (defect 10).
+        other = os.path.join(self.work, "other-keys")
+        run([args.keygen, "--out", other, "--seats", str(k)])
+        with open(self.genesis) as f, open(os.path.join(other, "genesis.json")) as g:
+            mine, theirs = json.load(f), json.load(g)
+        if mine["network"]["domain"] == theirs["network"]["domain"] or mine["mesh_magic"] == theirs["mesh_magic"]:
+            raise RuntimeError("two fm2-keygen runs share a domain or a mesh magic")
         with open(self.genesis) as f:
             self.doc = json.load(f)
         self.pins = os.path.join(self.work, "pins.json")
