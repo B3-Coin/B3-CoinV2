@@ -197,6 +197,8 @@ public:
     Result<uint64_t> AppendPreparedQc(const PreparedQcRecord& record);
     //! The prepared proof of the highest view this log holds for `slot`, if any.
     std::optional<PreparedQcRecord> HighestPrepared(uint64_t slot) const;
+    //! Every prepared proof this log holds for `slot`, by ascending view (a restarted seat rebuilds its signed report from them, R5).
+    std::vector<PreparedQcRecord> PreparedAt(uint64_t slot) const;
 
     /** An EVIDENCE record (M4-AGR-07): the encoded agreement evidence
      * message, appended as a fact (the evidence store checks and verifies

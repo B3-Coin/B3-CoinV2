@@ -22,6 +22,7 @@
 
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <span>
@@ -57,6 +58,8 @@ public:
     std::vector<Sent> sent;
     std::deque<net::InboundFrame> inbound;
     std::optional<Error> refuse; //!< the transport's answer instead of queueing
+    //! Called with every frame the transport takes, at the moment it leaves (a test observes what is durable by then).
+    std::function<void(const Sent&)> on_transmit;
 
     Result<std::optional<net::InboundFrame>> Poll() override
     {
@@ -71,6 +74,7 @@ protected:
     {
         if (refuse) return *refuse;
         sent.push_back(Sent{seat, lane, std::vector<unsigned char>{frame.begin(), frame.end()}});
+        if (on_transmit) on_transmit(sent.back());
         return Ok();
     }
 

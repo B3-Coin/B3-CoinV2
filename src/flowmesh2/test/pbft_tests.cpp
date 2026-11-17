@@ -815,4 +815,166 @@ BOOST_AUTO_TEST_CASE(a_prepared_certificate_from_another_slot_is_refused)
     for (uint32_t i{0}; i < 4; ++i) BOOST_CHECK(c.At(i).rig->commit_log.HighestPrepared(2)->header_hash == second.Header().Hash());
 }
 
+namespace {
+
+MessageType TypeOf(const std::vector<unsigned char>& frame)
+{
+    return frame.size() > 1 ? static_cast<MessageType>(frame[1]) : MessageType::EVIDENCE;
+}
+
+//! The leader restarted over its logs (the agreement rebuilt, everything else kept).
+void Restart(Cluster& c, uint32_t i)
+{
+    Seat& seat{c.At(i)};
+    seat.pbft.reset();
+    const PbftContext context{*seat.rig->adapter, *seat.rig->owner, seat.rig->signer, seat.rig->signer_log, seat.rig->commit_log, seat.rules,
+                              *seat.mesh, *seat.mesh, *seat.evidence};
+    PbftConfig config;
+    config.self_seat = i;
+    Result<std::unique_ptr<PbftAgreement>> pbft{PbftAgreement::Create(seat.rig->profile, config, context)};
+    RequireOk(pbft, "Create after a restart");
+    seat.pbft = std::move(pbft).value();
+}
+
+} // namespace
+
+BOOST_AUTO_TEST_CASE(the_proposal_leaves_only_after_accepted_proposal_is_durable)
+{
+    // Review of 2026-11-16, R4: the leader sent its proposal before ACCEPTED_PROPOSAL was durable, so a crash between the
+    // send and its own B-INTENT brought it back without the proposal it had put on the wire, and the view was lost.
+    Cluster c{4};
+    c.AppendBlock(130, {Fact{DepositAtCursor(FactCursor{130, 0}, "d0")}});
+    const uint32_t leader{c.Leader()};
+    Seat& seat{c.At(leader)};
+    std::vector<storage::JournalStatus> at_send; // the leader's signer journal as each PROPOSAL frame leaves
+    seat.mesh->on_transmit = [&](const RecordingMesh::Sent& s) {
+        if (TypeOf(s.frame) == MessageType::PROPOSAL) at_send.push_back(seat.rig->signer_journal->Status());
+    };
+    const state::Candidate candidate{seat.rig->Preview(c.InputsFromChain(leader))};
+    RequireOk(seat.pbft->Propose(candidate, c.Authority()), "Propose");
+    seat.mesh->on_transmit = nullptr;
+    BOOST_REQUIRE_EQUAL(at_send.size(), 3U); // one frame per other seat
+    for (const storage::JournalStatus& status : at_send) {
+        BOOST_CHECK_GE(status.appended_seq, 1U);
+        // ACCEPTED_PROPOSAL is the last record appended when the proposal leaves, and it is durable by then.
+        BOOST_CHECK_EQUAL(status.durable_seq, status.appended_seq);
+    }
+    const std::vector<storage::RecordType> types{c.SignerTypes(leader)};
+    BOOST_REQUIRE(!types.empty());
+    BOOST_CHECK(types.front() == storage::RecordType::ACCEPTED_PROPOSAL);
+    c.Deliver();
+    BOOST_CHECK(c.refusals.empty());
+    BOOST_CHECK(c.ApplyDecisions(candidate, leader) == candidate.Header().Hash());
+}
+
+BOOST_AUTO_TEST_CASE(a_restarted_seat_resends_the_report_it_signed)
+{
+    // Review of 2026-11-16, R5: a seat restarted while CHANGING never resent its report, and the report it rebuilt
+    // carried the highest preparation it held, which may be one it learnt after signing, so the rebuilt report no
+    // longer matched its signature. Here one seat sees nothing of view 0, reports target 1 with no preparation, then
+    // learns the view-0 PreparedQC from the others' reports, and restarts.
+    Cluster c{4};
+    c.AppendBlock(130, {Fact{DepositAtCursor(FactCursor{130, 0}, "d0")}});
+    const uint32_t leader{c.Leader()};
+    const uint32_t late{(leader + 3) % 4};
+    const Filter view0{[&](uint32_t, uint32_t to, const std::vector<unsigned char>& frame) { return to != late && !IsCommitVote(frame); }};
+    const state::Candidate candidate{c.At(leader).rig->Preview(c.InputsFromChain(leader))};
+    RequireOk(c.At(leader).pbft->Propose(candidate, c.Authority()), "Propose");
+    c.Deliver(view0);
+    BOOST_CHECK(c.refusals.empty());
+    for (uint32_t i{0}; i < 4; ++i) BOOST_CHECK_EQUAL(c.At(i).pbft->Status().prepared, i != late);
+    // Every seat times out into view 1. No NEW_VIEW reaches anyone and the late seat's report reaches nobody; the others'
+    // reports reach the late seat, which learns the preparation (never downgrade) after it signed its own report.
+    const uint64_t timeout{PbftConfig{}.view_timeout_floor_ms};
+    const Filter changing{[&](uint32_t from, uint32_t, const std::vector<unsigned char>& frame) {
+        const MessageType type{TypeOf(frame)};
+        if (type == MessageType::NEW_VIEW) return false;
+        if (type == MessageType::VIEW_CHANGE && from == late) return false;
+        return !IsCommitVote(frame);
+    }};
+    c.Tick(timeout, changing);
+    BOOST_CHECK(c.refusals.empty());
+    for (uint32_t i{0}; i < 4; ++i) BOOST_CHECK_EQUAL(c.At(i).pbft->Status().view, 1U);
+    BOOST_CHECK(c.At(late).pbft->Status().changing);
+    BOOST_REQUIRE(c.At(late).rig->commit_log.HighestPrepared(1).has_value()); // learnt from the reports, after signing
+    BOOST_CHECK_EQUAL(c.At(late).rig->commit_log.HighestPrepared(1)->view, 0U);
+    for (uint32_t i{0}; i < 4; ++i) BOOST_CHECK_EQUAL(c.At(i).pbft->Status().reports_held, i == late ? 4U : 3U);
+    Restart(c, late);
+    {
+        const PbftStatus status{c.At(late).pbft->Status()};
+        BOOST_CHECK_EQUAL(status.view, 1U);
+        BOOST_CHECK(status.changing);
+        BOOST_CHECK_EQUAL(status.reports_held, 1U); // its own report, rebuilt
+    }
+    // The retry timer resends the report: the one signed (no preparation), accepted by every seat.
+    std::vector<ViewChange> resent;
+    c.At(late).mesh->on_transmit = [&](const RecordingMesh::Sent& s) {
+        if (TypeOf(s.frame) != MessageType::VIEW_CHANGE) return;
+        Result<Message> decoded{DecodeMessage(s.frame, c.At(late).rig->profile)};
+        RequireOk(decoded, "DecodeMessage");
+        resent.push_back(std::get<ViewChange>(*decoded));
+    };
+    const Filter no_new_view{[&](uint32_t, uint32_t, const std::vector<unsigned char>& frame) { return TypeOf(frame) != MessageType::NEW_VIEW; }};
+    c.Tick(timeout + PbftConfig{}.retry_ms, no_new_view);
+    c.At(late).mesh->on_transmit = nullptr;
+    BOOST_CHECK(c.refusals.empty());
+    BOOST_REQUIRE_EQUAL(resent.size(), 3U);
+    for (const ViewChange& report : resent) {
+        BOOST_CHECK_EQUAL(report.new_view, 1U);
+        BOOST_CHECK_EQUAL(report.seat, late);
+        BOOST_CHECK(!report.prepared.has_value()); // what was signed, not the preparation learnt afterwards
+    }
+    // Every other seat now holds all four reports; the restarted seat holds its own and what the seats still CHANGING
+    // retransmitted (the view-1 leader, ACTIVE since it built its NEW_VIEW, retransmits no report).
+    for (uint32_t i{0}; i < 4; ++i) {
+        if (i == late) {
+            BOOST_CHECK_GE(c.At(i).pbft->Status().reports_held, 3U);
+        } else {
+            BOOST_CHECK_EQUAL(c.At(i).pbft->Status().reports_held, 4U);
+        }
+    }
+}
+
+BOOST_AUTO_TEST_CASE(reports_are_bounded_per_seat_and_replays_are_dropped_before_verification)
+{
+    // Review of 2026-11-16, R6: reports were kept per attacker-chosen target view with no cap, and every report and vote
+    // was BLS-verified before the duplicate check. Seat 1 names a hundred targets to seat 0.
+    Cluster c{4};
+    const uint256 domain{c.Domain()};
+    const auto report_from{[&](uint32_t seat, uint64_t target, bool valid) {
+        ViewChange report;
+        report.epoch = 0;
+        report.slot = 1;
+        report.new_view = target;
+        report.seat = seat;
+        const uint256 digest{ViewChangeDigest(domain, report)};
+        report.signature = BlsKeyFromLabel(SeatLabel("s" + std::to_string(seat))).Sign(std::span<const unsigned char>{digest.data(), digest.size()}).Compressed();
+        if (!valid) report.signature.front() ^= 1;
+        return EncodeMessage(Message{report}, c.At(0).rig->profile).value();
+    }};
+    Seat& seat0{c.At(0)};
+    for (uint64_t target{2}; target <= 101; ++target) RequireOk(seat0.pbft->OnMessage(1, report_from(1, target, true)), "a report");
+    PbftStatus status{seat0.pbft->Status()};
+    BOOST_CHECK_EQUAL(status.reports_held, 1U); // the highest target only
+    BOOST_CHECK_EQUAL(status.view, 0U);
+    BOOST_CHECK(!status.changing);
+    // A lower target from that seat after a higher one is stale.
+    RequireOk(seat0.pbft->OnMessage(1, report_from(1, 50, true)), "a stale lower target");
+    BOOST_CHECK_EQUAL(seat0.pbft->Status().reports_held, 1U);
+    // The held report again with a broken signature: known (seat, target), dropped before any verification.
+    RequireOk(seat0.pbft->OnMessage(1, report_from(1, 101, false)), "a replay with a broken signature");
+    // A report not held with a broken signature is still refused.
+    const Result<void> forged{seat0.pbft->OnMessage(2, report_from(2, 101, false))};
+    BOOST_REQUIRE(!forged.has_value());
+    BOOST_CHECK(forged.error().code == ErrorCode::VERIFY_FAILED);
+    BOOST_CHECK(forged.error().detail == PBFT_REPORT_SIGNATURE);
+    BOOST_CHECK_EQUAL(seat0.pbft->Status().reports_held, 1U);
+    // f + 1 = 2 reports for target 101 synchronise seat 0 into CHANGING 101; nothing below the target is kept.
+    RequireOk(seat0.pbft->OnMessage(2, report_from(2, 101, true)), "the second report");
+    status = seat0.pbft->Status();
+    BOOST_CHECK_EQUAL(status.view, 101U);
+    BOOST_CHECK(status.changing);
+    BOOST_CHECK_EQUAL(status.reports_held, 3U); // seats 1 and 2 and its own
+}
+
 BOOST_AUTO_TEST_SUITE_END()

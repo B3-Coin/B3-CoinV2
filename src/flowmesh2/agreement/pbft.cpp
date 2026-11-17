@@ -243,26 +243,46 @@ Result<void> PbftAgreement::ResumeViewState(const state::HeadView& head)
             }
         }
     } else {
-        // Durable VIEW_STATE without its NEW_VIEW: the seat was CHANGING; its report, if signed, is in the signer log.
+        // Durable VIEW_STATE without its NEW_VIEW: the seat was CHANGING. Its report, if signed, is in the signer log as
+        // the digest it signed and the signature. The report is rebuilt from the durable preparations of this slot and
+        // must reproduce that digest exactly: a preparation learnt after the signature never rewrites a signed report
+        // (PROTOCOL.md), and the highest one is not necessarily the one signed. Rebuilt with its statement, the retry
+        // timer resends it like any report (review of 2026-11-16, R5: a restarted seat never resent its report, and the
+        // report it rebuilt from the highest preparation could no longer match its signature).
         m_slot.changing = true;
+        // CHANGING waits for q reports before its timer runs (EnterChanging): the slot's timer that StartSlot armed would
+        // otherwise move a restarted seat to the next view after one timeout, alone.
+        m_slot.timer_running = false;
         const storage::VoteKey key{m_domain, m_slot.epoch, m_slot.slot, m_slot.view, storage::VotePhase::VIEW_CHANGE};
-        if (const std::optional<storage::VoteSignature> signature{m_signer_log.SignedStatement(key)}) {
+        if (const std::optional<storage::SignedVoteRecord> signed_report{m_signer_log.SignedVote(key)}) {
             ViewChange report;
             report.epoch = m_slot.epoch;
             report.slot = m_slot.slot;
             report.new_view = m_slot.view;
             report.seat = m_config.self_seat;
-            if (const std::optional<storage::PreparedQcRecord> prepared{m_commit_log.HighestPrepared(m_slot.slot)};
-                prepared.has_value() && prepared->view < m_slot.view) {
-                const Result<SlotCertificate> cert{SlotCertificate::Decode(prepared->qc)};
-                if (cert.has_value()) report.prepared = PreparedCert{prepared->view, *cert};
+            report.signature = signed_report->signature;
+            // The candidates: no preparation, then every durable preparation below the target.
+            std::vector<std::optional<PreparedCert>> candidates{std::nullopt};
+            for (const storage::PreparedQcRecord& prepared : m_commit_log.PreparedAt(m_slot.slot)) {
+                if (prepared.view >= m_slot.view) continue;
+                const Result<SlotCertificate> cert{SlotCertificate::Decode(prepared.qc)};
+                if (cert.has_value()) candidates.emplace_back(PreparedCert{prepared.view, *cert});
             }
-            report.signature = *signature;
+            bool matched{false};
+            for (const std::optional<PreparedCert>& candidate : candidates) {
+                report.prepared = candidate;
+                if (ViewChangeDigest(m_domain, report) == signed_report->digest) {
+                    matched = true;
+                    break;
+                }
+            }
+            // The signer log signed a digest no durable preparation reproduces: the two logs disagree about the past.
+            if (!matched) return Error{ErrorCode::VERIFY_FAILED, PBFT_REPORT_RECOVERY};
             Result<std::vector<unsigned char>> bytes{EncodeMessage(Message{report}, m_profile)};
-            if (bytes.has_value()) {
-                m_slot.own_report = std::move(bytes).value();
-                m_slot.reports[m_slot.view].emplace(m_config.self_seat, report);
-            }
+            if (!bytes.has_value()) return bytes.error();
+            m_slot.own_report = std::move(bytes).value();
+            m_slot.own_report_statement = OutboundVote::Recovered(*signed_report);
+            m_slot.reports[m_slot.view].emplace(m_config.self_seat, report);
         }
     }
     if (const std::optional<storage::PreparedQcRecord> prepared{m_commit_log.HighestPrepared(m_slot.slot)}) {
@@ -308,6 +328,7 @@ PbftStatus PbftAgreement::Status()
     status.commit_votes = static_cast<uint32_t>(m_slot.commits.size());
     status.selected_missing = !m_slot.selected.IsNull() && !m_slot.known_proposals.contains(m_slot.selected);
     status.ahead_hint = AheadHint().value_or(0);
+    for (const auto& [target, by_seat] : m_slot.reports) status.reports_held += static_cast<uint32_t>(by_seat.size());
     return status;
 }
 
@@ -477,6 +498,10 @@ Result<void> PbftAgreement::ProposeHeaderBody(const SlotHeaderV2& header, const 
     Result<storage::PendingProposal> pending{
         m_signer_log.AppendAcceptedProposal(storage::ProposalKey{m_slot.epoch, m_slot.slot, m_slot.view}, header, body)};
     if (!pending.has_value()) return pending.error();
+    // ACCEPTED_PROPOSAL is durable before the proposal leaves (review of 2026-11-16, R4): a leader that crashed between
+    // the send and its own B-INTENT came back without the proposal it had put on the wire, and the view was lost. The
+    // leader's PREPARE barriers right after, so this costs nothing on the happy path.
+    if (Result<uint64_t> barrier{m_signer_log.Barrier()}; !barrier.has_value()) return barrier.error();
     Result<std::vector<unsigned char>> bytes{EncodeMessage(Message{proposal}, m_profile)};
     if (!bytes.has_value()) return bytes.error();
     m_slot.accepted = proposal;
@@ -606,28 +631,26 @@ Result<void> PbftAgreement::OnVote(uint32_t from, const Vote& vote)
     const uint256 accepted{m_slot.accepted->header.Hash()};
     if (vote.phase == storage::VotePhase::PREPARE) {
         if (vote.view != m_slot.view) return Ok(); // another view's preparation
+        // A vote already counted costs no BLS work (review of 2026-11-16, R6); a conflicting one is verified before it is
+        // called a double vote (evidence names two signatures of the seat).
+        const auto known{m_slot.prepares.find(vote.seat)};
+        if (known != m_slot.prepares.end() && known->second.header_hash == vote.header_hash) return Ok(); // a retransmission
         if (const Result<void> ok{VerifySeatSignature(vote.seat, PrepareDigest(m_domain, m_slot.epoch, m_slot.slot, vote.view, vote.header_hash), vote.signature,
                                                      PBFT_VOTE_SIGNATURE)};
             !ok.has_value()) {
             return ok.error();
         }
-        if (const auto it{m_slot.prepares.find(vote.seat)}; it != m_slot.prepares.end()) {
-            if (it->second.header_hash != vote.header_hash) return OnDoubleVote(it->second, vote);
-            return Ok(); // a retransmission
-        }
+        if (known != m_slot.prepares.end()) return OnDoubleVote(known->second, vote);
         if (vote.header_hash != accepted) return Ok(); // a valid vote for a header we did not accept: not ours to count
         m_slot.prepares.emplace(vote.seat, vote);
         return CountPrepare(vote);
     }
     if (vote.phase != storage::VotePhase::COMMIT) return Invalid(storage::VOTE_PHASE);
     if (vote.header_hash != accepted) return Ok();
+    if (m_slot.commits.contains(vote.seat)) return Ok(); // a retransmission (commits hold the accepted header only): no BLS work (R6)
     if (const Result<void> ok{VerifySeatSignature(vote.seat, m_slot.accepted->header.CommitDigest(), vote.signature, PBFT_VOTE_SIGNATURE)};
         !ok.has_value()) {
         return ok.error();
-    }
-    if (const auto it{m_slot.commits.find(vote.seat)}; it != m_slot.commits.end()) {
-        if (it->second.header_hash != vote.header_hash) return Error{ErrorCode::EQUIVOCATION_REFUSED, PBFT_DOUBLE_VOTE};
-        return Ok();
     }
     m_slot.commits.emplace(vote.seat, vote);
     return CountCommit(vote);
@@ -853,6 +876,7 @@ Result<void> PbftAgreement::EnterChanging(uint64_t target)
     if (Result<uint64_t> barrier{m_signer_log.Barrier()}; !barrier.has_value()) return barrier.error();
     m_slot.view = target;
     m_slot.changing = true;
+    std::erase_if(m_slot.reports, [target](const auto& by_target) { return by_target.first < target; }); // old targets (R6)
     m_slot.selected.SetNull();
     m_slot.accepted.reset();
     m_slot.accepted_pending.reset();
@@ -894,6 +918,17 @@ Result<void> PbftAgreement::OnViewChangeReport(uint32_t from, const ViewChange& 
     if (report.seat != from) return Invalid(PBFT_VOTE_SEAT);
     if (report.new_view < m_slot.view) return Ok(); // an old target
     if (from != m_config.self_seat) {
+        // Bounded storage, and no BLS work for a report already held (review of 2026-11-16, R6): one report per seat per
+        // target, and above the current view one report per seat, its highest target (a seat that moved on supersedes its
+        // lower reports, as PBFT view changes do), so at most 2k - 1 reports are ever kept whatever targets a seat names.
+        if (const auto target{m_slot.reports.find(report.new_view)}; target != m_slot.reports.end() && target->second.contains(report.seat)) {
+            return Ok(); // one report per seat per target
+        }
+        if (report.new_view > m_slot.view) {
+            for (const auto& [target, by_seat] : m_slot.reports) {
+                if (target > report.new_view && by_seat.contains(report.seat)) return Ok(); // the seat reported a higher target already
+            }
+        }
         if (const Result<void> ok{VerifySeatSignature(report.seat, ViewChangeDigest(m_domain, report), report.signature, PBFT_REPORT_SIGNATURE)};
             !ok.has_value()) {
             return ok.error();
@@ -915,9 +950,20 @@ Result<void> PbftAgreement::OnViewChangeReport(uint32_t from, const ViewChange& 
                 m_slot.prepared = report.prepared;
             }
         }
-        auto& reports{m_slot.reports[report.new_view]};
-        if (const auto it{reports.find(report.seat)}; it != reports.end()) return Ok(); // one report per seat per target
-        reports.emplace(report.seat, report);
+        if (report.new_view > m_slot.view) {
+            // The seat's lower reports above the current view are superseded.
+            for (auto it{m_slot.reports.begin()}; it != m_slot.reports.end();) {
+                if (it->first > m_slot.view && it->first < report.new_view) {
+                    it->second.erase(report.seat);
+                    if (it->second.empty()) {
+                        it = m_slot.reports.erase(it);
+                        continue;
+                    }
+                }
+                ++it;
+            }
+        }
+        m_slot.reports[report.new_view].emplace(report.seat, report);
     }
     const auto& reports{m_slot.reports[report.new_view]};
     const size_t quorum{m_seats.Quorum()};

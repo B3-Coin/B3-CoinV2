@@ -6,6 +6,7 @@
 #define B3_FLOWMESH2_AGREEMENT_OUTBOUND_H
 
 #include <flowmesh2/storage/durable.h>
+#include <flowmesh2/storage/signer_log.h>
 #include <flowmesh2/storage/tokens.h>
 #include <uint256.h>
 
@@ -29,10 +30,19 @@ class OutboundVote
 public:
     OutboundVote() = delete;
 
-    //! The only constructor path: from a durable signed vote.
+    //! The constructor path of a vote or statement signed now: from a durable signed vote.
     static OutboundVote From(const DurableSignedVote& vote)
     {
         return OutboundVote{vote.Binding().key, vote.Binding().digest, vote.Binding().signature};
+    }
+    /** The other path, after a restart: the signed record the signer log read
+     * back from its journal (SignerLog::SignedVote), so the seat resends the
+     * statement it signed before the restart (review of 2026-11-16, R5).
+     * Durable by construction: nothing is signed here.
+     */
+    static OutboundVote Recovered(const storage::SignedVoteRecord& record)
+    {
+        return OutboundVote{record.key, record.digest, record.signature};
     }
 
     const storage::VoteKey& Key() const { return m_key; }

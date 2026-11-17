@@ -208,6 +208,12 @@ public:
     Result<PendingSignedVote> AppendSignedVote(const DurableIntent& intent, const VoteSignature& signature);
     //! The signature this log holds for `key` (a vote or a statement), if it was signed.
     std::optional<VoteSignature> SignedStatement(const VoteKey& key) const;
+    /** The signed record of `key` (its digest, signature and intent), if it
+     * was signed: what a restarted seat needs to rebuild and resend the
+     * statement it signed before (review of 2026-11-16, R5). Durable by
+     * construction: the log read it back from its journal.
+     */
+    std::optional<SignedVoteRecord> SignedVote(const VoteKey& key) const;
     //! Journal::Barrier of the signer journal (B-INTENT, B-VOTE).
     Result<uint64_t> Barrier() { return m_journal->Barrier(); }
     //! Journal::Confirm: B-INTENT.

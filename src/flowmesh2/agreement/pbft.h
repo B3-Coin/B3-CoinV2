@@ -82,7 +82,13 @@
  *     (VIEW_STATE, NEW_VIEW_ACCEPTED, B) and prepares the proposal of that
  *     view only if its header is the selected one (or any valid header when
  *     nothing was prepared). A proposal that arrives before its NEW_VIEW
- *     waits (one per seat).
+ *     waits (one per seat). Reports are kept one per seat per target and,
+ *     above the current view, one per seat (its highest target), at most
+ *     2k - 1 in all, and a report or vote already held costs no
+ *     verification; a seat restarted while CHANGING rebuilds the report it
+ *     signed from the signer log's digest and the durable preparations
+ *     (VERIFY_FAILED PBFT_REPORT_RECOVERY when none reproduces it) and
+ *     resends it (review of 2026-11-16, R5 and R6).
  *
  * Safety rules the seat never breaks (PbftSafetyRules, M4-AGR-01): one
  * proposal per (epoch, slot, view); a proposal is prepared only in its
@@ -156,6 +162,7 @@ inline constexpr std::string_view PBFT_MESSAGE_SLOT{"message for another slot"};
 inline constexpr std::string_view PBFT_VIEW_STALE{"message for an older view"};                              //!< (INVALID_INPUT)
 inline constexpr std::string_view PBFT_NO_PROPOSAL{"no accepted proposal in this view"};                     //!< (ORDER_VIOLATION)
 inline constexpr std::string_view PBFT_PREPARED_MISMATCH{"the PreparedQC is not this view's or header's"};   //!< (INVALID_INPUT)
+inline constexpr std::string_view PBFT_REPORT_RECOVERY{"the signed view-change report cannot be rebuilt from the durable preparations"}; //!< (VERIFY_FAILED)
 
 //! Votes for a slot that arrive before its proposal are kept up to this many. PROVISIONAL.
 inline constexpr size_t MAX_EARLY_VOTES{64};
@@ -237,6 +244,7 @@ struct PbftStatus {
     uint32_t commit_votes{0};
     bool selected_missing{false}; //!< a NEW_VIEW selected a header this seat does not hold (the leader must fetch it, O-101)
     uint64_t ahead_hint{0};       //!< AheadHint() or 0: f + 1 peers claim a slot beyond this one (catch-up, O-101)
+    uint32_t reports_held{0};     //!< view-change reports kept for this slot over every target: at most 2k - 1 (R6)
 
     friend bool operator==(const PbftStatus&, const PbftStatus&) = default;
 };

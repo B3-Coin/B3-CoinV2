@@ -253,6 +253,13 @@ std::optional<VoteSignature> SignerLog::SignedStatement(const VoteKey& key) cons
     return it->second.signature;
 }
 
+std::optional<SignedVoteRecord> SignerLog::SignedVote(const VoteKey& key) const
+{
+    const auto it{m_votes.find(key)};
+    if (it == m_votes.end() || !it->second.signature.has_value()) return std::nullopt;
+    return SignedVoteRecord{key, it->second.digest, *it->second.signature, it->second.intent_seq};
+}
+
 Result<PendingIntent> SignerLog::AppendIntent(const VoteKey& key, const uint256& digest, const PendingProposal& proposal)
 {
     if (m_journal->IsFatal()) return Error{ErrorCode::FENCED, JOURNAL_FENCED};

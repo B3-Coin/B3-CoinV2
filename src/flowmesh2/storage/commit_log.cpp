@@ -274,4 +274,13 @@ std::optional<PreparedQcRecord> CommitLog::HighestPrepared(uint64_t slot) const
     return highest;
 }
 
+std::vector<PreparedQcRecord> CommitLog::PreparedAt(uint64_t slot) const
+{
+    std::vector<PreparedQcRecord> prepared;
+    for (const auto& [key, entry] : m_prepared) { // keyed by (epoch, slot, view): ascending view within the slot
+        if (key.slot == slot) prepared.push_back(entry.record);
+    }
+    return prepared;
+}
+
 } // namespace flowmesh2::storage
