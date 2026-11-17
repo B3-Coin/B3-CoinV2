@@ -43,7 +43,12 @@
  *                            SSE (M5-API-02): events `id: epoch:seq:head`,
  *                            `event: snapshot|delta|heartbeat|gap`, `data:` JSON;
  *                            a heartbeat every heartbeat_ms; `gap` closes the
- *                            stream (resubscribe with from=)
+ *                            stream (resubscribe with from=). A client that
+ *                            reads slower than events come has its events wait
+ *                            in the hub once stream_output_bytes are queued to
+ *                            its connection; the hub's queue cap then ends the
+ *                            stream with a gap, so a slow reader never grows this
+ *                            process's memory (review 2026-11-16, R2)
  *   GET  <static>            documents the owner registers (AddStatic: for
  *                            example /v2/genesis), served verbatim
  * JSON: hashes and ids as hex, encoded structures (envelopes, leaves, roots,
@@ -96,6 +101,7 @@ struct HttpsSseConfig {
     uint64_t reply_deadline_ms{2'000};         //!< how long a POST waits for the node's Pump
     uint64_t heartbeat_ms{1'000};              //!< SSE heartbeat
     size_t max_action_index{65'536};           //!< ADMITTED/DUPLICATE frames kept for GET /v2/actions/{id}
+    size_t stream_output_bytes{1024 * 1024};   //!< bytes queued to one SSE connection before its events wait in the hub (review 2026-11-16, R2)
 };
 
 struct HttpsSseStatus {
@@ -104,6 +110,7 @@ struct HttpsSseStatus {
     size_t streams{0};
     uint64_t requests_served{0};
     uint64_t refused{0};     //!< by a limit
+    size_t stream_output_bytes{0}; //!< the most bytes queued to one SSE connection, sampled at the last pump
 };
 
 class HttpsSseApi final : public ClientApi

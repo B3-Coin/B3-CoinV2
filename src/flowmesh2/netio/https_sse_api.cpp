@@ -164,6 +164,8 @@ struct HttpsSseApi::Impl {
     void Remember(const ActionId& id, std::vector<unsigned char> frame);
     void SendEvent(Stream& stream, const std::string& id, std::string_view event, const std::string& data);
     void CloseStream(uint64_t key, bool gap);
+    //! Bytes queued to the stream's connection and not yet written to its socket.
+    static size_t QueuedOutput(const Stream& stream);
 };
 
 HttpsSseApi::Impl::~Impl()
@@ -320,7 +322,10 @@ void HttpsSseApi::Stop()
 {
     if (!m_impl) return;
     if (m_impl->running.exchange(false)) {
-        event_base_loopbreak(m_impl->base);
+        // The loop may not have entered event_base_loop yet, and libevent clears a loopbreak on entry, so a Stop right after
+        // Create used to hang in join. The wake event stays active until the loop processes it, whenever that is, and its
+        // callback breaks the loop from inside (review 2026-11-16).
+        if (m_impl->wake != nullptr) event_active(m_impl->wake, 0, 0);
         if (m_impl->thread.joinable()) m_impl->thread.join();
         for (auto& [key, stream] : m_impl->streams) (void)m_impl->backend.Unsubscribe(stream.id);
         m_impl->streams.clear();
@@ -339,8 +344,24 @@ bufferevent* HttpsSseApi::Impl::OnNewConnection(event_base* base, void* arg)
 // ---- Requests ------------------------------------------------------------------------
 
 void HttpsSseApi::Impl::OnRequest(evhttp_request* req, void* arg) NO_THREAD_SAFETY_ANALYSIS { static_cast<Impl*>(arg)->Handle(req); }
-void HttpsSseApi::Impl::OnWake(evutil_socket_t, short, void* arg) NO_THREAD_SAFETY_ANALYSIS { static_cast<Impl*>(arg)->Pump(); }
-void HttpsSseApi::Impl::OnTimer(evutil_socket_t, short, void* arg) NO_THREAD_SAFETY_ANALYSIS { static_cast<Impl*>(arg)->Pump(); }
+void HttpsSseApi::Impl::OnWake(evutil_socket_t, short, void* arg) NO_THREAD_SAFETY_ANALYSIS
+{
+    auto* self{static_cast<Impl*>(arg)};
+    if (!self->running) {
+        event_base_loopbreak(self->base); // Stop() asked, from inside the loop so it is never lost
+        return;
+    }
+    self->Pump();
+}
+void HttpsSseApi::Impl::OnTimer(evutil_socket_t, short, void* arg) NO_THREAD_SAFETY_ANALYSIS
+{
+    auto* self{static_cast<Impl*>(arg)};
+    if (!self->running) {
+        event_base_loopbreak(self->base);
+        return;
+    }
+    self->Pump();
+}
 
 void HttpsSseApi::Impl::OnClose(evhttp_connection* conn, void* arg) NO_THREAD_SAFETY_ANALYSIS
 {
@@ -407,8 +428,15 @@ bool HttpsSseApi::Impl::Admit(evhttp_request* req, const std::string& ip)
 void HttpsSseApi::Impl::Release(const std::string& ip)
 {
     if (open_total > 0) --open_total;
-    if (auto it{open_per_ip.find(ip)}; it != open_per_ip.end() && it->second > 0) --it->second;
-    if (auto it{open_per_group.find(NetGroupOf(ip))}; it != open_per_group.end() && it->second > 0) --it->second;
+    // Entries at zero leave the maps, so they do not grow with every address ever seen (review 2026-11-16).
+    if (auto it{open_per_ip.find(ip)}; it != open_per_ip.end()) {
+        if (it->second > 0) --it->second;
+        if (it->second == 0) open_per_ip.erase(it);
+    }
+    if (auto it{open_per_group.find(NetGroupOf(ip))}; it != open_per_group.end()) {
+        if (it->second > 0) --it->second;
+        if (it->second == 0) open_per_group.erase(it);
+    }
 }
 
 void HttpsSseApi::Impl::Remember(const ActionId& id, std::vector<unsigned char> frame)
@@ -592,6 +620,14 @@ void HttpsSseApi::Impl::SendEvent(Stream& stream, const std::string& id, std::st
     stream.last_send = Clock::now();
 }
 
+size_t HttpsSseApi::Impl::QueuedOutput(const Stream& stream)
+{
+    if (stream.conn == nullptr) return 0;
+    bufferevent* bev{evhttp_connection_get_bufferevent(stream.conn)};
+    if (bev == nullptr) return 0;
+    return evbuffer_get_length(bufferevent_get_output(bev));
+}
+
 void HttpsSseApi::Impl::CloseStream(uint64_t key, bool gap)
 {
     const auto it{streams.find(key)};
@@ -646,16 +682,25 @@ void HttpsSseApi::Impl::Pump()
         }
         ++it;
     }
-    // Streams: events, gaps, heartbeats.
+    // Streams: events, gaps, heartbeats. CloseStream erases from the map, so the keys to close are collected and closed
+    // after the loop (review 2026-11-16, defect 5: a gap used to erase the element the loop was on).
     std::vector<uint64_t> gone;
+    std::vector<uint64_t> gapped;
+    size_t most_queued{0};
     for (auto& [key, stream] : streams) {
         if (stream.req == nullptr) {
             gone.push_back(key);
             continue;
         }
-        Result<std::vector<StreamEvent>> events{backend.TakeEvents(stream.id, 64)};
+        // Backpressure (R2): a connection with stream_output_bytes queued takes no more events this round; they wait in the
+        // hub, whose queue cap ends a stream that stays behind with a gap.
+        const size_t queued{QueuedOutput(stream)};
+        most_queued = std::max(most_queued, queued);
+        // A stalled connection takes nothing (max 0), which still reports the gap the hub declared once the reader fell too far
+        // behind: the stream then ends with the gap event instead of lingering until the connection times out.
+        Result<std::vector<StreamEvent>> events{backend.TakeEvents(stream.id, queued >= cfg.stream_output_bytes ? 0 : 64)};
         if (!events.has_value()) {
-            CloseStream(key, /*gap=*/true);
+            gapped.push_back(key);
             continue;
         }
         for (const StreamEvent& event : *events) {
@@ -667,8 +712,15 @@ void HttpsSseApi::Impl::Pump()
             SendEvent(stream, "", "heartbeat", "{}");
         }
     }
+    for (const uint64_t key : gapped) CloseStream(key, /*gap=*/true);
     for (const uint64_t key : gone) CloseStream(key, false);
+    // Addresses whose minute of arrivals has passed leave the rate map.
+    for (auto it{recent_per_ip.begin()}; it != recent_per_ip.end();) {
+        while (!it->second.empty() && now - it->second.front() > std::chrono::seconds{60}) it->second.pop_front();
+        it = it->second.empty() ? recent_per_ip.erase(it) : std::next(it);
+    }
     LOCK(mutex);
+    status.stream_output_bytes = most_queued;
     status.open_requests = 0;
     for (const auto& [id, item] : pending) {
         if (item.req != nullptr) ++status.open_requests;

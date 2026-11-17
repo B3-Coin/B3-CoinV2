@@ -124,6 +124,22 @@ public:
         return DecodeChunked(raw);
     }
 
+    //! Read what the open stream connection delivers within `limit` (decoded chunks); the connection stays open.
+    std::string ReadMore(std::chrono::milliseconds limit)
+    {
+        if (!m_connected) return {};
+        std::string raw;
+        char buf[4096];
+        const auto deadline{std::chrono::steady_clock::now() + limit};
+        while (std::chrono::steady_clock::now() < deadline) {
+            const int n{BIO_read(m_bio, buf, sizeof(buf))};
+            if (n <= 0) break;
+            raw.append(buf, static_cast<size_t>(n));
+            if (raw.find("event: gap") != std::string::npos || raw.find("\r\n0\r\n") != std::string::npos) break;
+        }
+        return DecodeChunks(raw);
+    }
+
     static Response Parse(const std::string& raw)
     {
         Response out;
@@ -211,9 +227,9 @@ struct Rig {
     std::thread pumper;
     fs::path dir;
 
-    explicit Rig(HttpsSseConfig config = {})
+    explicit Rig(HttpsSseConfig config = {}, const SimNodeConfig& node_config = {})
     {
-        Result<std::unique_ptr<SimNode>> created{SimNode::Create(SimNodeConfig{}, trace)};
+        Result<std::unique_ptr<SimNode>> created{SimNode::Create(node_config, trace)};
         RequireOk(created, "SimNode::Create");
         node = std::move(created).value();
         const std::vector<MarketDescriptor> markets{node->Markets().begin(), node->Markets().end()};
@@ -468,6 +484,83 @@ BOOST_AUTO_TEST_CASE(limits_and_timeouts_refuse_and_never_leak)
         const Response status{later.Request("POST", "/v2/actions/status", rig.Frame(bid))};
         BOOST_CHECK_EQUAL(status.status, 200);
         BOOST_CHECK_EQUAL(Json(status.body)["status"].get_str(), "PENDING");
+    }
+}
+
+BOOST_AUTO_TEST_CASE(a_gap_closes_streams_cleanly_and_new_readers_are_served)
+{
+    // Review of 2026-11-16, defect 5: a gap closed the stream from inside the loop over the streams map, erasing the
+    // element the loop was on. Two readers fall behind at once (the node seals more slots than the hub queues
+    // between two pumps); both streams end with a gap event, the map survives, and a new reader is served.
+    HttpsSseConfig config;
+    SimNodeConfig node_config;
+    node_config.streams.max_queued_events = 8;
+    Rig rig{config, node_config};
+    const uint16_t port{rig.api->Port()};
+    TlsClient one{port, TLS1_3_VERSION, TLS1_3_VERSION};
+    TlsClient two{port, TLS1_3_VERSION, TLS1_3_VERSION};
+    BOOST_CHECK(one.Stream("/v2/stream?channel=slots", "event: snapshot", std::chrono::milliseconds{3'000}).find("event: snapshot") != std::string::npos);
+    BOOST_CHECK(two.Stream("/v2/stream?channel=slots", "event: snapshot", std::chrono::milliseconds{3'000}).find("event: snapshot") != std::string::npos);
+    BOOST_CHECK_EQUAL(rig.api->Status().streams, 2U);
+    // No pump while twelve slots are sealed: both queues overflow the cap of eight.
+    rig.pumping = false;
+    if (rig.pumper.joinable()) rig.pumper.join();
+    for (int i{0}; i < 12; ++i) RequireOk(rig.node->SealSlot(), "SealSlot");
+    rig.api->Notify();
+    const auto deadline{std::chrono::steady_clock::now() + std::chrono::seconds{5}};
+    while (rig.api->Status().streams > 0 && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(std::chrono::milliseconds{5});
+    BOOST_CHECK_EQUAL(rig.api->Status().streams, 0U);
+    BOOST_CHECK(one.ReadMore(std::chrono::milliseconds{2'000}).find("event: gap") != std::string::npos);
+    BOOST_CHECK(two.ReadMore(std::chrono::milliseconds{2'000}).find("event: gap") != std::string::npos);
+    rig.StartPumper();
+    TlsClient later{port, TLS1_3_VERSION, TLS1_3_VERSION};
+    BOOST_CHECK(later.Stream("/v2/stream?channel=slots", "event: snapshot", std::chrono::milliseconds{3'000}).find("event: snapshot") != std::string::npos);
+    BOOST_CHECK_EQUAL(rig.api->Status().streams, 1U);
+}
+
+BOOST_AUTO_TEST_CASE(a_slow_reader_holds_events_in_the_hub_not_in_memory)
+{
+    // Review of 2026-11-16, lead R2 (confirmed): events went into libevent's output buffer however slowly the client
+    // read, so memory grew with the reader's lag and the hub's gap never came. Once stream_output_bytes are queued to a
+    // connection its events wait in the hub; the hub's cap then ends the stream with a gap.
+    HttpsSseConfig config;
+    config.stream_output_bytes = 4 * 1024;
+    SimNodeConfig node_config;
+    node_config.streams.max_queued_events = 64;
+    Rig rig{config, node_config};
+    const uint16_t port{rig.api->Port()};
+    TlsClient slow{port, TLS1_3_VERSION, TLS1_3_VERSION};
+    BOOST_CHECK(slow.Stream("/v2/stream?channel=slots", "event: snapshot", std::chrono::milliseconds{3'000}).find("event: snapshot") != std::string::npos);
+    // The reader stops reading; the node goes on sealing until the socket buffers are full and the hub's queue overflows.
+    size_t most_queued{0};
+    const auto deadline{std::chrono::steady_clock::now() + std::chrono::seconds{30}};
+    while (rig.api->Status().streams > 0 && std::chrono::steady_clock::now() < deadline) {
+        for (int i{0}; i < 50; ++i) RequireOk(rig.node->SealSlot(), "SealSlot");
+        rig.api->Notify();
+        std::this_thread::sleep_for(std::chrono::milliseconds{5});
+        most_queued = std::max(most_queued, rig.api->Status().stream_output_bytes);
+    }
+    BOOST_CHECK_EQUAL(rig.api->Status().streams, 0U);
+    // Bounded by the cap plus one round of events; the lag itself stayed in the hub.
+    BOOST_CHECK_LE(most_queued, config.stream_output_bytes + 64 * 1024);
+    BOOST_CHECK(slow.ReadMore(std::chrono::milliseconds{3'000}).find("event: gap") != std::string::npos);
+}
+
+BOOST_AUTO_TEST_CASE(stop_right_after_create_returns)
+{
+    // Review of 2026-11-16 (a reviewer's lead, confirmed): a Stop before the loop thread entered event_base_loop was lost,
+    // because libevent clears a loopbreak on entry, and join never returned. Stop now asks the loop to stop from inside.
+    Rig rig;
+    for (int i{0}; i < 20; ++i) {
+        HttpsSseConfig config;
+        config.profile = rig.node->Profile();
+        config.dev_self_signed = true;
+        config.self_signed_dir = fs::PathToString(rig.dir);
+        Result<std::unique_ptr<HttpsSseApi>> api{HttpsSseApi::Create(config, rig.node->Api())};
+        RequireOk(api, "Create");
+        const auto started{std::chrono::steady_clock::now()};
+        (*api)->Stop();
+        BOOST_CHECK_LT(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started).count(), 2'000);
     }
 }
 

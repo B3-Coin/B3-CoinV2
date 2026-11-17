@@ -162,6 +162,7 @@ Result<std::unique_ptr<SimNode>> SimNode::Create(const SimNodeConfig& config, Tr
     seat_config.ikm.assign(ikm.begin(), ikm.end());
     seat_config.max_replies = config.max_replies;
     seat_config.pbft = config.pbft;
+    seat_config.streams = config.streams;
     seat::SeatNodeParts seat_parts;
     seat_parts.chain = node->m_traced.get();
     seat_parts.signer_journal = node->m_signer_journal.get();

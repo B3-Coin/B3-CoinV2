@@ -123,6 +123,7 @@ struct SimNodeConfig {
     uint32_t self_seat{0};
     net::SeatMesh* mesh{nullptr};
     agreement::PbftConfig pbft; //!< self_seat is taken from above
+    net::StreamHubLimits streams; //!< the stream hub's limits (tests make the queue small to force a gap)
 };
 
 using SealedSlot = seat::SealedSlot;
