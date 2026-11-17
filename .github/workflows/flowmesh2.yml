@@ -47,7 +47,7 @@ env:
 
 jobs:
   guards:
-    if: github.ref == 'refs/heads/rebirth'
+    if: startsWith(github.ref, 'refs/heads/rebirth') # rebirth and rebirth-* (review of 2026-11-16, question 3)
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
@@ -96,7 +96,7 @@ jobs:
           if-no-files-found: error
 
   asan-ubsan:
-    if: github.ref == 'refs/heads/rebirth'
+    if: startsWith(github.ref, 'refs/heads/rebirth') # rebirth and rebirth-* (review of 2026-11-16, question 3)
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     env:
@@ -153,7 +153,7 @@ jobs:
           if-no-files-found: error
 
   tsan:
-    if: github.ref == 'refs/heads/rebirth'
+    if: startsWith(github.ref, 'refs/heads/rebirth') # rebirth and rebirth-* (review of 2026-11-16, question 3)
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     env:
