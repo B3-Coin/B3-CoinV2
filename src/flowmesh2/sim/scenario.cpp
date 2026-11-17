@@ -226,6 +226,9 @@ bool Driver::Setup()
     case Variant::AUTHORITY_FAULT:
         config.faults.bump_authority_at = 3; // N11
         break;
+    case Variant::PBFT_CLUSTER:
+        NoteHarness("pbft_cluster is not a walking-skeleton variant (RunPbftCluster runs it)");
+        return false;
     }
     Result<std::unique_ptr<SimCluster>> cluster{SimCluster::Create(1, config, m_trace)};
     if (!Got(cluster, "SimCluster::Create")) return false;
@@ -1212,6 +1215,8 @@ RunReport Driver::Run()
         case Variant::AUTHORITY_FAULT:
             done = ScriptAuthorityFault();
             break;
+        case Variant::PBFT_CLUSTER:
+            break; // Setup refused it already
         }
         if (!done && m_harness.empty()) NoteHarness("the script stopped without a reason");
         CheckTrace();

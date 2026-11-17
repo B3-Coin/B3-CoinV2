@@ -99,7 +99,7 @@ bool SimCluster::Dropped(uint32_t from, uint32_t to)
 {
     for (const DropRule& rule : m_faults.drop) {
         if (rule.from_seat != from || rule.to_seat != to || rule.per_mille == 0) continue;
-        if (m_rng.randrange(1000) < rule.per_mille) return true;
+        if (m_rng.randrange(uint32_t{1000}) < rule.per_mille) return true; // both unsigned: the draw's type follows its bound
     }
     return false;
 }

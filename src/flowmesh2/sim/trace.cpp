@@ -39,6 +39,8 @@ std::string_view RolePrefix(storage::JournalRole role)
         return "signer";
     case storage::JournalRole::COMMIT:
         return "commit";
+    case storage::JournalRole::OUTBOX:
+        return "outbox"; // the client's journal (cli/outbox.h); no simulator writes one, the prefix is total
     }
     return "journal";
 }
