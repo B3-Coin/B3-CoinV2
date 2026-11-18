@@ -34,6 +34,7 @@
 #include <chrono>
 #include <fstream>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <thread>
@@ -282,12 +283,18 @@ UniValue Json(const std::string& text)
 
 //! The node's API with a hand on the stream pump: while `hold` is set, TakeEvents answers no events and leaves the hub's
 //! queues alone. The HTTPS loop pumps the hub on its own timer too, so stopping the rig's pumper did not stop the draining;
-//! a test that needs a queue to overflow holds it here instead of racing that timer.
+//! a test that needs a queue to overflow holds it here instead of racing that timer. The check and the drain run under
+//! one mutex, and Hold takes it: a drain that saw no hold just before Hold(true) finishes before Hold returns, instead of
+//! draining part of what the test seals next (Codex review of 2026-11-18 over 273ac7ca).
 class HeldStreams final : public ClientApi
 {
 public:
     explicit HeldStreams(ClientApi& inner) : m_inner{inner} {}
-    std::atomic<bool> hold{false};
+    void Hold(bool on)
+    {
+        const std::lock_guard<std::mutex> lock{m_mutex};
+        m_hold = on;
+    }
 
     Result<RequestId> Submit(std::span<const unsigned char> frame) override { return m_inner.Submit(frame); }
     Result<RequestId> SubmitStatus(const ActionV2& original) override { return m_inner.SubmitStatus(original); }
@@ -298,13 +305,16 @@ public:
     Result<StreamId> Subscribe(const StreamRequest& request) override { return m_inner.Subscribe(request); }
     Result<std::vector<StreamEvent>> TakeEvents(StreamId id, size_t max) override
     {
-        if (hold) return Ok(std::vector<StreamEvent>{});
+        const std::lock_guard<std::mutex> lock{m_mutex};
+        if (m_hold) return Ok(std::vector<StreamEvent>{});
         return m_inner.TakeEvents(id, max);
     }
     Result<void> Unsubscribe(StreamId id) override { return m_inner.Unsubscribe(id); }
 
 private:
     ClientApi& m_inner;
+    std::mutex m_mutex;
+    bool m_hold{false};
 };
 
 struct Rig {
@@ -597,9 +607,9 @@ BOOST_AUTO_TEST_CASE(a_gap_closes_streams_cleanly_and_new_readers_are_served)
     // Nothing taken from the hub while twelve slots are sealed: both queues overflow the cap of eight. (Stopping the rig's
     // pumper was not enough: the server's own timer pumps the hub every heartbeat_ms / 4 and drained the queues in about
     // four runs of ten.)
-    rig.streams->hold = true;
+    rig.streams->Hold(true);
     for (int i{0}; i < 12; ++i) RequireOk(rig.node->SealSlot(), "SealSlot");
-    rig.streams->hold = false;
+    rig.streams->Hold(false);
     rig.api->Notify();
     const auto deadline{std::chrono::steady_clock::now() + std::chrono::seconds{5}};
     while (rig.api->Status().streams > 0 && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(std::chrono::milliseconds{5});
