@@ -178,6 +178,33 @@ public:
         return raw;
     }
 
+    //! `count` GETs of `path` on one connection (pipelined, keep-alive, the last with Connection: close); the status of
+    //! each reply, in order.
+    std::vector<int> Pipelined(const std::string& path, size_t count)
+    {
+        Disconnect();
+        Connect();
+        BOOST_REQUIRE(m_connected);
+        std::string requests;
+        for (size_t i{0}; i < count; ++i) {
+            requests += "GET " + path + " HTTP/1.1\r\nHost: 127.0.0.1\r\n" + (i + 1 == count ? "Connection: close\r\n" : "") + "\r\n";
+        }
+        BOOST_REQUIRE(BIO_write(m_bio, requests.data(), static_cast<int>(requests.size())) == static_cast<int>(requests.size()));
+        std::string raw;
+        char buf[4096];
+        for (;;) {
+            const int n{BIO_read(m_bio, buf, sizeof(buf))};
+            if (n <= 0) break;
+            raw.append(buf, static_cast<size_t>(n));
+        }
+        Disconnect();
+        std::vector<int> statuses;
+        for (size_t at{raw.find("HTTP/1.1 ")}; at != std::string::npos; at = raw.find("HTTP/1.1 ", at + 1)) {
+            statuses.push_back(std::atoi(raw.substr(at + 9, 3).c_str()));
+        }
+        return statuses;
+    }
+
     static Response Parse(const std::string& raw)
     {
         Response out;
@@ -549,14 +576,14 @@ BOOST_AUTO_TEST_CASE(limits_and_timeouts_refuse_and_never_leak)
         config.max_connections_per_ip = 2;
         Rig rig{config};
         const uint16_t port{rig.api->Port()};
-        // Two streams hold the per-IP budget; a third request is refused with 429 while they are open.
+        // Two streams hold the per-IP budget; a third connection is closed before TLS while they are open (review R1: a
+        // connection, not a request, holds the slot).
         TlsClient one{port, TLS1_3_VERSION, TLS1_3_VERSION};
         TlsClient two{port, TLS1_3_VERSION, TLS1_3_VERSION};
         (void)one.Stream("/v2/stream?channel=slots", "event: snapshot", std::chrono::milliseconds{3'000});
         (void)two.Stream("/v2/stream?channel=slots", "event: snapshot", std::chrono::milliseconds{3'000});
         TlsClient three{port, TLS1_3_VERSION, TLS1_3_VERSION};
-        const Response refused{three.Request("GET", "/v2/health")};
-        BOOST_CHECK_EQUAL(refused.status, 429);
+        BOOST_CHECK(!three.Connected());
         BOOST_CHECK_GE(rig.api->Status().refused, 1U);
         BOOST_CHECK_EQUAL(rig.api->Status().streams, 2U);
     }
@@ -775,6 +802,89 @@ BOOST_AUTO_TEST_CASE(a_stalled_stream_on_a_quiet_hub_times_out_and_frees_its_slo
     BOOST_CHECK(next.Stream("/v2/stream?channel=slots", "event: snapshot", std::chrono::milliseconds{3'000}).find("event: snapshot") != std::string::npos);
 }
 
+BOOST_AUTO_TEST_CASE(connections_that_never_send_a_request_count_against_the_cap)
+{
+    // Review of 2026-11-16, lead R1: only requests and streams were counted (the limits ran from Handle, once a whole
+    // request had arrived), so connections that never sent one, TLS done or not even a ClientHello, were bounded by no
+    // limit: a third connection over max_connections 2 was held until the 10 s request timeout. A connection now counts
+    // from its accept to its close, and one over a limit is closed before its handshake.
+    HttpsSseConfig config;
+    config.max_connections = 2;
+    Rig rig{config};
+    const uint16_t port{rig.api->Port()};
+    const auto entries_become{[&](size_t want) {
+        const auto deadline{std::chrono::steady_clock::now() + std::chrono::seconds{5}};
+        while (rig.api->Status().limit_entries != want && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(std::chrono::milliseconds{10});
+        return rig.api->Status().limit_entries;
+    }};
+    {
+        std::vector<std::unique_ptr<TlsClient>> idle;
+        for (int i{0}; i < 2; ++i) {
+            idle.push_back(std::make_unique<TlsClient>(port, TLS1_3_VERSION, TLS1_3_VERSION));
+            BOOST_REQUIRE(idle.back()->Connected()); // TLS done (so admitted: admission precedes the first read), no request sent
+        }
+        TlsClient extra{port, TLS1_3_VERSION, TLS1_3_VERSION};
+        BOOST_CHECK(!extra.Connected());
+        BOOST_CHECK_GE(rig.api->Status().refused, 1U);
+        BOOST_CHECK_EQUAL(entries_become(2), 2U); // 127.0.0.1 and 127.0
+    }
+    // Both idle clients left: their slots are free again.
+    BOOST_CHECK_EQUAL(entries_become(0), 0U);
+    {
+        TlsClient later{port, TLS1_3_VERSION, TLS1_3_VERSION};
+        BOOST_CHECK_EQUAL(later.Request("GET", "/v2/health").status, 200);
+    }
+    BOOST_CHECK_EQUAL(entries_become(0), 0U);
+    // Sockets that never send a ClientHello count too. The listener accepts in arrival order and admits each before the
+    // loop reads a byte, so the TLS client behind two raw connects is refused without a wait.
+    std::vector<int> raw;
+    for (int i{0}; i < 2; ++i) {
+        const int fd{::socket(AF_INET, SOCK_STREAM, 0)};
+        BOOST_REQUIRE(fd >= 0);
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(port);
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        BOOST_REQUIRE_EQUAL(::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)), 0);
+        raw.push_back(fd);
+    }
+    TlsClient behind{port, TLS1_3_VERSION, TLS1_3_VERSION};
+    BOOST_CHECK(!behind.Connected());
+    for (const int fd : raw) ::close(fd);
+    BOOST_CHECK_EQUAL(entries_become(0), 0U);
+}
+
+BOOST_AUTO_TEST_CASE(handshakes_alone_spend_the_new_connection_budget)
+{
+    // R1's other half: max_new_connections_per_minute was spent by requests only, so connections that finished TLS and
+    // left without a request (probes, a wrong pin) were never limited, each costing the server a handshake. Each admitted
+    // connection now spends it; a refused one does not.
+    HttpsSseConfig config;
+    config.max_new_connections_per_minute = 3;
+    Rig rig{config};
+    for (int i{0}; i < 3; ++i) {
+        TlsClient probe{rig.api->Port(), TLS1_3_VERSION, TLS1_3_VERSION};
+        BOOST_REQUIRE_MESSAGE(probe.Connected(), "probe " << i);
+    }
+    TlsClient over{rig.api->Port(), TLS1_3_VERSION, TLS1_3_VERSION};
+    BOOST_CHECK(!over.Connected());
+    BOOST_CHECK_GE(rig.api->Status().refused, 1U);
+}
+
+BOOST_AUTO_TEST_CASE(requests_on_one_kept_alive_connection_still_spend_the_per_minute_budget)
+{
+    // Kept from before R1's fix (its review check): the per-address budget of max_new_connections_per_minute also counts
+    // requests, so one kept-alive connection cannot send an unbounded number of them into the shared read permits and
+    // lanes. The connection spends one; its first three requests are served, the next two are 429 BUSY.
+    HttpsSseConfig config;
+    config.max_new_connections_per_minute = 3;
+    Rig rig{config};
+    TlsClient client{rig.api->Port(), TLS1_3_VERSION, TLS1_3_VERSION};
+    const std::vector<int> statuses{client.Pipelined("/v2/health", 5)};
+    const std::vector<int> expected{200, 200, 200, 429, 429};
+    BOOST_CHECK_EQUAL_COLLECTIONS(statuses.begin(), statuses.end(), expected.begin(), expected.end());
+}
+
 BOOST_AUTO_TEST_CASE(requests_refused_by_a_full_netgroup_leave_no_entries_in_the_limit_counts)
 {
     // Review workflow of 2026-11-18: the limit check indexed the per-address and per-netgroup counts, so a refused request
@@ -813,7 +923,7 @@ BOOST_AUTO_TEST_CASE(requests_refused_by_a_full_netgroup_leave_no_entries_in_the
     for (int i{2}; i <= 41; ++i) {
         TlsClient other{rig.api->Port(), TLS1_3_VERSION, TLS1_3_VERSION};
         other.SetSource("127.0.0." + std::to_string(i));
-        BOOST_CHECK_EQUAL(other.Request("GET", "/v2/health").status, 429);
+        BOOST_CHECK(!other.Connected()); // closed before TLS (review R1)
     }
     BOOST_CHECK_GE(rig.api->Status().refused, 40U);
     // Let a few pumps pass, so a count that grew would show.

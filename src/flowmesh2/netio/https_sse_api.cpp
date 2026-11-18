@@ -26,6 +26,8 @@
 #include <openssl/x509v3.h>
 
 #include <fcntl.h>
+#include <netdb.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -35,9 +37,11 @@
 #include <deque>
 #include <map>
 #include <mutex>
+#include <new>
 #include <string>
 #include <thread>
 #include <utility>
+#include <vector>
 
 namespace flowmesh2::net {
 
@@ -86,6 +90,33 @@ std::string NetGroupOf(const std::string& address)
     return address;
 }
 
+//! A count by key, looked up, not indexed: a refusal leaves no zero entry (review workflow of 2026-11-18).
+size_t CountOf(const std::map<std::string, size_t>& counts, const std::string& key)
+{
+    const auto it{counts.find(key)};
+    return it == counts.end() ? 0 : it->second;
+}
+
+//! How many arrivals `key` had in the last minute; the older ones are dropped. No entry is created.
+size_t RecentOf(std::map<std::string, std::deque<Clock::time_point>>& recent, const std::string& key, Clock::time_point now)
+{
+    const auto it{recent.find(key)};
+    if (it == recent.end()) return 0;
+    while (!it->second.empty() && now - it->second.front() > std::chrono::seconds{60}) it->second.pop_front();
+    return it->second.size();
+}
+
+//! The peer of an accepted socket, numeric, as libevent's evhttp_connection_get_peer gives it (name_from_addr).
+std::string PeerAddressOf(evutil_socket_t fd)
+{
+    sockaddr_storage storage{};
+    socklen_t len{sizeof(storage)};
+    if (::getpeername(fd, reinterpret_cast<sockaddr*>(&storage), &len) != 0) return std::string{};
+    char host[NI_MAXHOST];
+    if (::getnameinfo(reinterpret_cast<sockaddr*>(&storage), len, host, sizeof(host), nullptr, 0, NI_NUMERICHOST) != 0) return std::string{};
+    return host;
+}
+
 std::string SpkiFingerprint(EVP_PKEY* key)
 {
     unsigned char* der{nullptr};
@@ -122,7 +153,6 @@ struct HttpsSseApi::Impl {
         RequestKind kind{RequestKind::SUBMIT_ACTION};
         evhttp_request* req{nullptr}; //!< null once the client left or the deadline passed
         evhttp_connection* conn{nullptr};
-        std::string ip;
         Clock::time_point deadline;
         std::vector<unsigned char> frame; //!< SUBMIT_ACTION: the bytes, for the action index
     };
@@ -131,14 +161,25 @@ struct HttpsSseApi::Impl {
         StreamId id;
         evhttp_request* req{nullptr};
         evhttp_connection* conn{nullptr};
-        std::string ip;
         Clock::time_point last_send;
     };
     std::map<uint64_t, Stream> streams;
+    // Open connections, from their admission to their SSL_free (review R1: requests were counted, idle connections not).
     std::map<std::string, size_t> open_per_ip;
     std::map<std::string, size_t> open_per_group;
-    std::map<std::string, std::deque<Clock::time_point>> recent_per_ip;
     size_t open_total{0};
+    // Per address, the last minute's admitted connections and requests: each spends max_new_connections_per_minute,
+    // so neither handshake churn nor requests on one kept-alive connection are unbounded.
+    std::map<std::string, std::deque<Clock::time_point>> recent_connections_per_ip;
+    std::map<std::string, std::deque<Clock::time_point>> recent_requests_per_ip;
+    //! One per accepted TLS connection, held in its SSL's ex_data; FreeConn (from SSL_free) releases what it counted.
+    struct Conn {
+        Impl* self{nullptr};
+        std::string ip;
+        bool counted{false}; //!< holds a slot in open_total / open_per_ip / open_per_group
+    };
+    std::vector<bufferevent*> accepted; //!< made by OnNewConnection, not yet admitted; each holds a bufferevent_incref
+    event* admit{nullptr};
     std::map<ActionId, std::vector<unsigned char>> action_index;
     std::deque<ActionId> action_order;
 
@@ -156,12 +197,20 @@ struct HttpsSseApi::Impl {
     static void OnTimer(evutil_socket_t, short, void* arg);
     static void OnClose(evhttp_connection* conn, void* arg);
     static bufferevent* OnNewConnection(event_base* base, void* arg);
+    static int ConnIndex();
+    static void FreeConn(void* parent, void* ptr, CRYPTO_EX_DATA* ad, int idx, long argl, void* argp);
+    //! The admitted Conn of a request's connection; null for one this API did not admit.
+    static const Conn* ConnOf(evhttp_connection* conn);
+    static void OnAdmit(evutil_socket_t, short, void* arg);
+    //! Count a just-accepted connection against the limits, or free it (before TLS: no byte of it was read).
+    void AdmitConnection(bufferevent* bev) EXCLUSIVE_LOCKS_REQUIRED(!mutex);
     void Handle(evhttp_request* req) EXCLUSIVE_LOCKS_REQUIRED(!mutex);
     void Pump() EXCLUSIVE_LOCKS_REQUIRED(!mutex);
     void Reply(evhttp_request* req, int code, const UniValue& body) EXCLUSIVE_LOCKS_REQUIRED(!mutex);
     void ReplyError(evhttp_request* req, int code, std::string_view error, std::string_view reason) EXCLUSIVE_LOCKS_REQUIRED(!mutex);
-    //! A connection unit opened (a request or a stream); false (and a 429 sent) when a limit refuses it.
-    bool Admit(evhttp_request* req, const std::string& ip) EXCLUSIVE_LOCKS_REQUIRED(!mutex);
+    //! A request on an admitted connection spends the address's per-minute budget; false (and a 429 sent) when it is spent.
+    bool AdmitRequest(evhttp_request* req, const std::string& ip) EXCLUSIVE_LOCKS_REQUIRED(!mutex);
+    //! An admitted connection closed (FreeConn).
     void Release(const std::string& ip);
     void Remember(const ActionId& id, std::vector<unsigned char> frame);
     void SendEvent(Stream& stream, const std::string& id, std::string_view event, const std::string& data);
@@ -172,7 +221,13 @@ struct HttpsSseApi::Impl {
 
 HttpsSseApi::Impl::~Impl()
 {
+    // A Stop can end the loop's pass between an accept and its admission (loopbreak returns at once): those keep
+    // OnNewConnection's reference until here.
+    for (bufferevent* bev : accepted) bufferevent_decref(bev);
+    accepted.clear();
+    // evhttp_free and event_base_free free every SSL; FreeConn then calls Release on this Impl, whose maps outlive this body.
     if (http != nullptr) evhttp_free(http);
+    if (admit != nullptr) event_free(admit);
     if (wake != nullptr) event_free(wake);
     if (timer != nullptr) event_free(timer);
     if (base != nullptr) event_base_free(base);
@@ -261,6 +316,7 @@ Result<void> HttpsSseApi::Impl::MakeSelfSigned()
 
 Result<void> HttpsSseApi::Impl::SetupTls()
 {
+    if (ConnIndex() < 0) return Error{ErrorCode::STORAGE_FATAL, HTTPS_TLS};
     ctx = SSL_CTX_new(TLS_server_method());
     if (ctx == nullptr) return Error{ErrorCode::STORAGE_FATAL, HTTPS_TLS};
     if (SSL_CTX_set_min_proto_version(ctx, TLS1_3_VERSION) != 1) return Error{ErrorCode::STORAGE_FATAL, HTTPS_TLS};
@@ -309,7 +365,8 @@ Result<void> HttpsSseApi::Impl::Start()
     }
     wake = event_new(base, -1, EV_PERSIST, &Impl::OnWake, this);
     timer = event_new(base, -1, EV_PERSIST, &Impl::OnTimer, this);
-    if (wake == nullptr || timer == nullptr) return Error{ErrorCode::STORAGE_FATAL, HTTPS_BIND};
+    admit = event_new(base, -1, 0, &Impl::OnAdmit, this);
+    if (wake == nullptr || timer == nullptr || admit == nullptr) return Error{ErrorCode::STORAGE_FATAL, HTTPS_BIND};
     event_add(wake, nullptr);
     const uint64_t period_ms{std::clamp<uint64_t>(cfg.heartbeat_ms / 4, 20, 250)};
     timeval period{static_cast<time_t>(period_ms / 1000), static_cast<suseconds_t>((period_ms % 1000) * 1000)};
@@ -343,9 +400,106 @@ void HttpsSseApi::Stop()
 bufferevent* HttpsSseApi::Impl::OnNewConnection(event_base* base, void* arg)
 {
     auto* self{static_cast<Impl*>(arg)};
-    SSL* ssl{SSL_new(self->ctx)};
-    if (ssl == nullptr) return nullptr;
-    return bufferevent_openssl_socket_new(base, -1, ssl, BUFFEREVENT_SSL_ACCEPTING, BEV_OPT_CLOSE_ON_FREE);
+    bufferevent* bev{nullptr};
+    if (SSL* ssl{SSL_new(self->ctx)}; ssl != nullptr) {
+        auto* conn{new (std::nothrow) Conn{self, {}, false}};
+        if (conn != nullptr && SSL_set_ex_data(ssl, ConnIndex(), conn) == 1) {
+            // On failure libevent frees the SSL (BEV_OPT_CLOSE_ON_FREE), and FreeConn the Conn with it.
+            bev = bufferevent_openssl_socket_new(base, -1, ssl, BUFFEREVENT_SSL_ACCEPTING, BEV_OPT_CLOSE_ON_FREE);
+        } else {
+            delete conn;
+            SSL_free(ssl);
+        }
+    }
+    // No TLS: a bufferevent of this API's own anyway, which OnAdmit frees before a byte is read. A null here made libevent
+    // serve the socket as plain HTTP (review 2026-11-16, R1).
+    if (bev == nullptr) bev = bufferevent_socket_new(base, -1, BEV_OPT_CLOSE_ON_FREE);
+    if (bev == nullptr) return nullptr; // libevent's own plain fallback, if it can: Handle serves nothing on it (ConnOf)
+    // Admission needs the socket, which evhttp sets on the bufferevent only after this callback returns (and before any
+    // read: http.c evhttp_get_request_connection). An event activated now runs in this loop pass, after the accept and
+    // before the next poll reads a byte.
+    try {
+        self->accepted.push_back(bev);
+    } catch (const std::bad_alloc&) {
+        return bev; // never admitted: Handle serves nothing on it, and the request timeout ends it
+    }
+    bufferevent_incref(bev); // valid in OnAdmit even if evhttp frees it first
+    event_active(self->admit, EV_TIMEOUT, 0);
+    return bev;
+}
+
+int HttpsSseApi::Impl::ConnIndex()
+{
+    static const int index{SSL_get_ex_new_index(0, nullptr, nullptr, nullptr, &Impl::FreeConn)};
+    return index;
+}
+
+void HttpsSseApi::Impl::FreeConn(void*, void* ptr, CRYPTO_EX_DATA*, int, long, void*)
+{
+    // SSL_free calls this for every SSL in the process (the index is global): other SSLs carry no Conn, and a refused or
+    // never-admitted connection counted nothing.
+    auto* conn{static_cast<Conn*>(ptr)};
+    if (conn == nullptr) return;
+    if (conn->counted) conn->self->Release(conn->ip);
+    delete conn;
+}
+
+const HttpsSseApi::Impl::Conn* HttpsSseApi::Impl::ConnOf(evhttp_connection* conn)
+{
+    bufferevent* bev{conn != nullptr ? evhttp_connection_get_bufferevent(conn) : nullptr};
+    SSL* ssl{bev != nullptr ? bufferevent_openssl_get_ssl(bev) : nullptr}; // null for a plain bufferevent
+    const auto* c{ssl != nullptr ? static_cast<const Conn*>(SSL_get_ex_data(ssl, ConnIndex())) : nullptr};
+    return c != nullptr && c->counted ? c : nullptr;
+}
+
+void HttpsSseApi::Impl::OnAdmit(evutil_socket_t, short, void* arg) NO_THREAD_SAFETY_ANALYSIS
+{
+    auto* self{static_cast<Impl*>(arg)};
+    std::vector<bufferevent*> batch;
+    batch.swap(self->accepted);
+    for (bufferevent* bev : batch) {
+        self->AdmitConnection(bev);
+        bufferevent_decref(bev);
+    }
+}
+
+void HttpsSseApi::Impl::AdmitConnection(bufferevent* bev)
+{
+    // evhttp already let it go (a setup step after OnNewConnection failed; bufferevent_free clears the callbacks): its
+    // socket may be closed and its number reused by a later accept, so it is not touched.
+    bufferevent_data_cb readcb{nullptr};
+    void* cbarg{nullptr};
+    bufferevent_getcb(bev, &readcb, nullptr, nullptr, &cbarg);
+    const evutil_socket_t fd{bufferevent_getfd(bev)};
+    if (readcb == nullptr || cbarg == nullptr || fd < 0) return;
+    auto* evcon{static_cast<evhttp_connection*>(cbarg)}; // evhttp's own callback argument
+    SSL* ssl{bufferevent_openssl_get_ssl(bev)};
+    Conn* conn{ssl != nullptr ? static_cast<Conn*>(SSL_get_ex_data(ssl, ConnIndex())) : nullptr};
+    const std::string ip{PeerAddressOf(fd)};
+    bool refused{conn == nullptr || ip.empty()}; // no TLS (R1's fail-open) or no peer: never served
+    if (!refused) {
+        const Clock::time_point now{Clock::now()};
+        const std::string group{NetGroupOf(ip)};
+        refused = open_total >= cfg.max_connections || CountOf(open_per_ip, ip) >= cfg.max_connections_per_ip ||
+                  CountOf(open_per_group, group) >= cfg.max_connections_per_netgroup ||
+                  RecentOf(recent_connections_per_ip, ip, now) >= cfg.max_new_connections_per_minute;
+        if (!refused) {
+            recent_connections_per_ip[ip].push_back(now);
+            ++open_total;
+            ++open_per_ip[ip];
+            ++open_per_group[group];
+            conn->ip = ip;
+            conn->counted = true;
+        }
+    }
+    if (!refused) return;
+    {
+        LOCK(mutex);
+        ++status.refused;
+    }
+    // Freed as evhttp frees a connection whose client left before its first line: nothing was read or written on it, so
+    // the client sees its handshake end (no ServerHello) and this side spends no key exchange or signature on it.
+    evhttp_connection_free(evcon);
 }
 
 // ---- Requests ------------------------------------------------------------------------
@@ -383,14 +537,12 @@ void HttpsSseApi::Impl::OnClose(evhttp_connection* conn, void* arg) NO_THREAD_SA
     for (auto& [id, item] : self->pending) {
         if (item.conn == conn && item.req != nullptr) {
             drop(item.req); // the reply is still taken when it comes (no reservation leaks)
-            self->Release(item.ip);
             item.conn = nullptr;
         }
     }
     for (auto it{self->streams.begin()}; it != self->streams.end();) {
         if (it->second.conn == conn) {
             (void)self->backend.Unsubscribe(it->second.id);
-            self->Release(it->second.ip);
             drop(it->second.req);
             it = self->streams.erase(it);
         } else {
@@ -417,32 +569,20 @@ void HttpsSseApi::Impl::ReplyError(evhttp_request* req, int code, std::string_vi
     Reply(req, code, netio::ErrorJson(error, reason));
 }
 
-bool HttpsSseApi::Impl::Admit(evhttp_request* req, const std::string& ip)
+bool HttpsSseApi::Impl::AdmitRequest(evhttp_request* req, const std::string& ip)
 {
+    // The open limits hold for the connection (AdmitConnection); a request spends only the per-minute budget, which keeps
+    // a kept-alive connection from sending requests without bound.
     const Clock::time_point now{Clock::now()};
-    std::deque<Clock::time_point>& recent{recent_per_ip[ip]};
-    while (!recent.empty() && now - recent.front() > std::chrono::seconds{60}) recent.pop_front();
-    const std::string group{NetGroupOf(ip)};
-    // Looked up, not indexed: a refused request leaves no zero entry, which only Release would erase (review workflow of
-    // 2026-11-18: a full netgroup grew the per-address count with every address of it that it refused).
-    const auto open_count{[](const std::map<std::string, size_t>& counts, const std::string& key) -> size_t {
-        const auto it{counts.find(key)};
-        return it == counts.end() ? 0 : it->second;
-    }};
-    const bool refused{open_total >= cfg.max_connections || open_count(open_per_ip, ip) >= cfg.max_connections_per_ip ||
-                       recent.size() >= cfg.max_new_connections_per_minute || open_count(open_per_group, group) >= cfg.max_connections_per_netgroup};
-    if (refused) {
+    if (RecentOf(recent_requests_per_ip, ip, now) >= cfg.max_new_connections_per_minute) {
         {
             LOCK(mutex);
             ++status.refused;
         }
-        ReplyError(req, STATUS_TOO_MANY, "BUSY", "connection limit");
+        ReplyError(req, STATUS_TOO_MANY, "BUSY", "request rate limit");
         return false;
     }
-    recent.push_back(now);
-    ++open_total;
-    ++open_per_ip[ip];
-    ++open_per_group[group];
+    recent_requests_per_ip[ip].push_back(now);
     return true;
 }
 
@@ -474,10 +614,18 @@ void HttpsSseApi::Impl::Remember(const ActionId& id, std::vector<unsigned char> 
 void HttpsSseApi::Impl::Handle(evhttp_request* req)
 {
     evhttp_connection* conn{evhttp_request_get_connection(req)};
-    char* address{nullptr};
-    ev_uint16_t peer_port{0};
-    if (conn != nullptr) evhttp_connection_get_peer(conn, &address, &peer_port);
-    const std::string ip{address != nullptr ? address : "?"};
+    const Conn* admitted{ConnOf(conn)};
+    if (admitted == nullptr) {
+        // Not a TLS connection this API admitted (only libevent's own plain fallback, when OnNewConnection could allocate
+        // nothing, or one OnAdmit never saw can get here): nothing is served on it.
+        {
+            LOCK(mutex);
+            ++status.refused;
+        }
+        evhttp_add_header(evhttp_request_get_output_headers(req), "Connection", "close");
+        return ReplyError(req, STATUS_BAD_REQUEST, "TLS", "TLS 1.3 only");
+    }
+    const std::string ip{admitted->ip};
     const evhttp_cmd_type method{evhttp_request_get_command(req)};
     if (method != EVHTTP_REQ_GET && method != EVHTTP_REQ_POST) return ReplyError(req, STATUS_METHOD_NOT_ALLOWED, "METHOD", "GET or POST");
     const evhttp_uri* uri{evhttp_request_get_evhttp_uri(req)};
@@ -485,12 +633,9 @@ void HttpsSseApi::Impl::Handle(evhttp_request* req)
     const std::string path{path_c != nullptr ? path_c : "/"};
     const char* query_c{uri != nullptr ? evhttp_uri_get_query(uri) : nullptr};
     const std::string query{query_c != nullptr ? query_c : ""};
-    if (!Admit(req, ip)) return;
-    // Everything below either answers synchronously (and releases) or registers a pending request or a stream.
-    const auto sync{[&](int code, const UniValue& body) {
-        Reply(req, code, body);
-        Release(ip);
-    }};
+    if (!AdmitRequest(req, ip)) return;
+    // Everything below either answers synchronously or registers a pending request or a stream.
+    const auto sync{[&](int code, const UniValue& body) { Reply(req, code, body); }};
     const auto body_bytes{[&]() -> std::vector<unsigned char> {
         evbuffer* in{evhttp_request_get_input_buffer(req)};
         const size_t len{in != nullptr ? evbuffer_get_length(in) : 0};
@@ -505,7 +650,6 @@ void HttpsSseApi::Impl::Handle(evhttp_request* req)
         item.kind = kind;
         item.req = req;
         item.conn = conn;
-        item.ip = ip;
         item.deadline = Clock::now() + Ms{static_cast<int64_t>(cfg.reply_deadline_ms)};
         item.frame = std::move(frame);
         pending.emplace(id->value, std::move(item));
@@ -600,7 +744,6 @@ void HttpsSseApi::Impl::Handle(evhttp_request* req)
         stream.id = *id;
         stream.req = req;
         stream.conn = conn;
-        stream.ip = ip;
         stream.last_send = Clock::now();
         streams.emplace(id->value, std::move(stream));
         if (conn != nullptr) evhttp_connection_set_closecb(conn, &Impl::OnClose, this);
@@ -620,7 +763,6 @@ void HttpsSseApi::Impl::Handle(evhttp_request* req)
             evhttp_send_reply(req, STATUS_OK, nullptr, out);
             evbuffer_free(out);
             ++status.requests_served;
-            Release(ip);
             return;
         }
     }
@@ -657,7 +799,6 @@ void HttpsSseApi::Impl::CloseStream(uint64_t key, bool gap)
     if (gap) SendEvent(stream, "", "gap", netio::ErrorJson("STREAM_GAP", STREAM_GAP).write());
     if (stream.req != nullptr) evhttp_send_reply_end(stream.req);
     if (!gap) (void)backend.Unsubscribe(stream.id);
-    Release(stream.ip);
     streams.erase(it);
 }
 
@@ -691,14 +832,12 @@ void HttpsSseApi::Impl::Pump()
                         }
                     },
                     reply->body);
-                Release(item.ip);
             }
             it = pending.erase(it);
             continue;
         }
         if (item.req != nullptr && now > item.deadline) {
             ReplyError(item.req, STATUS_GATEWAY_TIMEOUT, "TIMEOUT", "the node did not answer in time; the outcome is unknown, resend the exact bytes");
-            Release(item.ip);
             item.req = nullptr; // keep waiting for the reply itself
         }
         ++it;
@@ -737,10 +876,12 @@ void HttpsSseApi::Impl::Pump()
     }
     for (const uint64_t key : gapped) CloseStream(key, /*gap=*/true);
     for (const uint64_t key : gone) CloseStream(key, false);
-    // Addresses whose minute of arrivals has passed leave the rate map.
-    for (auto it{recent_per_ip.begin()}; it != recent_per_ip.end();) {
-        while (!it->second.empty() && now - it->second.front() > std::chrono::seconds{60}) it->second.pop_front();
-        it = it->second.empty() ? recent_per_ip.erase(it) : std::next(it);
+    // Addresses whose minute of arrivals has passed leave the rate maps.
+    for (auto* recent : {&recent_connections_per_ip, &recent_requests_per_ip}) {
+        for (auto it{recent->begin()}; it != recent->end();) {
+            while (!it->second.empty() && now - it->second.front() > std::chrono::seconds{60}) it->second.pop_front();
+            it = it->second.empty() ? recent->erase(it) : std::next(it);
+        }
     }
     LOCK(mutex);
     status.stream_output_bytes = most_queued;
