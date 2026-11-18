@@ -11,6 +11,7 @@
 #include <util/fs.h>
 
 #include <algorithm>
+#include <csignal>
 #include <cstdint>
 #include <fstream>
 #include <memory>
@@ -18,6 +19,7 @@
 #include <vector>
 
 #include <fcntl.h>
+#include <sys/resource.h>
 #include <unistd.h>
 
 using namespace flowmesh2;
@@ -641,6 +643,32 @@ BOOST_AUTO_TEST_CASE(a_crash_while_creating_the_first_segment_leaves_a_directory
         RequireRefusal(FileJournal::CreateNew(locked, JournalRole::COMMIT, 7, SEGMENT_PAGE_BYTES), ErrorCode::BUSY, JOURNAL_DIR_LOCKED, "locked");
         BOOST_CHECK(fs::exists(locked / fs::u8path(SegmentFileName(0) + ".tmp")));
     }
+}
+
+BOOST_AUTO_TEST_CASE(a_create_that_fails_keeps_its_lock_file)
+{
+    // Codex review of 2026-11-18 over 0bb5567d: when CreateSegment failed, CreateNew released the lock and then unlinked
+    // `.lock`. A creator that took the lock in between held it on the unlinked inode, and a later opener created and locked
+    // a fresh `.lock` beside it: two owners of one journal. Since 0bb5567d CreateNew takes a directory holding `.lock` and
+    // segment leftovers, so the lock file can stay. The failure here is a file-size limit below the segment's size.
+    const TestDir root{"failed_create"};
+    const fs::path dir{root.Sub("journal")};
+    rlimit saved{};
+    BOOST_REQUIRE_EQUAL(::getrlimit(RLIMIT_FSIZE, &saved), 0);
+    void (*const previous)(int){std::signal(SIGXFSZ, SIG_IGN)}; // a write past the limit fails with EFBIG instead
+    rlimit small{saved};
+    small.rlim_cur = SEGMENT_PAGE_BYTES;
+    BOOST_REQUIRE_EQUAL(::setrlimit(RLIMIT_FSIZE, &small), 0);
+    Result<std::unique_ptr<FileJournal>> failed{FileJournal::CreateNew(dir, JournalRole::SIGNER, 7, 4 * SEGMENT_PAGE_BYTES)};
+    BOOST_REQUIRE_EQUAL(::setrlimit(RLIMIT_FSIZE, &saved), 0);
+    std::signal(SIGXFSZ, previous);
+    BOOST_REQUIRE(!failed.has_value());
+    BOOST_CHECK(failed.error().code == ErrorCode::STORAGE_FATAL);
+    BOOST_CHECK(fs::exists(dir / fs::u8path(".lock")));
+    BOOST_CHECK(!fs::exists(dir / fs::u8path(FIRST_SEGMENT_NAME)));
+    // The directory is still one CreateNew takes.
+    Result<std::unique_ptr<FileJournal>> created{FileJournal::CreateNew(dir, JournalRole::SIGNER, 7, 4 * SEGMENT_PAGE_BYTES)};
+    RequireStorageOk(created, "create after the failure");
 }
 
 BOOST_AUTO_TEST_CASE(a_second_opener_of_a_journal_directory_is_refused)

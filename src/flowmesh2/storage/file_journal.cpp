@@ -316,8 +316,9 @@ Result<std::unique_ptr<FileJournal>> FileJournal::CreateNewWithCommitHook(const 
     }
     const Result<int> fd{CreateSegment(empty_dir, 0, segment_bytes)};
     if (!fd.has_value()) {
+        // The lock file stays: unlinked after the unlock, a creator that took the lock in between would hold it on a gone
+        // inode while a later opener locked a new `.lock` (Codex review of 2026-11-18). CreateNew takes the directory again.
         CloseFd(*lock);
-        fs::remove(empty_dir / fs::u8path(std::string{LOCK_FILE_NAME}), ec); // the directory is empty again
         return fd.error();
     }
     return Ok(std::unique_ptr<FileJournal>{new FileJournal{role, instance_id, observer, empty_dir, *lock, *fd, segment_bytes, commit}});
