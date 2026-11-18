@@ -936,17 +936,20 @@ Result<void> PbftAgreement::OnViewChangeReport(uint32_t from, const ViewChange& 
     if (report.seat != from) return Invalid(PBFT_VOTE_SEAT);
     if (report.new_view < m_slot.view) return Ok(); // an old target
     if (from != m_config.self_seat) {
-        // Bounded storage, and no BLS work for a report already held (review of 2026-11-16, R6): one report per seat per
-        // target, and above the current view one report per seat, its highest target (a seat that moved on supersedes its
-        // lower reports, as PBFT view changes do), so at most 2k - 1 reports are ever kept whatever targets a seat names.
+        // Bounded storage, and no BLS work for a report that is not kept (review of 2026-11-16, R6): one report per seat
+        // per target, and per seat its REPORTS_PER_SEAT highest targets, so at most 2k - 1 reports are ever kept whatever
+        // targets a seat names. Keeping one (ba5f43f0) lost the same-target f + 1 of PROTOCOL.md when a seat moved on
+        // (review workflow of 2026-11-18).
         if (const auto target{m_slot.reports.find(report.new_view)}; target != m_slot.reports.end() && target->second.contains(report.seat)) {
             return Ok(); // one report per seat per target
         }
-        if (report.new_view > m_slot.view) {
-            for (const auto& [target, by_seat] : m_slot.reports) {
-                if (target > report.new_view && by_seat.contains(report.seat)) return Ok(); // the seat reported a higher target already
-            }
+        size_t kept{0};
+        uint64_t lowest{0}; // the seat's lowest kept target (the map is ordered by target)
+        for (const auto& [target, by_seat] : m_slot.reports) {
+            if (!by_seat.contains(report.seat)) continue;
+            if (kept++ == 0) lowest = target;
         }
+        if (kept >= REPORTS_PER_SEAT && report.new_view < lowest) return Ok(); // below every target the seat has kept
         if (const Result<void> ok{VerifySeatSignature(report.seat, ViewChangeDigest(m_domain, report), report.signature, PBFT_REPORT_SIGNATURE)};
             !ok.has_value()) {
             return ok.error();
@@ -968,18 +971,11 @@ Result<void> PbftAgreement::OnViewChangeReport(uint32_t from, const ViewChange& 
                 m_slot.prepared = report.prepared;
             }
         }
-        if (report.new_view > m_slot.view) {
-            // The seat's lower reports above the current view are superseded.
-            for (auto it{m_slot.reports.begin()}; it != m_slot.reports.end();) {
-                if (it->first > m_slot.view && it->first < report.new_view) {
-                    it->second.erase(report.seat);
-                    if (it->second.empty()) {
-                        it = m_slot.reports.erase(it);
-                        continue;
-                    }
-                }
-                ++it;
-            }
+        if (kept >= REPORTS_PER_SEAT) {
+            // The seat's lowest kept report gives way, only now that the new one verified (a seat evicts only its own).
+            const auto evicted{m_slot.reports.find(lowest)};
+            evicted->second.erase(report.seat);
+            if (evicted->second.empty()) m_slot.reports.erase(evicted);
         }
         m_slot.reports[report.new_view].emplace(report.seat, report);
     }

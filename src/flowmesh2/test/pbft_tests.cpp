@@ -1039,12 +1039,12 @@ BOOST_AUTO_TEST_CASE(reports_are_bounded_per_seat_and_replays_are_dropped_before
     Seat& seat0{c.At(0)};
     for (uint64_t target{2}; target <= 101; ++target) RequireOk(seat0.pbft->OnMessage(1, report_from(1, target, true)), "a report");
     PbftStatus status{seat0.pbft->Status()};
-    BOOST_CHECK_EQUAL(status.reports_held, 1U); // the highest target only
+    BOOST_CHECK_EQUAL(status.reports_held, 2U); // the seat's two highest targets, 100 and 101 (REPORTS_PER_SEAT)
     BOOST_CHECK_EQUAL(status.view, 0U);
     BOOST_CHECK(!status.changing);
-    // A lower target from that seat after a higher one is stale.
+    // A lower target from that seat below the two it keeps is stale.
     RequireOk(seat0.pbft->OnMessage(1, report_from(1, 50, true)), "a stale lower target");
-    BOOST_CHECK_EQUAL(seat0.pbft->Status().reports_held, 1U);
+    BOOST_CHECK_EQUAL(seat0.pbft->Status().reports_held, 2U);
     // The held report again with a broken signature: known (seat, target), dropped before any verification.
     RequireOk(seat0.pbft->OnMessage(1, report_from(1, 101, false)), "a replay with a broken signature");
     // A report not held with a broken signature is still refused.
@@ -1052,13 +1052,63 @@ BOOST_AUTO_TEST_CASE(reports_are_bounded_per_seat_and_replays_are_dropped_before
     BOOST_REQUIRE(!forged.has_value());
     BOOST_CHECK(forged.error().code == ErrorCode::VERIFY_FAILED);
     BOOST_CHECK(forged.error().detail == PBFT_REPORT_SIGNATURE);
-    BOOST_CHECK_EQUAL(seat0.pbft->Status().reports_held, 1U);
+    BOOST_CHECK_EQUAL(seat0.pbft->Status().reports_held, 2U);
     // f + 1 = 2 reports for target 101 synchronise seat 0 into CHANGING 101; nothing below the target is kept.
     RequireOk(seat0.pbft->OnMessage(2, report_from(2, 101, true)), "the second report");
     status = seat0.pbft->Status();
     BOOST_CHECK_EQUAL(status.view, 101U);
     BOOST_CHECK(status.changing);
-    BOOST_CHECK_EQUAL(status.reports_held, 3U); // seats 1 and 2 and its own
+    BOOST_CHECK_EQUAL(status.reports_held, 3U); // seats 1 and 2 and its own (EnterChanging erased seat 1's 100)
+}
+
+namespace {
+//! A signed VIEW_CHANGE of `seat` for slot 1 of epoch 0 naming `target`, as cluster `c`'s seat 0 decodes it.
+std::vector<unsigned char> ReportFrom(Cluster& c, uint32_t seat, uint64_t target, bool valid = true)
+{
+    ViewChange report;
+    report.epoch = 0;
+    report.slot = 1;
+    report.new_view = target;
+    report.seat = seat;
+    const uint256 digest{ViewChangeDigest(c.Domain(), report)};
+    report.signature = BlsKeyFromLabel(SeatLabel("s" + std::to_string(seat))).Sign(std::span<const unsigned char>{digest.data(), digest.size()}).Compressed();
+    if (!valid) report.signature.front() ^= 1;
+    return EncodeMessage(Message{report}, c.At(0).rig->profile).value();
+}
+} // namespace
+
+BOOST_AUTO_TEST_CASE(same_target_reports_survive_a_seats_higher_target)
+{
+    // Review workflow of 2026-11-18: ba5f43f0's supersede rule kept only each seat's highest target, so a seat that
+    // moved on erased the lower report that PROTOCOL.md's same-target f + 1 synchronisation (:102, :122-123, :181) counts.
+    Cluster c{4};
+    Seat& x{c.At(0)};
+    // Seat 1 moved through targets 1, 2 and 3; seat 2 reached target 2 and stopped there.
+    for (const uint64_t target : {1, 2, 3}) RequireOk(x.pbft->OnMessage(1, ReportFrom(c, 1, target)), "a report from seat 1");
+    BOOST_CHECK_EQUAL(x.pbft->Status().reports_held, 2U); // seat 1's two highest targets, 2 and 3
+    RequireOk(x.pbft->OnMessage(2, ReportFrom(c, 2, 2)), "a report from seat 2");
+    BOOST_CHECK_EQUAL(x.pbft->Status().view, 2U); // before: 0 (seat 1's target 2 was erased when its target 3 arrived)
+    // Control: the same two target-2 reports on their own synchronise a fresh seat into view 2.
+    Cluster control{4};
+    RequireOk(control.At(0).pbft->OnMessage(1, ReportFrom(control, 1, 2)), "control: seat 1 at target 2");
+    RequireOk(control.At(0).pbft->OnMessage(2, ReportFrom(control, 2, 2)), "control: seat 2 at target 2");
+    BOOST_CHECK_EQUAL(control.At(0).pbft->Status().view, 2U);
+}
+
+BOOST_AUTO_TEST_CASE(reports_keep_each_seats_two_highest_targets)
+{
+    // REPORTS_PER_SEAT = 2, whatever the arrival order; what falls below a seat's kept targets costs no verification.
+    Cluster c{4};
+    Seat& x{c.At(0)};
+    for (const uint64_t target : {3, 1, 4, 2}) RequireOk(x.pbft->OnMessage(1, ReportFrom(c, 1, target)), "a report from seat 1");
+    BOOST_CHECK_EQUAL(x.pbft->Status().reports_held, 2U); // 3 and 4
+    RequireOk(x.pbft->OnMessage(1, ReportFrom(c, 1, 1, false)), "a broken report below the kept targets, dropped unverified");
+    BOOST_CHECK_EQUAL(x.pbft->Status().reports_held, 2U);
+    // Seat 1's 2 is not kept, so seat 2 at 2 does not synchronise; at 3, kept, it does.
+    RequireOk(x.pbft->OnMessage(2, ReportFrom(c, 2, 2)), "seat 2 at 2");
+    BOOST_CHECK_EQUAL(x.pbft->Status().view, 0U);
+    RequireOk(x.pbft->OnMessage(2, ReportFrom(c, 2, 3)), "seat 2 at 3");
+    BOOST_CHECK_EQUAL(x.pbft->Status().view, 3U);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

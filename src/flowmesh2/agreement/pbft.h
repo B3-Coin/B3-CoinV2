@@ -83,9 +83,9 @@
  *     view only if its header is the selected one (or any valid header when
  *     nothing was prepared). A proposal that arrives before its NEW_VIEW
  *     waits (one per seat). Reports are kept one per seat per target and,
- *     above the current view, one per seat (its highest target), at most
- *     2k - 1 in all, and a report or vote already held costs no
- *     verification; a seat restarted while CHANGING rebuilds the report it
+ *     per seat, its REPORTS_PER_SEAT (2) highest targets, at most 2k - 1 in
+ *     all, and a report or vote already held, or below what a seat has
+ *     kept, costs no verification; a seat restarted while CHANGING rebuilds the report it
  *     signed from the signer log's digest and the durable preparations
  *     (VERIFY_FAILED PBFT_REPORT_RECOVERY when none reproduces it) and
  *     resends it (review of 2026-11-16, R5 and R6).
@@ -166,6 +166,13 @@ inline constexpr std::string_view PBFT_REPORT_RECOVERY{"the signed view-change r
 
 //! Votes for a slot that arrive before its proposal are kept up to this many. PROVISIONAL.
 inline constexpr size_t MAX_EARLY_VOTES{64};
+/** View-change reports kept per other seat: its REPORTS_PER_SEAT highest targets (review workflow of 2026-11-18).
+ * Two is the least that keeps PROTOCOL.md's same-target f + 1 synchronisation of a laggard: the first honest seat to
+ * sign a target M timed out of M - 1 with q reports there, so f + 1 honest seats signed M - 1, and their latest target
+ * is M - 1 or M. With one, M evicts the M - 1 a laggard needs. At most REPORTS_PER_SEAT * (k - 1) + 1 = 2k - 1 reports
+ * are held (the + 1 is this seat's own: EnterChanging erases its lower targets). This is about the bound, not a proof
+ * of liveness in general. PROVISIONAL. */
+inline constexpr size_t REPORTS_PER_SEAT{2};
 
 /** The safety rules of one seat (M4-AGR-01). They read what the agreement
  * tells them (SetView, SetAccepted) and refuse what PROTOCOL.md forbids;
@@ -244,7 +251,7 @@ struct PbftStatus {
     uint32_t commit_votes{0};
     bool selected_missing{false}; //!< a NEW_VIEW selected a header this seat does not hold (the leader must fetch it, O-101)
     uint64_t ahead_hint{0};       //!< AheadHint() or 0: f + 1 peers claim a slot beyond this one (catch-up, O-101)
-    uint32_t reports_held{0};     //!< view-change reports kept for this slot over every target: at most 2k - 1 (R6)
+    uint32_t reports_held{0};     //!< view-change reports kept for this slot over every target: at most REPORTS_PER_SEAT * (k - 1) + 1 = 2k - 1 (R6)
 
     friend bool operator==(const PbftStatus&, const PbftStatus&) = default;
 };
