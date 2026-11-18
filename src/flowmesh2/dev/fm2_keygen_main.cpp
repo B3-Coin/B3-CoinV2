@@ -201,6 +201,23 @@ int main(int argc, char** argv)
             return 1;
         }
     }
+    // Nothing is written while any file this run writes is there already. The genesis document used to go first and a key
+    // that existed stopped the run after it: the directory then held a genesis naming keys that were never written, and
+    // every later run refused it because genesis.json existed (review workflow of 2026-11-18). O_EXCL below stays the guard
+    // against a file that appears in between.
+    std::vector<fs::path> targets{out / fs::u8path("genesis.json")};
+    for (uint64_t i{0}; i < seats; ++i) {
+        const fs::path seat_dir{out / fs::u8path("seat" + std::to_string(i))};
+        targets.push_back(seat_dir / fs::u8path("seat.key"));
+        targets.push_back(seat_dir / fs::u8path("transport.key"));
+    }
+    for (const fs::path& target : targets) {
+        std::error_code status_ec;
+        if (fs::symlink_status(target, status_ec).type() != fs::file_type::not_found) {
+            std::cerr << "fm2-keygen: " << fs::PathToString(target) << " exists already (this tool never overwrites); nothing was written\n";
+            return 1;
+        }
+    }
     if (!WritePublic(out / fs::u8path("genesis.json"), doc.Json())) {
         std::cerr << "fm2-keygen: could not write genesis.json (it exists already? this tool never overwrites)\n";
         return 1;
