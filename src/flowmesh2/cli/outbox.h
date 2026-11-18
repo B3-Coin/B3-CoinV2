@@ -39,7 +39,10 @@
  *   detail (string): what a certified reply proved about the action
  *   (INCLUDED or EXPIRED, verified by the client with b3verify before it is
  *   written) or a terminal status a seat reported (FAILED, not certified; the
- *   detail says what the seat said).
+ *   detail says what the seat said). fm2-cli no longer writes FAILED (since
+ *   4da8c4d2 it prints it and records only certified ends), but an outbox an
+ *   earlier build wrote may hold one. A FAILED is never final: a certified
+ *   result may follow it, and the later record is the one Load keeps.
  *
  * The highest nonce of an account across every entry, with or without a
  * result, is the client's floor for the account's next nonce: a nonce once
@@ -93,7 +96,8 @@ public:
 
     //! Make `bytes` durable under `label` (Append, then Barrier) before returning. The bytes must decode under the profile.
     Result<void> Add(const std::string& label, std::span<const unsigned char> bytes);
-    //! Record what became of `label`, durable before returning. Once per label.
+    //! Record what became of `label`, durable before returning. Once per label, except that a certified result (INCLUDED,
+    //! EXPIRED) may follow a FAILED.
     Result<void> Record(const std::string& label, const OutboxResult& result);
 
     const std::vector<OutboxEntry>& Entries() const { return m_entries; }

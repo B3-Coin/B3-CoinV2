@@ -129,7 +129,11 @@ Result<void> Outbox::Record(const std::string& label, const OutboxResult& result
 {
     const auto entry{std::find_if(m_entries.begin(), m_entries.end(), [&](const OutboxEntry& e) { return e.label == label; })};
     if (entry == m_entries.end()) return Error{ErrorCode::INVALID_INPUT, OUTBOX_LABEL_UNKNOWN};
-    if (entry->result.has_value()) return Error{ErrorCode::ORDER_VIOLATION, OUTBOX_RESULT_TWICE};
+    // A FAILED is not certified and never final: a certified result may follow it (an earlier build recorded FAILED; review
+    // workflow of 2026-11-18). After a certified result, or a FAILED over a FAILED, nothing more is taken.
+    const bool superseding_failed{entry->result.has_value() && entry->result->outcome == OutboxOutcome::FAILED &&
+                                  result.outcome != OutboxOutcome::FAILED};
+    if (entry->result.has_value() && !superseding_failed) return Error{ErrorCode::ORDER_VIOLATION, OUTBOX_RESULT_TWICE};
     if (!IsKnown(result.outcome)) return Error{ErrorCode::INVALID_INPUT, OUTBOX_RECORD};
     if (const Result<uint64_t> seq{m_journal->Append(storage::RecordType::OUTBOX_RESULT, EncodeOutboxResult(label, result))}; !seq.has_value()) {
         return seq.error();
