@@ -684,19 +684,18 @@ BOOST_AUTO_TEST_CASE(a_stalled_stream_on_a_quiet_hub_queues_no_heartbeats)
     std::this_thread::sleep_for(std::chrono::seconds{2});
     BOOST_CHECK_LE(rig.api->Status().stream_output_bytes, queued);
     BOOST_CHECK_EQUAL(rig.api->Status().streams, 1U);
-    // The reader reads again: the backlog arrives, then the events the hub held, then heartbeats as before. A heartbeat
-    // after the backlog's first delta is one sent once the stream was below its cap again (none goes out at the cap, and
-    // none between two deltas of the fill, which sealed every 5 ms). How long the hub's held events take depends on the
-    // load, so the limit is generous; the read returns at the heartbeat.
+    // The reader reads again: the stream drains below its cap and delivers again. (Not "until the next heartbeat": a beat
+    // goes out only after heartbeat_ms with nothing to send, so only once the hub's held events are all delivered, and on a
+    // plain Linux loopback a reader whose receive buffer was 4 KiB takes about 33 deltas a second, measured: the 2026-11-18
+    // full CTest read 740 KB in 20 s and was not through. Beats below the cap are the same branch every stream test runs.)
     std::string seen;
-    bool resumed{false};
+    bool drained{false};
     const auto resume_deadline{std::chrono::steady_clock::now() + std::chrono::seconds{20}};
-    while (!resumed && std::chrono::steady_clock::now() < resume_deadline) {
-        seen += stalled.ReadRawUntil("event: heartbeat", std::chrono::milliseconds{1'000});
-        const size_t delta{seen.find("event: delta")};
-        resumed = delta != std::string::npos && seen.find("event: heartbeat", delta) != std::string::npos;
+    while (!drained && std::chrono::steady_clock::now() < resume_deadline) {
+        seen += stalled.ReadRawUntil("event: delta", std::chrono::milliseconds{200});
+        drained = seen.find("event: delta") != std::string::npos && rig.api->Status().stream_output_bytes < config.stream_output_bytes;
     }
-    BOOST_CHECK(resumed);
+    BOOST_CHECK_MESSAGE(drained, "read " << seen.size() << " bytes; queued now " << rig.api->Status().stream_output_bytes << ", at the cap " << queued);
     BOOST_CHECK_EQUAL(rig.api->Status().streams, 1U);
 }
 
