@@ -968,6 +968,57 @@ BOOST_AUTO_TEST_CASE(a_seat_restarted_before_signing_its_report_signs_and_sends_
     }
 }
 
+BOOST_AUTO_TEST_CASE(a_seat_restarted_in_view_zero_keeps_its_preparation)
+{
+    // A seat that prepared in view 0 and restarted came back without its preparation: view 0 writes no VIEW_STATE, and
+    // ResumeViewState returned before it read the commit log's preparations, although pbft.h says a restart reads
+    // HighestPrepared. Its next report then carried none. Its commit log still held the PreparedQC, and it may have signed
+    // COMMIT for that header; q reports without the preparation let a NEW_VIEW select nothing and the slot decide another
+    // header.
+    Cluster c{4};
+    c.AppendBlock(130, {Fact{DepositAtCursor(FactCursor{130, 0}, "d0")}});
+    const uint32_t leader{c.Leader()};
+    const uint32_t restarted{(leader + 2) % 4};
+    const state::Candidate candidate{c.At(leader).rig->Preview(c.InputsFromChain(leader))};
+    RequireOk(c.At(leader).pbft->Propose(candidate, c.Authority()), "Propose");
+    const Filter drop_commits{[](uint32_t, uint32_t, const std::vector<unsigned char>& frame) { return !IsCommitVote(frame); }};
+    c.Deliver(drop_commits);
+    BOOST_CHECK(c.refusals.empty());
+    BOOST_REQUIRE(c.At(restarted).pbft->Status().prepared);
+    BOOST_REQUIRE(c.At(restarted).rig->commit_log.HighestPrepared(1).has_value());
+    Restart(c, restarted);
+    {
+        const PbftStatus status{c.At(restarted).pbft->Status()};
+        BOOST_CHECK_EQUAL(status.view, 0U);
+        BOOST_CHECK(!status.changing);
+        BOOST_CHECK(status.prepared); // from its commit log
+    }
+    // Its view-1 report carries the view-0 preparation of the candidate.
+    std::vector<ViewChange> reports;
+    c.At(restarted).mesh->on_transmit = [&](const RecordingMesh::Sent& s) {
+        if (TypeOf(s.frame) != MessageType::VIEW_CHANGE) return;
+        Result<Message> decoded{DecodeMessage(s.frame, c.At(restarted).rig->profile)};
+        RequireOk(decoded, "DecodeMessage");
+        reports.push_back(std::get<ViewChange>(*decoded));
+    };
+    const uint64_t timeout{PbftConfig{}.view_timeout_floor_ms};
+    c.Tick(timeout, drop_commits);
+    c.At(restarted).mesh->on_transmit = nullptr;
+    BOOST_CHECK(c.refusals.empty());
+    BOOST_REQUIRE(!reports.empty());
+    for (const ViewChange& report : reports) {
+        BOOST_CHECK_EQUAL(report.new_view, 1U);
+        BOOST_REQUIRE(report.prepared.has_value());
+        BOOST_CHECK_EQUAL(report.prepared->view, 0U);
+        BOOST_CHECK(report.prepared->cert.header_hash == candidate.Header().Hash());
+    }
+    // View 1 decides the prepared header.
+    c.Tick(timeout + PbftConfig{}.retry_ms);
+    BOOST_CHECK(c.refusals.empty());
+    for (uint32_t i{0}; i < 4; ++i) BOOST_CHECK(c.At(i).pbft->Status().decided);
+    BOOST_CHECK(c.ApplyDecisions() == candidate.Header().Hash());
+}
+
 BOOST_AUTO_TEST_CASE(reports_are_bounded_per_seat_and_replays_are_dropped_before_verification)
 {
     // Review of 2026-11-16, R6: reports were kept per attacker-chosen target view with no cap, and every report and vote

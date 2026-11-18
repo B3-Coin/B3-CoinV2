@@ -231,13 +231,19 @@ Result<void> PbftAgreement::ProposeSelected(const SlotHeaderV2& header, const Sl
 Result<void> PbftAgreement::ResumeViewState(const state::HeadView& head)
 {
     (void)head;
+    // The slot's highest durable preparation of this epoch, read whatever the view. View 0 writes no VIEW_STATE, and the
+    // early return below used to come first: a seat that prepared in view 0 and restarted forgot its PreparedQC, so its
+    // next report carried none although it may have signed COMMIT for that header. A preparation of another epoch is
+    // not this instance's (its digest names that epoch) and is never carried.
+    for (const storage::PreparedQcRecord& prepared : m_commit_log.PreparedAt(m_slot.slot)) {
+        if (prepared.epoch != m_slot.epoch) continue;
+        if (m_slot.prepared.has_value() && prepared.view <= m_slot.prepared->view) continue;
+        const Result<SlotCertificate> cert{SlotCertificate::Decode(prepared.qc)};
+        if (cert.has_value()) m_slot.prepared = PreparedCert{prepared.view, *cert};
+    }
     const std::optional<storage::ViewStateRecord> state{m_signer_log.ViewState()};
     if (!state.has_value() || state->slot != m_slot.slot || state->epoch != m_slot.epoch) return Ok();
     m_slot.view = state->view;
-    if (const std::optional<storage::PreparedQcRecord> prepared{m_commit_log.HighestPrepared(m_slot.slot)}) {
-        const Result<SlotCertificate> cert{SlotCertificate::Decode(prepared->qc)};
-        if (cert.has_value()) m_slot.prepared = PreparedCert{prepared->view, *cert};
-    }
     const std::optional<std::vector<unsigned char>> new_view{m_signer_log.NewViewAccepted(state->epoch, state->slot, state->view)};
     if (state->view == 0 || new_view.has_value()) {
         m_slot.changing = false;
