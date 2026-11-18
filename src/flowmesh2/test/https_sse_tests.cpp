@@ -25,6 +25,7 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <atomic>
@@ -790,6 +791,26 @@ BOOST_AUTO_TEST_CASE(requests_refused_by_a_full_netgroup_leave_no_entries_in_the
     BOOST_CHECK_EQUAL(entries_become(2), 2U);
     holder.reset();
     BOOST_CHECK_EQUAL(entries_become(0), 0U);
+}
+
+BOOST_AUTO_TEST_CASE(a_self_signed_key_file_others_can_read_is_made_private)
+{
+    // Review workflow of 2026-11-18: the key file is opened with mode 0600 and O_TRUNC, and open applies a mode only to a
+    // file it creates. An api.key already there with a wider mode (one an earlier build wrote 0644, one an operator
+    // copied in) kept it, so every start wrote the new private key into a file other users could read.
+    Rig rig;
+    const std::string key{fs::PathToString(rig.dir / fs::u8path("api.key"))};
+    BOOST_REQUIRE_EQUAL(::chmod(key.c_str(), 0644), 0);
+    HttpsSseConfig config;
+    config.profile = rig.node->Profile();
+    config.dev_self_signed = true;
+    config.self_signed_dir = fs::PathToString(rig.dir);
+    Result<std::unique_ptr<HttpsSseApi>> api{HttpsSseApi::Create(config, rig.node->Api())};
+    RequireOk(api, "Create over a readable api.key");
+    struct stat st{};
+    BOOST_REQUIRE_EQUAL(::stat(key.c_str(), &st), 0);
+    BOOST_CHECK_EQUAL(st.st_mode & 0777, 0600U);
+    (*api)->Stop();
 }
 
 BOOST_AUTO_TEST_CASE(stop_right_after_create_returns)

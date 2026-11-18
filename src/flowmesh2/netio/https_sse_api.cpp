@@ -236,9 +236,12 @@ Result<void> HttpsSseApi::Impl::MakeSelfSigned()
         if (cf != nullptr) std::fclose(cf);
         // The key file is private from its creation (mode 0600 at open), not world-readable until a chmod (review 2026-11-16, R11).
         const int kfd{::open(key_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600)};
+        // open's mode applies only to a file it creates: an api.key already there keeps its own, so the mode is set on the open
+        // file before a key byte is written (review workflow of 2026-11-18).
+        const bool private_mode{kfd >= 0 && ::fchmod(kfd, 0600) == 0};
         FILE* kf{kfd < 0 ? nullptr : ::fdopen(kfd, "wb")};
         if (kf == nullptr && kfd >= 0) ::close(kfd);
-        ok = ok && kf != nullptr && PEM_write_PrivateKey(kf, key, nullptr, nullptr, 0, nullptr, nullptr) == 1;
+        ok = ok && private_mode && kf != nullptr && PEM_write_PrivateKey(kf, key, nullptr, nullptr, 0, nullptr, nullptr) == 1;
         if (kf != nullptr) std::fclose(kf);
     }
     if (ok) {
