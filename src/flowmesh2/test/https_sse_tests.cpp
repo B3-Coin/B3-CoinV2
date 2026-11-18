@@ -154,6 +154,24 @@ public:
         return DecodeChunks(raw);
     }
 
+    //! The raw bytes the open stream connection delivers within `limit`, read until `until` appears among them or the limit
+    //! passes. Not decoded: a read need not end on a chunk boundary, and decoding from inside a chunk loses what follows.
+    std::string ReadRawUntil(const std::string& until, std::chrono::milliseconds limit)
+    {
+        if (!m_connected) return {};
+        std::string raw;
+        char buf[4096];
+        const auto deadline{std::chrono::steady_clock::now() + limit};
+        while (std::chrono::steady_clock::now() < deadline) {
+            const int n{BIO_read(m_bio, buf, sizeof(buf))};
+            if (n <= 0) break;
+            const size_t from{raw.size() > until.size() ? raw.size() - until.size() : 0};
+            raw.append(buf, static_cast<size_t>(n));
+            if (raw.find(until, from) != std::string::npos) break;
+        }
+        return raw;
+    }
+
     static Response Parse(const std::string& raw)
     {
         Response out;
@@ -630,6 +648,46 @@ BOOST_AUTO_TEST_CASE(a_reader_that_leaves_with_events_queued_does_not_take_the_p
     }
     TlsClient later{port, TLS1_3_VERSION, TLS1_3_VERSION};
     BOOST_CHECK(later.Stream("/v2/stream?channel=slots", "event: snapshot", std::chrono::milliseconds{3'000}).find("event: snapshot") != std::string::npos);
+}
+
+BOOST_AUTO_TEST_CASE(a_stalled_stream_on_a_quiet_hub_queues_no_heartbeats)
+{
+    // Review workflow of 2026-11-18: the pump held events back from a backpressured stream (R2) but still queued a
+    // heartbeat every heartbeat_ms. With nothing new to send, the hub never overflowed into a gap, so a reader that
+    // stopped reading on a quiet hub grew its connection's output buffer without bound (about 230 B/s here, measured
+    // over 16 s), and the stream outlived the 10 s request timeout. A stream at its cap now gets no heartbeat either;
+    // once its reader drains it, the heartbeats resume.
+    HttpsSseConfig config;
+    config.stream_output_bytes = 4 * 1024;
+    SimNodeConfig node_config;
+    node_config.streams.max_queued_events = 4'096; // no gap: the hub stays quiet once the sealing stops
+    Rig rig{config, node_config};
+    const uint16_t port{rig.api->Port()};
+    TlsClient stalled{port, TLS1_3_VERSION, TLS1_3_VERSION};
+    BOOST_REQUIRE(stalled.Stream("/v2/stream?channel=slots", "event: snapshot", std::chrono::milliseconds{3'000}).find("event: snapshot") != std::string::npos);
+    // A small receive buffer, so the socket's buffers fill and the rest stays queued at the server.
+    stalled.SetReceiveBuffer(4 * 1024);
+    const auto deadline{std::chrono::steady_clock::now() + std::chrono::seconds{60}};
+    bool full{false};
+    while (!full && std::chrono::steady_clock::now() < deadline) {
+        for (int i{0}; i < 50; ++i) RequireOk(rig.node->SealSlot(), "SealSlot");
+        rig.api->Notify();
+        std::this_thread::sleep_for(std::chrono::milliseconds{5});
+        if (rig.api->Status().stream_output_bytes < config.stream_output_bytes) continue;
+        // Still at the cap after a pause: the kernel takes no more.
+        std::this_thread::sleep_for(std::chrono::milliseconds{500});
+        full = rig.api->Status().stream_output_bytes >= config.stream_output_bytes;
+    }
+    BOOST_REQUIRE(full);
+    const size_t queued{rig.api->Status().stream_output_bytes};
+    // Two seconds of a quiet hub: about thirteen heartbeat periods, none of them queued.
+    std::this_thread::sleep_for(std::chrono::seconds{2});
+    BOOST_CHECK_LE(rig.api->Status().stream_output_bytes, queued);
+    BOOST_CHECK_EQUAL(rig.api->Status().streams, 1U);
+    // The reader reads again: the backlog arrives (two seconds of reading), then heartbeats as before.
+    (void)stalled.ReadRawUntil("no such marker", std::chrono::milliseconds{2'000});
+    BOOST_CHECK(stalled.ReadRawUntil("event: heartbeat", std::chrono::milliseconds{2'000}).find("event: heartbeat") != std::string::npos);
+    BOOST_CHECK_EQUAL(rig.api->Status().streams, 1U);
 }
 
 BOOST_AUTO_TEST_CASE(stop_right_after_create_returns)

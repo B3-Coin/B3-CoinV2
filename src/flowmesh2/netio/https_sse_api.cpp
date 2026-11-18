@@ -708,9 +708,10 @@ void HttpsSseApi::Impl::Pump()
         // hub, whose queue cap ends a stream that stays behind with a gap.
         const size_t queued{QueuedOutput(stream)};
         most_queued = std::max(most_queued, queued);
+        const bool backpressured{queued >= cfg.stream_output_bytes};
         // A stalled connection takes nothing (max 0), which still reports the gap the hub declared once the reader fell too far
         // behind: the stream then ends with the gap event instead of lingering until the connection times out.
-        Result<std::vector<StreamEvent>> events{backend.TakeEvents(stream.id, queued >= cfg.stream_output_bytes ? 0 : 64)};
+        Result<std::vector<StreamEvent>> events{backend.TakeEvents(stream.id, backpressured ? 0 : 64)};
         if (!events.has_value()) {
             gapped.push_back(key);
             continue;
@@ -718,9 +719,10 @@ void HttpsSseApi::Impl::Pump()
         for (const StreamEvent& event : *events) {
             SendEvent(stream, netio::CursorText(event.cursor), ToString(event.kind), netio::StreamEventJson(event).write());
         }
-        if (now - stream.last_send >= Ms{static_cast<int64_t>(cfg.heartbeat_ms)}) {
-            UniValue beat{UniValue::VOBJ};
-            beat.pushKV("stream_epoch", UniValue{static_cast<uint64_t>(0)});
+        // No heartbeat to a connection at its cap: the reader is not reading, and on a quiet hub nothing overflows into a gap,
+        // so each beat used to grow its output buffer without bound (review workflow of 2026-11-18). Once it drains below
+        // the cap, the beats resume.
+        if (!backpressured && now - stream.last_send >= Ms{static_cast<int64_t>(cfg.heartbeat_ms)}) {
             SendEvent(stream, "", "heartbeat", "{}");
         }
     }
