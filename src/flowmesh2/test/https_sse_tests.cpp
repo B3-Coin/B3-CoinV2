@@ -217,11 +217,39 @@ UniValue Json(const std::string& text)
     return value;
 }
 
+//! The node's API with a hand on the stream pump: while `hold` is set, TakeEvents answers no events and leaves the hub's
+//! queues alone. The HTTPS loop pumps the hub on its own timer too, so stopping the rig's pumper did not stop the draining;
+//! a test that needs a queue to overflow holds it here instead of racing that timer.
+class HeldStreams final : public ClientApi
+{
+public:
+    explicit HeldStreams(ClientApi& inner) : m_inner{inner} {}
+    std::atomic<bool> hold{false};
+
+    Result<RequestId> Submit(std::span<const unsigned char> frame) override { return m_inner.Submit(frame); }
+    Result<RequestId> SubmitStatus(const ActionV2& original) override { return m_inner.SubmitStatus(original); }
+    Result<RequestId> SubmitHealth() override { return m_inner.SubmitHealth(); }
+    std::optional<ApiReply> TakeReply(RequestId id) override { return m_inner.TakeReply(id); }
+    Result<ActionStatusReply> GetAction(const ActionV2& original) const override { return m_inner.GetAction(original); }
+    Result<read::AccountReply> GetState(const AccountId& account) const override { return m_inner.GetState(account); }
+    Result<StreamId> Subscribe(const StreamRequest& request) override { return m_inner.Subscribe(request); }
+    Result<std::vector<StreamEvent>> TakeEvents(StreamId id, size_t max) override
+    {
+        if (hold) return Ok(std::vector<StreamEvent>{});
+        return m_inner.TakeEvents(id, max);
+    }
+    Result<void> Unsubscribe(StreamId id) override { return m_inner.Unsubscribe(id); }
+
+private:
+    ClientApi& m_inner;
+};
+
 struct Rig {
     TraceRecorder trace;
     std::unique_ptr<SimNode> node;
     std::optional<SimClient> alice;
     std::optional<SimClient> bob;
+    std::unique_ptr<HeldStreams> streams; //!< between the server and the node, so it outlives `api`
     std::unique_ptr<HttpsSseApi> api;
     std::atomic<bool> pumping{true};
     std::thread pumper;
@@ -259,7 +287,8 @@ struct Rig {
         config.dev_self_signed = true;
         config.self_signed_dir = fs::PathToString(dir);
         if (config.heartbeat_ms == 1'000) config.heartbeat_ms = 150;
-        Result<std::unique_ptr<HttpsSseApi>> served{HttpsSseApi::Create(config, node->Api())};
+        streams = std::make_unique<HeldStreams>(node->Api());
+        Result<std::unique_ptr<HttpsSseApi>> served{HttpsSseApi::Create(config, *streams)};
         RequireOk(served, "HttpsSseApi::Create");
         api = std::move(served).value();
         StartPumper();
@@ -502,17 +531,18 @@ BOOST_AUTO_TEST_CASE(a_gap_closes_streams_cleanly_and_new_readers_are_served)
     BOOST_CHECK(one.Stream("/v2/stream?channel=slots", "event: snapshot", std::chrono::milliseconds{3'000}).find("event: snapshot") != std::string::npos);
     BOOST_CHECK(two.Stream("/v2/stream?channel=slots", "event: snapshot", std::chrono::milliseconds{3'000}).find("event: snapshot") != std::string::npos);
     BOOST_CHECK_EQUAL(rig.api->Status().streams, 2U);
-    // No pump while twelve slots are sealed: both queues overflow the cap of eight.
-    rig.pumping = false;
-    if (rig.pumper.joinable()) rig.pumper.join();
+    // Nothing taken from the hub while twelve slots are sealed: both queues overflow the cap of eight. (Stopping the rig's
+    // pumper was not enough: the server's own timer pumps the hub every heartbeat_ms / 4 and drained the queues in about
+    // four runs of ten.)
+    rig.streams->hold = true;
     for (int i{0}; i < 12; ++i) RequireOk(rig.node->SealSlot(), "SealSlot");
+    rig.streams->hold = false;
     rig.api->Notify();
     const auto deadline{std::chrono::steady_clock::now() + std::chrono::seconds{5}};
     while (rig.api->Status().streams > 0 && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(std::chrono::milliseconds{5});
     BOOST_CHECK_EQUAL(rig.api->Status().streams, 0U);
     BOOST_CHECK(one.ReadMore(std::chrono::milliseconds{2'000}).find("event: gap") != std::string::npos);
     BOOST_CHECK(two.ReadMore(std::chrono::milliseconds{2'000}).find("event: gap") != std::string::npos);
-    rig.StartPumper();
     TlsClient later{port, TLS1_3_VERSION, TLS1_3_VERSION};
     BOOST_CHECK(later.Stream("/v2/stream?channel=slots", "event: snapshot", std::chrono::milliseconds{3'000}).find("event: snapshot") != std::string::npos);
     BOOST_CHECK_EQUAL(rig.api->Status().streams, 1U);
