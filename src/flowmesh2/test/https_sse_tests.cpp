@@ -23,12 +23,14 @@
 #include <boost/test/unit_test.hpp>
 
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <fstream>
 #include <memory>
@@ -219,8 +221,9 @@ private:
         SSL_CTX_set_max_proto_version(m_ctx, m_max);
         SSL_CTX_set_verify(m_ctx, SSL_VERIFY_NONE, nullptr); // the pin above replaces the CA check
         if (!m_source.empty()) {
-            m_fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+            m_fd = ::socket(AF_INET, SOCK_STREAM, 0); // no SOCK_CLOEXEC: macOS has none
             BOOST_REQUIRE(m_fd >= 0);
+            BOOST_REQUIRE_EQUAL(::fcntl(m_fd, F_SETFD, FD_CLOEXEC), 0);
             sockaddr_in local{};
             local.sin_family = AF_INET;
             BOOST_REQUIRE_EQUAL(inet_pton(AF_INET, m_source.c_str(), &local.sin_addr), 1);
@@ -769,6 +772,23 @@ BOOST_AUTO_TEST_CASE(requests_refused_by_a_full_netgroup_leave_no_entries_in_the
     // its cap thus grew the per-address count with every address of the group it refused (65,536 in an IPv4 /16, no real
     // bound in an IPv6 group). Here one stream fills its netgroup (127.0/16) and forty other addresses of it are
     // refused; the counts hold the stream's two entries (its address and its netgroup), then none once it ends.
+    // The other addresses must be local. All of 127.0.0.0/8 is on Linux; macOS's lo0 has 127.0.0.1 only unless aliases
+    // are added (ifconfig lo0 alias 127.0.0.2 ... 127.0.0.41), so there the case says why and stops.
+    {
+        const int probe{::socket(AF_INET, SOCK_STREAM, 0)};
+        BOOST_REQUIRE(probe >= 0);
+        sockaddr_in local{};
+        local.sin_family = AF_INET;
+        BOOST_REQUIRE_EQUAL(inet_pton(AF_INET, "127.0.0.41", &local.sin_addr), 1);
+        const bool bound{::bind(probe, reinterpret_cast<sockaddr*>(&local), sizeof(local)) == 0};
+        const int bind_errno{errno};
+        ::close(probe);
+        if (!bound && bind_errno == EADDRNOTAVAIL) {
+            BOOST_TEST_MESSAGE("127.0.0.2-41 are not local on this host: the netgroup-count case does not run here");
+            return;
+        }
+        BOOST_REQUIRE(bound);
+    }
     HttpsSseConfig config;
     config.max_connections_per_netgroup = 1;
     Rig rig{config};
