@@ -32,9 +32,11 @@
  * Record: `u32 len | u32 crc32c(payload) | payload`, payload =
  * `u32 height | hash (32) | u32 n | n x (u32 len | fact bytes)` (EncodeFact),
  * little-endian. Blocks are appended by `fm2-devchain` (the faucet) with
- * fsync; a reader that finds a partial record at the tail waits for the rest
- * (nothing is ever rewritten), a CRC or shape error is STORAGE_FATAL. Heights
- * are consecutive from base + 1; hashes are DevChainBlockHash(height).
+ * fsync, one writer at a time (an exclusive flock on the file from the read
+ * to the fsync); a reader that finds a partial record at the tail waits for
+ * the rest, a CRC or shape error is STORAGE_FATAL. A complete record is never
+ * rewritten; a torn one that a dead writer left is cut by the next append.
+ * Heights are consecutive from base + 1; hashes are DevChainBlockHash(height).
  */
 namespace flowmesh2::dev {
 
@@ -61,7 +63,8 @@ Outpoint DevChainOutpoint(uint32_t height, uint32_t index);
 Result<std::vector<unsigned char>> EncodeDevChainBlock(const DevChainBlock& block);
 Result<DevChainBlock> DecodeDevChainBlock(std::span<const unsigned char> payload);
 
-//! Append one block (creating the file), fsync'd before returning.
+//! Append one block (creating the file), fsync'd before returning; under the file's lock, so the height check holds against
+//! any other writer (DEVCHAIN_HEIGHT if one appended first).
 Result<void> AppendDevChainBlock(const fs::path& file, const DevChainBlock& block);
 //! Whether every fm2d of the cluster takes `block` after `existing`: Ok, or the refusal a seat would give. The blocks go
 //! through a FakeChainAdapter built from the same network, authority, seats and base as fm2d's (MAX_SLOT_FACTS, cursors,

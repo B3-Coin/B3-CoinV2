@@ -21,9 +21,15 @@
 
 #include <boost/test/unit_test.hpp>
 
+#include <chrono>
 #include <fstream>
+#include <future>
 #include <string>
 #include <vector>
+
+#include <fcntl.h>
+#include <sys/file.h>
+#include <unistd.h>
 
 /** The genesis document and the dev chain file (M5-NODE-01, O-105): the
  * document round-trips, every party computes the same seat set and genesis
@@ -205,6 +211,49 @@ BOOST_AUTO_TEST_CASE(the_dev_chain_file_appends_tails_and_refuses_corruption)
     }
     RequireRefusal(tail.Poll(), ErrorCode::STORAGE_FATAL, dev::DEVCHAIN_CORRUPT, "bad crc");
     RequireRefusal(dev::ReadDevChain(file), ErrorCode::STORAGE_FATAL, dev::DEVCHAIN_CORRUPT, "bad crc everywhere");
+    fs::remove_all(dir);
+}
+
+BOOST_AUTO_TEST_CASE(the_dev_chain_file_takes_one_writer_and_cuts_a_torn_tail)
+{
+    // Review workflow of 2026-11-18: AppendDevChainBlock read the file, checked the height and appended with no lock, after
+    // whatever the file ended with. Two faucet calls at once could both append the same next height. After a writer that
+    // died mid-record, the next block went in behind the torn bytes: every reader then took the torn length over the new
+    // record, failed its CRC, and every seat tailing the file stopped for good. An append now holds an exclusive lock on
+    // the file from its read to its fsync, and cuts a torn tail it finds under the lock (only a dead writer leaves one).
+    const fs::path dir{fs::PathFromString(FM2_TEST_TMP_DIR) / fs::u8path("devchain_writer_tests")};
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    const auto block{[](uint32_t height) { return dev::DevChainBlock{height, dev::DevChainBlockHash(height), {}}; }};
+    // A writer that died four bytes into the record after block 130.
+    const fs::path torn{dir / fs::u8path("torn.log")};
+    RequireOk(dev::AppendDevChainBlock(torn, block(130)), "append 130");
+    {
+        const std::vector<unsigned char> payload{dev::EncodeDevChainBlock(block(131)).value()};
+        std::ofstream out{fs::PathToString(torn), std::ios::binary | std::ios::app};
+        const uint32_t len{static_cast<uint32_t>(payload.size())};
+        out.write(reinterpret_cast<const char*>(&len), 4); // little-endian host
+    }
+    BOOST_CHECK_EQUAL(dev::ReadDevChain(torn).value().size(), 1U); // the torn record waits, as a partial one does
+    RequireOk(dev::AppendDevChainBlock(torn, block(131)), "append after a torn tail");
+    const Result<std::vector<dev::DevChainBlock>> after_torn{dev::ReadDevChain(torn)};
+    BOOST_CHECK_MESSAGE(after_torn.has_value() && after_torn->size() == 2 && after_torn->back() == block(131),
+                        "the chain after the torn tail: " << (after_torn.has_value() ? std::to_string(after_torn->size()) + " blocks"
+                                                                                      : std::string{after_torn.error().detail}));
+    // One writer at a time: while another holds the file's lock, an append waits for it.
+    const fs::path shared{dir / fs::u8path("shared.log")};
+    RequireOk(dev::AppendDevChainBlock(shared, block(130)), "append 130");
+    const int held{::open(fs::PathToString(shared).c_str(), O_RDWR | O_CLOEXEC)};
+    BOOST_REQUIRE(held >= 0);
+    BOOST_REQUIRE_EQUAL(::flock(held, LOCK_EX), 0);
+    std::future<Result<void>> appending{std::async(std::launch::async, [&] { return dev::AppendDevChainBlock(shared, block(131)); })};
+    BOOST_CHECK(appending.wait_for(std::chrono::milliseconds{300}) == std::future_status::timeout);
+    BOOST_CHECK_EQUAL(dev::ReadDevChain(shared).value().size(), 1U);
+    ::close(held); // the lock goes with it
+    RequireOk(appending.get(), "append once the lock is free");
+    BOOST_CHECK_EQUAL(dev::ReadDevChain(shared).value().size(), 2U);
+    // A writer that lost the race refuses its block instead of writing the height again.
+    RequireRefusal(dev::AppendDevChainBlock(shared, block(131)), ErrorCode::INVALID_INPUT, dev::DEVCHAIN_HEIGHT, "131 again");
     fs::remove_all(dir);
 }
 

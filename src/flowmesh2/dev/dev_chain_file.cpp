@@ -11,6 +11,7 @@
 #include <crypto/sha256.h>
 
 #include <fcntl.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -60,26 +61,30 @@ Result<std::vector<DevChainBlock>> ParseRecords(const std::vector<unsigned char>
     return Ok(std::move(blocks));
 }
 
-Result<std::vector<unsigned char>> ReadWhole(const fs::path& file)
+//! Everything from the descriptor's offset to its end.
+Result<std::vector<unsigned char>> ReadRest(int fd)
 {
-    const int fd{::open(fs::PathToString(file).c_str(), O_RDONLY)};
-    if (fd < 0) {
-        if (errno == ENOENT) return Ok(std::vector<unsigned char>{});
-        return Error{ErrorCode::STORAGE_FATAL, DEVCHAIN_OPEN};
-    }
     std::vector<unsigned char> bytes;
     unsigned char buf[65536];
     for (;;) {
         const ssize_t n{::read(fd, buf, sizeof(buf))};
-        if (n < 0) {
-            ::close(fd);
-            return Error{ErrorCode::STORAGE_FATAL, DEVCHAIN_OPEN};
-        }
+        if (n < 0) return Error{ErrorCode::STORAGE_FATAL, DEVCHAIN_OPEN};
         if (n == 0) break;
         bytes.insert(bytes.end(), buf, buf + n);
     }
-    ::close(fd);
     return Ok(std::move(bytes));
+}
+
+Result<std::vector<unsigned char>> ReadWhole(const fs::path& file)
+{
+    const int fd{::open(fs::PathToString(file).c_str(), O_RDONLY | O_CLOEXEC)};
+    if (fd < 0) {
+        if (errno == ENOENT) return Ok(std::vector<unsigned char>{});
+        return Error{ErrorCode::STORAGE_FATAL, DEVCHAIN_OPEN};
+    }
+    Result<std::vector<unsigned char>> bytes{ReadRest(fd)};
+    ::close(fd);
+    return bytes;
 }
 
 } // namespace
@@ -134,31 +139,39 @@ Result<DevChainBlock> DecodeDevChainBlock(std::span<const unsigned char> payload
 
 Result<void> AppendDevChainBlock(const fs::path& file, const DevChainBlock& block)
 {
+    // One writer at a time, from the read to the fsync: two faucet calls at once used to both append the same next height
+    // (review workflow of 2026-11-18). The lock is advisory; every writer of the file goes through here.
+    const int fd{::open(fs::PathToString(file).c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644)};
+    if (fd < 0) return Error{ErrorCode::STORAGE_FATAL, DEVCHAIN_OPEN};
+    const auto fail{[fd](Error error) {
+        ::close(fd); // the lock goes with it
+        return error;
+    }};
+    if (::flock(fd, LOCK_EX) != 0) return fail(Error{ErrorCode::STORAGE_FATAL, DEVCHAIN_OPEN});
+    const Result<std::vector<unsigned char>> bytes{ReadRest(fd)};
+    if (!bytes.has_value()) return fail(bytes.error());
+    uint64_t end{0};
+    const Result<std::vector<DevChainBlock>> existing{ParseRecords(*bytes, end)};
+    if (!existing.has_value()) return fail(existing.error());
     // The next height only: a reader applies blocks in order.
-    Result<std::vector<DevChainBlock>> existing{ReadDevChain(file)};
-    if (!existing.has_value()) return existing.error();
-    if (!existing->empty() && existing->back().height + 1 != block.height) return Error{ErrorCode::INVALID_INPUT, DEVCHAIN_HEIGHT};
+    if (!existing->empty() && existing->back().height + 1 != block.height) return fail(Error{ErrorCode::INVALID_INPUT, DEVCHAIN_HEIGHT});
     const Result<std::vector<unsigned char>> payload{EncodeDevChainBlock(block)};
-    if (!payload.has_value()) return payload.error();
+    if (!payload.has_value()) return fail(payload.error());
     std::vector<unsigned char> record;
     PutU32(record, static_cast<uint32_t>(payload->size()));
     PutU32(record, crc32c::Crc32c(payload->data(), payload->size()));
     record.insert(record.end(), payload->begin(), payload->end());
-    const int fd{::open(fs::PathToString(file).c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644)};
-    if (fd < 0) return Error{ErrorCode::STORAGE_FATAL, DEVCHAIN_OPEN};
+    // Bytes after the last complete record, found under the lock, are a writer that died mid-append. They are cut: the
+    // next record written behind them would sit under the torn length, and no reader could parse past it again. No reader
+    // ever advanced over them (a reader takes complete records only).
+    if (end < bytes->size() && ::ftruncate(fd, static_cast<off_t>(end)) != 0) return fail(Error{ErrorCode::STORAGE_FATAL, DEVCHAIN_WRITE});
     size_t written{0};
     while (written < record.size()) {
-        const ssize_t n{::write(fd, record.data() + written, record.size() - written)};
-        if (n <= 0) {
-            ::close(fd);
-            return Error{ErrorCode::STORAGE_FATAL, DEVCHAIN_WRITE};
-        }
+        const ssize_t n{::pwrite(fd, record.data() + written, record.size() - written, static_cast<off_t>(end + written))};
+        if (n <= 0) return fail(Error{ErrorCode::STORAGE_FATAL, DEVCHAIN_WRITE});
         written += static_cast<size_t>(n);
     }
-    if (::fsync(fd) != 0) {
-        ::close(fd);
-        return Error{ErrorCode::STORAGE_FATAL, DEVCHAIN_WRITE};
-    }
+    if (::fsync(fd) != 0) return fail(Error{ErrorCode::STORAGE_FATAL, DEVCHAIN_WRITE});
     ::close(fd);
     return Ok();
 }
