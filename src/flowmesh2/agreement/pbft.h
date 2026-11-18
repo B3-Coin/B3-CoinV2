@@ -125,7 +125,16 @@
  * for the current slot and resumes that view (ACTIVE if its NEW_VIEW was
  * accepted or it is view 0, CHANGING otherwise, re-sending the durable
  * report), the commit log's HighestPrepared, and the parent certificate
- * from the commit journal's last DECISION.
+ * from the commit journal's last DECISION. A leader restarted in the ACTIVE
+ * view it proposed in resumes that proposal from the signer log's last
+ * ACCEPTED_PROPOSAL (re-executed against the head first) with the PREPARE
+ * and COMMIT it signed, signing the ones it had not yet, and the retry timer
+ * resends them: a fresh candidate would be a second header for the key
+ * (PROPOSAL_CONFLICT, the node fenced; ARCHITECTURE.md 17.3 item 15(a)).
+ * At a view above 0 its NEW_VIEW is not resent (a peer that missed it holds
+ * the proposal pending, as before). Create fails, so the node does not
+ * start, when that resume cannot sign or the two logs disagree
+ * (VERIFY_FAILED PBFT_PROPOSAL_RECOVERY), as for the report above.
  *
  * Inclusion lists (M4-AGR-04), adaptive timeouts (M4-AGR-05), the restart
  * fence (M4-AGR-06), evidence (M4-AGR-07) and invalid-share exclusion
@@ -163,6 +172,7 @@ inline constexpr std::string_view PBFT_VIEW_STALE{"message for an older view"}; 
 inline constexpr std::string_view PBFT_NO_PROPOSAL{"no accepted proposal in this view"};                     //!< (ORDER_VIOLATION)
 inline constexpr std::string_view PBFT_PREPARED_MISMATCH{"the PreparedQC is not this view's or header's"};   //!< (INVALID_INPUT)
 inline constexpr std::string_view PBFT_REPORT_RECOVERY{"the signed view-change report cannot be rebuilt from the durable preparations"}; //!< (VERIFY_FAILED)
+inline constexpr std::string_view PBFT_PROPOSAL_RECOVERY{"a signed vote of the resumed proposal does not match it"};                  //!< (VERIFY_FAILED)
 
 //! Votes for a slot that arrive before its proposal are kept up to this many. PROVISIONAL.
 inline constexpr size_t MAX_EARLY_VOTES{64};
@@ -352,6 +362,8 @@ private:
     Result<void> SyncHead();
     void StartSlot(const state::HeadView& head);
     Result<void> ResumeViewState(const state::HeadView& head);
+    //! The leader restarted in the ACTIVE view it proposed in: its durable ACCEPTED_PROPOSAL and own votes (17.3 item 15(a)).
+    Result<void> ResumeAccepted();
     uint64_t TimeoutMs(uint64_t view) const;
     //! Work showed up: the deadline becomes now + TimeoutMs(view) if that is sooner.
     void TightenDeadline();

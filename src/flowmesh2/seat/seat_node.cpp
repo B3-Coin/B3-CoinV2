@@ -341,6 +341,10 @@ Result<uint64_t> SeatNode::ProposeSlot()
 {
     if (m_pbft == nullptr) return Error{ErrorCode::INVALID_INPUT, SEAT_MULTI_SEAT};
     if (!m_pbft->IsLeader()) return Error{ErrorCode::INVALID_INPUT, SEAT_NOT_LEADER};
+    // The view holds this seat's proposal already (resumed after a restart, ARCHITECTURE.md 17.3 item 15(a), or proposed
+    // before): the retry timer resends it. Prepare would take pool actions for a candidate Propose then refuses as
+    // ORDER_VIOLATION PBFT_PROPOSAL_PENDING, which fences the node.
+    if (m_pbft->Status().proposal_accepted) return Error{ErrorCode::BUSY, SEAT_PROPOSAL_IN_FLIGHT};
     // A NEW_VIEW selected a header: re-propose it when this seat holds it, with the parent certificate the header binds; fetch
     // it (Tick) when not. A fresh candidate would be refused in either case (PBFT_NEW_VIEW_SELECTED; O-101).
     if (const std::optional<uint256> selected{m_pbft->SelectedHeader()}; selected.has_value()) {

@@ -146,6 +146,39 @@ BOOST_AUTO_TEST_CASE(a_partition_without_a_quorum_decides_nothing_until_it_heals
     BOOST_CHECK_GT(trace.Size(), 0U);
 }
 
+BOOST_AUTO_TEST_CASE(a_leader_restarted_after_proposing_resumes_instead_of_fencing)
+{
+    // ARCHITECTURE.md 17.3 item 15(a), through SeatNode: the leader proposes, crashes (its frames lost) and restarts over its
+    // journals while the chain moved on. Before, its next ProposeSlot built a fresh candidate, the signer log answered
+    // PROPOSAL_CONFLICT for (epoch, slot, view) and the node fenced. Now it resumes the durable proposal: ProposeSlot is
+    // BUSY (the retry timer resends it) and the slot decides the original header.
+    TraceRecorder trace;
+    Result<std::unique_ptr<SimCluster>> created{SimCluster::Create(4, SimNodeConfig{}, trace)};
+    RequireOk(created, "SimCluster::Create(4)");
+    SimCluster& cluster{**created};
+    for (size_t i{0}; i < 4; ++i) RequireOk(cluster.Node(i).Chain().AppendBlock(SimBlockHash(SIM_BASE_HEIGHT + 1), {}), "AppendBlock");
+    const std::optional<uint32_t> leader{cluster.Leader()};
+    BOOST_REQUIRE(leader.has_value());
+    RequireOk(cluster.Node(*leader).ProposeSlot(), "ProposeSlot");
+    RequireOk(cluster.RestartNode(*leader), "RestartNode");
+    for (size_t i{0}; i < 4; ++i) RequireOk(cluster.Node(i).Chain().AppendBlock(SimBlockHash(SIM_BASE_HEIGHT + 2), {}), "AppendBlock");
+    SimNode& node{cluster.Node(*leader)};
+    const std::optional<agreement::PbftStatus> status{node.AgreementStatus()};
+    BOOST_REQUIRE(status.has_value());
+    BOOST_CHECK(status->proposal_accepted); // before: false
+    RequireError(node.ProposeSlot(), ErrorCode::BUSY, "a ProposeSlot after the restart (SEAT_PROPOSAL_IN_FLIGHT)");
+    BOOST_REQUIRE(!node.Fenced()); // before: fenced on PROPOSAL_CONFLICT
+    bool all{false};
+    for (uint64_t now{1}; now < 2'000 && !all; ++now) {
+        RequireOk(cluster.Pump(now), "Pump");
+        all = true;
+        for (size_t i{0}; i < 4; ++i) all = all && cluster.Node(i).Owner().Head()->Header().height == 1;
+    }
+    BOOST_REQUIRE_MESSAGE(all, "slot 1 did not decide");
+    for (size_t i{0}; i < 4; ++i) BOOST_CHECK(!cluster.Node(i).Fenced());
+    for (size_t i{1}; i < 4; ++i) BOOST_CHECK(cluster.Node(i).Owner().Head()->HeaderHash() == cluster.Node(0).Owner().Head()->HeaderHash());
+}
+
 BOOST_AUTO_TEST_CASE(an_inconsistent_fault_plan_is_refused)
 {
     FaultPlan plan;

@@ -242,7 +242,7 @@ Result<void> PbftAgreement::ResumeViewState(const state::HeadView& head)
         if (cert.has_value()) m_slot.prepared = PreparedCert{prepared.view, *cert};
     }
     const std::optional<storage::ViewStateRecord> state{m_signer_log.ViewState()};
-    if (!state.has_value() || state->slot != m_slot.slot || state->epoch != m_slot.epoch) return Ok();
+    if (!state.has_value() || state->slot != m_slot.slot || state->epoch != m_slot.epoch) return ResumeAccepted(); // view 0, ACTIVE
     m_slot.view = state->view;
     const std::optional<std::vector<unsigned char>> new_view{m_signer_log.NewViewAccepted(state->epoch, state->slot, state->view)};
     if (state->view == 0 || new_view.has_value()) {
@@ -254,7 +254,7 @@ Result<void> PbftAgreement::ResumeViewState(const state::HeadView& head)
             }
         }
         Tell();
-        return Ok();
+        return ResumeAccepted();
     }
     // Durable VIEW_STATE without its NEW_VIEW: the seat was CHANGING. Its report, if signed, is in the signer log as
     // the digest it signed and the signature. The report is rebuilt from the durable preparations of this slot and
@@ -305,6 +305,89 @@ Result<void> PbftAgreement::ResumeViewState(const state::HeadView& head)
     m_slot.own_report_statement = OutboundVote::Recovered(*signed_report);
     m_slot.reports[m_slot.view].emplace(m_config.self_seat, report);
     return Ok();
+}
+
+Result<void> PbftAgreement::ResumeAccepted()
+{
+    // ARCHITECTURE.md 17.3 item 15(a): ACCEPTED_PROPOSAL of (epoch, slot, view) is durable before the proposal leaves (R4),
+    // so a fresh candidate after a restart was a second header for the key: PROPOSAL_CONFLICT, and SeatNode fenced the node.
+    // The leader resumes that proposal from the signer log instead, with its own durable votes; a vote it never signed is
+    // signed now, as its path would have (B-INTENT, check 2, Sign, B-VOTE). Anything that does not fit declines the resume
+    // and leaves the slot as it was before this change.
+    if (Fenced() || m_slot.changing || m_slot.accepted.has_value()) return Ok();
+    const Result<uint32_t> leader{LeaderOf(m_slot.view)};
+    if (!leader.has_value() || *leader != m_config.self_seat) return Ok();
+    const storage::ProposalKey key{m_slot.epoch, m_slot.slot, m_slot.view};
+    std::optional<storage::AcceptedProposalRecord> record{m_signer_log.AcceptedProposal(key)};
+    if (!record.has_value()) return Ok();
+    const std::shared_ptr<const state::HeadView> head{m_owner.Head()};
+    if (record->header.parent_hash != head->HeaderHash()) return Ok();
+    Proposal proposal;
+    proposal.epoch = m_slot.epoch;
+    proposal.view = m_slot.view;
+    proposal.header = std::move(record->header);
+    proposal.body = std::move(record->body);
+    if (!proposal.header.parent_cert_hash.IsNull()) {
+        // The header binds its parent certificate, which ACCEPTED_PROPOSAL does not hold. The leader's own candidate binds
+        // the head's (the commit log's, m_parent_cert); a re-proposed selection may bind another quorum's: that header is
+        // the view's selection, which ProposeSlot fetches and re-proposes idempotently (the same header for the key).
+        if (!m_parent_cert.has_value() || m_parent_cert->Hash() != proposal.header.parent_cert_hash) return Ok();
+        proposal.parent_cert = m_parent_cert;
+    }
+    if (const Result<void> shape{CheckProposal(proposal)}; !shape.has_value()) return shape.error();
+    const uint256 hash{proposal.header.Hash()};
+    // O-89, as ProposeHeaderBody: a height this commit log decided with another header is never signed again.
+    if (const std::optional<storage::DecisionRef> decided{m_commit_log.DecisionAt(m_slot.slot)};
+        decided.has_value() && decided->header_hash != hash) {
+        return Ok();
+    }
+    // Execute-then-vote, as for any proposal this seat signs: the body reproduces the header over this head.
+    if (const Result<state::Candidate> candidate{m_owner.Reexecute(proposal.header, proposal.body)}; !candidate.has_value()) {
+        return candidate.error();
+    }
+    // The same header again: the original token, nothing written.
+    Result<storage::PendingProposal> pending{m_signer_log.AppendAcceptedProposal(key, proposal.header, proposal.body)};
+    if (!pending.has_value()) return pending.error();
+    Result<std::vector<unsigned char>> bytes{EncodeMessage(Message{proposal}, m_profile)};
+    if (!bytes.has_value()) return bytes.error();
+    m_slot.accepted = proposal;
+    m_slot.accepted_pending = *pending;
+    m_slot.known_proposals.emplace(hash, proposal);
+    m_slot.own_proposal = std::move(bytes).value();
+    TightenDeadline();
+    Tell();
+    const auto own_vote{[&](storage::VotePhase phase, const storage::VoteSignature& signature) {
+        Vote vote;
+        vote.phase = phase;
+        vote.epoch = m_slot.epoch;
+        vote.view = m_slot.view;
+        vote.slot = m_slot.slot;
+        vote.header_hash = hash;
+        vote.seat = m_config.self_seat;
+        vote.signature = signature;
+        return vote;
+    }};
+    const storage::VoteKey prepare_key{m_domain, m_slot.epoch, m_slot.slot, m_slot.view, storage::VotePhase::PREPARE};
+    if (const std::optional<storage::SignedVoteRecord> prepare{m_signer_log.SignedVote(prepare_key)}) {
+        if (prepare->digest != PrepareDigest(m_domain, m_slot.epoch, m_slot.slot, m_slot.view, hash)) {
+            return Error{ErrorCode::VERIFY_FAILED, PBFT_PROPOSAL_RECOVERY};
+        }
+        m_slot.own_prepare = OutboundVote::Recovered(*prepare);
+        m_slot.prepares[m_config.self_seat] = own_vote(storage::VotePhase::PREPARE, prepare->signature);
+    } else if (const Result<void> voted{VotePrepare(proposal)}; !voted.has_value()) {
+        return voted.error();
+    }
+    const storage::VoteKey commit_key{m_domain, m_slot.epoch, m_slot.slot, m_slot.view, storage::VotePhase::COMMIT};
+    if (const std::optional<storage::SignedVoteRecord> commit{m_signer_log.SignedVote(commit_key)}) {
+        if (commit->digest != proposal.header.CommitDigest()) return Error{ErrorCode::VERIFY_FAILED, PBFT_PROPOSAL_RECOVERY};
+        m_slot.commit_voted = true;
+        m_slot.own_commit = OutboundVote::Recovered(*commit);
+        m_slot.commits[m_config.self_seat] = own_vote(storage::VotePhase::COMMIT, commit->signature);
+        return Ok();
+    }
+    // A PreparedQC of this view is durable before the COMMIT intent (restored by ResumeViewState from PreparedAt): sign it
+    // now. VoteCommit does nothing unless m_slot.prepared is of this view and MayCommit agrees.
+    return VoteCommit();
 }
 
 Result<void> PbftAgreement::SyncHead()

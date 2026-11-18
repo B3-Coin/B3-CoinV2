@@ -836,6 +836,18 @@ void Restart(Cluster& c, uint32_t i)
     seat.pbft = std::move(pbft).value();
 }
 
+//! A real restart's signer log, rebuilt from the SIGNER journal's durable records (SignerLog::Recover, as SeatNode does) and
+//! assigned in place (the rig's SeatSigner points at rig->signer_log); then the agreement (Restart).
+void RestartRecovered(Cluster& c, uint32_t i)
+{
+    Seat& seat{c.At(i)};
+    seat.pbft.reset();
+    Result<storage::SignerLog> recovered{storage::SignerLog::Recover(*seat.rig->signer_journal, seat.rig->profile)};
+    RequireOk(recovered, "SignerLog::Recover");
+    seat.rig->signer_log = std::move(recovered).value();
+    Restart(c, i);
+}
+
 } // namespace
 
 BOOST_AUTO_TEST_CASE(the_proposal_leaves_only_after_accepted_proposal_is_durable)
@@ -1109,6 +1121,117 @@ BOOST_AUTO_TEST_CASE(reports_keep_each_seats_two_highest_targets)
     BOOST_CHECK_EQUAL(x.pbft->Status().view, 0U);
     RequireOk(x.pbft->OnMessage(2, ReportFrom(c, 2, 3)), "seat 2 at 3");
     BOOST_CHECK_EQUAL(x.pbft->Status().view, 3U);
+}
+
+BOOST_AUTO_TEST_CASE(a_leader_restarted_in_its_view_resends_its_proposal)
+{
+    // ARCHITECTURE.md 17.3 item 15(a): a leader restarted in the view it proposed in came back without its proposal, so its
+    // next candidate was a second header for (epoch, slot, view): the signer log answered PROPOSAL_CONFLICT and SeatNode
+    // fenced the node. Slot 2, so the rebuilt proposal must carry the parent certificate its header binds. The proposal and
+    // the leader's PREPARE reach nobody before the crash.
+    Cluster c{4};
+    c.AppendBlock(130, {Fact{DepositAtCursor(FactCursor{130, 0}, "d0")}});
+    const uint32_t first{c.Leader()};
+    BOOST_REQUIRE_LT(first, 4U);
+    const state::Candidate one{c.At(first).rig->Preview(c.InputsFromChain(first))};
+    RequireOk(c.At(first).pbft->Propose(one, c.Authority()), "Propose slot 1");
+    c.Deliver();
+    BOOST_REQUIRE(c.refusals.empty());
+    BOOST_REQUIRE(c.ApplyDecisions(one, first) == one.Header().Hash());
+
+    const uint32_t leader{c.Leader()};
+    BOOST_REQUIRE_LT(leader, 4U);
+    Seat& seat{c.At(leader)};
+    const state::Candidate candidate{seat.rig->Preview(c.InputsFromChain(leader))};
+    BOOST_REQUIRE_EQUAL(candidate.Header().height, 2U);
+    BOOST_REQUIRE(!candidate.Header().parent_cert_hash.IsNull());
+    RequireOk(seat.pbft->Propose(candidate, c.Authority()), "Propose slot 2");
+    std::vector<unsigned char> original;
+    for (const RecordingMesh::Sent& s : seat.mesh->sent) {
+        if (TypeOf(s.frame) == MessageType::PROPOSAL) original = s.frame;
+    }
+    BOOST_REQUIRE(!original.empty());
+    seat.mesh->sent.clear(); // lost with the crash
+    const uint64_t written{seat.rig->signer_journal->Status().appended_seq};
+
+    RestartRecovered(c, leader);
+    {
+        const PbftStatus status{seat.pbft->Status()};
+        BOOST_CHECK_EQUAL(status.slot, 2U);
+        BOOST_CHECK_EQUAL(status.view, 0U);
+        BOOST_CHECK(status.leader);
+        BOOST_REQUIRE(status.proposal_accepted);     // before: false, nothing resumed the durable ACCEPTED_PROPOSAL
+        BOOST_CHECK_EQUAL(status.prepare_votes, 1U); // its own PREPARE, from the signer log
+    }
+    BOOST_CHECK_EQUAL(seat.rig->signer_journal->Status().appended_seq, written); // resumed: nothing signed or written
+    // New chain facts during the downtime give a fresh candidate: refused in memory (before: PROPOSAL_CONFLICT, the fence).
+    c.AppendBlock(131, {Fact{DepositAtCursor(FactCursor{131, 0}, "d1")}});
+    const state::Candidate another{seat.rig->Preview(c.InputsFromChain(leader))};
+    BOOST_REQUIRE(another.Header().Hash() != candidate.Header().Hash());
+    RequireRefusal(seat.pbft->Propose(another, c.Authority()), ErrorCode::ORDER_VIOLATION, PBFT_PROPOSAL_PENDING, "a fresh candidate after the restart");
+    BOOST_CHECK_EQUAL(seat.rig->signer_journal->Status().appended_seq, written);
+
+    // The retry timer resends the exact proposal, byte for byte, and the slot decides it.
+    std::vector<std::vector<unsigned char>> resent;
+    seat.mesh->on_transmit = [&](const RecordingMesh::Sent& s) {
+        if (TypeOf(s.frame) == MessageType::PROPOSAL) resent.push_back(s.frame);
+    };
+    c.Tick(PbftConfig{}.retry_ms);
+    seat.mesh->on_transmit = nullptr;
+    BOOST_CHECK(c.refusals.empty());
+    BOOST_REQUIRE_EQUAL(resent.size(), 3U);
+    for (const std::vector<unsigned char>& frame : resent) BOOST_CHECK(frame == original);
+    for (uint32_t i{0}; i < 4; ++i) BOOST_CHECK(c.At(i).pbft->Status().decided);
+    BOOST_CHECK(c.ApplyDecisions() == candidate.Header().Hash());
+}
+
+BOOST_AUTO_TEST_CASE(a_leader_restarted_before_its_prepare_signs_it)
+{
+    // The other window of 17.3 item 15(a): ACCEPTED_PROPOSAL durable (item 11's barrier), then the crash before the proposal
+    // or the PREPARE left. Staged by writing the record and the barrier the leader writes first.
+    Cluster c{4};
+    c.AppendBlock(130, {Fact{DepositAtCursor(FactCursor{130, 0}, "d0")}});
+    const uint32_t leader{c.Leader()};
+    BOOST_REQUIRE_LT(leader, 4U);
+    Seat& seat{c.At(leader)};
+    const uint64_t epoch{c.Authority().epoch};
+    const state::Candidate candidate{seat.rig->Preview(c.InputsFromChain(leader))};
+    RequireOk(seat.rig->signer_log.AppendAcceptedProposal(storage::ProposalKey{epoch, 1, 0}, candidate.Header(), candidate.Body()), "ACCEPTED_PROPOSAL");
+    RequireOk(seat.rig->signer_log.Barrier(), "barrier");
+    RestartRecovered(c, leader);
+    BOOST_REQUIRE(seat.pbft->Status().proposal_accepted); // before: false
+    // The PREPARE is signed at the restart (B-INTENT, check 2, Sign, B-VOTE) and sent; the others hold it as an early vote.
+    BOOST_CHECK(seat.rig->signer_log.SignedStatement(storage::VoteKey{c.Domain(), epoch, 1, 0, storage::VotePhase::PREPARE}).has_value());
+    c.Deliver();
+    c.Tick(PbftConfig{}.retry_ms); // the proposal is resent
+    BOOST_CHECK(c.refusals.empty());
+    for (uint32_t i{0}; i < 4; ++i) BOOST_CHECK(c.At(i).pbft->Status().decided);
+    BOOST_CHECK(c.ApplyDecisions() == candidate.Header().Hash());
+}
+
+BOOST_AUTO_TEST_CASE(a_leader_restarted_after_its_commit_resends_it)
+{
+    // 17.3 item 15(a), the COMMIT window: every seat prepared and signed COMMIT, no COMMIT arrived, the leader restarted.
+    // It resumes its proposal with the PREPARE and COMMIT it signed (nothing new signed) and decides with the others.
+    Cluster c{4};
+    c.AppendBlock(130, {Fact{DepositAtCursor(FactCursor{130, 0}, "d0")}});
+    const uint32_t leader{c.Leader()};
+    BOOST_REQUIRE_LT(leader, 4U);
+    Seat& seat{c.At(leader)};
+    const state::Candidate candidate{seat.rig->Preview(c.InputsFromChain(leader))};
+    RequireOk(seat.pbft->Propose(candidate, c.Authority()), "Propose");
+    const Filter drop_commits{[](uint32_t, uint32_t, const std::vector<unsigned char>& frame) { return !IsCommitVote(frame); }};
+    c.Deliver(drop_commits);
+    BOOST_REQUIRE(c.refusals.empty());
+    for (uint32_t i{0}; i < 4; ++i) BOOST_REQUIRE(c.At(i).pbft->Status().prepared);
+    const uint64_t written{seat.rig->signer_journal->Status().appended_seq};
+    RestartRecovered(c, leader);
+    BOOST_REQUIRE(seat.pbft->Status().proposal_accepted); // before: false
+    BOOST_CHECK_EQUAL(seat.rig->signer_journal->Status().appended_seq, written); // its COMMIT came back from the log
+    c.Tick(PbftConfig{}.retry_ms); // every seat resends its COMMIT
+    BOOST_CHECK(c.refusals.empty());
+    for (uint32_t i{0}; i < 4; ++i) BOOST_CHECK_MESSAGE(c.At(i).pbft->Status().decided, "seat " << i << " decided"); // before: not the leader
+    BOOST_CHECK(c.ApplyDecisions() == candidate.Header().Hash());
 }
 
 BOOST_AUTO_TEST_SUITE_END()

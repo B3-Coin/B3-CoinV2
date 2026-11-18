@@ -124,6 +124,7 @@ inline constexpr std::string_view SEAT_NO_AGREEMENT{"a one-seat node needs an ag
 inline constexpr std::string_view SEAT_PARTS_MISSING{"a node needs its chain adapter, journals and budget"};   //!< (INVALID_INPUT)
 inline constexpr std::string_view SEAT_SET_SIZE{"seat_count differs from the seat set"};                       //!< (INVALID_INPUT)
 inline constexpr std::string_view SEAT_SELECTED_MISSING{"the new view selected a header this seat must fetch first"}; //!< (NEED_DATA)
+inline constexpr std::string_view SEAT_PROPOSAL_IN_FLIGHT{"the view holds this seat's proposal already"};          //!< (BUSY)
 inline constexpr std::string_view SEAT_SYNC_SLOT{"fetched decision is not for the slot after the head"};        //!< (STALE_PARENT)
 inline constexpr std::string_view SEAT_SYNC_PARENT{"fetched decision does not build on the head"};              //!< (STALE_PARENT)
 inline constexpr std::string_view SEAT_SYNC_CERT_HEADER{"fetched certificate names another header"};            //!< (VERIFY_FAILED)
