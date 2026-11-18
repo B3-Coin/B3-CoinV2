@@ -448,6 +448,9 @@ std::optional<uint256> PbftAgreement::SelectedHeader()
 Result<OutboundVote> PbftAgreement::SignVote(const storage::VoteKey& key, const uint256& digest, const storage::PendingProposal& proposal,
                                              const AuthorityVersion& authority)
 {
+    // O-89: a decision this log holds for the height, under any epoch, is the only header this seat signs there. Every
+    // PREPARE and COMMIT, leader and follower, comes through here; refused before B-INTENT.
+    if (const Result<void> undecided{CheckHeightUndecided(key.slot, proposal.Key().header_hash)}; !undecided.has_value()) return undecided.error();
     Result<storage::PendingIntent> intent{m_signer_log.AppendIntent(key, digest, proposal)};
     if (!intent.has_value()) return intent.error();
     // B-INTENT, authority check 2 (the INTENT stays durable, nothing is signed if the authority moved), Sign, B-VOTE.
@@ -519,6 +522,15 @@ Result<void> CheckCertificate(const SlotCertificate& cert, const uint256& digest
 Result<void> PbftAgreement::VerifyCertificate(const SlotCertificate& cert, const uint256& digest) const
 {
     return CheckCertificate(cert, digest, m_seats, PBFT_PREPARED_CERT);
+}
+
+Result<void> PbftAgreement::CheckHeightUndecided(uint64_t height, const uint256& header_hash) const
+{
+    if (const std::optional<storage::DecisionRef> decided{m_commit_log.DecisionAt(height)};
+        decided.has_value() && decided->header_hash != header_hash) {
+        return Error{ErrorCode::EQUIVOCATION_REFUSED, PBFT_HEIGHT_DECIDED};
+    }
+    return Ok();
 }
 
 Result<void> PbftAgreement::SendToAll(std::span<const unsigned char> message)
@@ -662,6 +674,8 @@ Result<void> PbftAgreement::OnProposal(uint32_t from, Proposal proposal)
         if (m_slot.accepted->header.Hash() == hash) return Ok(); // a retransmission
         return Error{ErrorCode::EQUIVOCATION_REFUSED, PBFT_DOUBLE_VOTE};
     }
+    // O-89 on the follower path: nothing is written or executed for another header of a decided height.
+    if (const Result<void> undecided{CheckHeightUndecided(proposal.header.height, hash)}; !undecided.has_value()) return undecided.error();
     const std::shared_ptr<const state::HeadView> head{m_owner.Head()};
     if (proposal.header.parent_hash != head->HeaderHash()) return Error{ErrorCode::STALE_PARENT, PBFT_PARENT};
     // The proposer's parent certificate: not necessarily this seat's (O-4b), but it must certify the head (O-98).

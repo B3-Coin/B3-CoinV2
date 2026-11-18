@@ -1234,4 +1234,110 @@ BOOST_AUTO_TEST_CASE(a_leader_restarted_after_its_commit_resends_it)
     BOOST_CHECK(c.ApplyDecisions() == candidate.Header().Hash());
 }
 
+BOOST_AUTO_TEST_CASE(a_seat_that_decided_a_height_never_prepares_another_header_for_it_in_a_new_epoch)
+{
+    // O-89 on the follower path (review workflow of 2026-11-18; unreachable from fm2d while its epoch is fixed at 0). Slot 1
+    // decides under epoch 0 and is never applied (check 3 refused it: the head stays at the genesis). The authority moves to
+    // epoch 1 and every agreement is rebuilt, as a restart after that refusal does: slot 1 starts again at (1, 1, 0) with no
+    // lock, since ResumeViewState skips the epoch-0 preparation. Only the leader path checked DecisionAt; a follower
+    // prepared the epoch-1 header for the decided height.
+    Cluster c{4};
+    c.AppendBlock(130, {Fact{DepositAtCursor(FactCursor{130, 0}, "d0")}});
+    const uint32_t first_leader{c.Leader()};
+    BOOST_REQUIRE_LT(first_leader, 4U);
+    const state::Candidate first{c.At(first_leader).rig->Preview(c.InputsFromChain(first_leader))};
+    RequireOk(c.At(first_leader).pbft->Propose(first, c.Authority()), "Propose slot 1 under epoch 0");
+    c.Deliver();
+    BOOST_REQUIRE(c.refusals.empty());
+    const uint256 decided{first.Header().Hash()};
+    for (uint32_t i{0}; i < 4; ++i) {
+        BOOST_REQUIRE(c.At(i).pbft->Status().decided);
+        BOOST_REQUIRE(c.At(i).rig->commit_log.DecisionAt(1).has_value());
+        BOOST_REQUIRE(c.At(i).rig->commit_log.DecisionAt(1)->header_hash == decided);
+    }
+    // No ApplyDecisions: decided but unapplied. The authority moves on every seat's chain; every agreement restarts.
+    for (uint32_t i{0}; i < 4; ++i) {
+        (void)c.At(i).rig->adapter->BumpAuthority();
+        Restart(c, i);
+        const PbftStatus status{c.At(i).pbft->Status()};
+        BOOST_REQUIRE_EQUAL(status.epoch, 1U);
+        BOOST_REQUIRE_EQUAL(status.slot, 1U);
+        BOOST_REQUIRE_EQUAL(status.view, 0U);
+        BOOST_REQUIRE(!status.prepared); // the epoch-0 preparation is not this instance's
+        BOOST_REQUIRE_EQUAL(c.At(i).rig->owner->Head()->Header().height, 0U);
+    }
+    const uint32_t leader{c.Leader()};
+    BOOST_REQUIRE_LT(leader, 4U);
+    const uint32_t target{(leader + 1) % 4};
+    const state::Candidate second{c.At(leader).rig->Preview(c.InputsFromChain(leader))};
+    BOOST_REQUIRE_EQUAL(second.Header().height, 1U);
+    BOOST_REQUIRE_EQUAL(second.Header().authority_epoch, 1U);
+    BOOST_REQUIRE(second.Header().Hash() != decided);
+    // The leader path refused it already.
+    RequireRefusal(c.At(leader).pbft->Propose(second, c.At(leader).rig->adapter->CurrentAuthority()), ErrorCode::EQUIVOCATION_REFUSED,
+                   PBFT_HEIGHT_DECIDED, "the decided leader proposes another header");
+    // The follower path: the proposal delivered as from the epoch-1 leader (a proposal is not signed).
+    Proposal proposal;
+    proposal.epoch = 1;
+    proposal.view = 0;
+    proposal.header = second.Header();
+    proposal.body = second.Body();
+    for (auto& s : c.seats) s->mesh->sent.clear();
+    Seat& seat{c.At(target)};
+    const uint64_t signer_before{seat.rig->signer_journal->Status().appended_seq};
+    RequireRefusal(seat.pbft->OnMessage(leader, EncodeMessage(Message{proposal}, seat.rig->profile).value()), ErrorCode::EQUIVOCATION_REFUSED,
+                   PBFT_HEIGHT_DECIDED, "another header for a decided height under a new epoch");
+    BOOST_CHECK_EQUAL(seat.rig->signer_journal->Status().appended_seq, signer_before); // no ACCEPTED_PROPOSAL, INTENT or SIGNED_VOTE
+    BOOST_CHECK(!seat.rig->signer_log.SignedVote(storage::VoteKey{c.Domain(), 1, 1, 0, storage::VotePhase::PREPARE}).has_value());
+    const PbftStatus status{seat.pbft->Status()};
+    BOOST_CHECK(!status.proposal_accepted);
+    BOOST_CHECK_EQUAL(status.prepare_votes, 0U);
+    BOOST_CHECK(!status.halted); // a local rule, not evidence
+    BOOST_CHECK(seat.mesh->sent.empty()); // no PREPARE left
+}
+
+BOOST_AUTO_TEST_CASE(a_decision_learnt_after_preparing_stops_the_commit_vote)
+{
+    // The COMMIT leg of O-89. A follower accepted and prepared the view's proposal; then its commit log gains a DECISION for
+    // that height with another header, as SeatNode::ApplyFetched writes one before Finish's check 3 can refuse it. The
+    // PREPARE quorum that arrives next must not make it sign COMMIT.
+    Cluster c{4};
+    c.AppendBlock(130, {Fact{DepositAtCursor(FactCursor{130, 0}, "d0")}});
+    const uint32_t leader{c.Leader()};
+    BOOST_REQUIRE_LT(leader, 4U);
+    const state::Candidate candidate{c.At(leader).rig->Preview(c.InputsFromChain(leader))};
+    RequireOk(c.At(leader).pbft->Propose(candidate, c.Authority()), "Propose");
+    c.Deliver([](uint32_t, uint32_t, const std::vector<unsigned char>& frame) { return TypeOf(frame) == MessageType::PROPOSAL; });
+    for (auto& s : c.seats) s->mesh->sent.clear();
+    const uint32_t target{(leader + 1) % 4};
+    const uint32_t other{(leader + 2) % 4};
+    Seat& seat{c.At(target)};
+    BOOST_REQUIRE(seat.pbft->Status().proposal_accepted);
+    BOOST_REQUIRE_EQUAL(seat.pbft->Status().prepare_votes, 1U); // its own
+    // The staged DECISION (AppendDecision checks the certificate's header hash and the body, not the BLS aggregate).
+    const state::Candidate elsewhere{seat.rig->Preview(seat.rig->Inputs(c.Authority(), 1, "decided-elsewhere"))};
+    BOOST_REQUIRE_EQUAL(elsewhere.Header().height, 1U);
+    BOOST_REQUIRE(elsewhere.Header().Hash() != candidate.Header().Hash());
+    SlotCertificate cert;
+    cert.header_hash = elsewhere.Header().Hash();
+    const std::vector<uint32_t> signers{0, 1, 2};
+    cert.bitmap = SlotCertificate::MakeBitmap(4, signers).value();
+    RequireOk(seat.rig->commit_log.AppendDecision(elsewhere.Header(), cert, elsewhere.Body()), "the staged DECISION");
+    RequireOk(seat.rig->commit_log.Barrier(), "B-DECISION");
+    // Two more PREPAREs for the accepted header make the quorum: the PreparedQC forms, the COMMIT is not signed.
+    const uint256 hash{candidate.Header().Hash()};
+    const uint256 digest{PrepareDigest(c.Domain(), 0, 1, 0, hash)};
+    const ProfileParams& profile{seat.rig->profile};
+    const Vote from_leader{SignedVote("s" + std::to_string(leader), leader, storage::VotePhase::PREPARE, 0, 0, 1, hash, digest)};
+    const Vote from_other{SignedVote("s" + std::to_string(other), other, storage::VotePhase::PREPARE, 0, 0, 1, hash, digest)};
+    RequireOk(seat.pbft->OnMessage(leader, EncodeMessage(Message{from_leader}, profile).value()), "the leader's PREPARE");
+    RequireRefusal(seat.pbft->OnMessage(other, EncodeMessage(Message{from_other}, profile).value()), ErrorCode::EQUIVOCATION_REFUSED,
+                   PBFT_HEIGHT_DECIDED, "COMMIT for another header than the decided one");
+    BOOST_CHECK(seat.pbft->Status().prepared); // the PreparedQC is a proof, not a signature
+    BOOST_CHECK(!seat.rig->signer_log.SignedVote(storage::VoteKey{c.Domain(), 0, 1, 0, storage::VotePhase::COMMIT}).has_value());
+    BOOST_CHECK_EQUAL(seat.pbft->Status().commit_votes, 0U);
+    BOOST_CHECK(!seat.pbft->Status().halted);
+    BOOST_CHECK(seat.mesh->sent.empty()); // no COMMIT left
+}
+
 BOOST_AUTO_TEST_SUITE_END()

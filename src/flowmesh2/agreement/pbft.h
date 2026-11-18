@@ -97,7 +97,9 @@
  * PreparedQC of the same view and header; the view never moves backwards
  * and never on one arbitrary report; the cross-epoch rule of O-89: a
  * height this commit log decided is never signed for another header,
- * whatever the epoch or view (PBFT_HEIGHT_DECIDED). Votes with a bad
+ * whatever the epoch or view (PBFT_HEIGHT_DECIDED): checked by the leader
+ * before ACCEPTED_PROPOSAL, by a follower before it accepts a proposal, and
+ * before every PREPARE or COMMIT intent (SignVote). Votes with a bad
  * signature, from the wrong seat, or for another header than the seat's
  * own earlier vote in the same key (a double vote) are refused
  * (PBFT_VOTE_SIGNATURE, PBFT_VOTE_SEAT, PBFT_DOUBLE_VOTE); evidence
@@ -403,6 +405,8 @@ private:
                                      std::string_view detail) const;
     Result<SlotCertificate> AggregateVotes(const std::map<uint32_t, Vote>& votes, const uint256& header_hash, const uint256& digest) const;
     Result<void> VerifyCertificate(const SlotCertificate& cert, const uint256& digest) const;
+    //! O-89 across epochs: Ok unless this commit log decided `height` with another header (EQUIVOCATION_REFUSED PBFT_HEIGHT_DECIDED).
+    Result<void> CheckHeightUndecided(uint64_t height, const uint256& header_hash) const;
     Result<void> SendToAll(std::span<const unsigned char> message);
     Result<void> SendVoteToAll(const OutboundVote& vote, const uint256& header_hash);
     Result<void> SendStatementToAll(const OutboundVote& statement, std::span<const unsigned char> message);
