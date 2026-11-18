@@ -269,7 +269,8 @@ Result<AnchorProof> B3dFinalizedAdapter::ProveAnchor(const Anchor& candidate, co
     LOCK(m_mutex);
     if (Result<void> ok{VerifyAnchorLocked(candidate, from)}; !ok.has_value()) return ok.error();
     AnchorProof proof{from, candidate, {}, m_finalized};
-    for (uint32_t height{from.height + 1}; height <= candidate.height; ++height) {
+    // Through the candidate up to the pin, which is on the chain and at or above it (candidate <= exposed <= finalized).
+    for (uint32_t height{from.height + 1}; height <= m_finalized.height; ++height) {
         const Block& block{m_blocks[height - m_base.height - 1]};
         proof.path.push_back(HeaderLink{height, block.hash, block.parent});
     }
