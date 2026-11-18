@@ -355,8 +355,13 @@ int main(int argc, char** argv)
         const fs::path ready_path{opt.datadir / fs::u8path("fm2d.ready")};
         const fs::path ready_tmp{opt.datadir / fs::u8path("fm2d.ready.tmp")};
         {
-            std::ofstream out{fs::PathToString(ready_tmp)};
+            // Checked before the rename: an open or write that failed (a full disk, something else at the temporary name)
+            // used to be renamed into place anyway, and fm2d reported ready without a ready file (review workflow of
+            // 2026-11-18).
+            std::ofstream out{fs::PathToString(ready_tmp), std::ios::trunc};
             out << ready.write() << "\n";
+            out.close();
+            if (!out) return Fail("ready file", Error{ErrorCode::STORAGE_FATAL, "could not write fm2d.ready.tmp"});
         }
         std::error_code rename_ec;
         fs::rename(ready_tmp, ready_path, rename_ec);
