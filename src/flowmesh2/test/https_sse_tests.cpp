@@ -576,6 +576,44 @@ BOOST_AUTO_TEST_CASE(a_slow_reader_holds_events_in_the_hub_not_in_memory)
     BOOST_CHECK(slow.ReadMore(std::chrono::milliseconds{3'000}).find("event: gap") != std::string::npos);
 }
 
+BOOST_AUTO_TEST_CASE(a_reader_that_leaves_with_events_queued_does_not_take_the_process_down)
+{
+    // A reader that stops reading and then leaves: its connection still holds events the server goes on writing. The
+    // kernel answers that write with EPIPE and, unless the process ignores it, SIGPIPE, whose default action ends the
+    // process. fm2d ignores SIGPIPE; the test runner has to as well, or one such write ends the whole run. Whether a
+    // given write draws EPIPE (signal) or ECONNRESET (none) depends on timing, about one leaver in three on Linux, so
+    // six leave in turn.
+    HttpsSseConfig config;
+    config.stream_output_bytes = 4 * 1024;
+    SimNodeConfig node_config;
+    node_config.streams.max_queued_events = 4'096; // no gap: the reader leaves first
+    Rig rig{config, node_config};
+    const uint16_t port{rig.api->Port()};
+    for (int round{0}; round < 6; ++round) {
+        {
+            TlsClient leaver{port, TLS1_3_VERSION, TLS1_3_VERSION};
+            BOOST_REQUIRE(leaver.Stream("/v2/stream?channel=slots", "event: snapshot", std::chrono::milliseconds{3'000}).find("event: snapshot") != std::string::npos);
+            const auto deadline{std::chrono::steady_clock::now() + std::chrono::seconds{30}};
+            while (rig.api->Status().stream_output_bytes < config.stream_output_bytes && std::chrono::steady_clock::now() < deadline) {
+                for (int i{0}; i < 50; ++i) RequireOk(rig.node->SealSlot(), "SealSlot");
+                rig.api->Notify();
+                std::this_thread::sleep_for(std::chrono::milliseconds{5});
+            }
+            BOOST_REQUIRE_GE(rig.api->Status().stream_output_bytes, config.stream_output_bytes);
+        } // the reader leaves with its socket full: the kernel resets the connection
+        for (int i{0}; i < 20; ++i) {
+            RequireOk(rig.node->SealSlot(), "SealSlot");
+            rig.api->Notify();
+            std::this_thread::sleep_for(std::chrono::milliseconds{20});
+        }
+        const auto deadline{std::chrono::steady_clock::now() + std::chrono::seconds{5}};
+        while (rig.api->Status().streams > 0 && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(std::chrono::milliseconds{5});
+        BOOST_REQUIRE_EQUAL(rig.api->Status().streams, 0U);
+    }
+    TlsClient later{port, TLS1_3_VERSION, TLS1_3_VERSION};
+    BOOST_CHECK(later.Stream("/v2/stream?channel=slots", "event: snapshot", std::chrono::milliseconds{3'000}).find("event: snapshot") != std::string::npos);
+}
+
 BOOST_AUTO_TEST_CASE(stop_right_after_create_returns)
 {
     // Review of 2026-11-16 (a reviewer's lead, confirmed): a Stop before the loop thread entered event_base_loop was lost,

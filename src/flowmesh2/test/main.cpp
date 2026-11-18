@@ -11,7 +11,11 @@
  *
  * Global fixture (slice R4): one ECC_Context for the whole run, so tests can
  * sign with CKey (test/util/keys.h). Verification needs no fixture: it uses
- * libsecp256k1's static context.
+ * libsecp256k1's static context. It also ignores SIGPIPE, as fm2d does: the
+ * HTTPS server and the TLS clients the tests run in this process write through
+ * OpenSSL to sockets a peer may have closed, and the signal's default action
+ * would end the whole run (https_sse_tests/a_reader_that_leaves_with_events_
+ * queued_does_not_take_the_process_down).
  */
 #define BOOST_TEST_MODULE FlowMesh2 Rebirth Outline Tests
 
@@ -20,12 +24,15 @@
 #include <key.h>
 #include <util/translation.h>
 
+#include <csignal>
+
 // Core's clientversion.cpp (bitcoin_common) refers to this; every executable
 // defines it, as bitcoind and bitcoin-cli do. Nothing here is translated.
 const TranslateFn G_TRANSLATION_FUN{nullptr};
 
 namespace {
 struct Fm2EccFixture {
+    Fm2EccFixture() { std::signal(SIGPIPE, SIG_IGN); }
     ECC_Context ecc_context;
 };
 } // namespace
