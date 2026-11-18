@@ -29,6 +29,8 @@ import sys
 import xml.etree.ElementTree as ET
 
 CASE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(/[A-Za-z_][A-Za-z0-9_]*)+$")
+# One run of the binary (plain build). CTest passes --run-timeout scaled by FM2_TEST_TIMEOUT_SCALE: a fixed 120 s
+# ended the TSan inventory run while test_flowmesh2 alone took 135 s, under the scaled CTest TIMEOUT of 1800 s.
 RUN_TIMEOUT_S = 120
 
 
@@ -188,12 +190,17 @@ def selftest(binary, inventory_path, workdir, listed, disabled, full_run):
 
 
 def main():
+    global RUN_TIMEOUT_S
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--binary", required=True)
     parser.add_argument("--inventory", required=True)
     parser.add_argument("--workdir", required=True)
     parser.add_argument("--selftest", action="store_true")
+    parser.add_argument("--run-timeout", type=int, default=RUN_TIMEOUT_S, help="seconds one run of the binary may take")
     args = parser.parse_args()
+    if args.run_timeout <= 0:
+        parser.error("--run-timeout must be positive")
+    RUN_TIMEOUT_S = args.run_timeout
 
     os.makedirs(args.workdir, exist_ok=True)
     listed, disabled = list_cases(args.binary)
