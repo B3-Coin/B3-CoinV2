@@ -595,6 +595,54 @@ BOOST_AUTO_TEST_CASE(a_crash_while_creating_a_segment_leaves_no_short_segment)
     }
 }
 
+BOOST_AUTO_TEST_CASE(a_crash_while_creating_the_first_segment_leaves_a_directory_create_accepts)
+{
+    // Review workflow of 2026-11-18 over R7: the fix above covered spare segments, not segment 0. A crash during
+    // CreateNew's fill leaves `.lock` and `00000000.seg.tmp`. No segment was ever renamed into place, so nothing was
+    // committed, but CreateNew refused the directory as not empty (the CLI outbox, which creates when segment 0 is
+    // absent, then failed on every later run), and OpenExisting refused it as missing segment 0. CreateNew now takes such
+    // a directory as empty, removes the leftovers under the lock, and creates the journal.
+    const TestDir root{"first_segment_tmp"};
+    const fs::path crashed{root.Sub("crashed")};
+    WriteFile(crashed / fs::u8path(".lock"), {});
+    WriteFile(crashed / fs::u8path(SegmentFileName(0) + ".tmp"), std::vector<unsigned char>(100, 0));
+    RequireRefusal(FileJournal::OpenExisting(crashed, JournalRole::COMMIT, 7), ErrorCode::INVALID_INPUT, JOURNAL_SEGMENT_MISSING, "no journal to open");
+    {
+        Result<std::unique_ptr<FileJournal>> created{FileJournal::CreateNew(crashed, JournalRole::COMMIT, 7, SEGMENT_PAGE_BYTES)};
+        RequireStorageOk(created, "create over an interrupted creation");
+        BOOST_CHECK_EQUAL((*created)->Append(RecordType::DECISION, Bytes("r")).value(), 1U);
+        BOOST_CHECK_EQUAL((*created)->Barrier().value(), 1U);
+    }
+    BOOST_CHECK(!fs::exists(crashed / fs::u8path(SegmentFileName(0) + ".tmp")));
+    Result<std::unique_ptr<FileJournal>> reopened{FileJournal::OpenExisting(crashed, JournalRole::COMMIT, 7)};
+    RequireStorageOk(reopened, "reopen");
+    BOOST_CHECK_EQUAL((*reopened)->Status().durable_seq, 1U);
+    reopened->reset();
+    // Only those two kinds of leftover: a journal's segment, or any other file, still makes the directory not empty, and
+    // nothing in it is touched.
+    const fs::path with_segment{root.Sub("with_segment")};
+    WriteFile(with_segment / fs::u8path(".lock"), {});
+    WriteFile(with_segment / fs::u8path(SegmentFileName(1) + ".tmp"), std::vector<unsigned char>(100, 0));
+    WriteFile(with_segment / fs::u8path(FIRST_SEGMENT_NAME), std::vector<unsigned char>(SEGMENT_PAGE_BYTES, 0));
+    RequireRefusal(FileJournal::CreateNew(with_segment, JournalRole::COMMIT, 7, SEGMENT_PAGE_BYTES), ErrorCode::INVALID_INPUT, JOURNAL_DIR_NOT_EMPTY, "a segment");
+    BOOST_CHECK(fs::exists(with_segment / fs::u8path(SegmentFileName(1) + ".tmp")));
+    const fs::path with_stray{root.Sub("with_stray")};
+    WriteFile(with_stray / fs::u8path(".lock"), {});
+    WriteFile(with_stray / fs::u8path(SegmentFileName(0) + ".tmp"), std::vector<unsigned char>(100, 0));
+    WriteFile(with_stray / fs::u8path("notes.seg.tmp"), Bytes("x"));
+    RequireRefusal(FileJournal::CreateNew(with_stray, JournalRole::COMMIT, 7, SEGMENT_PAGE_BYTES), ErrorCode::INVALID_INPUT, JOURNAL_DIR_NOT_EMPTY, "a stray file");
+    BOOST_CHECK(fs::exists(with_stray / fs::u8path(SegmentFileName(0) + ".tmp")));
+    // While another journal holds the lock, the leftovers are not touched either.
+    const fs::path locked{root.Sub("locked")};
+    {
+        auto holder{MustCreate(locked, JournalRole::COMMIT, 7, SEGMENT_PAGE_BYTES)};
+        fs::remove(holder->SegmentPath());
+        WriteFile(locked / fs::u8path(SegmentFileName(0) + ".tmp"), std::vector<unsigned char>(100, 0));
+        RequireRefusal(FileJournal::CreateNew(locked, JournalRole::COMMIT, 7, SEGMENT_PAGE_BYTES), ErrorCode::BUSY, JOURNAL_DIR_LOCKED, "locked");
+        BOOST_CHECK(fs::exists(locked / fs::u8path(SegmentFileName(0) + ".tmp")));
+    }
+}
+
 BOOST_AUTO_TEST_CASE(a_second_opener_of_a_journal_directory_is_refused)
 {
     // Review of 2026-11-16, defect 6: nothing stopped a second process (or a second FileJournal in this one) from

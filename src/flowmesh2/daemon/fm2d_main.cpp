@@ -113,12 +113,16 @@ std::optional<std::array<unsigned char, 32>> ReadKeyFile(const fs::path& path)
     return out;
 }
 
-bool DirHasFiles(const fs::path& dir)
+//! A journal exists in `dir` once its first segment does, as for the CLI outbox. Any file used to count: a crash during the
+//! first start's CreateNew left `.lock` and `00000000.seg.tmp`, so every later start called OpenExisting, which refused
+//! the directory for its missing segment 0 (review workflow of 2026-11-18 over R7). CreateNew takes such a directory as
+//! empty; anything else in a directory without segment 0 it still refuses as not empty.
+bool HasJournal(const fs::path& dir)
 {
     std::error_code ec;
-    if (!fs::is_directory(dir, ec)) return false;
-    const fs::directory_iterator it{dir, ec};
-    return !ec && it != fs::directory_iterator{};
+    const fs::path first{dir / fs::u8path(std::string{storage::FIRST_SEGMENT_NAME})};
+    const bool present{std::filesystem::exists(static_cast<const std::filesystem::path&>(first), ec)};
+    return present || ec; // a stat error: try to open it, and let that report the error
 }
 
 //! The node's events into the log.
@@ -251,7 +255,9 @@ int main(int argc, char** argv)
     // Journals: new on the first start, recovered afterwards.
     const fs::path signer_dir{opt.datadir / fs::u8path("signer")};
     const fs::path commit_dir{opt.datadir / fs::u8path("commit")};
-    const bool restart{DirHasFiles(signer_dir) || DirHasFiles(commit_dir)};
+    // Either journal present: both must open. A signer journal that is gone while the commit journal is there is refused,
+    // never replaced by a fresh one that could sign again.
+    const bool restart{HasJournal(signer_dir) || HasJournal(commit_dir)};
     fs::create_directories(signer_dir, ec);
     fs::create_directories(commit_dir, ec);
     Result<std::unique_ptr<storage::FileJournal>> signer_journal{

@@ -281,12 +281,39 @@ Result<std::unique_ptr<FileJournal>> FileJournal::CreateNewWithCommitHook(const 
     }
     std::error_code ec;
     if (!fs::is_directory(empty_dir, ec) || ec) return Error{ErrorCode::INVALID_INPUT, JOURNAL_DIR_MISSING};
-    const fs::directory_iterator first{empty_dir, ec};
-    if (ec) return Error{ErrorCode::INVALID_INPUT, JOURNAL_DIR_MISSING};
-    if (first != fs::directory_iterator{}) return Error{ErrorCode::INVALID_INPUT, JOURNAL_DIR_NOT_EMPTY};
+    // Empty, or what an interrupted CreateNew leaves: the lock file and segment leftovers under their temporary names.
+    // No segment was ever renamed into place there, so nothing was committed (review workflow of 2026-11-18 over R7: the
+    // CLI outbox, which creates when segment 0 is absent, used to be refused that directory on every later run).
+    const auto leftovers{[&]() -> Result<std::vector<fs::path>> {
+        std::vector<fs::path> found;
+        for (fs::directory_iterator it{empty_dir, ec}; !ec && it != fs::directory_iterator{}; it.increment(ec)) {
+            const std::string name{fs::PathToString(it->path().filename())};
+            if (name == LOCK_FILE_NAME) continue;
+            std::error_code type_ec;
+            const bool temporary{name.size() == 16 && name.ends_with(".tmp") && SegmentIndexOf(std::string_view{name}.substr(0, 12)).has_value() &&
+                                 it->is_regular_file(type_ec) && !type_ec};
+            if (!temporary) return Error{ErrorCode::INVALID_INPUT, JOURNAL_DIR_NOT_EMPTY};
+            found.push_back(it->path());
+        }
+        if (ec) return Error{ErrorCode::INVALID_INPUT, JOURNAL_DIR_MISSING};
+        return Ok(std::move(found));
+    }};
+    if (const Result<std::vector<fs::path>> before{leftovers()}; !before.has_value()) return before.error();
 
     const Result<int> lock{LockJournalDir(empty_dir)};
     if (!lock.has_value()) return lock.error();
+    // Again under the lock, which another creator held until it finished or crashed; only then are the leftovers removed.
+    const Result<std::vector<fs::path>> found{leftovers()};
+    if (!found.has_value()) {
+        CloseFd(*lock);
+        return found.error();
+    }
+    for (const fs::path& leftover : *found) {
+        if (!fs::remove(leftover, ec) || ec) {
+            CloseFd(*lock);
+            return Error{ErrorCode::STORAGE_FATAL, JOURNAL_SEGMENT_CREATE};
+        }
+    }
     const Result<int> fd{CreateSegment(empty_dir, 0, segment_bytes)};
     if (!fd.has_value()) {
         CloseFd(*lock);
