@@ -82,8 +82,14 @@ Result<std::vector<unsigned char>> ReadWhole(const fs::path& file)
         if (errno == ENOENT) return Ok(std::vector<unsigned char>{});
         return Error{ErrorCode::STORAGE_FATAL, DEVCHAIN_OPEN};
     }
+    // Shared, for the whole read: an append (exclusive) may cut a torn tail and write the next record in its place, and a
+    // read across that splices the two into a record that fails its CRC (Codex review of 2026-11-18).
+    if (::flock(fd, LOCK_SH) != 0) {
+        ::close(fd);
+        return Error{ErrorCode::STORAGE_FATAL, DEVCHAIN_OPEN};
+    }
     Result<std::vector<unsigned char>> bytes{ReadRest(fd)};
-    ::close(fd);
+    ::close(fd); // the lock goes with it
     return bytes;
 }
 

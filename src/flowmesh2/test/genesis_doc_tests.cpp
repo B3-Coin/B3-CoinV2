@@ -247,13 +247,39 @@ BOOST_AUTO_TEST_CASE(the_dev_chain_file_takes_one_writer_and_cuts_a_torn_tail)
     BOOST_REQUIRE(held >= 0);
     BOOST_REQUIRE_EQUAL(::flock(held, LOCK_EX), 0);
     std::future<Result<void>> appending{std::async(std::launch::async, [&] { return dev::AppendDevChainBlock(shared, block(131)); })};
+    const uintmax_t one_block{fs::file_size(shared)};
     BOOST_CHECK(appending.wait_for(std::chrono::milliseconds{300}) == std::future_status::timeout);
-    BOOST_CHECK_EQUAL(dev::ReadDevChain(shared).value().size(), 1U);
+    BOOST_CHECK_EQUAL(fs::file_size(shared), one_block); // nothing written (a read would wait for the lock too)
     ::close(held); // the lock goes with it
     RequireOk(appending.get(), "append once the lock is free");
     BOOST_CHECK_EQUAL(dev::ReadDevChain(shared).value().size(), 2U);
     // A writer that lost the race refuses its block instead of writing the height again.
     RequireRefusal(dev::AppendDevChainBlock(shared, block(131)), ErrorCode::INVALID_INPUT, dev::DEVCHAIN_HEIGHT, "131 again");
+    fs::remove_all(dir);
+}
+
+BOOST_AUTO_TEST_CASE(a_dev_chain_reader_waits_for_a_writer)
+{
+    // Codex review of 2026-11-18 over 7d326476: readers took no lock, so a reader could read part of a torn record, then,
+    // after an append cut the tail and wrote the next record in its place, read on into the new bytes. The record it put
+    // together failed its CRC on a valid file: STORAGE_FATAL for an fm2d tailing it, or at its start. Readers now hold a
+    // shared lock on the file for their read, so an append (exclusive) never runs during one.
+    const fs::path dir{fs::PathFromString(FM2_TEST_TMP_DIR) / fs::u8path("devchain_reader_tests")};
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    const fs::path file{dir / fs::u8path("devchain.log")};
+    RequireOk(dev::AppendDevChainBlock(file, dev::DevChainBlock{130, dev::DevChainBlockHash(130), {}}), "append 130");
+    dev::DevChainTail tail{file};
+    const int held{::open(fs::PathToString(file).c_str(), O_RDWR | O_CLOEXEC)};
+    BOOST_REQUIRE(held >= 0);
+    BOOST_REQUIRE_EQUAL(::flock(held, LOCK_EX), 0); // what an append holds
+    std::future<Result<std::vector<dev::DevChainBlock>>> reading{std::async(std::launch::async, [&] { return dev::ReadDevChain(file); })};
+    std::future<Result<std::vector<dev::DevChainBlock>>> polling{std::async(std::launch::async, [&] { return tail.Poll(); })};
+    BOOST_CHECK(reading.wait_for(std::chrono::milliseconds{300}) == std::future_status::timeout);
+    BOOST_CHECK(polling.wait_for(std::chrono::milliseconds{0}) == std::future_status::timeout);
+    ::close(held);
+    BOOST_CHECK_EQUAL(reading.get().value().size(), 1U);
+    BOOST_CHECK_EQUAL(polling.get().value().size(), 1U);
     fs::remove_all(dir);
 }
 

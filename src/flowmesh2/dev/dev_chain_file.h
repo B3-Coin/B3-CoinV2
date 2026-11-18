@@ -33,7 +33,7 @@
  * `u32 height | hash (32) | u32 n | n x (u32 len | fact bytes)` (EncodeFact),
  * little-endian. Blocks are appended by `fm2-devchain` (the faucet) with
  * fsync, one writer at a time (an exclusive flock on the file from the read
- * to the fsync); a reader that finds a partial record at the tail waits for
+ * to the fsync; readers hold it shared while they read); a reader that finds a partial record at the tail waits for
  * the rest, a CRC or shape error is STORAGE_FATAL. A complete record is never
  * rewritten; a torn one that a dead writer left is cut by the next append.
  * Heights are consecutive from base + 1; hashes are DevChainBlockHash(height).
