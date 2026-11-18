@@ -56,13 +56,14 @@ Result<void> WriteAllAt(int fd, std::span<const unsigned char> bytes, uint64_t o
     return Ok();
 }
 
-//! Read the whole file at `path` (at most `max_bytes`); STORAGE_FATAL if it cannot be opened or read.
+//! Read the whole file at `path` (at most `max_bytes`); STORAGE_FATAL if it cannot be opened or read. A symlink is not
+//! followed (refused): every file of a journal is opened with O_NOFOLLOW, as the rebirth journal's segments were.
 Result<std::vector<unsigned char>> ReadWholeFile(const fs::path& path, uint64_t max_bytes)
 {
 #ifdef WIN32
     const int fd{_wopen(path.c_str(), _O_RDONLY | _O_BINARY)};
 #else
-    const int fd{open(path.c_str(), O_RDONLY | O_CLOEXEC)};
+    const int fd{open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW)};
 #endif
     if (fd < 0) return Error{ErrorCode::STORAGE_FATAL, JOURNAL_SEGMENT_READ};
     std::vector<unsigned char> out;
@@ -141,7 +142,8 @@ std::optional<uint64_t> SegmentIndexOf(std::string_view name)
 }
 
 //! Create or open `<dir>/.lock` and take an exclusive, non-blocking lock on it (review of 2026-11-16, defect 6):
-//! BUSY JOURNAL_DIR_LOCKED while another FileJournal, in this process or another, holds it.
+//! BUSY JOURNAL_DIR_LOCKED while another FileJournal, in this process or another, holds it. A `.lock` that is a symlink
+//! is STORAGE_FATAL JOURNAL_DIR_LOCK: nothing is created or locked where it points.
 Result<int> LockJournalDir(const fs::path& dir)
 {
     const fs::path lock_path{dir / fs::u8path(std::string{LOCK_FILE_NAME})};
@@ -150,7 +152,7 @@ Result<int> LockJournalDir(const fs::path& dir)
     if (fd < 0) return Error{ErrorCode::STORAGE_FATAL, JOURNAL_DIR_LOCK};
     return Ok(fd); // no advisory lock on this branch, which is not compiled on this host (O-24 pattern)
 #else
-    const int fd{open(lock_path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600)};
+    const int fd{open(lock_path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600)};
     if (fd < 0) return Error{ErrorCode::STORAGE_FATAL, JOURNAL_DIR_LOCK};
     if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
         const int saved{errno};
@@ -336,7 +338,7 @@ int OpenSegmentForWriting(const fs::path& path)
 #ifdef WIN32
     return _wopen(path.c_str(), _O_RDWR | _O_BINARY);
 #else
-    return open(path.c_str(), O_RDWR | O_CLOEXEC);
+    return open(path.c_str(), O_RDWR | O_CLOEXEC | O_NOFOLLOW);
 #endif
 }
 

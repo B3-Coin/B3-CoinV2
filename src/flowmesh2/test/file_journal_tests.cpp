@@ -701,4 +701,41 @@ BOOST_AUTO_TEST_CASE(a_second_opener_of_a_journal_directory_is_refused)
     RequireRefusal(FileJournal::OpenExisting(stale, JournalRole::SIGNER, 2), ErrorCode::INVALID_INPUT, JOURNAL_SEGMENT_MISSING, "a lock file alone");
 }
 
+BOOST_AUTO_TEST_CASE(a_segment_or_lock_file_that_is_a_symlink_is_refused)
+{
+    // Tier 3 review of 2026-11-18: the rebirth journal opened an existing segment with O_NOFOLLOW; stage 2's segments and
+    // `.lock` are opened through symlinks. A symlink planted in the journal directory then made the journal read and
+    // write another file, and a dangling `.lock` symlink made it create a file wherever the link pointed.
+    const TestDir root{"symlinks"};
+    const fs::path dir{root.Sub("journal")};
+    {
+        auto journal{MustCreate(dir, JournalRole::COMMIT, 5, SEGMENT_PAGE_BYTES)};
+        BOOST_CHECK_EQUAL(journal->Append(RecordType::DECISION, Bytes("d")).value(), 1U);
+        BOOST_CHECK_EQUAL(journal->Barrier().value(), 1U);
+    }
+    const fs::path segment{dir / fs::u8path(FIRST_SEGMENT_NAME)};
+    const fs::path moved{root.Sub("elsewhere") / fs::u8path(FIRST_SEGMENT_NAME)};
+    fs::rename(segment, moved);
+    fs::create_symlink(moved, segment);
+    RequireRefusal(FileJournal::OpenExisting(dir, JournalRole::COMMIT, 5), ErrorCode::STORAGE_FATAL, JOURNAL_SEGMENT_READ, "a segment symlink");
+    BOOST_REQUIRE(fs::remove(segment));
+    fs::rename(moved, segment);
+    {
+        Result<std::unique_ptr<FileJournal>> reopened{FileJournal::OpenExisting(dir, JournalRole::COMMIT, 5)};
+        RequireStorageOk(reopened, "reopen once the segment is a file again");
+        BOOST_CHECK_EQUAL((*reopened)->Status().durable_seq, 1U);
+    }
+    // A dangling `.lock` symlink: refused, and nothing is created where it points, by OpenExisting or by CreateNew.
+    const fs::path planted{root.path / fs::u8path("planted")};
+    BOOST_REQUIRE(fs::remove(dir / fs::u8path(".lock")));
+    fs::create_symlink(planted, dir / fs::u8path(".lock"));
+    RequireRefusal(FileJournal::OpenExisting(dir, JournalRole::COMMIT, 5), ErrorCode::STORAGE_FATAL, JOURNAL_DIR_LOCK, "a lock symlink");
+    BOOST_CHECK(!fs::exists(planted));
+    const fs::path fresh{root.Sub("fresh")};
+    fs::create_symlink(planted, fresh / fs::u8path(".lock"));
+    RequireRefusal(FileJournal::CreateNew(fresh, JournalRole::COMMIT, 5, SEGMENT_PAGE_BYTES), ErrorCode::STORAGE_FATAL, JOURNAL_DIR_LOCK,
+                   "a lock symlink in a new directory");
+    BOOST_CHECK(!fs::exists(planted));
+}
+
 BOOST_AUTO_TEST_SUITE_END()
