@@ -264,9 +264,13 @@ int main(int argc, char** argv)
         restart ? storage::FileJournal::OpenExisting(signer_dir, storage::JournalRole::SIGNER, 1)
                 : storage::FileJournal::CreateNew(signer_dir, storage::JournalRole::SIGNER, 1, storage::DEFAULT_SEGMENT_BYTES)};
     if (!signer_journal.has_value()) return Fail("signer journal", signer_journal.error());
+    // A crash between the two CreateNew calls of the first start leaves a signer journal and no commit journal. With no
+    // signer record at all this seat never signed anything, so a fresh commit journal loses nothing that safety rests on;
+    // with any record, the missing commit journal stays a refusal (review workflow of 2026-11-18 over R7).
+    const bool create_commit{!restart || (!HasJournal(commit_dir) && (*signer_journal)->Status().appended_seq == 0)};
     Result<std::unique_ptr<storage::FileJournal>> commit_journal{
-        restart ? storage::FileJournal::OpenExisting(commit_dir, storage::JournalRole::COMMIT, 2)
-                : storage::FileJournal::CreateNew(commit_dir, storage::JournalRole::COMMIT, 2, storage::DEFAULT_SEGMENT_BYTES)};
+        create_commit ? storage::FileJournal::CreateNew(commit_dir, storage::JournalRole::COMMIT, 2, storage::DEFAULT_SEGMENT_BYTES)
+                      : storage::FileJournal::OpenExisting(commit_dir, storage::JournalRole::COMMIT, 2)};
     if (!commit_journal.has_value()) return Fail("commit journal", commit_journal.error());
 
     // The chain: the shared dev chain file replayed into the fake adapter.
