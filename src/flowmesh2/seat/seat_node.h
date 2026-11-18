@@ -257,9 +257,10 @@ public:
      * (O-101): while f + 1 peers claim a slot beyond head + 1 this seat asks
      * the next peer round-robin for head + 1 and the slots after it, up to
      * net::MAX_SYNC_DECISIONS per request (one request in flight; a request
-     * stays pending until its last reply, and the retry period, doubling from
-     * sync_backoff_ms, holds the next one back while replies are empty or
-     * missing, so an empty reply never spins);
+     * stays pending until its last reply; its retry period runs from the send,
+     * or from the first Tick after its latest reply that moved the head, and
+     * doubles from sync_backoff_ms while replies are empty or missing, so an
+     * empty reply never spins and a slow batch is not asked for again);
      * a leader whose NEW_VIEW selected a header it does not hold asks for
      * that proposal the same way.
      */
@@ -351,7 +352,8 @@ private:
         bool pending_proposal{false}; //!< the request in flight is a PROPOSAL_REQUEST
         uint64_t pending_slot{0};
         uint8_t pending_max{0}; //!< decisions the request in flight asked for (replies for pending_slot .. +pending_max-1 are its answers)
-        uint64_t sent_ms{0};
+        uint64_t sent_ms{0};   //!< the send, or the Tick after the latest reply of the request in flight that moved the head
+        bool progressed{false}; //!< a solicited reply moved the head since the last Tick: that Tick restarts the retry period
         uint64_t backoff_ms{0};
         uint32_t next_peer{0};
         std::map<uint32_t, std::pair<uint64_t, uint64_t>> pushed; //!< per peer: the last (slot, m_now_ms) a decision was pushed

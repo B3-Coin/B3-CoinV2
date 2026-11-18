@@ -408,6 +408,10 @@ Result<void> SeatNode::Tick(uint64_t now_ms)
         m_sync.pending_peer.reset();
         return Ok();
     }
+    if (m_sync.progressed) {
+        m_sync.progressed = false;
+        if (m_sync.pending_peer.has_value()) m_sync.sent_ms = m_now_ms; // the request in flight is still answering
+    }
     if (m_sync.pending_peer.has_value() && m_now_ms - m_sync.sent_ms < m_sync.backoff_ms) return Ok();
     if (m_sync.pending_peer.has_value()) m_sync.backoff_ms = std::min(m_sync.backoff_ms * 2, m_config.sync_backoff_max_ms);
     if (m_sync.backoff_ms == 0) m_sync.backoff_ms = m_config.sync_backoff_ms;
@@ -522,7 +526,12 @@ Result<void> SeatNode::OnBulk(const net::InboundFrame& frame)
         m_sync.backoff_ms = m_config.sync_backoff_ms;
         if (last_of_batch) {
             m_sync.pending_peer.reset(); // the batch is complete: the driver asks for the next one at the next tick
-        } else if (!solicited && m_sync.pending_peer.has_value() && m_sync.pending_slot == reply->slot) {
+        } else if (solicited) {
+            // The batch is still arriving: its retry period runs from its latest record that applied, not from the send
+            // (review workflow of 2026-11-18). Only a record that moved the head counts; the next Tick stamps it (OnFrame
+            // does not see the clock), so the period is never shortened.
+            if (m_owner->Head()->Header().height == reply->slot) m_sync.progressed = true;
+        } else if (m_sync.pending_peer.has_value() && m_sync.pending_slot == reply->slot) {
             m_sync.pending_peer.reset(); // a push answered the pending request: it is moot
         }
         return Ok();
