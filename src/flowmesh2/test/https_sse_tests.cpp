@@ -684,10 +684,55 @@ BOOST_AUTO_TEST_CASE(a_stalled_stream_on_a_quiet_hub_queues_no_heartbeats)
     std::this_thread::sleep_for(std::chrono::seconds{2});
     BOOST_CHECK_LE(rig.api->Status().stream_output_bytes, queued);
     BOOST_CHECK_EQUAL(rig.api->Status().streams, 1U);
-    // The reader reads again: the backlog arrives (two seconds of reading), then heartbeats as before.
-    (void)stalled.ReadRawUntil("no such marker", std::chrono::milliseconds{2'000});
-    BOOST_CHECK(stalled.ReadRawUntil("event: heartbeat", std::chrono::milliseconds{2'000}).find("event: heartbeat") != std::string::npos);
+    // The reader reads again: the backlog arrives, then the events the hub held, then heartbeats as before. A heartbeat
+    // after the backlog's first delta is one sent once the stream was below its cap again (none goes out at the cap, and
+    // none between two deltas of the fill, which sealed every 5 ms). How long the hub's held events take depends on the
+    // load, so the limit is generous; the read returns at the heartbeat.
+    std::string seen;
+    bool resumed{false};
+    const auto resume_deadline{std::chrono::steady_clock::now() + std::chrono::seconds{20}};
+    while (!resumed && std::chrono::steady_clock::now() < resume_deadline) {
+        seen += stalled.ReadRawUntil("event: heartbeat", std::chrono::milliseconds{1'000});
+        const size_t delta{seen.find("event: delta")};
+        resumed = delta != std::string::npos && seen.find("event: heartbeat", delta) != std::string::npos;
+    }
+    BOOST_CHECK(resumed);
     BOOST_CHECK_EQUAL(rig.api->Status().streams, 1U);
+}
+
+BOOST_AUTO_TEST_CASE(a_stalled_stream_on_a_quiet_hub_times_out_and_frees_its_slot)
+{
+    // The other half of the heartbeat fix: each heartbeat queued to a stalled connection re-armed libevent's write
+    // timeout, so a reader that stopped reading on a quiet hub was never timed out and held its connection slot for good
+    // (measured: still open after 16 s with the 10 s timeout). With no heartbeat at the cap, the request timeout ends it
+    // (about 10 s by default, 1 s here) and the slot is free again: one connection per address is allowed below.
+    HttpsSseConfig config;
+    config.stream_output_bytes = 4 * 1024;
+    config.request_timeout_ms = 1'000;
+    config.max_connections_per_ip = 1;
+    SimNodeConfig node_config;
+    node_config.streams.max_queued_events = 4'096; // no gap
+    Rig rig{config, node_config};
+    TlsClient stalled{rig.api->Port(), TLS1_3_VERSION, TLS1_3_VERSION};
+    BOOST_REQUIRE(stalled.Stream("/v2/stream?channel=slots", "event: snapshot", std::chrono::milliseconds{3'000}).find("event: snapshot") != std::string::npos);
+    stalled.SetReceiveBuffer(4 * 1024);
+    const auto deadline{std::chrono::steady_clock::now() + std::chrono::seconds{60}};
+    bool full{false};
+    while (!full && std::chrono::steady_clock::now() < deadline) {
+        for (int i{0}; i < 50; ++i) RequireOk(rig.node->SealSlot(), "SealSlot");
+        rig.api->Notify();
+        std::this_thread::sleep_for(std::chrono::milliseconds{5});
+        if (rig.api->Status().stream_output_bytes < config.stream_output_bytes) continue;
+        std::this_thread::sleep_for(std::chrono::milliseconds{500});
+        full = rig.api->Status().stream_output_bytes >= config.stream_output_bytes;
+    }
+    BOOST_REQUIRE(full);
+    // Well past the 1 s timeout, but bounded: the stream ends and its slot is released.
+    const auto closed_by{std::chrono::steady_clock::now() + std::chrono::seconds{10}};
+    while (rig.api->Status().streams > 0 && std::chrono::steady_clock::now() < closed_by) std::this_thread::sleep_for(std::chrono::milliseconds{20});
+    BOOST_CHECK_EQUAL(rig.api->Status().streams, 0U);
+    TlsClient next{rig.api->Port(), TLS1_3_VERSION, TLS1_3_VERSION};
+    BOOST_CHECK(next.Stream("/v2/stream?channel=slots", "event: snapshot", std::chrono::milliseconds{3'000}).find("event: snapshot") != std::string::npos);
 }
 
 BOOST_AUTO_TEST_CASE(stop_right_after_create_returns)
