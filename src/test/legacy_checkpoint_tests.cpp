@@ -33,8 +33,8 @@ BOOST_AUTO_TEST_CASE(hardened_checkpoint_matches_pinned_height_only)
     Consensus::Params params;
     params.legacy_checkpoints = legacy::MainnetCheckpoints();
 
-    const uint256 good{"907be67958dcd6d9d06c2c896f3b65aad687867ff342db2c7cb0ff5d717c5255"}; // height 77900
-    const uint256 wrong{"0000000000000000000000000000000000000000000000000000000000000001"};
+    constexpr uint256 good{"907be67958dcd6d9d06c2c896f3b65aad687867ff342db2c7cb0ff5d717c5255"}; // height 77900
+    constexpr uint256 wrong{"0000000000000000000000000000000000000000000000000000000000000001"};
 
     // A pinned height must match exactly.
     BOOST_CHECK(legacy::CheckpointAllows(params, 77900, good));

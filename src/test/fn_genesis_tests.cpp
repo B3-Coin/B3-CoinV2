@@ -115,7 +115,7 @@ BOOST_AUTO_TEST_SUITE(fn_genesis_tests)
 
 BOOST_AUTO_TEST_CASE(fn_asset_identity)
 {
-    const uint256 genesis{
+    constexpr uint256 genesis{
         "1111111111111111111111111111111111111111111111111111111111111111"};
     const auto domain{modern::ModernChainDomain(genesis, uint256::ONE)};
     BOOST_REQUIRE(domain);
