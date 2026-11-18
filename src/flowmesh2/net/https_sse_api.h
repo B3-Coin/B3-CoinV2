@@ -111,6 +111,7 @@ struct HttpsSseStatus {
     uint64_t requests_served{0};
     uint64_t refused{0};     //!< by a limit
     size_t stream_output_bytes{0}; //!< the most bytes queued to one SSE connection, sampled at the last pump
+    size_t limit_entries{0};       //!< entries of the per-address and per-netgroup connection counts, sampled at the last pump
 };
 
 class HttpsSseApi final : public ClientApi

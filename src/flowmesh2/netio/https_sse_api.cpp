@@ -420,8 +420,14 @@ bool HttpsSseApi::Impl::Admit(evhttp_request* req, const std::string& ip)
     std::deque<Clock::time_point>& recent{recent_per_ip[ip]};
     while (!recent.empty() && now - recent.front() > std::chrono::seconds{60}) recent.pop_front();
     const std::string group{NetGroupOf(ip)};
-    const bool refused{open_total >= cfg.max_connections || open_per_ip[ip] >= cfg.max_connections_per_ip ||
-                       recent.size() >= cfg.max_new_connections_per_minute || open_per_group[group] >= cfg.max_connections_per_netgroup};
+    // Looked up, not indexed: a refused request leaves no zero entry, which only Release would erase (review workflow of
+    // 2026-11-18: a full netgroup grew the per-address count with every address of it that it refused).
+    const auto open_count{[](const std::map<std::string, size_t>& counts, const std::string& key) -> size_t {
+        const auto it{counts.find(key)};
+        return it == counts.end() ? 0 : it->second;
+    }};
+    const bool refused{open_total >= cfg.max_connections || open_count(open_per_ip, ip) >= cfg.max_connections_per_ip ||
+                       recent.size() >= cfg.max_new_connections_per_minute || open_count(open_per_group, group) >= cfg.max_connections_per_netgroup};
     if (refused) {
         {
             LOCK(mutex);
@@ -740,6 +746,7 @@ void HttpsSseApi::Impl::Pump()
         if (item.req != nullptr) ++status.open_requests;
     }
     status.streams = streams.size();
+    status.limit_entries = open_per_ip.size() + open_per_group.size();
 }
 
 // ---- The public surface ----------------------------------------------------------------

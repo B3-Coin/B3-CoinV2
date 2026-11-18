@@ -61,6 +61,8 @@ class TlsClient
 public:
     TlsClient(uint16_t port, int min_version, int max_version) : m_port{port}, m_min{min_version}, m_max{max_version} {}
     ~TlsClient() { Disconnect(); }
+    //! Connect from this loopback address (all of 127.0.0.0/8 is local on Linux), which is what the per-address limits see.
+    void SetSource(std::string address) { m_source = std::move(address); }
     bool Connected()
     {
         Connect();
@@ -215,6 +217,27 @@ private:
         SSL_CTX_set_min_proto_version(m_ctx, m_min);
         SSL_CTX_set_max_proto_version(m_ctx, m_max);
         SSL_CTX_set_verify(m_ctx, SSL_VERIFY_NONE, nullptr); // the pin above replaces the CA check
+        if (!m_source.empty()) {
+            m_fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+            BOOST_REQUIRE(m_fd >= 0);
+            sockaddr_in local{};
+            local.sin_family = AF_INET;
+            BOOST_REQUIRE_EQUAL(inet_pton(AF_INET, m_source.c_str(), &local.sin_addr), 1);
+            BOOST_REQUIRE_EQUAL(::bind(m_fd, reinterpret_cast<sockaddr*>(&local), sizeof(local)), 0);
+            sockaddr_in server{};
+            server.sin_family = AF_INET;
+            server.sin_port = htons(m_port);
+            server.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            BOOST_REQUIRE_EQUAL(::connect(m_fd, reinterpret_cast<sockaddr*>(&server), sizeof(server)), 0);
+            m_ssl = SSL_new(m_ctx);
+            BOOST_REQUIRE(m_ssl != nullptr);
+            BOOST_REQUIRE_EQUAL(SSL_set_fd(m_ssl, m_fd), 1);
+            m_bio = BIO_new(BIO_f_ssl());
+            BOOST_REQUIRE(m_bio != nullptr);
+            BIO_set_ssl(m_bio, m_ssl, BIO_CLOSE); // the BIO owns the SSL; the socket stays ours (closed in Disconnect)
+            m_connected = SSL_connect(m_ssl) == 1;
+            return;
+        }
         m_bio = BIO_new_ssl_connect(m_ctx);
         BOOST_REQUIRE(m_bio != nullptr);
         BIO_get_ssl(m_bio, &m_ssl);
@@ -227,15 +250,19 @@ private:
     {
         if (m_bio != nullptr) BIO_free_all(m_bio);
         if (m_ctx != nullptr) SSL_CTX_free(m_ctx);
+        if (m_fd >= 0) ::close(m_fd);
         m_bio = nullptr;
         m_ctx = nullptr;
         m_ssl = nullptr;
+        m_fd = -1;
         m_connected = false;
     }
 
     uint16_t m_port;
     int m_min;
     int m_max;
+    std::string m_source; //!< empty: the default source address
+    int m_fd{-1};         //!< the socket when m_source is set
     SSL_CTX* m_ctx{nullptr};
     BIO* m_bio{nullptr};
     SSL* m_ssl{nullptr};
@@ -732,6 +759,37 @@ BOOST_AUTO_TEST_CASE(a_stalled_stream_on_a_quiet_hub_times_out_and_frees_its_slo
     BOOST_CHECK_EQUAL(rig.api->Status().streams, 0U);
     TlsClient next{rig.api->Port(), TLS1_3_VERSION, TLS1_3_VERSION};
     BOOST_CHECK(next.Stream("/v2/stream?channel=slots", "event: snapshot", std::chrono::milliseconds{3'000}).find("event: snapshot") != std::string::npos);
+}
+
+BOOST_AUTO_TEST_CASE(requests_refused_by_a_full_netgroup_leave_no_entries_in_the_limit_counts)
+{
+    // Review workflow of 2026-11-18: the limit check indexed the per-address and per-netgroup counts, so a refused request
+    // from a new address created a zero entry, and only Release (never called for a refusal) erased one. A netgroup at
+    // its cap thus grew the per-address count with every address of the group it refused (65,536 in an IPv4 /16, no real
+    // bound in an IPv6 group). Here one stream fills its netgroup (127.0/16) and forty other addresses of it are
+    // refused; the counts hold the stream's two entries (its address and its netgroup), then none once it ends.
+    HttpsSseConfig config;
+    config.max_connections_per_netgroup = 1;
+    Rig rig{config};
+    const auto entries_become{[&](size_t want) {
+        const auto deadline{std::chrono::steady_clock::now() + std::chrono::seconds{5}};
+        while (rig.api->Status().limit_entries != want && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(std::chrono::milliseconds{10});
+        return rig.api->Status().limit_entries;
+    }};
+    auto holder{std::make_unique<TlsClient>(rig.api->Port(), TLS1_3_VERSION, TLS1_3_VERSION)};
+    BOOST_REQUIRE(holder->Stream("/v2/stream?channel=slots", "event: snapshot", std::chrono::milliseconds{3'000}).find("event: snapshot") != std::string::npos);
+    BOOST_CHECK_EQUAL(entries_become(2), 2U);
+    for (int i{2}; i <= 41; ++i) {
+        TlsClient other{rig.api->Port(), TLS1_3_VERSION, TLS1_3_VERSION};
+        other.SetSource("127.0.0." + std::to_string(i));
+        BOOST_CHECK_EQUAL(other.Request("GET", "/v2/health").status, 429);
+    }
+    BOOST_CHECK_GE(rig.api->Status().refused, 40U);
+    // Let a few pumps pass, so a count that grew would show.
+    std::this_thread::sleep_for(std::chrono::milliseconds{200});
+    BOOST_CHECK_EQUAL(entries_become(2), 2U);
+    holder.reset();
+    BOOST_CHECK_EQUAL(entries_become(0), 0U);
 }
 
 BOOST_AUTO_TEST_CASE(stop_right_after_create_returns)
