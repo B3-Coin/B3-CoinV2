@@ -258,12 +258,14 @@ BOOST_AUTO_TEST_CASE(the_dev_chain_file_takes_one_writer_and_cuts_a_torn_tail)
     fs::remove_all(dir);
 }
 
-BOOST_AUTO_TEST_CASE(a_dev_chain_reader_waits_for_a_writer)
+BOOST_AUTO_TEST_CASE(a_dev_chain_reader_never_reads_across_a_writer)
 {
     // Codex review of 2026-11-18 over 7d326476: readers took no lock, so a reader could read part of a torn record, then,
     // after an append cut the tail and wrote the next record in its place, read on into the new bytes. The record it put
     // together failed its CRC on a valid file: STORAGE_FATAL for an fm2d tailing it, or at its start. Readers now hold a
-    // shared lock on the file for their read, so an append (exclusive) never runs during one.
+    // shared lock on the file for their read, so an append (exclusive) never runs during one. ReadDevChain waits for
+    // the lock. A tail's Poll runs on fm2d's sealing thread every millisecond, so it does not wait: while a writer
+    // holds the file it finds nothing new, and it takes the block on a later poll (advisor review of 2026-11-18).
     const fs::path dir{fs::PathFromString(FM2_TEST_TMP_DIR) / fs::u8path("devchain_reader_tests")};
     fs::remove_all(dir);
     fs::create_directories(dir);
@@ -276,10 +278,15 @@ BOOST_AUTO_TEST_CASE(a_dev_chain_reader_waits_for_a_writer)
     std::future<Result<std::vector<dev::DevChainBlock>>> reading{std::async(std::launch::async, [&] { return dev::ReadDevChain(file); })};
     std::future<Result<std::vector<dev::DevChainBlock>>> polling{std::async(std::launch::async, [&] { return tail.Poll(); })};
     BOOST_CHECK(reading.wait_for(std::chrono::milliseconds{300}) == std::future_status::timeout);
-    BOOST_CHECK(polling.wait_for(std::chrono::milliseconds{0}) == std::future_status::timeout);
+    const bool poll_returned{polling.wait_for(std::chrono::milliseconds{0}) == std::future_status::ready};
+    BOOST_CHECK_MESSAGE(poll_returned, "a poll waited for the writer's lock");
     ::close(held);
     BOOST_CHECK_EQUAL(reading.get().value().size(), 1U);
-    BOOST_CHECK_EQUAL(polling.get().value().size(), 1U);
+    const Result<std::vector<dev::DevChainBlock>> while_held{polling.get()};
+    RequireOk(while_held, "Poll while the writer held the file");
+    if (poll_returned) BOOST_CHECK(while_held->empty());
+    const size_t polled_before{while_held->size()};
+    BOOST_CHECK_EQUAL(polled_before + tail.Poll().value().size(), 1U); // the block arrives once
     fs::remove_all(dir);
 }
 

@@ -77,7 +77,8 @@ Result<void> CheckDevChainBlock(const NetworkId& network, const AuthorityVersion
 //! Every complete block of the file in order (an absent file is an empty chain).
 Result<std::vector<DevChainBlock>> ReadDevChain(const fs::path& file);
 
-//! A tail reader: Poll() gives the complete records appended since the last call.
+//! A tail reader: Poll() gives the complete records appended since the last call. It never waits for a writer: while
+//! an append holds the file it gives nothing, and the records come on a later poll.
 class DevChainTail
 {
 public:

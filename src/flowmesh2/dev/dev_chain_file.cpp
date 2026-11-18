@@ -18,6 +18,7 @@
 #include <cstring>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <variant>
 
@@ -75,22 +76,26 @@ Result<std::vector<unsigned char>> ReadRest(int fd)
     return Ok(std::move(bytes));
 }
 
-Result<std::vector<unsigned char>> ReadWhole(const fs::path& file)
+//! The whole file, read under a shared lock; nullopt when `wait` is false and a writer holds the file.
+Result<std::optional<std::vector<unsigned char>>> ReadWhole(const fs::path& file, bool wait)
 {
     const int fd{::open(fs::PathToString(file).c_str(), O_RDONLY | O_CLOEXEC)};
     if (fd < 0) {
-        if (errno == ENOENT) return Ok(std::vector<unsigned char>{});
+        if (errno == ENOENT) return Ok(std::optional<std::vector<unsigned char>>{std::vector<unsigned char>{}});
         return Error{ErrorCode::STORAGE_FATAL, DEVCHAIN_OPEN};
     }
     // Shared, for the whole read: an append (exclusive) may cut a torn tail and write the next record in its place, and a
     // read across that splices the two into a record that fails its CRC (Codex review of 2026-11-18).
-    if (::flock(fd, LOCK_SH) != 0) {
+    if (::flock(fd, LOCK_SH | (wait ? 0 : LOCK_NB)) != 0) {
+        const int lock_errno{errno};
         ::close(fd);
+        if (!wait && lock_errno == EWOULDBLOCK) return Ok(std::optional<std::vector<unsigned char>>{});
         return Error{ErrorCode::STORAGE_FATAL, DEVCHAIN_OPEN};
     }
     Result<std::vector<unsigned char>> bytes{ReadRest(fd)};
     ::close(fd); // the lock goes with it
-    return bytes;
+    if (!bytes.has_value()) return bytes.error();
+    return Ok(std::optional<std::vector<unsigned char>>{std::move(bytes).value()});
 }
 
 } // namespace
@@ -207,19 +212,24 @@ Result<void> CheckDevChainBlock(const NetworkId& network, const AuthorityVersion
 
 Result<std::vector<DevChainBlock>> ReadDevChain(const fs::path& file)
 {
-    Result<std::vector<unsigned char>> bytes{ReadWhole(file)};
+    Result<std::optional<std::vector<unsigned char>>> bytes{ReadWhole(file, /*wait=*/true)};
     if (!bytes.has_value()) return bytes.error();
     uint64_t offset{0};
-    return ParseRecords(*bytes, offset);
+    return ParseRecords(**bytes, offset);
 }
 
 Result<std::vector<DevChainBlock>> DevChainTail::Poll()
 {
-    Result<std::vector<unsigned char>> bytes{ReadWhole(m_file)};
-    if (!bytes.has_value()) return bytes.error();
-    if (bytes->size() < m_offset) return Error{ErrorCode::STORAGE_FATAL, DEVCHAIN_CORRUPT}; // the file shrank: never rewritten
+    // No wait: Poll runs on fm2d's sealing thread every millisecond, and a writer holds the file through its fsync (or,
+    // a tool that misbehaves, for good). While one does, there is nothing new this poll (advisor review of 2026-11-18).
+    Result<std::optional<std::vector<unsigned char>>> read{ReadWhole(m_file, /*wait=*/false)};
+    if (!read.has_value()) return read.error();
+    if (!read->has_value()) return Ok(std::vector<DevChainBlock>{});
+    const std::vector<unsigned char>& bytes{**read};
+    // A complete record is never rewritten (a torn tail a dead writer left is cut, but no reader ever advanced over it).
+    if (bytes.size() < m_offset) return Error{ErrorCode::STORAGE_FATAL, DEVCHAIN_CORRUPT};
     uint64_t offset{m_offset};
-    Result<std::vector<DevChainBlock>> blocks{ParseRecords(*bytes, offset)};
+    Result<std::vector<DevChainBlock>> blocks{ParseRecords(bytes, offset)};
     if (!blocks.has_value()) return blocks.error();
     m_offset = offset;
     return blocks;
