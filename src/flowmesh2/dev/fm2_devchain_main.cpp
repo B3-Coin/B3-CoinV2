@@ -3,6 +3,7 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <flowmesh2/core/facts.h>
+#include <flowmesh2/core/params.h>
 #include <flowmesh2/dev/dev_chain_file.h>
 #include <flowmesh2/netio/genesis_doc.h>
 #include <util/fs.h>
@@ -118,6 +119,23 @@ int main(int argc, char** argv)
         fact.asset = *asset;
         fact.amount = *amount;
         block.facts.push_back(Fact{fact});
+    }
+    // Only a block every seat takes: one a seat refuses wedges every fm2d that tails the file, and makes it fail on every
+    // restart (review workflow of 2026-11-18). The adapter is built as fm2d builds it.
+    const Result<ProfileParams> profile{DevRegtestProfile(ChainType::REGTEST)};
+    if (!profile.has_value()) {
+        std::cerr << "fm2-devchain: profile: " << profile.error().detail << "\n";
+        return 1;
+    }
+    const Result<SeatSet> seats{doc->SeatSetOf()};
+    if (!seats.has_value()) {
+        std::cerr << "fm2-devchain: seat set: " << seats.error().detail << "\n";
+        return 1;
+    }
+    const AuthorityVersion authority{doc->Authority(*profile, *seats)};
+    if (const Result<void> taken{dev::CheckDevChainBlock(doc->network, authority, *seats, doc->base, *existing, block)}; !taken.has_value()) {
+        std::cerr << "fm2-devchain: no seat would take this block: " << ToString(taken.error().code) << " " << taken.error().detail << "\n";
+        return 1;
     }
     if (const Result<void> appended{dev::AppendDevChainBlock(path, block)}; !appended.has_value()) {
         std::cerr << "fm2-devchain: " << appended.error().detail << "\n";

@@ -2,6 +2,9 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
+#include <flowmesh2/chain/chain_adapter.h>
+#include <flowmesh2/core/amount.h>
+#include <flowmesh2/core/body.h>
 #include <flowmesh2/core/hashes.h>
 #include <flowmesh2/dev/dev_chain_file.h>
 #include <flowmesh2/netio/genesis_doc.h>
@@ -203,6 +206,44 @@ BOOST_AUTO_TEST_CASE(the_dev_chain_file_appends_tails_and_refuses_corruption)
     RequireRefusal(tail.Poll(), ErrorCode::STORAGE_FATAL, dev::DEVCHAIN_CORRUPT, "bad crc");
     RequireRefusal(dev::ReadDevChain(file), ErrorCode::STORAGE_FATAL, dev::DEVCHAIN_CORRUPT, "bad crc everywhere");
     fs::remove_all(dir);
+}
+
+BOOST_AUTO_TEST_CASE(the_faucet_check_refuses_a_block_no_seat_would_take)
+{
+    // Review workflow of 2026-11-18: R8 kept undecodable blocks out of the dev chain file, but the faucet still wrote
+    // blocks every fm2d refuses (more than MAX_SLOT_FACTS deposits, a protocol account) or that no slot can carry (an
+    // asset's deposits past MAX_ATOMS, O-34). A seat that tails such a file logs the refusal and never takes another
+    // block, and fails on every restart. CheckDevChainBlock answers what a seat would.
+    const GenesisDoc doc{TestGenesis()};
+    const SeatSet seats{doc.SeatSetOf().value()};
+    const AuthorityVersion authority{doc.Authority(RegtestProfile(), seats)};
+    const auto deposit{[](uint32_t height, uint32_t index, const std::string& who, Atoms amount) {
+        DepositFact fact;
+        fact.cursor = FactCursor{height, index};
+        fact.outpoint = dev::DevChainOutpoint(height, index);
+        fact.account = AccountId{LabelHash("fm2/test/devchain/" + who)};
+        fact.asset = AssetId::Native();
+        fact.amount = amount;
+        return Fact{fact};
+    }};
+    const auto check{[&](const std::vector<dev::DevChainBlock>& existing, const dev::DevChainBlock& block) {
+        return dev::CheckDevChainBlock(doc.network, authority, seats, doc.base, existing, block);
+    }};
+    // A block of MAX_SLOT_FACTS deposits is taken; one more is not.
+    dev::DevChainBlock full{130, dev::DevChainBlockHash(130), {}};
+    for (uint32_t i{0}; i < MAX_SLOT_FACTS; ++i) full.facts.push_back(deposit(130, i, "many", 1));
+    RequireOk(check({}, full), "MAX_SLOT_FACTS deposits");
+    full.facts.push_back(deposit(130, static_cast<uint32_t>(MAX_SLOT_FACTS), "many", 1));
+    RequireRefusal(check({}, full), ErrorCode::INVALID_INPUT, chain::BATCH_TOO_MANY, "one deposit too many");
+    // An asset's deposits up to MAX_ATOMS over the file are taken; one atom more is not, in another block or the same one.
+    const dev::DevChainBlock most{130, dev::DevChainBlockHash(130), {deposit(130, 0, "alice", MAX_ATOMS)}};
+    RequireOk(check({}, most), "MAX_ATOMS");
+    RequireRefusal(check({most}, dev::DevChainBlock{131, dev::DevChainBlockHash(131), {deposit(131, 0, "bob", 1)}}), ErrorCode::INVALID_INPUT,
+                   dev::DEVCHAIN_DEPOSIT_TOTAL, "one atom past MAX_ATOMS in the next block");
+    RequireRefusal(check({}, dev::DevChainBlock{130, dev::DevChainBlockHash(130), {deposit(130, 0, "alice", MAX_ATOMS - 1), deposit(130, 1, "bob", 2)}}),
+                   ErrorCode::INVALID_INPUT, dev::DEVCHAIN_DEPOSIT_TOTAL, "one atom past MAX_ATOMS in one block");
+    // A height the adapter does not expect next is refused too (its cursors name another block).
+    RequireCode(check({most}, dev::DevChainBlock{132, dev::DevChainBlockHash(132), {deposit(132, 0, "bob", 1)}}), ErrorCode::INVALID_INPUT, "a gap");
 }
 
 BOOST_AUTO_TEST_SUITE_END()

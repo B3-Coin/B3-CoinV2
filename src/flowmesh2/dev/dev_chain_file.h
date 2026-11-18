@@ -11,7 +11,10 @@
 
 #include <flowmesh2/core/authority.h>
 #include <flowmesh2/core/facts.h>
+#include <flowmesh2/core/ids.h>
+#include <flowmesh2/core/params.h>
 #include <flowmesh2/core/result.h>
+#include <flowmesh2/core/seat_set.h>
 #include <uint256.h>
 #include <util/fs.h>
 
@@ -39,6 +42,7 @@ inline constexpr std::string_view DEVCHAIN_OPEN{"the dev chain file could not be
 inline constexpr std::string_view DEVCHAIN_CORRUPT{"a dev chain record is corrupt"};              //!< (STORAGE_FATAL)
 inline constexpr std::string_view DEVCHAIN_WRITE{"the dev chain file could not be written"};      //!< (STORAGE_FATAL)
 inline constexpr std::string_view DEVCHAIN_HEIGHT{"a dev chain block is not the next height"};    //!< (INVALID_INPUT)
+inline constexpr std::string_view DEVCHAIN_DEPOSIT_TOTAL{"the deposits of an asset over the dev chain would exceed MAX_ATOMS"}; //!< (INVALID_INPUT)
 inline constexpr size_t DEVCHAIN_MAX_RECORD_BYTES{16 * 1024 * 1024};
 
 struct DevChainBlock {
@@ -59,6 +63,14 @@ Result<DevChainBlock> DecodeDevChainBlock(std::span<const unsigned char> payload
 
 //! Append one block (creating the file), fsync'd before returning.
 Result<void> AppendDevChainBlock(const fs::path& file, const DevChainBlock& block);
+//! Whether every fm2d of the cluster takes `block` after `existing`: Ok, or the refusal a seat would give. The blocks go
+//! through a FakeChainAdapter built from the same network, authority, seats and base as fm2d's (MAX_SLOT_FACTS, cursors,
+//! protocol accounts, repeated outpoints), and each asset's deposits over the whole file stay within MAX_ATOMS (O-34: a
+//! deposit total above it is a ledger error no slot can carry, so DEVCHAIN_DEPOSIT_TOTAL). The faucet checks a block
+//! with this before it appends it: a block a seat refuses wedges every seat that tails the file (review workflow of
+//! 2026-11-18).
+Result<void> CheckDevChainBlock(const NetworkId& network, const AuthorityVersion& authority, const SeatSet& seats, const Anchor& base,
+                                const std::vector<DevChainBlock>& existing, const DevChainBlock& block);
 //! Every complete block of the file in order (an absent file is an empty chain).
 Result<std::vector<DevChainBlock>> ReadDevChain(const fs::path& file);
 

@@ -4,6 +4,9 @@
 
 #include <flowmesh2/dev/dev_chain_file.h>
 
+#include <flowmesh2/core/amount.h>
+#include <flowmesh2/dev/fake_chain.h>
+
 #include <crc32c/crc32c.h>
 #include <crypto/sha256.h>
 
@@ -12,7 +15,10 @@
 #include <unistd.h>
 
 #include <cstring>
+#include <map>
+#include <memory>
 #include <string>
+#include <variant>
 
 namespace flowmesh2::dev {
 
@@ -155,6 +161,29 @@ Result<void> AppendDevChainBlock(const fs::path& file, const DevChainBlock& bloc
     }
     ::close(fd);
     return Ok();
+}
+
+Result<void> CheckDevChainBlock(const NetworkId& network, const AuthorityVersion& authority, const SeatSet& seats, const Anchor& base,
+                                const std::vector<DevChainBlock>& existing, const DevChainBlock& block)
+{
+    Result<std::unique_ptr<FakeChainAdapter>> chain{FakeChainAdapter::Create(network, authority, seats, base)};
+    if (!chain.has_value()) return chain.error();
+    std::map<AssetId, Atoms> deposited;
+    const auto take{[&](const DevChainBlock& next) -> Result<void> {
+        if (Result<Anchor> appended{(*chain)->AppendBlock(next.hash, next.facts)}; !appended.has_value()) return appended.error();
+        for (const Fact& fact : next.facts) {
+            const auto* deposit{std::get_if<DepositFact>(&fact)};
+            if (deposit == nullptr) continue;
+            const Result<Atoms> total{AddAtoms(deposited[deposit->asset], deposit->amount)};
+            if (!total.has_value()) return Error{ErrorCode::INVALID_INPUT, DEVCHAIN_DEPOSIT_TOTAL};
+            deposited[deposit->asset] = *total;
+        }
+        return Ok();
+    }};
+    for (const DevChainBlock& earlier : existing) {
+        if (Result<void> taken{take(earlier)}; !taken.has_value()) return taken.error(); // the file is already one no seat takes
+    }
+    return take(block);
 }
 
 Result<std::vector<DevChainBlock>> ReadDevChain(const fs::path& file)
