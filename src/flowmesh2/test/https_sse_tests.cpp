@@ -124,18 +124,32 @@ public:
         return DecodeChunked(raw);
     }
 
-    //! Read what the open stream connection delivers within `limit` (decoded chunks); the connection stays open.
+    //! Size the open connection's kernel receive buffer (SO_RCVBUF), so how much a stalled reader's socket holds does not
+    //! depend on this kernel's autotuning.
+    void SetReceiveBuffer(int bytes)
+    {
+        int fd{-1};
+        BOOST_REQUIRE(m_bio != nullptr && BIO_get_fd(m_bio, &fd) >= 0);
+        BOOST_REQUIRE_EQUAL(setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &bytes, sizeof(bytes)), 0);
+    }
+
+    //! Read what the open stream connection delivers within `limit` (decoded chunks), up to a gap event or the last chunk;
+    //! the connection stays open.
     std::string ReadMore(std::chrono::milliseconds limit)
     {
         if (!m_connected) return {};
         std::string raw;
         char buf[4096];
         const auto deadline{std::chrono::steady_clock::now() + limit};
+        // Only what a read added, and the few bytes before it a marker can straddle, is searched. Searching the whole
+        // buffer after every read was quadratic in a stalled reader's backlog: 1.5 MB took 7 s under TSan, past the limit.
+        constexpr size_t STRADDLE{16};
         while (std::chrono::steady_clock::now() < deadline) {
             const int n{BIO_read(m_bio, buf, sizeof(buf))};
             if (n <= 0) break;
+            const size_t from{raw.size() > STRADDLE ? raw.size() - STRADDLE : 0};
             raw.append(buf, static_cast<size_t>(n));
-            if (raw.find("event: gap") != std::string::npos || raw.find("\r\n0\r\n") != std::string::npos) break;
+            if (raw.find("event: gap", from) != std::string::npos || raw.find("\r\n0\r\n", from) != std::string::npos) break;
         }
         return DecodeChunks(raw);
     }
@@ -561,6 +575,9 @@ BOOST_AUTO_TEST_CASE(a_slow_reader_holds_events_in_the_hub_not_in_memory)
     const uint16_t port{rig.api->Port()};
     TlsClient slow{port, TLS1_3_VERSION, TLS1_3_VERSION};
     BOOST_CHECK(slow.Stream("/v2/stream?channel=slots", "event: snapshot", std::chrono::milliseconds{3'000}).find("event: snapshot") != std::string::npos);
+    // A receive buffer of 1 MiB: the socket then holds about 1.5 MB before the server holds events back, as on the CI
+    // runners (run 44154355944, tsan), whatever this kernel's autotuning would give.
+    slow.SetReceiveBuffer(1024 * 1024);
     // The reader stops reading; the node goes on sealing until the socket buffers are full and the hub's queue overflows.
     size_t most_queued{0};
     const auto deadline{std::chrono::steady_clock::now() + std::chrono::seconds{30}};
@@ -573,7 +590,8 @@ BOOST_AUTO_TEST_CASE(a_slow_reader_holds_events_in_the_hub_not_in_memory)
     BOOST_CHECK_EQUAL(rig.api->Status().streams, 0U);
     // Bounded by the cap plus one round of events; the lag itself stayed in the hub.
     BOOST_CHECK_LE(most_queued, config.stream_output_bytes + 64 * 1024);
-    BOOST_CHECK(slow.ReadMore(std::chrono::milliseconds{3'000}).find("event: gap") != std::string::npos);
+    // The backlog the socket holds comes first, then the gap; ReadMore returns at the gap, the limit only bounds a failure.
+    BOOST_CHECK(slow.ReadMore(std::chrono::milliseconds{10'000}).find("event: gap") != std::string::npos);
 }
 
 BOOST_AUTO_TEST_CASE(a_reader_that_leaves_with_events_queued_does_not_take_the_process_down)
