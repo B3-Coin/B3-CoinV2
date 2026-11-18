@@ -151,6 +151,7 @@ struct Refusal {
  * unregistered kind.
  */
 Result<void> KindAdmissible(ActionKind kind);
+Result<void> KindAdmissible(ActionKind kind, const ProfileParams& profile);
 
 /** A2 payload rule, the validity predicate's (engine ValidateSlotInputs step
  * 8): a supported kind's payload decodes exactly (ActionV2::Place, Cancel,
@@ -158,6 +159,7 @@ Result<void> KindAdmissible(ActionKind kind);
  * every other kind.
  */
 bool PayloadAdmissible(const ActionV2& action);
+bool PayloadAdmissible(const ActionV2& action, const ProfileParams& profile);
 
 /** A6 against the slot after `head_height`, in this order: BAD_EXPIRY
  * unless MaxDelayValid; REF_SLOT_AHEAD if ref_slot > head_height; EXPIRED

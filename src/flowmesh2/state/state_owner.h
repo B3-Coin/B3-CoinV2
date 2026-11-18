@@ -99,6 +99,8 @@ inline constexpr std::string_view DECISION_OTHER_HEADER{"decision token for anot
 inline constexpr std::string_view AUTHORITY_SUPERSEDED{"candidate authority is not the current authority"};   //!< (AUTHORITY_CHANGED)
 inline constexpr std::string_view RESTORE_NOT_FRESH{"restore onto an owner whose head already moved"};         //!< (ORDER_VIOLATION)
 
+inline constexpr std::string_view OWNER_COMMITMENT_VERSION{"head commitment version differs from its profile"}; //!< (VERIFY_FAILED)
+
 //! What a successful Apply gives: the new head, and the receipt CommitLog::AppendApplied requires (O-92).
 struct AppliedSlot {
     std::shared_ptr<const HeadView> head;
@@ -133,6 +135,7 @@ public:
 
     //! Install the committed head ReplayDecisions rebuilds from the genesis `base` and the whole commit journal (file comment).
     Result<void> Restore(const HeadView& base, std::span<const storage::JournalRecord> records) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+
 
 private:
     StateOwner(engine::Engine engine, std::shared_ptr<const HeadView> genesis, uint64_t commit_journal_instance);

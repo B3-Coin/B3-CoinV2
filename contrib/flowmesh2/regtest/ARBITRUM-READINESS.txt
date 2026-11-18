@@ -1,0 +1,100 @@
+B3 Arbitrum asset preparation -- MAINNET DISABLED
+
+Preferred asset: Arbitrum One USDT0
+  chain: 42161; settlement parent: Ethereum 1
+  token: 0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9
+Secondary asset: native Circle USDC
+  token: 0xaf88d065e77c8cc2239327c5edb3a432268e5831
+USDC.e and arbitrary tokens are not registry aliases. No token is selected by
+symbol/decimals alone. Confirm current issuer deployments before release:
+  https://docs.usdt0.to/technical-documentation/deployments
+  https://docs.usdt0.to/technical-documentation/token-features/
+  https://developers.circle.com/stablecoins/usdc-contract-addresses
+
+What the additional code does
+
+The read-only HTTPS adapter authenticates configured provider TLS identities,
+pins chain and genesis, permits explicit finalized/number/hash-selected reads,
+rejects writes and implicit latest reads, bounds resource use, and publishes no
+provider credentials. The finality helper requires two to four distinctly
+configured provider operators/endpoints. It keeps finalized observations and a
+durable rollback/identity fence. Provider independence is a deployment trust
+assertion; this is not an Ethereum/Arbitrum consensus light client. Deleting or
+coherently rolling back all local state still needs an independent witness.
+
+The token registry checks exact addresses, proxy/implementation/admin identity,
+issuer roles and six-decimal behavior at a pinned source origin. Fork transfer
+boundaries also check current issuer restrictions and actual vault backing.
+A typed issuer restriction can defer an existing claim without replacing its
+recipient or votes. It never suppresses a source/identity/reserve failure.
+Issuer upgrade, block, mint/burn and confiscation powers remain trust risks.
+
+The vault adds EIP-3009 receiveWithAuthorization deposits. The nonce commits
+the exact account, principal, sender, chain, vault, asset, instance and user
+salt. A third party can pay native gas but cannot redirect the credited account.
+This implementation uses EOA v/r/s authorization; contract-wallet signature UX
+and the production sponsor service/pricing are not qualified. Source gas is ETH;
+the local sponsor absorbs it, with zero deposit service fee only in the fixture.
+
+The separate fork adapter preserves the original LocalRpc fork rejection.
+It accepts only literal-loopback owned Anvil chain31337, the exact original
+Arbitrum block and provider URL commitment, and the registered quote token.
+Only local authorized issuer minting funds artificial fixture balances. It
+does not overwrite token code or storage and cannot sign a chain42161 tx.
+
+The four-operator rehearsal uses zero-ETH source EOAs, sponsor-paid deposits,
+public signed maker/taker orders on two markets, stable fees, public withdrawal,
+automatic threshold custody and payout, a retained-identity operator restart,
+duplicate retry, verified account/total proofs and exact reserve reconciliation.
+Its native internal quote remains synthetic Q and its source facts remain
+chain31337. Actual token code on a local fork is compatibility evidence only.
+
+How to qualify this candidate
+
+Use qualify_arbitrum_prelaunch.py from this directory, in the established Linux
+environment, with a fresh evidence directory outside source. Use its --help
+for explicit source/build/Foundry/B3 paths, provider-config, finality-state and
+fork-provider options. Provider URLs come only from the named environment
+variables in the read-only configuration. Public endpoints have no production
+availability guarantee. An archive-capable endpoint is required for token state.
+
+Keep the finalized checkpoint and fence between runs; never delete it to make
+a provider replacement or rollback pass. Keep fixture keys/journals/logs private.
+Anvil's upstream URL is process-local operational data and may appear in its
+private process arguments/logs. Use a dedicated least-privilege read-only API
+credential if the provider needs one. Never use a real wallet in a fixture.
+
+The qualifier preserves all existing network/sanitizer/legacy/latency gates,
+then requires new offline guards, live read-only provider observations, exact
+token pins, all fourteen opt-in actual-token contract cases, and the independent
+four-operator roundtrip for each asset. The contract tests live outside contracts/
+to avoid accidental fork requirements in the ordinary src='.' Foundry suite.
+Only the rehearsal child selects contrib/flowmesh2/rehearsal via FOUNDRY_TEST.
+
+The separate contrib/b3bridge/peer tooling now obtains Ethereum consensus
+proofs from peers and verifies BLS/SSZ natively with durable replay. Its README
+explains reviewed checkpoint trust, fork horizons and conservative outage bounds.
+It does not yet verify Arbitrum execution or replace historical fork state.
+
+No local gate authorizes activation
+
+Every new tool and report keeps mainnet_enabled=false and mainnet_ready=false.
+arbitrum_plan.py records a disabled plan; editing readiness flags or checksums
+cannot turn it into a runtime configuration. Keep all old native profiles,
+source facts, signer journals and custody identities unchanged.
+
+Required production work remains a separately versioned real-asset native
+profile/domain and markets; live finalized source observation/catchup/custody
+integration; a chain42161 gas signer with qualified bounds and recovery; exact
+release vault/token/governance policy; independently operated hosts and client
+pin/key distribution; external signer antirollback and disaster recovery;
+funded stable-fee sponsorship/product behavior; acceptance/review of three-of-four
+committee custody and its exit model; independent protocol/contract review,
+internet load/failure tests, monitoring/reconciliation and incident drills.
+The compiler/EVM target must also be qualified against actual Arbitrum execution
+rules; the inherited local Foundry target is not evidence of live compatibility.
+
+The vault checks committee signatures, not a native state proof or permissionless
+fraud proof/escape. Snapshot pins are evidence, not issuer-governance approval.
+Local trading latency excludes real source finality/challenge/network delays.
+There is no supported mainnet activation switch in this candidate.

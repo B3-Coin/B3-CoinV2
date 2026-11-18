@@ -13,6 +13,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <vector>
 
@@ -20,7 +21,8 @@
  *
  * A certificate says: the seats marked in `bitmap` signed the header whose
  * Hash() is `header_hash`, and `aggregate` is the BLS aggregate of their
- * signatures over that header's CommitDigest(). This file holds the data
+ * signatures over CertificateDigest(header, certificate): the frozen digest
+ * for commitments 0/2, or the exact view-bound digest for commitment 3. This file holds the data
  * type only. Checking it (FastAggregateVerify over CommitDigest with the
  * PoP-verified keys of the marked seats, at least Quorum() of them) is
  * b3verify's VerifyCertificate (R11); the k = 1 dev certifier (R10) makes
@@ -32,7 +34,13 @@
  * ceil(k / 8) bytes and every bit at an index >= k is zero.
  *
  * Encoding: header_hash (32) | CompactSize-capped bitmap (at most
- * MAX_SEATS / 8 bytes) | aggregate (96, compressed G2). Decode is exact:
+ * MAX_SEATS / 8 bytes) | aggregate (96, compressed G2) | optional u64 view.
+ * The exact base length is legacy; exactly eight additional bytes carry a
+ * view (including zero). Other trailing lengths refuse. The header version
+ * decides whether that view must be absent or present; CertificateDigest
+ * enforces it before any signature can be accepted. PREPARE proof containers
+ * additionally require this metadata to match their signed prepare view.
+ * Decode is exact:
  * a longer bitmap or input is OVERSIZE, malformed or trailing bytes DECODE.
  * Decode does not parse the aggregate as a curve point; b3verify does
  * (bls::Signature::Decode). Encode() is total.
@@ -40,6 +48,8 @@
  * Hash() = Tagged(CERT, Encode()): the next header's parent_cert_hash.
  */
 namespace flowmesh2 {
+
+struct SlotHeaderV2;
 
 inline constexpr size_t MAX_BITMAP_BYTES{(MAX_SEATS + 7) / 8};
 
@@ -50,10 +60,14 @@ struct SlotCertificate {
     uint256 header_hash;
     std::vector<unsigned char> bitmap;
     std::array<unsigned char, bls::SIGNATURE_SIZE> aggregate{};
+    //! Absent for legacy commitments 0/2. Commitment 3 requires presence,
+    //! including view zero. PREPARE certificates bind the same explicit view.
+    std::optional<uint64_t> view{};
 
     friend bool operator==(const SlotCertificate&, const SlotCertificate&) = default;
 
-    static constexpr size_t MAX_ENCODED_BYTES{32 + 1 + MAX_BITMAP_BYTES + bls::SIGNATURE_SIZE};
+    static constexpr size_t MAX_LEGACY_ENCODED_BYTES{32 + 1 + MAX_BITMAP_BYTES + bls::SIGNATURE_SIZE};
+    static constexpr size_t MAX_ENCODED_BYTES{MAX_LEGACY_ENCODED_BYTES + 8};
 
     std::vector<unsigned char> Encode() const;
     static Result<SlotCertificate> Decode(std::span<const unsigned char> bytes);
@@ -73,6 +87,10 @@ struct SlotCertificate {
      */
     static Result<std::vector<unsigned char>> MakeBitmap(size_t seat_count, std::span<const uint32_t> signers);
 };
+
+//! Exact certificate/header version binding and the appropriate COMMIT digest.
+//! This checks the absent/present view format; BLS/quorum/header-hash checks are separate.
+Result<uint256> CertificateDigest(const SlotHeaderV2& header, const SlotCertificate& certificate);
 
 } // namespace flowmesh2
 

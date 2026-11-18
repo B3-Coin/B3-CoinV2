@@ -151,4 +151,23 @@ BOOST_AUTO_TEST_CASE(market_id_depends_on_every_field)
     BOOST_CHECK(ids.insert(MarketDescriptor{base.quote, base.base, base.base_atoms_per_lot, base.quote_atoms_per_tick}.Id().id).second);
 }
 
+BOOST_AUTO_TEST_CASE(stable_q_market_policy)
+{
+    const ProfileParams profile{StableQRegtestProfile(ChainType::REGTEST).value()};
+    BOOST_CHECK(ValidateMarketForProfile(M1(), profile).has_value());
+    BOOST_CHECK(ValidateMarketForProfile(M2(), profile).has_value());
+    const MarketDescriptor native_quote{TestAsset("TOK"), AssetId::Native(), 1, 1};
+    const MarketDescriptor other_quote{AssetId::Native(), TestAsset("other-rUSD"), 1, 1};
+    for (const MarketDescriptor& market : {native_quote, other_quote}) {
+        const auto denied{ValidateMarketForProfile(market, profile)};
+        BOOST_REQUIRE(!denied.has_value());
+        BOOST_CHECK(denied.error().code == ErrorCode::INVALID_INPUT);
+        BOOST_CHECK_EQUAL(denied.error().detail, STABLE_QUOTE_REQUIRED);
+        BOOST_CHECK(ValidateMarketForProfile(market, DevRegtestProfile(ChainType::REGTEST).value()).has_value());
+    }
+    MarketDescriptor invalid{M1()};
+    invalid.base_atoms_per_lot = 0;
+    CheckError(ValidateMarketForProfile(invalid, profile), ErrorCode::INVALID_INPUT);
+}
+
 BOOST_AUTO_TEST_SUITE_END()

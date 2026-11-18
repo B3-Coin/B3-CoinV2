@@ -554,6 +554,76 @@ if(B3_BRIDGE_TOOLS)
       univalue
   )
 
+  # Read-only peer proof verifier. Never linked into the node.
+  add_executable(b3-bridge-peercheck bridge/peercheck.cpp)
+  target_link_libraries(b3-bridge-peercheck
+    PRIVATE
+      core_interface
+      b3_blst
+      bitcoin_consensus
+      bitcoin_common
+      bitcoin_util
+      bitcoin_crypto
+      secp256k1
+      univalue
+  )
+
+  # Sepolia Gloas proof verifier with authenticated execution-header preimages.
+  add_executable(b3-bridge-gloascheck bridge/gloascheck.cpp)
+  target_link_libraries(b3-bridge-gloascheck
+    PRIVATE
+      core_interface
+      b3_blst
+      bitcoin_consensus
+      bitcoin_common
+      bitcoin_util
+      bitcoin_crypto
+      secp256k1
+      univalue
+  )
+
+  # Public Sepolia contract settlement; consumes native Gloas authority.
+  add_executable(b3-bridge-sepolia-arbitrumcheck bridge/sepolia_arbitrumcheck.cpp)
+  target_link_libraries(b3-bridge-sepolia-arbitrumcheck
+    PRIVATE
+      core_interface
+      b3_blst
+      bitcoin_consensus
+      bitcoin_common
+      bitcoin_util
+      bitcoin_crypto
+      secp256k1
+      univalue
+  )
+
+  # Explicit owned-L1 checkpoint settlement checks for the full REGTEST lab.
+  add_executable(b3-bridge-owned-arbitrumcheck bridge/owned_arbitrumcheck.cpp)
+  target_link_libraries(b3-bridge-owned-arbitrumcheck
+    PRIVATE
+      core_interface
+      b3_blst
+      bitcoin_consensus
+      bitcoin_common
+      bitcoin_util
+      bitcoin_crypto
+      secp256k1
+      univalue
+  )
+
+  # Offline Nitro history commitment checker; no source authority or node link.
+  add_executable(b3-bridge-arbitrumcheck bridge/arbitrumcheck.cpp)
+  target_link_libraries(b3-bridge-arbitrumcheck
+    PRIVATE
+      core_interface
+      b3_blst
+      bitcoin_consensus
+      bitcoin_common
+      bitcoin_util
+      bitcoin_crypto
+      secp256k1
+      univalue
+  )
+
   # Offline, deterministic 3-of-4 BLS bootstrap proof/calldata builder for
   # B3FinalityVerifier.initialize. Public manifests and signatures only.
   add_executable(b3-bridge-bootstrap-proof bridge/bootstrap_proof.cpp)

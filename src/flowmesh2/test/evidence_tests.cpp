@@ -124,7 +124,7 @@ BOOST_AUTO_TEST_CASE(conflicting_certificates_are_evidence_and_weak_ones_are_not
     EvidenceStore store{EvidenceStore::Create(rig.profile, rig.genesis.Header().domain, *rig.adapter, rig.commit_log).value()};
     const StateRootsV0 roots_a{LabelHash("fm2/test/evidence/a/accounts"), LabelHash("fm2/test/evidence/a/orders"),
                                LabelHash("fm2/test/evidence/a/markets"), LabelHash("fm2/test/evidence/a/nullifiers"),
-                               LabelHash("fm2/test/evidence/a/totals")};
+                               LabelHash("fm2/test/evidence/a/totals"), uint256{}};
     StateRootsV0 roots_b{roots_a};
     roots_b.accounts = LabelHash("fm2/test/evidence/b/accounts");
     SlotHeaderV2 a{SyntheticHeader(rig.seats, 1, roots_a)};

@@ -36,8 +36,11 @@ Result<std::unique_ptr<StateOwner>> StateOwner::Create(const ProfileParams& prof
     }
     if (header.profile_hash != ProfileHash(profile) || !(genesis.State().Profile() == profile)) return Invalid(OWNER_PROFILE_MISMATCH);
     if (header.seat_set_root != genesis.State().seat_set_root) return Invalid(OWNER_SEAT_SET_MISMATCH);
+    const uint8_t version{ExpectedCommitmentVersion(profile)};
+    if (header.commitment_version != version) return Error{ErrorCode::VERIFY_FAILED, OWNER_COMMITMENT_VERSION};
     const Result<StateRootsV0> roots{genesis.State().engine.Commit()};
     if (!roots.has_value()) return roots.error();
+    if (roots->version != version) return Error{ErrorCode::VERIFY_FAILED, OWNER_COMMITMENT_VERSION};
     if (roots->Root() != header.state_root) return Error{ErrorCode::VERIFY_FAILED, OWNER_STATE_ROOT_MISMATCH};
     std::unique_ptr<StateOwner> owner{
         new StateOwner{std::move(engine).value(), std::make_shared<const HeadView>(genesis), commit_journal_instance}};

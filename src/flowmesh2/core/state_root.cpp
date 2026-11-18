@@ -9,6 +9,7 @@
 #include <hash.h>
 #include <streams.h>
 
+#include <algorithm>
 #include <ios>
 #include <string_view>
 
@@ -87,10 +88,53 @@ uint256 MarketLeafValue(const MarketDescriptor& market) { return TaggedObject(Ha
 
 uint256 NullifierLeafValue(const Outpoint& outpoint) { return TaggedObject(HashTag::STATE_NULLIFIERS, outpoint); }
 
+bool WithdrawalRecord::IsCanonical() const
+{
+    return !id.id.IsNull() && !account.id.IsNull() && !asset.IsNative() && amount > 0 && InAtomRange(amount) &&
+           InAtomRange(fee) && AddAtoms(amount, fee).has_value() && slot > 0 &&
+           std::any_of(recipient.begin(), recipient.end(), [](unsigned char b) { return b != 0; }) &&
+           (paid ? !payout_event.txid.IsNull() : payout_event == Outpoint{});
+}
+
+std::vector<unsigned char> WithdrawalRecord::Encode() const
+{
+    std::vector<unsigned char> out;
+    VectorWriter{out, 0, id, account, asset, amount, fee, recipient, slot, static_cast<uint8_t>(paid), payout_event};
+    return out;
+}
+
+Result<WithdrawalRecord> WithdrawalRecord::Decode(std::span<const unsigned char> bytes)
+{
+    return DecodeExactWith(bytes, ENCODED_BYTES, [](SpanReader& reader) {
+        WithdrawalRecord out;
+        uint8_t paid_byte{0};
+        reader >> out.id >> out.account >> out.asset >> out.amount >> out.fee >> out.recipient >> out.slot >> paid_byte >> out.payout_event;
+        out.paid = paid_byte == 1;
+        if (paid_byte > 1 || !out.IsCanonical()) throw std::ios_base::failure("noncanonical withdrawal record");
+        return out;
+    });
+}
+
+uint256 WithdrawalRecord::LeafValue() const
+{
+    HashWriter writer{TaggedWriter(HashTag::STATE_TOTALS)};
+    writer << uint8_t{2};
+    const auto bytes{Encode()};
+    writer.write(MakeByteSpan(bytes));
+    return writer.GetSHA256();
+}
+
 uint256 StateRootsV0::Root() const
 {
+    if (version != COMMITMENT_VERSION_V0 && version != COMMITMENT_VERSION_WITHDRAWALS && version != COMMITMENT_VERSION_VIEW_BOUND) {
+        throw std::ios_base::failure("unknown state commitment version");
+    }
+    if (version == COMMITMENT_VERSION_V0 && !withdrawals.IsNull()) {
+        throw std::ios_base::failure("withdrawals root in legacy state commitment");
+    }
     HashWriter writer{TaggedWriter(HashTag::STATE)};
-    writer << COMMITMENT_VERSION_V0 << *this;
+    writer << version << accounts << orders << markets << nullifiers << totals;
+    if (version == COMMITMENT_VERSION_WITHDRAWALS || version == COMMITMENT_VERSION_VIEW_BOUND) writer << withdrawals;
     return writer.GetSHA256();
 }
 

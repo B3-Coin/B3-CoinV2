@@ -1,0 +1,29 @@
+{
+  "profile_id": "fm2-regtest-stable-q/2",
+  "encoding_version": 3,
+  "profile_hash": "c1e76cd5d1d4b8e1a2c510ea964c9d2ff73a954370d6cb0c0985b1357cd930fc",
+  "encoded_profile": "0316666d322d726567746573742d737461626c652d712f32010000000772656774657374016400000001500000000004000000100000000400000040000000200000e80300000032000000640000000004000000010010000000040000016439dd037ac1af8e258b4177319230f77f127c3fcf5ec6436aba005bb25bd7ed01e80300000000000001",
+  "stable_fee_asset": "6439dd037ac1af8e258b4177319230f77f127c3fcf5ec6436aba005bb25bd7ed",
+  "withdrawals_enabled": true,
+  "withdrawal_fee_atoms": 1000,
+  "withdrawal_fee_unit": "synthetic Q raw atoms (test-only; rUSD has six decimals in this fixture)",
+  "stable_fee_asset_definition": "Tagged(B3/FM2/TEST_ASSET, raw UTF-8 rUSD); synthetic regtest asset only, no backing or production-token claim",
+  "profile_hash_definition": "Tagged(B3/FM2/PROFILE, encoded_profile); hex in raw byte order, not uint256 GetHex",
+  "mainnet_valid": false,
+  "scope": "Separate prerelease stable-Q REGTEST profile with exact-view COMMIT certificates; legacy /1 archives keep commitment2 and original signatures",
+  "source": "core/params.cpp StableQViewRegtestProfile; params_tests/stable_q_view_profile_json_matches_code",
+  "inherits_unratified_test_parameters_from": "fm2-dex1-regtest-provisional/1",
+  "provisional_fee_ppm": 100,
+  "provisional_fee_incidence": "SELLER",
+  "provisional_seat_share_percent": 80,
+  "limitations": [
+    "No non-Q quote valuation or separate-fee reservation implementation",
+    "Wider asset-to-asset markets and futures remain required product scope",
+    "No production stablecoin, economics, custody model or activation selected"
+  ],
+  "view_bound_commits": true,
+  "commitment_version": 3,
+  "commit_digest_definition": "Tagged(B3/FM2/COMMIT, u8{3} || canonical 366-byte SlotHeaderV2 || u64 little-endian view)",
+  "certificate_extension": "optional u64 little-endian view after legacy bytes; required for commitment3 including zero, forbidden for commitment0/2",
+  "archive_policy": "Existing /1 journals, deployments and keys are retained. Open them only with their original /1 identity/rules; /2 refuses mismatched identity and never resets history."
+}

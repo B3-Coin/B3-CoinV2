@@ -1,0 +1,38 @@
+{
+  "format": "b3-owned-nitro-settlement-provenance/1",
+  "mainnet_enabled": false,
+  "trust_scope": "owned-geth-dev-parent-with-real-Nitro-batches-assertions-and-WASM-validator",
+  "nitro": {
+    "version": "3.12.1",
+    "commit": "70fa99a6e711f09eedd96a907290c3df0f3bcf7d",
+    "geth_submodule": "5eee8f546e7602b7deeef7909f291bbebc77e233",
+    "image": "offchainlabs/nitro-node@sha256:948cf8c42a6ed85bc055f13866fb9a029c8234dc16c12d7ffa4ed669270aaea8",
+    "binary_sha256": "a2d6988c0ef2706ec85b8eb0e8ed9fc50f9eef1ac866f6d8667e2a1436e0115a",
+    "wasm_module_root": "0xc10cd7ec6acaf1c441a3f6bd0900ad20f15855ba775a96f1939118cbc629dc97"
+  },
+  "testnode": {
+    "commit": "d46fe1bfe6dd0dbc2e27dcc6d0dc559a248433f5",
+    "url": "https://github.com/OffchainLabs/nitro-testnode/tree/d46fe1bfe6dd0dbc2e27dcc6d0dc559a248433f5",
+    "upstream_init_invoked": false
+  },
+  "contracts": {
+    "version": "3.2.0-beta.0",
+    "commit": "4341b132cfbdcc980ead03765ca5224ff6cb5d97",
+    "url": "https://github.com/OffchainLabs/nitro-contracts/tree/4341b132cfbdcc980ead03765ca5224ff6cb5d97",
+    "compiler": "0.8.17+commit.8df45f5f",
+    "compiler_sha256": "99f2070b776e9714f1f76c43c229cf99b8978a92938ee8d2364c6de11c1a03d4",
+    "compiler_adapter": "Only exact local compiler selection and storageLayout output; pinned upstream Solidity source unchanged."
+  },
+  "images": {
+    "geth": "ethereum/client-go@sha256:16c5a976cd8b6985300e80df4043a40e31e964793f937e8244bceda22163874d",
+    "node": "library/node@sha256:1694ccde5ea9efb3060bb8612b1f287256061ff2a04d75dc1b71f57cb7239520"
+  },
+  "primary_documentation": [
+    "https://docs.arbitrum.io/run-a-node/run-local-full-chain-simulation",
+    "https://docs.arbitrum.io/run-a-node/run-full-node",
+    "https://docs.arbitrum.io/run-a-node/more-types/run-archive-node",
+    "https://docs.arbitrum.io/run-a-node/nitro/nitro-database-snapshots",
+    "https://docs.arbitrum.io/run-a-node/data-availability",
+    "https://docs.arbitrum.io/chain-info"
+  ]
+}

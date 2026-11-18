@@ -152,7 +152,7 @@ struct Net {
     flowmesh::AccountId bob{flowmesh::AccountForKey(Xonly(bob_key))};
     flowmesh::SchnorrActionAuthenticator auth{MESH_DOMAIN, MESH_CONFIG};
     MapDeposits deposits;
-    AnchorRef anchor{100, uint256{"00000000000000000000000000000000000000000000000000000000000000aa"}};
+    AnchorRef anchor{100, uint256{uint8_t{0xaa}}};
     FlowMeshState state{VAULT, BaseX(), Quote()};
 
     Net()

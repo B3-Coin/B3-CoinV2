@@ -403,4 +403,98 @@ BOOST_AUTO_TEST_CASE(stubs_refuse_without_changing_state)
     BOOST_CHECK(ledger == before);
 }
 
+BOOST_AUTO_TEST_CASE(withdrawal_obligations_fees_payouts_and_refusals_are_atomic)
+{
+    const auto profile{StableQRegtestProfile(ChainType::REGTEST).value()};
+    LedgerState ledger{EmptyLedger(profile)};
+    RequireOk(ledger.CreditDeposit(Deposit(ALICE, RUSD, 10'000, TestOutpoint("withdraw-fund", 0))), "fund Q");
+    const ActionId id{LabelHash("withdraw-1")};
+    const WithdrawPayload request{RUSD, 3000, std::vector<unsigned char>(20, 0x42)};
+    BOOST_CHECK(ledger.RequestWithdrawal(id, ALICE, request, 7).value() == OutcomeCode::WITHDRAWAL_PENDING);
+    CheckBalance(ledger, ALICE, RUSD, 6000, 0);
+    BOOST_CHECK(ledger.TotalsOf(RUSD) == (AssetTotals{10'000, 0, 3000, 1000}));
+    RequireOk(ledger.CheckConservation(), "pending conservation");
+    const LedgerState pending{ledger};
+    RequireError(ledger.RequestWithdrawal(ALICE, request), ErrorCode::INVALID_INPUT, "missing authenticated identity");
+    BOOST_CHECK(ledger == pending);
+    BOOST_CHECK(ledger.RequestWithdrawal(id, ALICE, request, 7).value() == OutcomeCode::WITHDRAWAL_PENDING);
+    BOOST_CHECK(ledger == pending);
+    auto conflicting{request};
+    conflicting.destination_script[0] ^= 1;
+    RequireError(ledger.RequestWithdrawal(id, ALICE, conflicting, 7), ErrorCode::EQUIVOCATION_REFUSED, "conflicting identity");
+    BOOST_CHECK(ledger == pending);
+    for (int field{0}; field < 5; ++field) {
+        auto invalid{request};
+        if (field == 0) invalid.asset = B3;
+        if (field == 1) invalid.amount = 0;
+        if (field == 2) invalid.destination_script.resize(19);
+        if (field == 3) invalid.destination_script.assign(20, 0);
+        if (field == 4) invalid.amount = MAX_ATOMS;
+        BOOST_CHECK(ledger.RequestWithdrawal(ActionId{LabelHash("invalid")}, ALICE, invalid, 7).value() == OutcomeCode::REJ_BAD_PARAMS);
+        BOOST_CHECK(ledger == pending);
+    }
+    auto insufficient{request};
+    insufficient.amount = 6000;
+    BOOST_CHECK(ledger.RequestWithdrawal(ActionId{LabelHash("too-large")}, ALICE, insufficient, 7).value() == OutcomeCode::REJ_INSUFFICIENT_AVAILABLE);
+    BOOST_CHECK(ledger == pending);
+    PayoutConfirmedFact payout;
+    payout.cursor = FactCursor{131, 0};
+    payout.withdrawal = id;
+    payout.account = ALICE;
+    payout.asset = RUSD;
+    payout.amount = request.amount;
+    payout.recipient.fill(0x42);
+    payout.payout_event = TestOutpoint("withdraw-paid", 2);
+    payout.domain = LabelHash("test-withdraw-domain");
+    for (int field{0}; field < 5; ++field) {
+        auto wrong{payout};
+        if (field == 0) wrong.withdrawal = ActionId{LabelHash("unknown")};
+        if (field == 1) wrong.account = BOB;
+        if (field == 2) wrong.asset = TOK;
+        if (field == 3) ++wrong.amount;
+        if (field == 4) wrong.recipient[0] ^= 1;
+        RequireError(ledger.ConfirmWithdrawal(wrong), ErrorCode::VERIFY_FAILED, "payout mismatch");
+        BOOST_CHECK(ledger == pending);
+    }
+    RequireOk(ledger.ConfirmWithdrawal(payout), "confirmed payout");
+    BOOST_CHECK(ledger.TotalsOf(RUSD) == (AssetTotals{10'000, 3000, 0, 1000}));
+    BOOST_CHECK(ledger.Withdrawals().at(id).paid);
+    BOOST_CHECK(ledger.Withdrawals().at(id).payout_event == payout.payout_event);
+    CheckBalance(ledger, ALICE, RUSD, 6000, 0);
+    RequireOk(ledger.CheckConservation(), "paid conservation");
+    const LedgerState paid{ledger};
+    RequireOk(ledger.ConfirmWithdrawal(payout), "same event idempotent");
+    BOOST_CHECK(ledger == paid);
+    auto other_event{payout};
+    ++other_event.payout_event.vout;
+    RequireError(ledger.ConfirmWithdrawal(other_event), ErrorCode::VERIFY_FAILED, "same claim second event");
+    BOOST_CHECK(ledger == paid);
+    const ActionId second{LabelHash("withdraw-2")};
+    BOOST_CHECK(ledger.RequestWithdrawal(second, ALICE, request, 8).value() == OutcomeCode::WITHDRAWAL_PENDING);
+    const LedgerState two{ledger};
+    payout.withdrawal = second;
+    RequireError(ledger.ConfirmWithdrawal(payout), ErrorCode::VERIFY_FAILED, "event reused for another claim");
+    BOOST_CHECK(ledger == two);
+    RequireOk(ledger.Credit(ledger.SeatPool(), RUSD, 1600), "service fees to seats");
+    RequireOk(ledger.Credit(ledger.Treasury(), RUSD, 400), "service fees to treasury");
+    RequireOk(ledger.CheckConservation(), "distributed service fee conservation");
+    BOOST_CHECK_EQUAL(ledger.TotalsOf(RUSD).fees_held, 0);
+}
+
+BOOST_AUTO_TEST_CASE(withdrawal_pending_cap_refuses_without_charge)
+{
+    const auto profile{StableQRegtestProfile(ChainType::REGTEST).value()};
+    LedgerState ledger{EmptyLedger(profile)};
+    RequireOk(ledger.CreditDeposit(Deposit(ALICE, RUSD, 6'000'000, TestOutpoint("withdraw-cap-fund", 0))), "fund cap test");
+    const WithdrawPayload request{RUSD, 1, std::vector<unsigned char>(20, 0x21)};
+    for (size_t i{0}; i < MAX_PENDING_WITHDRAWALS; ++i) {
+        const auto result{ledger.RequestWithdrawal(ActionId{LabelHash("cap-" + std::to_string(i))}, ALICE, request, 1)};
+        RequireOk(result, "bounded request");
+        BOOST_REQUIRE(*result == OutcomeCode::WITHDRAWAL_PENDING);
+    }
+    const LedgerState full{ledger};
+    BOOST_CHECK(ledger.RequestWithdrawal(ActionId{LabelHash("over-cap")}, ALICE, request, 1).value() == OutcomeCode::REJ_BAD_PARAMS);
+    BOOST_CHECK(ledger == full);
+    RequireOk(ledger.CheckConservation(), "cap conservation");
+}
 BOOST_AUTO_TEST_SUITE_END()

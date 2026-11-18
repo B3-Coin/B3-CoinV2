@@ -346,6 +346,11 @@ BOOST_AUTO_TEST_CASE(close_refuses_new_messages_and_keeps_queued_ones)
 {
     auto lanes{NewLaneSet(Uniform(LaneLimits{10, 1'000, 100}))};
     RequireQueued(lanes->TryPush(Lane::PROPOSAL, TrafficClass::ORDINARY, IdOf(1), PayloadOf(3)), "before close");
+    Buffer maximum(100);
+    for (size_t i{0}; i < maximum.size(); ++i) maximum[i] = static_cast<unsigned char>(i);
+    RequireQueued(lanes->TryPush(Lane::PROPOSAL, TrafficClass::STATUS, IdOf(2), maximum), "maximum payload");
+    RequireQueued(lanes->TryPush(Lane::PROPOSAL, TrafficClass::CANCEL, IdOf(3), {}), "empty payload");
+    RequireMailboxAgrees(*lanes, Lane::PROPOSAL);
     lanes->Close();
     lanes->Close(); // idempotent
     BOOST_CHECK(lanes->Closed());
@@ -358,7 +363,19 @@ BOOST_AUTO_TEST_CASE(close_refuses_new_messages_and_keeps_queued_ones)
     BOOST_REQUIRE(kept.has_value());
     BOOST_CHECK_EQUAL(NumberOf(kept->request_id), 1U);
     BOOST_CHECK(kept->payload == PayloadOf(3));
+    const std::optional<net::LaneMessage> full_size{lanes->PopNext()};
+    BOOST_REQUIRE(full_size.has_value());
+    BOOST_CHECK_EQUAL(NumberOf(full_size->request_id), 2U);
+    BOOST_CHECK(full_size->traffic == TrafficClass::STATUS);
+    BOOST_CHECK(full_size->payload == maximum);
+    const std::optional<net::LaneMessage> empty{lanes->PopNext()};
+    BOOST_REQUIRE(empty.has_value());
+    BOOST_CHECK_EQUAL(NumberOf(empty->request_id), 3U);
+    BOOST_CHECK(empty->traffic == TrafficClass::CANCEL);
+    BOOST_CHECK(empty->payload.empty());
     BOOST_CHECK(!lanes->PopNext().has_value());
+    BOOST_CHECK((lanes->Stats(Lane::PROPOSAL) == LaneStats{0, 0, 0, 0, true}));
+    RequireMailboxAgrees(*lanes, Lane::PROPOSAL);
 }
 
 BOOST_AUTO_TEST_CASE(concurrent_pushers_and_poppers_keep_the_shares)

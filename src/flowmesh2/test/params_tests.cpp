@@ -55,6 +55,17 @@ void CheckCode(const Result<void>& result, ErrorCode expected, std::string_view 
 
 //! One mutation per ProfileParams field. field_count_matches_struct below
 //! fails to compile if a field is added without a mutation here.
+NitroLabBinding LabBinding()
+{
+    NitroLabBinding binding;
+    binding.source_genesis_hash.data()[0] = 0x11;
+    binding.quote_token.fill(0x22);
+    binding.quote_token_code_hash.data()[0] = 0x33;
+    binding.quote_implementation.fill(0x44);
+    binding.quote_implementation_code_hash.data()[0] = 0x55;
+    return binding;
+}
+
 std::vector<std::pair<std::string, std::function<void(ProfileParams&)>>> FieldMutations()
 {
     return {
@@ -79,10 +90,19 @@ std::vector<std::pair<std::string, std::function<void(ProfileParams&)>>> FieldMu
         {"signer_mode", [](ProfileParams& p) { p.signer_mode = SignerMode::FOLDED_SIGNING; }},
         {"pool_capacity", [](ProfileParams& p) { ++p.pool_capacity; }},
         {"outcome_index_slots", [](ProfileParams& p) { ++p.outcome_index_slots; }},
+        {"stable_fee_asset", [](ProfileParams& p) { p.stable_fee_asset = RegtestQuoteAsset(); }},
+        {"withdrawals_enabled", [](ProfileParams& p) { p.withdrawals_enabled = true; }},
+        {"withdrawal_fee_atoms", [](ProfileParams& p) { p.withdrawal_fee_atoms = 1; }},
+        {"view_bound_commits", [](ProfileParams& p) { p.view_bound_commits = true; }},
+        {"source_range_commitment", [](ProfileParams& p) { p.source_range_commitment = true; }},
+        {"source_chain_id", [](ProfileParams& p) { p.source_chain_id = 31337; }},
+        {"source_confirmations", [](ProfileParams& p) { p.source_confirmations = 2; }},
+        {"nitro_lab", [](ProfileParams& p) { p.nitro_lab = LabBinding(); }},
     };
 }
 
-constexpr size_t PROFILE_FIELDS{21};
+constexpr size_t LEGACY_PROFILE_FIELDS{21};
+constexpr size_t PROFILE_FIELDS{29};
 
 std::string ReadFile(const std::filesystem::path& path)
 {
@@ -101,9 +121,9 @@ BOOST_AUTO_TEST_CASE(field_count_matches_struct)
     // removing a ProfileParams field breaks this line until FieldMutations,
     // EncodeProfile, the JSON file and PROFILE_FIELDS are updated with it.
     const ProfileParams p{Dev()};
-    const auto& [f1, f2, f3, f4, f5, f6, f7, f8, f9, f10, f11, f12, f13, f14, f15, f16, f17, f18, f19, f20, f21] = p;
+    const auto& [f1, f2, f3, f4, f5, f6, f7, f8, f9, f10, f11, f12, f13, f14, f15, f16, f17, f18, f19, f20, f21, f22, f23, f24, f25, f26, f27, f28, f29] = p;
     (void)f1, (void)f2, (void)f3, (void)f4, (void)f5, (void)f6, (void)f7, (void)f8, (void)f9, (void)f10, (void)f11;
-    (void)f12, (void)f13, (void)f14, (void)f15, (void)f16, (void)f17, (void)f18, (void)f19, (void)f20, (void)f21;
+    (void)f12, (void)f13, (void)f14, (void)f15, (void)f16, (void)f17, (void)f18, (void)f19, (void)f20, (void)f21, (void)f22, (void)f23, (void)f24, (void)f25, (void)f26, (void)f27, (void)f28, (void)f29;
     BOOST_CHECK_EQUAL(FieldMutations().size(), PROFILE_FIELDS);
 }
 
@@ -313,10 +333,10 @@ BOOST_AUTO_TEST_CASE(profile_json_matches_code)
         "max_actions_per_slot", "max_action_payload_bytes", "max_fills_per_order", "max_fills_per_slot",
         "max_changed_leaves_per_slot", "max_open_orders_per_account", "price_band_enabled", "price_band_percent",
         "nonce_window", "max_delay_slots", "futures_enabled", "signer_mode", "pool_capacity", "outcome_index_slots"};
-    BOOST_CHECK_EQUAL(expected_keys.size(), PROFILE_FIELDS);
+    BOOST_CHECK_EQUAL(expected_keys.size(), LEGACY_PROFILE_FIELDS);
     const auto keys{params.getKeys()};
     BOOST_CHECK(std::set<std::string>(keys.begin(), keys.end()) == expected_keys);
-    BOOST_CHECK_EQUAL(keys.size(), PROFILE_FIELDS);
+    BOOST_CHECK_EQUAL(keys.size(), LEGACY_PROFILE_FIELDS);
 
     const auto u32{[&](const char* key) { return params[key].getInt<uint32_t>(); }};
     BOOST_CHECK_EQUAL(params["profile_id"].get_str(), p.profile_id);
@@ -349,6 +369,255 @@ BOOST_AUTO_TEST_CASE(profile_json_matches_code)
     BOOST_CHECK_EQUAL(refused["futures_enabled=true"].get_str(), "M9-FUT-01");
     BOOST_CHECK_EQUAL(refused["signer_mode=FOLDED"].get_str(), "M4-STO-05");
     BOOST_CHECK_EQUAL(refused.size(), 4U);
+}
+
+BOOST_AUTO_TEST_CASE(stable_q_profile_is_versioned_and_regtest_only)
+{
+    const auto built{StableQRegtestProfile(ChainType::REGTEST)};
+    BOOST_REQUIRE(built.has_value());
+    const ProfileParams profile{*built};
+    BOOST_CHECK(profile.stable_fee_asset == std::optional<AssetId>{RegtestQuoteAsset()});
+    BOOST_CHECK_EQUAL(profile.profile_id, STABLE_Q_PROFILE_ID);
+    BOOST_CHECK_EQUAL(EncodeProfile(profile).front(), STABLE_Q_PROFILE_ENCODING_VERSION);
+    BOOST_CHECK_EQUAL(Hex(ProfileHash(profile)), "5cc396e7254c54c792e2dfa33666268fb6cd9f73b41e6bdca648f054f3ae94ad");
+    BOOST_CHECK(ProfileHash(profile) != ProfileHash(Dev()));
+    BOOST_CHECK(Validate(profile).has_value());
+    ProfileParams expected{Dev()};
+    expected.profile_id = STABLE_Q_PROFILE_ID;
+    expected.stable_fee_asset = RegtestQuoteAsset();
+    expected.withdrawals_enabled = true;
+    expected.withdrawal_fee_atoms = 1'000;
+    BOOST_CHECK(profile == expected); // all other economics remain provisional test parameters
+    for (const ChainType chain : {ChainType::MAIN, ChainType::TESTNET, ChainType::TESTNET4, ChainType::SIGNET}) {
+        const auto other{StableQRegtestProfile(chain)};
+        BOOST_REQUIRE(!other.has_value());
+        BOOST_CHECK(other.error().code == ErrorCode::UNSUPPORTED_NETWORK);
+        ProfileParams moved{profile};
+        moved.chain = chain;
+        CheckCode(Validate(moved), ErrorCode::UNSUPPORTED_NETWORK);
+    }
+    ProfileParams missing{profile};
+    missing.stable_fee_asset.reset();
+    CheckCode(Validate(missing), ErrorCode::INVALID_INPUT);
+    ProfileParams native{profile};
+    native.stable_fee_asset = AssetId::Native();
+    CheckCode(Validate(native), ErrorCode::INVALID_INPUT);
+    BOOST_CHECK(ProfileHash(native) != ProfileHash(profile));
+    ProfileParams wrong{profile};
+    wrong.stable_fee_asset = AssetId{uint256::ONE};
+    CheckCode(Validate(wrong), ErrorCode::INVALID_INPUT);
+    BOOST_CHECK(ProfileHash(wrong) != ProfileHash(profile));
+    ProfileParams confused{Dev()};
+    confused.stable_fee_asset = RegtestQuoteAsset();
+    CheckCode(Validate(confused), ErrorCode::INVALID_INPUT);
+    ProfileParams disabled{profile};
+    disabled.withdrawals_enabled = false;
+    CheckCode(Validate(disabled), ErrorCode::INVALID_INPUT);
+    disabled.withdrawal_fee_atoms = 0;
+    BOOST_CHECK(Validate(disabled).has_value());
+    BOOST_CHECK(ProfileHash(disabled) != ProfileHash(profile));
+    ProfileParams negative{profile};
+    negative.withdrawal_fee_atoms = -1;
+    CheckCode(Validate(negative), ErrorCode::INVALID_INPUT);
+    ProfileParams too_large{profile};
+    too_large.withdrawal_fee_atoms = MAX_ATOMS + 1;
+    CheckCode(Validate(too_large), ErrorCode::INVALID_INPUT);
+    ProfileParams changed_fee{profile};
+    ++changed_fee.withdrawal_fee_atoms;
+    BOOST_CHECK(ProfileHash(changed_fee) != ProfileHash(profile));
+}
+
+BOOST_AUTO_TEST_CASE(stable_q_profile_json_matches_code)
+{
+    const auto path{std::filesystem::path{FM2_SOURCE_ROOT} / "src" / "flowmesh2" / "PROFILE_STABLE_Q_REGTEST.json"};
+    UniValue json;
+    BOOST_REQUIRE(json.read(ReadFile(path)));
+    const ProfileParams profile{StableQRegtestProfile(ChainType::REGTEST).value()};
+    BOOST_CHECK_EQUAL(json["profile_id"].get_str(), profile.profile_id);
+    BOOST_CHECK_EQUAL(json["encoding_version"].getInt<int>(), STABLE_Q_PROFILE_ENCODING_VERSION);
+    BOOST_CHECK_EQUAL(json["stable_fee_asset"].get_str(), HexStr(RegtestQuoteAsset().id));
+    BOOST_CHECK_EQUAL(json["encoded_profile"].get_str(), HexStr(EncodeProfile(profile)));
+    BOOST_CHECK_EQUAL(json["profile_hash"].get_str(), Hex(ProfileHash(profile)));
+    BOOST_CHECK(!json["mainnet_valid"].get_bool());
+    BOOST_CHECK_EQUAL(json["provisional_fee_ppm"].getInt<uint32_t>(), profile.fee_ppm);
+    BOOST_CHECK_EQUAL(json["provisional_seat_share_percent"].getInt<uint32_t>(), profile.seat_share_percent);
+    BOOST_CHECK_EQUAL(json["withdrawals_enabled"].get_bool(), profile.withdrawals_enabled);
+    BOOST_CHECK_EQUAL(json["withdrawal_fee_atoms"].getInt<Atoms>(), profile.withdrawal_fee_atoms);
+}
+
+
+BOOST_AUTO_TEST_CASE(stable_q_view_profile_preserves_archives_and_binds_explicit_policy)
+{
+    const auto legacy{StableQRegtestProfile(ChainType::REGTEST).value()};
+    const auto current{StableQViewRegtestProfile(ChainType::REGTEST).value()};
+    BOOST_CHECK(!legacy.view_bound_commits);
+    BOOST_CHECK_EQUAL(Hex(ProfileHash(legacy)), "5cc396e7254c54c792e2dfa33666268fb6cd9f73b41e6bdca648f054f3ae94ad");
+    BOOST_CHECK_EQUAL(EncodeProfile(legacy).front(), 2U);
+    BOOST_CHECK(current.view_bound_commits);
+    BOOST_CHECK_EQUAL(current.profile_id, STABLE_Q_VIEW_PROFILE_ID);
+    BOOST_CHECK_EQUAL(EncodeProfile(current).front(), 3U);
+    BOOST_CHECK_EQUAL(EncodeProfile(current).back(), 1U);
+    BOOST_CHECK_EQUAL(Hex(ProfileHash(current)), "c1e76cd5d1d4b8e1a2c510ea964c9d2ff73a954370d6cb0c0985b1357cd930fc");
+    BOOST_CHECK(Validate(current).has_value());
+    auto expected{legacy}; expected.profile_id = STABLE_Q_VIEW_PROFILE_ID; expected.view_bound_commits = true;
+    BOOST_CHECK(current == expected); // economics are unchanged; protocol/profile identity is distinct
+    auto confused{legacy}; confused.view_bound_commits = true;
+    CheckCode(Validate(confused), ErrorCode::INVALID_INPUT);
+    confused = current; confused.view_bound_commits = false;
+    CheckCode(Validate(confused), ErrorCode::INVALID_INPUT);
+    confused = Dev(); confused.view_bound_commits = true;
+    CheckCode(Validate(confused), ErrorCode::INVALID_INPUT);
+    for (const auto chain : {ChainType::MAIN, ChainType::TESTNET, ChainType::TESTNET4, ChainType::SIGNET}) {
+        const auto other{StableQViewRegtestProfile(chain)};
+        BOOST_REQUIRE(!other.has_value());
+        BOOST_CHECK(other.error().code == ErrorCode::UNSUPPORTED_NETWORK);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(stable_q_view_profile_json_matches_code)
+{
+    const auto path{std::filesystem::path{FM2_SOURCE_ROOT} / "src" / "flowmesh2" / "PROFILE_STABLE_Q_VIEW_REGTEST.json"};
+    UniValue json;
+    BOOST_REQUIRE(json.read(ReadFile(path)));
+    const auto profile{StableQViewRegtestProfile(ChainType::REGTEST).value()};
+    BOOST_CHECK_EQUAL(json["profile_id"].get_str(), profile.profile_id);
+    BOOST_CHECK_EQUAL(json["encoding_version"].getInt<int>(), STABLE_Q_VIEW_PROFILE_ENCODING_VERSION);
+    BOOST_CHECK_EQUAL(json["profile_hash"].get_str(), Hex(ProfileHash(profile)));
+    BOOST_CHECK_EQUAL(json["encoded_profile"].get_str(), HexStr(EncodeProfile(profile)));
+    BOOST_CHECK(json["view_bound_commits"].get_bool());
+    BOOST_CHECK(!json["mainnet_valid"].get_bool());
+    BOOST_CHECK_EQUAL(json["withdrawal_fee_atoms"].getInt<Atoms>(), profile.withdrawal_fee_atoms);
+}
+
+BOOST_AUTO_TEST_CASE(stable_q_network_profile_binds_source_policy_and_preserves_archives)
+{
+    const auto legacy{StableQRegtestProfile(ChainType::REGTEST).value()};
+    const auto view{StableQViewRegtestProfile(ChainType::REGTEST).value()};
+    const auto profile{StableQNetworkRegtestProfile(ChainType::REGTEST).value()};
+    BOOST_CHECK_EQUAL(Hex(ProfileHash(legacy)), "5cc396e7254c54c792e2dfa33666268fb6cd9f73b41e6bdca648f054f3ae94ad");
+    BOOST_CHECK_EQUAL(Hex(ProfileHash(view)), "c1e76cd5d1d4b8e1a2c510ea964c9d2ff73a954370d6cb0c0985b1357cd930fc");
+    BOOST_CHECK_EQUAL(profile.profile_id, STABLE_Q_NETWORK_PROFILE_ID);
+    BOOST_CHECK_EQUAL(EncodeProfile(profile).front(), 4U);
+    BOOST_CHECK(profile.view_bound_commits && profile.source_range_commitment);
+    BOOST_CHECK_EQUAL(profile.source_chain_id, 31337U);
+    BOOST_CHECK_EQUAL(profile.source_confirmations, 2U);
+    BOOST_CHECK(Validate(profile).has_value());
+    for (const auto& mutate : std::vector<std::function<void(ProfileParams&)>>{
+             [](auto& p) { p.source_range_commitment = false; }, [](auto& p) { p.source_chain_id = 1; },
+             [](auto& p) { p.source_confirmations = 1; }, [](auto& p) { p.view_bound_commits = false; }}) {
+        auto wrong{profile}; mutate(wrong);
+        CheckCode(Validate(wrong), ErrorCode::INVALID_INPUT);
+        BOOST_CHECK(ProfileHash(wrong) != ProfileHash(profile));
+    }
+    for (auto wrong : {legacy, view, Dev()}) {
+        wrong.source_range_commitment = true;
+        CheckCode(Validate(wrong), ErrorCode::INVALID_INPUT);
+    }
+    for (const auto chain : {ChainType::MAIN, ChainType::TESTNET, ChainType::TESTNET4, ChainType::SIGNET}) {
+        const auto refused{StableQNetworkRegtestProfile(chain)};
+        BOOST_REQUIRE(!refused.has_value());
+        BOOST_CHECK(refused.error().code == ErrorCode::UNSUPPORTED_NETWORK);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(stable_q_network_profile_json_matches_code)
+{
+    const auto path{std::filesystem::path{FM2_SOURCE_ROOT} / "src" / "flowmesh2" / "PROFILE_STABLE_Q_NETWORK_REGTEST.json"};
+    UniValue json;
+    BOOST_REQUIRE(json.read(ReadFile(path)));
+    const auto profile{StableQNetworkRegtestProfile(ChainType::REGTEST).value()};
+    BOOST_CHECK_EQUAL(json["profile_id"].get_str(), profile.profile_id);
+    BOOST_CHECK_EQUAL(json["encoding_version"].getInt<int>(), STABLE_Q_NETWORK_PROFILE_ENCODING_VERSION);
+    BOOST_CHECK_EQUAL(json["profile_hash"].get_str(), Hex(ProfileHash(profile)));
+    BOOST_CHECK_EQUAL(json["encoded_profile"].get_str(), HexStr(EncodeProfile(profile)));
+    BOOST_CHECK(json["view_bound_commits"].get_bool());
+    BOOST_CHECK(json["source_range_commitment"].get_bool());
+    BOOST_CHECK_EQUAL(json["source_chain_id"].getInt<uint64_t>(), profile.source_chain_id);
+    BOOST_CHECK_EQUAL(json["source_confirmations"].getInt<uint32_t>(), profile.source_confirmations);
+    BOOST_CHECK(!json["mainnet_valid"].get_bool());
+}
+
+BOOST_AUTO_TEST_CASE(nitro_lab_profile_binds_local_usdt0_and_preserves_archives)
+{
+    const auto binding{LabBinding()};
+    const auto profile{NitroLabRegtestProfile(ChainType::REGTEST, binding)};
+    BOOST_REQUIRE(profile.has_value());
+    BOOST_CHECK_EQUAL(profile->profile_id, NITRO_LAB_PROFILE_ID);
+    BOOST_CHECK_EQUAL(EncodeProfile(*profile).front(), 5U);
+    BOOST_CHECK(profile->stable_fee_asset == NitroLabQuoteAsset(binding));
+    BOOST_CHECK(profile->stable_fee_asset != RegtestQuoteAsset());
+    BOOST_CHECK(profile->nitro_lab == binding);
+    BOOST_CHECK(profile->withdrawals_enabled && profile->source_range_commitment && !profile->view_bound_commits);
+    BOOST_CHECK_EQUAL(profile->source_chain_id, 412346U);
+    BOOST_CHECK_EQUAL(profile->source_confirmations, 1U);
+    BOOST_CHECK(Validate(*profile).has_value());
+    // These fixed old hashes/JSON vectors retain their original encodings.
+    BOOST_CHECK_EQUAL(Hex(ProfileHash(StableQRegtestProfile(ChainType::REGTEST).value())), "5cc396e7254c54c792e2dfa33666268fb6cd9f73b41e6bdca648f054f3ae94ad");
+    BOOST_CHECK_EQUAL(Hex(ProfileHash(StableQViewRegtestProfile(ChainType::REGTEST).value())), "c1e76cd5d1d4b8e1a2c510ea964c9d2ff73a954370d6cb0c0985b1357cd930fc");
+    for (const auto& [factory, file] : std::vector<std::pair<ProfileParams, std::string>>{
+             {Dev(), "PROFILE_DEX1_REGTEST.json"},
+             {StableQRegtestProfile(ChainType::REGTEST).value(), "PROFILE_STABLE_Q_REGTEST.json"},
+             {StableQViewRegtestProfile(ChainType::REGTEST).value(), "PROFILE_STABLE_Q_VIEW_REGTEST.json"},
+             {StableQNetworkRegtestProfile(ChainType::REGTEST).value(), "PROFILE_STABLE_Q_NETWORK_REGTEST.json"}}) {
+        UniValue json;
+        BOOST_REQUIRE(json.read(ReadFile(std::filesystem::path{FM2_SOURCE_ROOT} / "src" / "flowmesh2" / file)));
+        BOOST_CHECK_EQUAL(Hex(ProfileHash(factory)), json["profile_hash"].get_str());
+        if (json.exists("encoded_profile")) BOOST_CHECK_EQUAL(HexStr(EncodeProfile(factory)), json["encoded_profile"].get_str());
+        BOOST_CHECK(!factory.nitro_lab);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(nitro_lab_profile_refuses_live_networks_and_invalid_pins)
+{
+    for (const auto chain : {ChainType::MAIN, ChainType::TESTNET, ChainType::TESTNET4, ChainType::SIGNET}) {
+        const auto rejected{NitroLabRegtestProfile(chain, LabBinding())};
+        BOOST_REQUIRE(!rejected.has_value()); BOOST_CHECK(rejected.error().code == ErrorCode::UNSUPPORTED_NETWORK);
+    }
+    for (const auto& mutate : std::vector<std::function<void(NitroLabBinding&)>>{
+             [](auto& b) { b.source_genesis_hash.SetNull(); }, [](auto& b) { b.quote_token.fill(0); },
+             [](auto& b) { b.quote_token_code_hash.SetNull(); }, [](auto& b) { b.quote_implementation.fill(0); },
+             [](auto& b) { b.quote_implementation_code_hash.SetNull(); }, [](auto& b) { b.quote_implementation = b.quote_token; }}) {
+        auto binding{LabBinding()}; mutate(binding);
+        BOOST_CHECK(!NitroLabRegtestProfile(ChainType::REGTEST, binding).has_value());
+    }
+    const auto profile{NitroLabRegtestProfile(ChainType::REGTEST, LabBinding()).value()};
+    for (const auto& mutate : std::vector<std::function<void(ProfileParams&)>>{
+             [](auto& p) { p.source_chain_id = 42161; }, [](auto& p) { p.source_chain_id = 31337; },
+             [](auto& p) { p.source_confirmations = 0; }, [](auto& p) { p.source_confirmations = 2; },
+             [](auto& p) { p.source_range_commitment = false; }, [](auto& p) { p.withdrawals_enabled = false; },
+             [](auto& p) { p.view_bound_commits = true; }, [](auto& p) { p.nitro_lab.reset(); },
+             [](auto& p) { p.stable_fee_asset = RegtestQuoteAsset(); }}) {
+        auto wrong{profile}; mutate(wrong); CheckCode(Validate(wrong), ErrorCode::INVALID_INPUT);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(nitro_lab_quote_and_profile_commit_every_identity_pin)
+{
+    const auto original{NitroLabRegtestProfile(ChainType::REGTEST, LabBinding()).value()};
+    for (const auto& mutate : std::vector<std::function<void(NitroLabBinding&)>>{
+             [](auto& b) { b.source_genesis_hash.data()[0] ^= 1; }, [](auto& b) { b.quote_token[0] ^= 1; },
+             [](auto& b) { b.quote_token_code_hash.data()[0] ^= 1; }, [](auto& b) { b.quote_implementation[0] ^= 1; },
+             [](auto& b) { b.quote_implementation_code_hash.data()[0] ^= 1; }}) {
+        auto binding{LabBinding()}; mutate(binding);
+        auto stale{original}; stale.nitro_lab = binding;
+        CheckCode(Validate(stale), ErrorCode::INVALID_INPUT);
+        const auto changed{NitroLabRegtestProfile(ChainType::REGTEST, binding)};
+        BOOST_REQUIRE(changed.has_value());
+        BOOST_CHECK(changed->stable_fee_asset != original.stable_fee_asset);
+        BOOST_CHECK(ProfileHash(*changed) != ProfileHash(original));
+    }
+}
+
+BOOST_AUTO_TEST_CASE(nitro_lab_bindings_cannot_reinterpret_any_old_profile)
+{
+    for (auto profile : {Dev(), StableQRegtestProfile(ChainType::REGTEST).value(),
+                         StableQViewRegtestProfile(ChainType::REGTEST).value(), StableQNetworkRegtestProfile(ChainType::REGTEST).value()}) {
+        const auto original{EncodeProfile(profile)};
+        profile.nitro_lab = LabBinding();
+        CheckCode(Validate(profile), ErrorCode::INVALID_INPUT);
+        BOOST_CHECK_EQUAL(EncodeProfile(profile).front(), 5U);
+        BOOST_CHECK(EncodeProfile(profile) != original);
+    }
 }
 
 BOOST_AUTO_TEST_SUITE_END()

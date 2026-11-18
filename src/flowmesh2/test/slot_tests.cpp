@@ -222,4 +222,51 @@ BOOST_AUTO_TEST_CASE(authority_accessor)
     BOOST_CHECK(h.Authority() == expected);
 }
 
+BOOST_AUTO_TEST_CASE(withdrawal_commitment_version_roundtrips_and_unknown_versions_refuse)
+{
+    SlotHeaderV2 header{Sample()};
+    header.commitment_version = COMMITMENT_VERSION_WITHDRAWALS;
+    BOOST_CHECK(SlotHeaderV2::Decode(header.Encode()).value() == header);
+    BOOST_CHECK(header.Hash() != Sample().Hash());
+    const auto genesis{GenesisHeader(header.domain, header.Authority(), header.anchor, header.facts_from,
+                                    header.state_root, COMMITMENT_VERSION_WITHDRAWALS)};
+    BOOST_REQUIRE(genesis.has_value());
+    BOOST_CHECK_EQUAL(genesis->commitment_version, COMMITMENT_VERSION_WITHDRAWALS);
+    for (const uint8_t version : {uint8_t{1}, uint8_t{4}, uint8_t{255}}) {
+        auto bytes{header.Encode()};
+        bytes.back() = version;
+        CheckError(SlotHeaderV2::Decode(bytes), ErrorCode::DECODE);
+        CheckError(GenesisHeader(header.domain, header.Authority(), header.anchor, header.facts_from,
+                                header.state_root, version), ErrorCode::INVALID_INPUT);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(view_bound_commit_digest_keeps_value_identity_and_legacy_vectors)
+{
+    auto header{Sample()};
+    for (const uint8_t version : {COMMITMENT_VERSION_V0, COMMITMENT_VERSION_WITHDRAWALS}) {
+        header.commitment_version = version;
+        BOOST_CHECK(VersionedCommitDigest(header, 0) == header.CommitDigest());
+        BOOST_CHECK(VersionedCommitDigest(header, 9) == header.CommitDigest());
+    }
+    header.commitment_version = COMMITMENT_VERSION_VIEW_BOUND;
+    const auto value_hash{header.Hash()};
+    BOOST_CHECK(SlotHeaderV2::Decode(header.Encode()).value() == header);
+    BOOST_CHECK_EQUAL(header.Encode().size(), 366U);
+    // Independent Python SHA256 tagged-hash/struct model, same Sample fields.
+    BOOST_CHECK_EQUAL(HexStr(VersionedCommitDigest(header, 0)), "c67ccd089a8b7f5ba337771d4b2f3700c7966d12121d76b94f621913a67afbf7");
+    BOOST_CHECK_EQUAL(HexStr(VersionedCommitDigest(header, 7)), "2b5e317d1fd2d090e414be664780bab31da38a59472ea77d14e979a48d61b644");
+    BOOST_CHECK(VersionedCommitDigest(header, 0) != header.CommitDigest());
+    BOOST_CHECK(VersionedCommitDigest(header, 0) != VersionedCommitDigest(header, 7));
+    BOOST_CHECK(header.Hash() == value_hash); // changing the voting view never changes the prepared value
+    auto changed{header}; ++changed.height;
+    BOOST_CHECK(VersionedCommitDigest(changed, 7) != VersionedCommitDigest(header, 7));
+    const auto genesis{GenesisHeader(header.domain, header.Authority(), header.anchor, header.facts_from,
+                                    header.state_root, COMMITMENT_VERSION_VIEW_BOUND)};
+    BOOST_REQUIRE(genesis.has_value());
+    BOOST_CHECK_EQUAL(genesis->commitment_version, COMMITMENT_VERSION_VIEW_BOUND);
+    header.commitment_version = 1;
+    BOOST_CHECK_THROW(VersionedCommitDigest(header, 0), std::ios_base::failure);
+}
+
 BOOST_AUTO_TEST_SUITE_END()

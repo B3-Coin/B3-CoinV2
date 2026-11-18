@@ -57,7 +57,9 @@
  * checks it once per slot, in phase 9):
  *   sum over accounts of (available + reserved) + pending + fees_held
  *     == deposits - effects                       (core/state_root.h)
- * In the outline effects and pending stay 0 (withdrawals are M2-LED-05).
+ * The legacy profile keeps effects/pending zero. The withdrawal-enabled
+ * regtest profile commits every unpaid and paid claim and independently
+ * recomputes these totals from that retained obligation map.
  *
  * Accounts exist only after a deposit credits them (CreditDeposit), except
  * the two protocol accounts (seat pool, treasury), which Credit creates.
@@ -93,6 +95,9 @@ struct AccountState {
 
 using AccountMap = std::map<AccountId, AccountState>;
 using TotalsMap = std::map<AssetId, AssetTotals>;
+using WithdrawalMap = std::map<ActionId, WithdrawalRecord>;
+//! Regtest live-obligation bound. Paid records/nullifiers are never pruned.
+inline constexpr size_t MAX_PENDING_WITHDRAWALS{4096};
 
 //! Result of a reservation. APPEND-ONLY; zero is never a value.
 enum class ReserveResult : uint8_t {
@@ -221,6 +226,17 @@ public:
     //! One resting order fewer; INVALID_INPUT at zero or for an unknown account.
     Result<void> RemoveOpenOrder(const AccountId& account);
 
+    //! Exact authenticated action identity supplied by the engine; principal
+    //! moves available -> pending, service fee moves available -> fees_held.
+    //! Repeating the same obligation consumes no funds; conflicting reuse
+    //! refuses. The engine owns signatures/nonces/slot and domain validation.
+    Result<OutcomeCode> RequestWithdrawal(const ActionId& id, const AccountId& account,
+                                           const WithdrawPayload& withdrawal, uint64_t slot);
+    //! The trusted chain adapter/engine validates external receipt and domain
+    //! first. Match every obligation field, preserve paid status/event forever.
+    Result<void> ConfirmWithdrawal(const PayoutConfirmedFact& payout);
+    const WithdrawalMap& Withdrawals() const { return m_withdrawals; }
+
     // ---- Stubs ----------------------------------------------------------------
 
     //! WITHDRAW into a pending reservation with a capacity bound (TRD-21).
@@ -246,6 +262,7 @@ private:
     AccountMap m_accounts;
     std::set<Outpoint> m_nullifiers;
     TotalsMap m_totals;
+    WithdrawalMap m_withdrawals;
 };
 
 } // namespace flowmesh2::ledger

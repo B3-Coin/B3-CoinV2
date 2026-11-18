@@ -33,6 +33,7 @@
 #include <flowmesh2/verify/b3verify.h>
 
 #include <atomic>
+#include <barrier>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -152,6 +153,39 @@ BOOST_AUTO_TEST_CASE(envelope_codec_scope_and_commit)
     BOOST_CHECK(commit.parent == header.parent_hash);
     BOOST_CHECK(commit.state_root == header.state_root);
     BOOST_CHECK_EQUAL(commit.sequence, header.height);
+}
+
+BOOST_AUTO_TEST_CASE(envelope_view_extension_is_exact_and_preserves_legacy_framing)
+{
+    ReadRig rig;
+    const PublishableSlot slot{rig.Run(FundingFacts(rig.actions), {})};
+    const auto profile{Take(StableQViewRegtestProfile(ChainType::REGTEST), "view-bound profile")};
+    read::CertifiedEnvelope envelope{slot.view->Envelope()};
+    envelope.header.commitment_version = COMMITMENT_VERSION_VIEW_BOUND;
+    envelope.header.profile_hash = ProfileHash(profile);
+    for (const uint64_t view : {uint64_t{0}, uint64_t{7}, UINT64_MAX}) {
+        envelope.cert = SignCertificate(envelope.header, rig.seat_names, {0}, std::nullopt, view);
+        const auto bytes{envelope.Encode()};
+        BOOST_CHECK(Take(read::CertifiedEnvelope::Decode(bytes), "view-bound decode") == envelope);
+        RequireOk(verify::VerifyCertificate(envelope.header, envelope.cert, rig.seats), "view-bound certificate");
+        const size_t base_size{bytes.size() - sizeof(uint64_t)};
+        for (size_t extension{0}; extension <= sizeof(uint64_t) + 1; ++extension) {
+            if (extension == sizeof(uint64_t)) continue;
+            auto malformed{bytes};
+            malformed.resize(base_size + extension, 0);
+            RequireError(read::CertifiedEnvelope::Decode(malformed), ErrorCode::DECODE, "partial/missing/extra view");
+        }
+    }
+    for (const uint8_t version : {COMMITMENT_VERSION_V0, COMMITMENT_VERSION_WITHDRAWALS}) {
+        envelope.header.commitment_version = version;
+        envelope.cert = SignCertificate(envelope.header, rig.seat_names, {0});
+        const auto bytes{envelope.Encode()};
+        BOOST_CHECK(Take(read::CertifiedEnvelope::Decode(bytes), "legacy decode") == envelope);
+        BOOST_CHECK_EQUAL(bytes.size(), SLOT_HEADER_BYTES + SlotCertificate::MAX_LEGACY_ENCODED_BYTES - MAX_BITMAP_BYTES + 1);
+        auto extra{bytes};
+        extra.resize(extra.size() + sizeof(uint64_t), 0);
+        RequireFailure(read::CertifiedEnvelope::Decode(extra), ErrorCode::DECODE, "trailing bytes", "legacy rejects view extension");
+    }
 }
 
 BOOST_AUTO_TEST_CASE(create_refuses_bad_limits_and_a_short_outcome_index)
@@ -600,12 +634,16 @@ BOOST_AUTO_TEST_CASE(four_readers_one_publisher_see_one_head_per_reply)
 
     std::atomic<size_t> published{0};
     std::atomic<bool> publish_failed{false};
+    // Fixed-count readers must not finish before the publisher is scheduled.
+    // First publish, then let every reader copy head 1 before racing onward.
+    std::barrier start{READERS + 1};
     std::vector<std::vector<std::string>> problems(READERS);
     std::vector<size_t> found(READERS, 0), evicted(READERS, 0), empty(READERS, 0), heights_seen(READERS, 0);
     const auto check = [&](size_t r, bool ok, const std::string& what) {
         if (!ok && problems[r].size() < 10) problems[r].push_back(what);
     };
     const auto reader = [&](size_t r) {
+        start.arrive_and_wait();
         uint64_t last_height{0};
         for (size_t i{0}; i < ITERATIONS; ++i) {
             // Alternate: a one-lease convenience reply, and a handle with two replies.
@@ -613,6 +651,13 @@ BOOST_AUTO_TEST_CASE(four_readers_one_publisher_see_one_head_per_reply)
             std::optional<read::HeadReply> head;
             if (i % 2 == 0) {
                 Result<read::AccountReply> reply{service->Account(alice)};
+                if (i == 0) {
+                    check(r, reply.has_value() && reply->status == read::LookupStatus::FOUND &&
+                                 reply->head.envelope.header.height == 1,
+                          "first published head was not readable");
+                    // Arrive even on failure, before any error-path continue.
+                    start.arrive_and_wait();
+                }
                 if (!reply.has_value()) {
                     check(r, reply.error().code == ErrorCode::NEED_DATA, "unexpected error");
                     ++empty[r];
@@ -655,7 +700,11 @@ BOOST_AUTO_TEST_CASE(four_readers_one_publisher_see_one_head_per_reply)
     std::thread publisher{[&] {
         for (const PublishableSlot& slot : slots) {
             if (!service->Publish(slot.applied, slot.view).has_value()) publish_failed = true;
-            published.fetch_add(1);
+            if (published.fetch_add(1) == 0) {
+                // Release both phases even if the first Publish was refused.
+                start.arrive_and_wait();
+                start.arrive_and_wait();
+            }
         }
     }};
     std::vector<std::thread> readers;
@@ -671,6 +720,7 @@ BOOST_AUTO_TEST_CASE(four_readers_one_publisher_see_one_head_per_reply)
     for (size_t r{0}; r < READERS; ++r) {
         for (const std::string& p : problems[r]) BOOST_ERROR("reader " << r << ": " << p);
         BOOST_CHECK_EQUAL(found[r] + evicted[r] + empty[r], ITERATIONS);
+        BOOST_CHECK_GT(found[r], 0U);
         total_found += found[r];
     }
     BOOST_TEST_MESSAGE("found " << total_found << " of " << READERS * ITERATIONS << " replies; distinct heads per reader "

@@ -41,8 +41,10 @@ Result<void> CheckSweepInputs(const OrderBook& book, const ledger::LedgerState& 
     const Result<void> valid{Validate(profile)};
     if (!valid.has_value()) return valid.error();
     if (profile.matching != MatchingProfile::A2_PRORATA) return Invalid("matching profile is not A2_PRORATA");
+    if (!(ledger.Profile() == profile)) return Invalid("matcher profile differs from ledger profile");
 
     const MarketDescriptor& market{book.Market()};
+    if (const Result<void> policy{ValidateMarketForProfile(market, profile)}; !policy.has_value()) return policy.error();
     std::set<OrderId> ids;
     std::set<uint64_t> ranks;
     Claims claims;

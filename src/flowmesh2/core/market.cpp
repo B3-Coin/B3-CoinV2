@@ -30,6 +30,16 @@ Result<void> ValidateMarket(const MarketDescriptor& market)
     return Ok();
 }
 
+Result<void> ValidateMarketForProfile(const MarketDescriptor& market, const ProfileParams& profile)
+{
+    if (const Result<void> valid{Validate(profile)}; !valid.has_value()) return valid.error();
+    if (const Result<void> valid{ValidateMarket(market)}; !valid.has_value()) return valid.error();
+    if (profile.stable_fee_asset.has_value() && market.quote != *profile.stable_fee_asset) {
+        return Error{ErrorCode::INVALID_INPUT, STABLE_QUOTE_REQUIRED};
+    }
+    return Ok();
+}
+
 Result<Atoms> BaseAtoms(const MarketDescriptor& market, uint64_t lots)
 {
     if (auto valid{ValidateMarket(market)}; !valid) return valid.error();

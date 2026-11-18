@@ -14,6 +14,17 @@ uint256 SlotHeaderV2::Hash() const { return TaggedObject(HashTag::SLOT, *this); 
 
 uint256 SlotHeaderV2::CommitDigest() const { return TaggedObject(HashTag::COMMIT, *this); }
 
+uint256 VersionedCommitDigest(const SlotHeaderV2& header, uint64_t view)
+{
+    if (header.commitment_version == COMMITMENT_VERSION_V0 || header.commitment_version == COMMITMENT_VERSION_WITHDRAWALS) {
+        return header.CommitDigest();
+    }
+    if (header.commitment_version != COMMITMENT_VERSION_VIEW_BOUND) throw std::ios_base::failure("unknown COMMIT digest version");
+    HashWriter writer{TaggedWriter(HashTag::COMMIT)};
+    writer << uint8_t{3} << header << view;
+    return writer.GetSHA256();
+}
+
 AuthorityVersion SlotHeaderV2::Authority() const
 {
     return AuthorityVersion{authority_epoch, seat_set_root, profile_hash};
@@ -27,8 +38,12 @@ Result<SlotHeaderV2> SlotHeaderV2::Decode(std::span<const unsigned char> bytes)
 }
 
 Result<SlotHeaderV2> GenesisHeader(const uint256& domain, const AuthorityVersion& authority, const Anchor& anchor,
-                                   const FactCursor& facts_start, const uint256& genesis_state_root)
+                                   const FactCursor& facts_start, const uint256& genesis_state_root, uint8_t commitment_version)
 {
+    if (commitment_version != COMMITMENT_VERSION_V0 && commitment_version != COMMITMENT_VERSION_WITHDRAWALS &&
+        commitment_version != COMMITMENT_VERSION_VIEW_BOUND) {
+        return Error{ErrorCode::INVALID_INPUT, "unknown genesis commitment version"};
+    }
     if (domain.IsNull()) return Error{ErrorCode::INVALID_INPUT, "genesis domain is zero"};
     if (authority.profile_hash.IsNull()) return Error{ErrorCode::INVALID_INPUT, "genesis profile hash is zero"};
     if (authority.seat_set_root.IsNull()) return Error{ErrorCode::INVALID_INPUT, "genesis seat-set root is zero"};
@@ -53,7 +68,7 @@ Result<SlotHeaderV2> GenesisHeader(const uint256& domain, const AuthorityVersion
     header.state_root = genesis_state_root;
     header.action_count = 0;
     header.outcome_count = 0;
-    header.commitment_version = COMMITMENT_VERSION_V0;
+    header.commitment_version = commitment_version;
     return Ok(header);
 }
 

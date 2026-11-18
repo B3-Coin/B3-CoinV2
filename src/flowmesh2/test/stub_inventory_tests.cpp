@@ -425,8 +425,8 @@ FM2_STUB_CASE(M8_BRG_02, "M8-BRG-02")
 {
     // The payout fact's codec (R4) and the bridge's withdrawal packet (R13).
     bridge::BridgeManagerV2 manager;
-    return FirstDeviation("M8-BRG-02", {FactStubProbe(PayoutConfirmedFact{}, "M8-BRG-02"),
-                                        Observe(manager.BuildWithdrawalPacket(bridge::WithdrawalRequest{}))});
+    // The payout fact codec is real since the origin/rebirth merge; the production packet export is still gated.
+    return Observe(manager.BuildWithdrawalPacket(bridge::WithdrawalRequest{}));
 }
 
 FM2_STUB_CASE(M8_EXIT_01, "M8-EXIT-01")

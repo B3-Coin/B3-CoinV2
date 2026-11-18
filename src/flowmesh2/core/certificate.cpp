@@ -6,6 +6,7 @@
 
 #include <flowmesh2/core/codec.h>
 #include <flowmesh2/core/hashes.h>
+#include <flowmesh2/core/slot.h>
 #include <streams.h>
 
 #include <utility>
@@ -33,6 +34,7 @@ std::vector<unsigned char> SlotCertificate::Encode() const
     WriteCompactSize(writer, bitmap.size());
     writer.write(MakeByteSpan(bitmap));
     writer << aggregate;
+    if (view.has_value()) writer << *view;
     return out;
 }
 
@@ -43,11 +45,28 @@ Result<SlotCertificate> SlotCertificate::Decode(std::span<const unsigned char> b
         reader >> cert.header_hash;
         ReadCappedVector(reader, cert.bitmap, MAX_BITMAP_BYTES);
         reader >> cert.aggregate;
+        if (!reader.empty()) {
+            if (reader.size() != sizeof(uint64_t)) throw std::ios_base::failure("unknown certificate extension");
+            uint64_t view{0}; reader >> view; cert.view = view;
+        }
         return cert;
     });
 }
 
 uint256 SlotCertificate::Hash() const { return Tagged(HashTag::CERT, Encode()); }
+
+Result<uint256> CertificateDigest(const SlotHeaderV2& header, const SlotCertificate& certificate)
+{
+    if (header.commitment_version == COMMITMENT_VERSION_VIEW_BOUND) {
+        if (!certificate.view.has_value()) return Error{ErrorCode::VERIFY_FAILED, "view-bound certificate is missing its view"};
+        return Ok(VersionedCommitDigest(header, *certificate.view));
+    }
+    if (header.commitment_version != COMMITMENT_VERSION_V0 && header.commitment_version != COMMITMENT_VERSION_WITHDRAWALS) {
+        return Error{ErrorCode::VERIFY_FAILED, "certificate names an unknown commitment version"};
+    }
+    if (certificate.view.has_value()) return Error{ErrorCode::VERIFY_FAILED, "legacy certificate must not carry a view"};
+    return Ok(header.CommitDigest());
+}
 
 Result<std::vector<uint32_t>> SlotCertificate::SignerIndices(size_t seat_count) const
 {

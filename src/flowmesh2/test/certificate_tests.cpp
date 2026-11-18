@@ -9,9 +9,12 @@
 #include <crypto/hex_base.h>
 #include <flowmesh2/core/certificate.h>
 #include <flowmesh2/core/hashes.h>
+#include <flowmesh2/core/slot.h>
 #include <flowmesh2/test/util/keys.h>
 
+#include <algorithm>
 #include <cstdint>
+#include <limits>
 #include <set>
 #include <string>
 #include <vector>
@@ -142,7 +145,7 @@ BOOST_AUTO_TEST_CASE(decode_refusals_and_field_sensitivity)
 
     SlotCertificate at_cap{cert};
     at_cap.bitmap.assign(MAX_BITMAP_BYTES, 0xff);
-    BOOST_CHECK_EQUAL(at_cap.Encode().size(), SlotCertificate::MAX_ENCODED_BYTES);
+    BOOST_CHECK_EQUAL(at_cap.Encode().size(), SlotCertificate::MAX_LEGACY_ENCODED_BYTES);
     BOOST_CHECK(SlotCertificate::Decode(at_cap.Encode()).has_value());
     SlotCertificate over{cert};
     over.bitmap.assign(MAX_BITMAP_BYTES + 1, 0xff);
@@ -164,6 +167,44 @@ BOOST_AUTO_TEST_CASE(decode_refusals_and_field_sensitivity)
     changed = cert;
     changed.aggregate[95] ^= 1;
     BOOST_CHECK(hashes.insert(changed.Hash()).second);
+}
+
+
+BOOST_AUTO_TEST_CASE(view_extension_is_exact_and_cannot_downgrade_header_policy)
+{
+    const auto legacy{Sample()};
+    const auto old_bytes{legacy.Encode()};
+    for (const uint64_t view : {uint64_t{0}, uint64_t{7}, std::numeric_limits<uint64_t>::max()}) {
+        auto cert{legacy}; cert.view = view;
+        const auto bytes{cert.Encode()};
+        BOOST_CHECK_EQUAL(bytes.size(), old_bytes.size() + 8);
+        BOOST_CHECK(std::equal(old_bytes.begin(), old_bytes.end(), bytes.begin()));
+        const auto decoded{SlotCertificate::Decode(bytes)};
+        BOOST_REQUIRE(decoded.has_value());
+        BOOST_CHECK(*decoded == cert);
+        BOOST_CHECK(cert.Hash() != legacy.Hash());
+    }
+    for (size_t count = 1; count <= 9; ++count) {
+        auto bytes{old_bytes}; bytes.insert(bytes.end(), count, 0);
+        if (count == 8) BOOST_CHECK(SlotCertificate::Decode(bytes).value().view == std::optional<uint64_t>{0});
+        else CheckError(SlotCertificate::Decode(bytes), ErrorCode::DECODE);
+    }
+    auto cap{legacy}; cap.bitmap.assign(MAX_BITMAP_BYTES, 0xff); cap.view = 0;
+    BOOST_CHECK_EQUAL(cap.Encode().size(), SlotCertificate::MAX_ENCODED_BYTES);
+    BOOST_CHECK(SlotCertificate::Decode(cap.Encode()).value() == cap);
+    SlotHeaderV2 header; header.commitment_version = COMMITMENT_VERSION_VIEW_BOUND;
+    CheckError(CertificateDigest(header, legacy), ErrorCode::VERIFY_FAILED);
+    auto cert{legacy}; cert.view = 0;
+    BOOST_CHECK(CertificateDigest(header, cert).value() == VersionedCommitDigest(header, 0));
+    auto stripped{cert.Encode()}; stripped.resize(stripped.size() - 8);
+    CheckError(CertificateDigest(header, SlotCertificate::Decode(stripped).value()), ErrorCode::VERIFY_FAILED);
+    for (const uint8_t version : {COMMITMENT_VERSION_V0, COMMITMENT_VERSION_WITHDRAWALS}) {
+        header.commitment_version = version;
+        CheckError(CertificateDigest(header, cert), ErrorCode::VERIFY_FAILED);
+        BOOST_CHECK(CertificateDigest(header, legacy).value() == header.CommitDigest());
+    }
+    header.commitment_version = 1;
+    CheckError(CertificateDigest(header, legacy), ErrorCode::VERIFY_FAILED);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

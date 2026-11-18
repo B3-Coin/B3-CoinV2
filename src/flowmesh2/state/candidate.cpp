@@ -126,7 +126,7 @@ Result<Candidate> BuildCandidateBinding(const engine::Engine& engine, const Head
     header.state_root = result.roots.Root();
     header.action_count = static_cast<uint32_t>(body.originals.size());
     header.outcome_count = static_cast<uint32_t>(result.outcomes.size());
-    header.commitment_version = COMMITMENT_VERSION_V0;
+    header.commitment_version = ExpectedCommitmentVersion(parent.State().engine.ledger.Profile());
 
     auto next{std::make_shared<const CoreState>(CoreState{std::move(result.state), parent.State().seat_set_root})};
     return Ok(Candidate{std::move(header), std::move(result.outcomes), std::move(outcome_leaves), std::move(action_leaves),
@@ -163,7 +163,7 @@ Result<HeadView> GenesisHead(const ProfileParams& profile, std::span<const Marke
     if (!state.has_value()) return state.error();
     const Result<StateRootsV0> roots{state->engine.Commit()};
     if (!roots.has_value()) return roots.error();
-    const Result<SlotHeaderV2> header{GenesisHeader(domain, authority, anchor, facts_start, roots->Root())};
+    const Result<SlotHeaderV2> header{GenesisHeader(domain, authority, anchor, facts_start, roots->Root(), roots->version)};
     if (!header.has_value()) return header.error();
     return HeadView::Make(*header, uint256{}, std::make_shared<const CoreState>(std::move(state).value()));
 }

@@ -1,0 +1,24 @@
+{
+  "profile_id": "fm2-regtest-stable-q/1",
+  "encoding_version": 2,
+  "profile_hash": "5cc396e7254c54c792e2dfa33666268fb6cd9f73b41e6bdca648f054f3ae94ad",
+  "encoded_profile": "0216666d322d726567746573742d737461626c652d712f31010000000772656774657374016400000001500000000004000000100000000400000040000000200000e80300000032000000640000000004000000010010000000040000016439dd037ac1af8e258b4177319230f77f127c3fcf5ec6436aba005bb25bd7ed01e803000000000000",
+  "stable_fee_asset": "6439dd037ac1af8e258b4177319230f77f127c3fcf5ec6436aba005bb25bd7ed",
+  "withdrawals_enabled": true,
+  "withdrawal_fee_atoms": 1000,
+  "withdrawal_fee_unit": "synthetic Q raw atoms (test-only; rUSD has six decimals in this fixture)",
+  "stable_fee_asset_definition": "Tagged(B3/FM2/TEST_ASSET, raw UTF-8 rUSD); synthetic regtest asset only, no backing or production-token claim",
+  "profile_hash_definition": "Tagged(B3/FM2/PROFILE, encoded_profile); hex in raw byte order, not uint256 GetHex",
+  "mainnet_valid": false,
+  "scope": "FIRST two-market stable-Q REGTEST slice; every admitted market quote must equal the exact stable_fee_asset",
+  "source": "core/params.cpp StableQRegtestProfile; params_tests/stable_q_profile_json_matches_code",
+  "inherits_unratified_test_parameters_from": "fm2-dex1-regtest-provisional/1",
+  "provisional_fee_ppm": 100,
+  "provisional_fee_incidence": "SELLER",
+  "provisional_seat_share_percent": 80,
+  "limitations": [
+    "No non-Q quote valuation or separate-fee reservation implementation",
+    "Wider asset-to-asset markets and futures remain required product scope",
+    "No production stablecoin, economics, custody model or activation selected"
+  ]
+}

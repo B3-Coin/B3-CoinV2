@@ -15,6 +15,7 @@
 #include <serialize.h>
 #include <uint256.h>
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <ios>
@@ -51,6 +52,13 @@
  * or locale.
  */
 namespace flowmesh2 {
+
+//! Pure profile-to-state/certificate version boundary. Call Validate(profile) first.
+inline uint8_t ExpectedCommitmentVersion(const ProfileParams& profile)
+{
+    return profile.view_bound_commits ? COMMITMENT_VERSION_VIEW_BOUND :
+           profile.withdrawals_enabled ? COMMITMENT_VERSION_WITHDRAWALS : COMMITMENT_VERSION_V0;
+}
 
 // COMMITMENT_VERSION_V0 (the SlotHeaderV2.commitment_version of the
 // sorted-leaf commitment) is defined once, in core/slot.h. Until slice R7 this
@@ -161,17 +169,59 @@ struct RestingOrderLeafV0 {
     uint256 LeafValue() const;
 };
 
-/** The five component roots of commitment v0, 160 bytes in field order. */
+/** One immutable withdrawal identity and its monotone unpaid -> paid state.
+ * Paid records are retained: their payout event is a committed nullifier.
+ * Encode is fixed-width; LeafValue uses STATE_TOTALS with prefix byte 2 and
+ * 177-byte payload, distinct from the 64-byte legacy totals leaf domain.
+ */
+struct WithdrawalRecord {
+    ActionId id;
+    AccountId account;
+    AssetId asset;
+    Atoms amount{0};
+    Atoms fee{0};
+    std::array<unsigned char, 20> recipient{};
+    uint64_t slot{0};
+    bool paid{false};
+    Outpoint payout_event;
+
+    static constexpr size_t ENCODED_BYTES{3 * 32 + 2 * 8 + 20 + 8 + 1 + 36};
+    bool IsCanonical() const;
+    std::vector<unsigned char> Encode() const;
+    static Result<WithdrawalRecord> Decode(std::span<const unsigned char> bytes);
+    uint256 LeafValue() const;
+    friend bool operator==(const WithdrawalRecord&, const WithdrawalRecord&) = default;
+};
+
+/** Legacy v0 wire encoding remains five roots/160 bytes. The in-memory
+ * carrier also holds versions 2/3's sixth withdrawals root and explicit
+ * version. Both use six components with distinct root-of-roots prefixes;
+ * they require a versioned transport, never this legacy codec.
+ */
 struct StateRootsV0 {
     uint256 accounts;
     uint256 orders;
     uint256 markets;
     uint256 nullifiers;
     uint256 totals;
+    uint256 withdrawals;
+    uint8_t version{COMMITMENT_VERSION_V0};
 
     static constexpr size_t ENCODED_BYTES{5 * 32};
     friend bool operator==(const StateRootsV0&, const StateRootsV0&) = default;
-    SERIALIZE_METHODS(StateRootsV0, obj) { READWRITE(obj.accounts, obj.orders, obj.markets, obj.nullifiers, obj.totals); }
+    template <typename Stream> void Serialize(Stream& s) const
+    {
+        if (version != COMMITMENT_VERSION_V0 || !withdrawals.IsNull()) {
+            throw std::ios_base::failure("extended state roots require a versioned transport");
+        }
+        s << accounts << orders << markets << nullifiers << totals;
+    }
+    template <typename Stream> void Unserialize(Stream& s)
+    {
+        s >> accounts >> orders >> markets >> nullifiers >> totals;
+        withdrawals = uint256{};
+        version = COMMITMENT_VERSION_V0;
+    }
 
     //! state_root: Tagged(STATE, u8 COMMITMENT_VERSION_V0 || the five roots).
     uint256 Root() const;

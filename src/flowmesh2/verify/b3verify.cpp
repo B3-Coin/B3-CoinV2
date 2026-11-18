@@ -68,8 +68,9 @@ Result<void> VerifyCertificate(const SlotHeaderV2& header, const SlotCertificate
     keys.reserve(signers->size());
     const std::span<const bls::VerifiedPublicKey> all{seats.Keys()};
     for (const uint32_t index : *signers) keys.push_back(all[index]);
-    const uint256 digest{header.CommitDigest()};
-    if (!bls::FastAggregateVerify(keys, std::span<const unsigned char>{digest.begin(), digest.end()}, *aggregate)) {
+    const auto digest{CertificateDigest(header, cert)};
+    if (!digest.has_value()) return Failed(CERT_VIEW);
+    if (!bls::FastAggregateVerify(keys, std::span<const unsigned char>{digest->begin(), digest->end()}, *aggregate)) {
         return Failed(CERT_SIGNATURE);
     }
     return Ok();
@@ -83,19 +84,52 @@ Result<void> VerifyOutcome(const SlotHeaderV2& header, const OutcomeV2& outcome,
     return Ok();
 }
 
+Result<void> VerifyOutcome(const SlotHeaderV2& header, const OutcomeV2& outcome, const MerkleProof& proof,
+                           const ProfileParams& profile)
+{
+    if (const Result<void> valid{CheckProfile(header, profile)}; !valid.has_value()) return valid.error();
+    if (const Result<void> valid{VerifyOutcome(header, outcome, proof)}; !valid.has_value()) return valid.error();
+    if (profile.stable_fee_asset.has_value() && outcome.code == OutcomeCode::FEES_DISTRIBUTED) {
+        const AssetId& q{*profile.stable_fee_asset};
+        if (outcome.subject != q.id) return Failed(FEE_OUTCOME_ASSET);
+        for (const BalanceDelta& delta : outcome.deltas) {
+            if (delta.asset != q) return Failed(FEE_OUTCOME_ASSET);
+            if (delta.available_delta <= 0 || delta.reserved_delta != 0) return Failed(FEE_OUTCOME_DELTA);
+        }
+    }
+    return Ok();
+}
+
 Result<void> VerifyAccountLeaf(const SlotHeaderV2& header, const AccountLeafV0& leaf, const StateRootsV0& roots,
                                const MerkleProof& proof, const ProfileParams& profile)
 {
     if (Result<void> ok{CheckProfile(header, profile)}; !ok.has_value()) return ok.error();
+    const uint8_t expected_version{ExpectedCommitmentVersion(profile)};
+    if (header.commitment_version != expected_version || roots.version != expected_version ||
+        (expected_version == COMMITMENT_VERSION_V0 && !roots.withdrawals.IsNull())) return Failed(LEAF_STATE_ROOTS);
     if (roots.Root() != header.state_root) return Failed(LEAF_STATE_ROOTS);
     if (!leaf.IsCanonical(profile)) return Failed(LEAF_NOT_CANONICAL);
     if (!MerkleVerify(leaf.LeafValue(), proof, roots.accounts)) return Failed(LEAF_PROOF);
     return Ok();
 }
 
+Result<void> VerifyWithdrawal(const SlotHeaderV2& header, const WithdrawalRecord& record, const StateRootsV0& roots,
+                              const MerkleProof& proof, const ProfileParams& profile)
+{
+    if (Result<void> ok{CheckProfile(header, profile)}; !ok.has_value()) return ok.error();
+    if (!profile.withdrawals_enabled || !profile.stable_fee_asset.has_value() ||
+        header.commitment_version != ExpectedCommitmentVersion(profile) || roots.version != ExpectedCommitmentVersion(profile) ||
+        !record.IsCanonical() || record.asset != *profile.stable_fee_asset || record.fee != profile.withdrawal_fee_atoms ||
+        record.slot > header.height) return Failed(WITHDRAWAL_POLICY);
+    if (roots.Root() != header.state_root) return Failed(LEAF_STATE_ROOTS);
+    if (!MerkleVerify(record.LeafValue(), proof, roots.withdrawals)) return Failed(WITHDRAWAL_PROOF);
+    return Ok();
+}
+
 Result<void> VerifyFill(const Fill& fill, const MarketDescriptor& market, const ProfileParams& profile)
 {
     if (Result<void> valid{Validate(profile)}; !valid.has_value()) return valid.error();
+    if (const Result<void> policy{ValidateMarketForProfile(market, profile)}; !policy.has_value()) return Failed(FILL_FEE_ASSET);
     if (fill.market != market.Id()) return Failed(FILL_MARKET);
     if (fill.lots == 0) return Failed(FILL_LOTS);
     const Result<Atoms> quote{QuoteAtoms(market, fill.lots, fill.price_ticks)};

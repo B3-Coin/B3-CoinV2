@@ -12,6 +12,8 @@
 #include <serialize.h>
 #include <uint256.h>
 
+#include <array>
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <ios>
@@ -42,9 +44,10 @@
  * - SeatChangeFact: seat registration, PoP, maturity, endpoints (M7-SEAT-01);
  * - ListingFact: asset and market listing (M7-GOV-01);
  * - CheckpointAcceptedFact: B3 accepted a CheckpointV2 (MB1-B3D-02);
- * - PayoutConfirmedFact: a bridge withdrawal paid out (M8-BRG-02);
  * - ExitNullifierFact: a forced-exit nullifier (M8-EXIT-01).
  * Each stub struct carries only its cursor until its task defines it.
+ * PayoutConfirmedFact is a fixed 201-byte, fully bound local custody receipt;
+ * its cryptographic/finality authentication belongs to the chain adapter.
  *
  * DecodeFact refuses: input above MAX_FACT_BYTES (OVERSIZE, core/body.h),
  * empty input or an unknown kind (DECODE), a malformed deposit (DECODE, or
@@ -60,6 +63,7 @@ enum class FactKind : uint8_t {
     CHECKPOINT_ACCEPTED = 4,
     PAYOUT_CONFIRMED = 5,
     EXIT_NULLIFIER = 6,
+    SOURCE_RANGE = 7,
 };
 
 bool IsKnown(FactKind kind);
@@ -97,17 +101,68 @@ struct CheckpointAcceptedFact {
     FactCursor cursor;
     friend bool operator==(const CheckpointAcceptedFact&, const CheckpointAcceptedFact&) = default;
 };
+/** Authenticated custody payout. The chain adapter must verify the external
+ * receipt, vault/token/instance and finality; the engine checks this domain
+ * and matches this exact obligation. A txid plus event index is the nullifier.
+ */
 struct PayoutConfirmedFact {
     FactCursor cursor;
+    ActionId withdrawal;
+    AccountId account;
+    AssetId asset;
+    Atoms amount{0};
+    std::array<unsigned char, 20> recipient{};
+    Outpoint payout_event;
+    uint256 domain;
+
+    static constexpr size_t BODY_BYTES{8 + 32 + 32 + 32 + 8 + 20 + 36 + 32};
+    bool IsCanonical() const;
     friend bool operator==(const PayoutConfirmedFact&, const PayoutConfirmedFact&) = default;
+    template <typename Stream> void Serialize(Stream& s) const
+    {
+        s << cursor << withdrawal << account << asset << amount << recipient << payout_event << domain;
+    }
+    template <typename Stream> void Unserialize(Stream& s)
+    {
+        s >> cursor >> withdrawal >> account >> asset >> amount >> recipient >> payout_event >> domain;
+        if (!IsCanonical()) throw std::ios_base::failure("noncanonical payout confirmation");
+    }
 };
 struct ExitNullifierFact {
     FactCursor cursor;
     friend bool operator==(const ExitNullifierFact&, const ExitNullifierFact&) = default;
 };
 
+/** Exact independently observed external source range. This commits the
+ * adapter's boundary even when no deposits/payouts occurred. It creates no
+ * ledger balance, outcome, chain-finality proof or custody authorization.
+ */
+struct SourceRangeFact {
+    FactCursor cursor;
+    uint256 domain;
+    uint64_t chain_id{0};
+    uint64_t previous_height{0};
+    uint256 previous_hash;
+    uint64_t to_height{0};
+    uint256 to_hash;
+    uint32_t confirmations{0};
+
+    static constexpr size_t BODY_BYTES{8 + 32 + 8 + 8 + 32 + 8 + 32 + 4};
+    bool IsCanonical() const;
+    friend bool operator==(const SourceRangeFact&, const SourceRangeFact&) = default;
+    template <typename Stream> void Serialize(Stream& s) const
+    {
+        s << cursor << domain << chain_id << previous_height << previous_hash << to_height << to_hash << confirmations;
+    }
+    template <typename Stream> void Unserialize(Stream& s)
+    {
+        s >> cursor >> domain >> chain_id >> previous_height >> previous_hash >> to_height >> to_hash >> confirmations;
+        if (!IsCanonical()) throw std::ios_base::failure("noncanonical source range commitment");
+    }
+};
+
 using Fact = std::variant<DepositFact, SeatChangeFact, ListingFact, CheckpointAcceptedFact, PayoutConfirmedFact,
-                          ExitNullifierFact>;
+                          ExitNullifierFact, SourceRangeFact>;
 
 FactKind KindOf(const Fact& fact);
 FactCursor CursorOf(const Fact& fact);
@@ -120,6 +175,7 @@ Result<std::vector<unsigned char>> EncodeFact(const ListingFact& fact);
 Result<std::vector<unsigned char>> EncodeFact(const CheckpointAcceptedFact& fact);
 Result<std::vector<unsigned char>> EncodeFact(const PayoutConfirmedFact& fact);
 Result<std::vector<unsigned char>> EncodeFact(const ExitNullifierFact& fact);
+Result<std::vector<unsigned char>> EncodeFact(const SourceRangeFact& fact);
 
 //! Tagged(FACT, EncodeFact(fact)); EncodeFact's error otherwise.
 Result<uint256> FactId(const Fact& fact);
