@@ -17,6 +17,7 @@
 #include <flowmesh2/core/action.h>
 #include <flowmesh2/core/facts.h>
 #include <flowmesh2/core/result.h>
+#include <flowmesh2/engine/engine.h>
 #include <flowmesh2/ledger/ledger.h>
 #include <flowmesh2/net/client_api.h>
 #include <flowmesh2/sim/faults.h>
@@ -357,6 +358,191 @@ BOOST_AUTO_TEST_CASE(an_action_that_breaks_its_slot_is_left_out_and_the_slot_sea
     const std::optional<admission::PoolEntryStatus> later_status{node.Pool().Status(later.Id())};
     BOOST_REQUIRE(later_status.has_value());
     BOOST_CHECK(!admission::IsTerminal(later_status->status));
+}
+
+//! M4-ADM-03 cases: a k = 1 sim node whose first slot carries the deposits; bob gets MAX_LEAF_ASSETS assets, so a
+//! transfer of rUSD to him gives him a 257th, an engine error that one action causes (O-34).
+struct Adm03Rig {
+    TraceRecorder trace;
+    std::unique_ptr<SimNode> node;
+    std::vector<MarketDescriptor> markets;
+    const AccountId bob{SimClient::AccountOf("bob").value()};
+    const AssetId rusd{SimAsset("rUSD")};
+    std::vector<Fact> block;
+
+    Adm03Rig()
+    {
+        Result<std::unique_ptr<SimNode>> created{SimNode::Create(SimNodeConfig{}, trace)};
+        RequireOk(created, "SimNode::Create");
+        node = std::move(created).value();
+        markets.assign(node->Markets().begin(), node->Markets().end());
+    }
+    SimClient Client(const std::string& name)
+    {
+        Result<SimClient> made{SimClient::Create(name, node->Profile(), node->Domain(), node->Seats(), markets)};
+        RequireOk(made, "SimClient::Create " + name);
+        return std::move(made).value();
+    }
+    void Deposit(const AccountId& to, const AssetId& asset, Atoms amount)
+    {
+        DepositFact fact;
+        fact.cursor = FactCursor{SIM_BASE_HEIGHT + 1, static_cast<uint32_t>(block.size())};
+        fact.outpoint = Outpoint{SimLabelHash("fm2/test/sim_node/adm03b/" + std::to_string(block.size())), 0};
+        fact.account = to;
+        fact.asset = asset;
+        fact.amount = amount;
+        block.push_back(Fact{fact});
+    }
+    //! Bob's MAX_LEAF_ASSETS assets join the deposits, and slot 1 seals them all.
+    void SealDeposits()
+    {
+        for (size_t i{0}; i < MAX_LEAF_ASSETS; ++i) Deposit(bob, SimAsset("fm2/test/adm03b/" + std::to_string(i)), 1);
+        RequireOk(node->Chain().AppendBlock(SimBlockHash(SIM_BASE_HEIGHT + 1), std::move(block)), "AppendBlock 1");
+        RequireOk(node->SealSlot(), "SealSlot 1");
+    }
+    ActionV2 Admit(const Result<std::vector<unsigned char>>& bytes, std::string_view what)
+    {
+        RequireOk(bytes, std::string{what});
+        return Admit(*bytes, what);
+    }
+    ActionV2 Admit(const std::vector<unsigned char>& bytes, std::string_view what)
+    {
+        const Result<admission::AdmissionReply> reply{node->Admitter().Admit(bytes)};
+        RequireOk(reply, "Admit " + std::string{what});
+        BOOST_REQUIRE_MESSAGE(reply->code == AdmissionCode::ADMITTED, std::string{what} + " not admitted");
+        Result<ActionV2> action{ActionV2::Decode(bytes, node->Profile())};
+        RequireOk(action, "Decode " + std::string{what});
+        return std::move(action).value();
+    }
+    admission::PoolStatus StatusOf(const ActionV2& action) const
+    {
+        const std::optional<admission::PoolEntryStatus> status{node->Pool().Status(action.Id())};
+        BOOST_REQUIRE(status.has_value());
+        return status->status;
+    }
+    bool Traced(size_t from, std::string_view step) const
+    {
+        const std::vector<TraceEvent> all{trace.Events()};
+        for (size_t i{from}; i < all.size(); ++i) {
+            if (all[i].Step() == step) return true;
+        }
+        return false;
+    }
+    uint64_t Height() const { return node->Owner().Head()->Header().height; }
+};
+
+BOOST_AUTO_TEST_CASE(an_action_that_breaks_its_slot_only_after_another_is_deferred_not_excluded)
+{
+    // Codex review round 10 of M4-ADM-03 (2026-11-19): the bisection over admission-order prefixes found the first
+    // action whose addition broke the slot, and that is not always the action that fails. Mallory holds no rUSD and
+    // sends bob rUSD; carol funds mallory with rUSD, admitted after mallory's transfer but executed before it in the
+    // canonical order. Mallory's transfer alone is a certified REJ_INSUFFICIENT_AVAILABLE; after carol's it gives bob
+    // a 257th asset (OVERSIZE). The node excluded carol's honest transfer. Now an action is excluded only when it breaks
+    // the slot alone; carol's is deferred to the next slot and mallory's is rejected as it would be alone.
+    Adm03Rig r;
+    SimClient mallory{r.Client("mallory")};
+    SimClient carol{r.Client("carol")};
+    r.Deposit(mallory.Account(), SimAsset("fm2/test/adm03b/mallory"), 1); // an account, but no rUSD
+    r.Deposit(carol.Account(), r.rusd, 1'000'000);
+    r.SealDeposits();
+    const std::shared_ptr<const state::HeadView> head{r.node->Owner().Head()};
+    const uint64_t ref{head->Header().height};
+    const uint64_t height{ref + 1};
+    const ActionV2 bad{r.Admit(mallory.Transfer("bad", 1, r.bob, r.rusd, 5, ref), "mallory's transfer to bob")};
+    // Carol's amount is ground until her transfer runs first in this slot's canonical order (two accounts: the key decides).
+    std::optional<std::vector<unsigned char>> funding;
+    for (Atoms amount{7}; !funding.has_value(); ++amount) {
+        BOOST_REQUIRE(amount < 100);
+        Result<std::vector<unsigned char>> bytes{carol.Transfer("fund", 1, mallory.Account(), r.rusd, amount, ref)};
+        RequireOk(bytes, "carol's transfer");
+        Result<ActionV2> action{ActionV2::Decode(*bytes, r.node->Profile())};
+        RequireOk(action, "Decode carol's transfer");
+        if (engine::OrderKey(head->HeaderHash(), height, action->Id()) < engine::OrderKey(head->HeaderHash(), height, bad.Id())) {
+            funding = std::move(bytes).value();
+        }
+    }
+    const ActionV2 good{r.Admit(*funding, "carol's transfer to mallory")};
+
+    const size_t events{r.trace.Size()};
+    const Result<SealReport> sealed{r.node->SealSlot()};
+    RequireOk(sealed, "SealSlot 2");
+    BOOST_CHECK_EQUAL(sealed->originals, 1U);
+    BOOST_CHECK(r.StatusOf(bad) == admission::PoolStatus::INCLUDED); // REJ_INSUFFICIENT_AVAILABLE, its nonce used
+    BOOST_CHECK(r.StatusOf(good) == admission::PoolStatus::PENDING);
+    BOOST_CHECK(r.Traced(events, "pool.defer"));
+    BOOST_CHECK(!r.Traced(events, "pool.exclude"));
+    const Result<SealReport> next{r.node->SealSlot()};
+    RequireOk(next, "SealSlot 3");
+    BOOST_CHECK_EQUAL(next->originals, 1U);
+    BOOST_CHECK(r.StatusOf(good) == admission::PoolStatus::INCLUDED);
+    const ledger::AccountState* bob_state{r.node->Owner().Head()->State().engine.ledger.Find(r.bob)};
+    BOOST_REQUIRE(bob_state != nullptr);
+    BOOST_CHECK_EQUAL(bob_state->balances.size(), MAX_LEAF_ASSETS);
+}
+
+BOOST_AUTO_TEST_CASE(many_breaking_actions_and_their_resends_do_not_stop_sealing)
+{
+    // Codex review round 10 of M4-ADM-03: after eight exclusions (MAX_SLOT_EXCLUSIONS) step 3 returned the error and
+    // proposed nothing, so nine actions that each break the slot, resent after their exclusion (an exact resend is
+    // admitted again), stopped sealing for good. Now every slot seals: an action that breaks the slot alone is
+    // excluded, and once step 3's preview budget is spent the slot seals the part known to have a candidate and leaves
+    // the rest in the pool. An honest action waits only for the actions admitted before it.
+    Adm03Rig r;
+    std::vector<SimClient> spammers;
+    for (size_t i{0}; i < 40; ++i) {
+        spammers.push_back(r.Client("spam" + std::to_string(i)));
+        r.Deposit(spammers.back().Account(), r.rusd, 100);
+    }
+    SimClient carol{r.Client("carol")};
+    r.Deposit(carol.Account(), r.rusd, 1'000'000);
+    r.SealDeposits();
+    const uint64_t ref{r.Height()};
+    std::vector<std::vector<unsigned char>> sent;
+    std::vector<ActionV2> spam;
+    for (SimClient& spammer : spammers) {
+        Result<std::vector<unsigned char>> bytes{spammer.Transfer("spam", 1, r.bob, r.rusd, 1, ref)};
+        RequireOk(bytes, "a spam transfer");
+        sent.push_back(*bytes);
+    }
+    const auto admit_spam = [&](size_t n) {
+        for (size_t i{0}; i < n; ++i) {
+            const ActionV2 action{r.Admit(sent[i], "spam " + std::to_string(i))};
+            if (spam.size() <= i) spam.push_back(action);
+        }
+    };
+    const auto seal = [&](std::string_view what) {
+        const uint64_t before{r.Height()};
+        const Result<SealReport> sealed{r.node->SealSlot()};
+        RequireOk(sealed, std::string{what});
+        BOOST_CHECK_EQUAL(r.Height(), before + 1);
+        return *sealed;
+    };
+
+    // 1. Twelve breaking transfers, then carol's: the twelve are excluded and carol's is included.
+    admit_spam(12);
+    const ActionV2 good1{r.Admit(carol.Transfer("good1", 1, spammers[0].Account(), r.rusd, 1, ref), "carol 1")};
+    BOOST_CHECK_EQUAL(seal("SealSlot 2").originals, 1U);
+    BOOST_CHECK(r.StatusOf(good1) == admission::PoolStatus::INCLUDED);
+    for (size_t i{0}; i < 12; ++i) BOOST_CHECK(r.StatusOf(spam[i]) == admission::PoolStatus::EXCLUDED);
+
+    // 2. The same twelve resent, then carol's next: the same again.
+    admit_spam(12);
+    const ActionV2 good2{r.Admit(carol.Transfer("good2", 2, spammers[0].Account(), r.rusd, 1, ref), "carol 2")};
+    BOOST_CHECK_EQUAL(seal("SealSlot 3").originals, 1U);
+    BOOST_CHECK(r.StatusOf(good2) == admission::PoolStatus::INCLUDED);
+
+    // 3. Forty breaking transfers are more than one slot's preview budget: the first slot seals without actions and
+    // leaves the rest in the pool, the next one excludes the rest and includes carol's.
+    admit_spam(40);
+    const ActionV2 good3{r.Admit(carol.Transfer("good3", 3, spammers[0].Account(), r.rusd, 1, ref), "carol 3")};
+    const size_t events{r.trace.Size()};
+    BOOST_CHECK_EQUAL(seal("SealSlot 4").originals, 0U);
+    BOOST_CHECK(r.Traced(events, "pool.defer"));
+    BOOST_CHECK(r.StatusOf(good3) == admission::PoolStatus::PENDING);
+    BOOST_CHECK_EQUAL(seal("SealSlot 5").originals, 1U);
+    BOOST_CHECK(r.StatusOf(good3) == admission::PoolStatus::INCLUDED);
+    for (const ActionV2& action : spam) BOOST_CHECK(r.StatusOf(action) == admission::PoolStatus::EXCLUDED);
+    BOOST_CHECK_EQUAL(r.node->Pool().Size(), 0U);
 }
 
 BOOST_AUTO_TEST_CASE(a_restart_rebuilds_the_retained_pool_records_and_reads)

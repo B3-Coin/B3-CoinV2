@@ -256,13 +256,13 @@ Result<std::pair<state::Candidate, std::vector<ActionId>>> SeatNode::Prepare(con
         inputs.body.facts.push_back(std::move(bytes).value());
     }
     inputs.body.originals = taken->originals;
-    // An engine error that one action causes (O-34) leaves that action out (M4-ADM-03); one a fact causes is returned
-    // unfenced and the slot is retried.
+    // An engine error that actions cause (O-34) leaves them out (M4-ADM-03); one a fact causes is returned unfenced and
+    // the slot is retried.
     Result<state::Candidate> candidate{m_owner->Preview(state::ParentRef::Committed(*head), inputs)};
     if (!candidate.has_value() && !taken->ids.empty() && !FencesNode(candidate.error().code) &&
         candidate.error().code != ErrorCode::STALE_PARENT) {
         const Error failed{candidate.error()};
-        candidate = ExcludeBreakingActions(*head, height, inputs, *taken, failed);
+        candidate = LeaveOutBreakingActions(*head, height, inputs, *taken, failed);
     }
     if (!candidate.has_value()) return FenceOn(candidate.error());
     Hooks().Record("state.preview", "slot=" + std::to_string(height) + ",header=" + candidate->Header().Hash().GetHex());
@@ -272,50 +272,93 @@ Result<std::pair<state::Candidate, std::vector<ActionId>>> SeatNode::Prepare(con
     return Ok(std::pair{std::move(candidate).value(), taken->ids});
 }
 
-Result<state::Candidate> SeatNode::ExcludeBreakingActions(const state::HeadView& head, uint64_t height, state::SlotInputs& inputs,
-                                                          admission::TakenSlot& taken, const Error& failed)
+Result<state::Candidate> SeatNode::LeaveOutBreakingActions(const state::HeadView& head, uint64_t height, state::SlotInputs& inputs,
+                                                           admission::TakenSlot& taken, const Error& failed)
 {
     const state::ParentRef parent{state::ParentRef::Committed(head)};
-    // The slot with the first n taken actions (admission order; the engine's result does not depend on body order).
-    const auto preview_first = [&](size_t n) {
-        inputs.body.originals.assign(taken.originals.begin(), taken.originals.begin() + static_cast<std::ptrdiff_t>(n));
+    size_t previews{0};
+    // The slot with `originals` (admission order; the engine's result does not depend on body order).
+    const auto preview = [&](std::vector<std::vector<unsigned char>> originals) {
+        ++previews;
+        inputs.body.originals = std::move(originals);
         return m_owner->Preview(parent, inputs);
     };
-    // Without actions the slot must have a candidate, or a fact (not an action) breaks it: nothing is excluded.
-    if (!preview_first(0).has_value()) {
+    const auto first = [&](size_t n) {
+        return preview({taken.originals.begin(), taken.originals.begin() + static_cast<std::ptrdiff_t>(n)});
+    };
+    // An error that ends the search: it fences the node, or the head moved.
+    const auto ends = [](const Error& error) { return FencesNode(error.code) || error.code == ErrorCode::STALE_PARENT; };
+    const auto stop = [&](const Error& error) {
         inputs.body.originals = taken.originals;
-        return failed;
-    }
+        return Result<state::Candidate>{error};
+    };
+    const auto trace = [&](std::string_view step, const ActionId& id, const Error& error) {
+        Hooks().Record(step, "slot=" + std::to_string(height) + ",action=" + id.id.GetHex() + "," + std::string{ToString(error.code)} +
+                                 "," + std::string{error.detail});
+    };
+    // Without actions the slot must have a candidate, or a fact (not an action) breaks it: nothing is left out.
+    Result<state::Candidate> valid{first(0)};
+    if (!valid.has_value()) return stop(failed);
+    // Invariant: the first `lo` taken actions give the candidate `valid`, and all of them (more than lo) give `last`.
+    size_t lo{0};
     Error last{failed};
-    for (size_t excluded{0}; excluded < MAX_SLOT_EXCLUSIONS; ++excluded) {
-        // The first `lo` actions give a candidate, the first `hi` none; then action lo is one whose addition breaks it.
-        size_t lo{0};
+    while (previews < MAX_SLOT_PREVIEWS) {
+        // The boundary: the first lo give a candidate, the first hi none. Exponential search from lo, then bisection.
         size_t hi{taken.originals.size()};
-        while (hi - lo > 1) {
+        for (size_t step{1}; lo + step < hi && previews < MAX_SLOT_PREVIEWS; step *= 2) {
+            Result<state::Candidate> probe{first(lo + step)};
+            if (!probe.has_value()) {
+                if (ends(probe.error())) return stop(probe.error());
+                hi = lo + step;
+                break;
+            }
+            lo += step;
+            valid = std::move(probe);
+        }
+        while (hi - lo > 1 && previews < MAX_SLOT_PREVIEWS) {
             const size_t mid{lo + (hi - lo) / 2};
-            if (preview_first(mid).has_value()) {
+            Result<state::Candidate> probe{first(mid)};
+            if (probe.has_value()) {
                 lo = mid;
+                valid = std::move(probe);
+            } else if (ends(probe.error())) {
+                return stop(probe.error());
             } else {
                 hi = mid;
             }
         }
-        const ActionId id{taken.ids[lo]};
-        if (const Result<void> out{m_pool->Exclude(height, id)}; !out.has_value()) {
-            inputs.body.originals = taken.originals;
-            return out.error();
+        if (hi - lo > 1) break; // the budget ran out before the boundary was found
+        // Action lo breaks the slot after the first lo. Alone (for lo = 0 that is the probe just made) it either gives no
+        // candidate, so it is the cause and terminal; or it needs the actions before it, so it only waits for a later slot.
+        bool alone_breaks{lo == 0};
+        if (lo > 0) {
+            if (previews >= MAX_SLOT_PREVIEWS) break;
+            Result<state::Candidate> alone{preview({taken.originals[lo]})};
+            if (!alone.has_value() && ends(alone.error())) return stop(alone.error());
+            alone_breaks = !alone.has_value();
         }
-        Hooks().Record("pool.exclude", "slot=" + std::to_string(height) + ",action=" + id.id.GetHex() + "," +
-                                           std::string{ToString(last.code)} + "," + std::string{last.detail});
+        const ActionId id{taken.ids[lo]};
+        if (alone_breaks) {
+            if (const Result<void> out{m_pool->Exclude(height, id)}; !out.has_value()) return stop(out.error());
+            trace("pool.exclude", id, last);
+        } else {
+            trace("pool.defer", id, last);
+        }
         taken.ids.erase(taken.ids.begin() + static_cast<std::ptrdiff_t>(lo));
         taken.originals.erase(taken.originals.begin() + static_cast<std::ptrdiff_t>(lo));
-        inputs.body.originals = taken.originals;
-        Result<state::Candidate> again{m_owner->Preview(parent, inputs)};
-        if (again.has_value() || taken.ids.empty() || FencesNode(again.error().code) || again.error().code == ErrorCode::STALE_PARENT) {
-            return again;
-        }
+        if (taken.originals.size() == lo || previews >= MAX_SLOT_PREVIEWS) break;
+        Result<state::Candidate> again{first(taken.originals.size())};
+        if (again.has_value()) return again;
+        if (ends(again.error())) return stop(again.error());
         last = again.error();
     }
-    return last;
+    // The slot is the first lo, whose candidate was seen; the rest stay in the pool (IN_PROPOSAL until the slot commits,
+    // then PENDING) and a later slot takes them again.
+    for (size_t i{lo}; i < taken.ids.size(); ++i) trace("pool.defer", taken.ids[i], last);
+    taken.ids.resize(lo);
+    taken.originals.resize(lo);
+    inputs.body.originals = taken.originals;
+    return valid;
 }
 
 Result<void> SeatNode::RebuildRetained(uint64_t base)
