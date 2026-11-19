@@ -106,8 +106,13 @@ Result<void> SeatNode::BuildComponents(bool restart)
     Result<std::unique_ptr<read::ReadService>> read{read::ReadService::Create(limits, m_config.profile)};
     if (!read.has_value()) return read.error();
     m_read = std::move(read).value();
-    Result<std::unique_ptr<admission::ActionPool>> pool{
-        admission::ActionPool::Create(admission::PoolLimits::FromProfile(m_config.profile), m_config.profile, head->Header().height)};
+    // A restart's pool starts at the first slot the pool and the read service retain; RebuildRetained brings both to
+    // the committed head (M4-STO-03's pool rebuild, O-71).
+    const admission::PoolLimits pool_limits{admission::PoolLimits::FromProfile(m_config.profile)};
+    const uint64_t committed{head->Header().height};
+    const uint64_t window{std::max<uint64_t>({pool_limits.retention_slots, limits.outcome_index_slots, limits.view_slots})};
+    const uint64_t base{restart ? committed - std::min(committed, window) : committed};
+    Result<std::unique_ptr<admission::ActionPool>> pool{admission::ActionPool::Create(pool_limits, m_config.profile, base)};
     if (!pool.has_value()) return pool.error();
     m_pool = std::move(pool).value();
     Result<std::unique_ptr<admission::Admission>> admission{
@@ -130,6 +135,7 @@ Result<void> SeatNode::BuildComponents(bool restart)
     // refusal keeps the head where it is and fences the node, which then starts and serves reads (O-89: that height is
     // never re-decided with another header); a storage failure is the restart's error.
     if (restart) {
+        if (const Result<void> rebuilt{RebuildRetained(base)}; !rebuilt.has_value()) return rebuilt.error();
         if (const Result<void> tail{ApplyUnappliedTail()}; !tail.has_value()) {
             Hooks().Record("restart.tail", std::string{ToString(tail.error().code)} + "," + std::string{tail.error().detail});
             if (tail.error().code == ErrorCode::STORAGE_FATAL || tail.error().code == ErrorCode::INVARIANT) return tail.error();
@@ -310,6 +316,52 @@ Result<state::Candidate> SeatNode::ExcludeBreakingActions(const state::HeadView&
         last = again.error();
     }
     return last;
+}
+
+Result<void> SeatNode::RebuildRetained(uint64_t base)
+{
+    const std::shared_ptr<const state::HeadView> restored{m_owner->Head()};
+    const uint64_t committed{restored->Header().height};
+    if (committed == base) return Ok(); // nothing committed yet
+    Result<std::unique_ptr<state::StateOwner>> created{state::StateOwner::Create(m_config.profile, m_genesis, m_commit_journal->InstanceId())};
+    if (!created.has_value()) return created.error();
+    state::StateOwner& replayer{**created};
+    for (uint64_t height{1}; height <= committed; ++height) {
+        const std::optional<std::vector<unsigned char>> bytes{m_commit_log->DecisionRecordAt(height)};
+        if (!bytes.has_value()) return Error{ErrorCode::INVARIANT, SEAT_REBUILD_GAP};
+        Result<storage::DecisionRecord> record{storage::DecisionRecord::Decode(*bytes, m_config.profile)};
+        if (!record.has_value()) return record.error();
+        Result<state::Candidate> candidate{replayer.Reexecute(record->header, record->body)};
+        if (!candidate.has_value()) return candidate.error();
+        const std::vector<OutcomeV2> outcomes{candidate->Outcomes()};
+        // The DECISION record is durable: AppendDecision names it again (idempotent), as in ApplyUnappliedTail.
+        Result<storage::PendingDecision> pending{m_commit_log->AppendDecision(record->header, record->certificate, record->body)};
+        if (!pending.has_value()) return pending.error();
+        Result<DurableDecision> decision{m_commit_log->Confirm(*pending)};
+        if (!decision.has_value()) return decision.error();
+        // Its APPLIED record is durable too (height <= the committed head), so check 3 passed under the authority the
+        // header names: applying under that authority on the replayer gives the slot's receipt.
+        Result<state::AppliedSlot> applied{replayer.Apply(std::move(candidate).value(), *decision, record->header.Authority())};
+        if (!applied.has_value()) return applied.error();
+        if (height <= base) continue;
+        // AppendApplied names the durable APPLIED record again (idempotent); Confirm gives the slot's DurableApplied.
+        Result<storage::PendingApplied> pending_applied{m_commit_log->AppendApplied(applied->receipt)};
+        if (!pending_applied.has_value()) return pending_applied.error();
+        Result<DurableApplied> token{m_commit_log->Confirm(*pending_applied)};
+        if (!token.has_value()) return token.error();
+        Result<std::shared_ptr<const read::SlotView>> view{read::SlotView::Build(*applied->head, record->certificate, outcomes)};
+        if (!view.has_value()) return view.error();
+        if (const Result<void> published{m_read->Publish(*token, *view)}; !published.has_value()) return published.error();
+        Result<admission::CommitReport> report{m_pool->OnCommitted(*token, *applied->head, outcomes, record->body)};
+        if (!report.has_value()) return report.error();
+    }
+    const std::shared_ptr<const state::HeadView> replayed{replayer.Head()};
+    if (replayed->HeaderHash() != restored->HeaderHash() || replayed->CertHash() != restored->CertHash() ||
+        !(replayed->State() == restored->State())) {
+        return Error{ErrorCode::INVARIANT, SEAT_REBUILD_HEAD};
+    }
+    Hooks().Record("restart.rebuild", "from=" + std::to_string(base + 1) + ",to=" + std::to_string(committed));
+    return Ok();
 }
 
 Result<void> SeatNode::ApplyUnappliedTail()

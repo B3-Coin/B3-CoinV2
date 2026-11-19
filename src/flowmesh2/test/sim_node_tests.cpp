@@ -37,6 +37,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <vector>
 
 using namespace flowmesh2;
@@ -255,9 +256,9 @@ BOOST_AUTO_TEST_CASE(a_restart_after_a_check_3_refusal_keeps_the_live_head_and_s
     RequireOk(rig.node->Restart(), "Restart");
     BOOST_CHECK(rig.node->Fenced());
     BOOST_CHECK_EQUAL(rig.node->Owner().Head()->Header().height, 1U);
-    // The read service is rebuilt empty on every restart and publishes from the next applied slot on (M4-STO-01); nothing
-    // was applied here, so nothing is published, and slot 2 in particular never was.
-    BOOST_CHECK(!rig.node->Read().PublishedHeight().has_value());
+    // The restart replays the retained committed slots into the read service (M4-STO-03's rebuild): slot 1 is
+    // published again, and slot 2, never applied, is not.
+    BOOST_CHECK(rig.node->Read().PublishedHeight() == std::optional<uint64_t>{1});
     const Result<std::vector<storage::JournalRecord>> records{rig.node->CommitJournal().ReadAll()};
     RequireOk(records, "commit ReadAll");
     BOOST_CHECK_EQUAL(records->size(), 3U); // no APPLIED 2
@@ -356,6 +357,136 @@ BOOST_AUTO_TEST_CASE(an_action_that_breaks_its_slot_is_left_out_and_the_slot_sea
     const std::optional<admission::PoolEntryStatus> later_status{node.Pool().Status(later.Id())};
     BOOST_REQUIRE(later_status.has_value());
     BOOST_CHECK(!admission::IsTerminal(later_status->status));
+}
+
+BOOST_AUTO_TEST_CASE(a_restart_rebuilds_the_retained_pool_records_and_reads)
+{
+    // M4-STO-03's pool rebuild (O-71): a restarted seat built its pool and read service empty at the replayed head, so
+    // an exact resend of an action included before the restart was no longer DUPLICATE, GetAction no longer proved its
+    // inclusion and nothing was readable until the next slot. The restart now replays the retained slots into both.
+    TraceRecorder trace;
+    Result<std::unique_ptr<SimNode>> created{SimNode::Create(SimNodeConfig{}, trace)};
+    RequireOk(created, "SimNode::Create");
+    SimNode& node{**created};
+    const std::vector<MarketDescriptor> markets{node.Markets().begin(), node.Markets().end()};
+    Result<SimClient> alice{SimClient::Create("alice", node.Profile(), node.Domain(), node.Seats(), markets)};
+    RequireOk(alice, "SimClient::Create");
+    const AccountId bob{SimClient::AccountOf("bob").value()};
+    const AssetId rusd{SimAsset("rUSD")};
+    std::vector<Fact> facts;
+    for (const AccountId& to : {alice->Account(), bob}) {
+        DepositFact fact;
+        fact.cursor = FactCursor{SIM_BASE_HEIGHT + 1, static_cast<uint32_t>(facts.size())};
+        fact.outpoint = Outpoint{SimLabelHash("fm2/test/sim_node/sto03/" + std::to_string(facts.size())), 0};
+        fact.account = to;
+        fact.asset = rusd;
+        fact.amount = 1'000'000;
+        facts.push_back(Fact{fact});
+    }
+    RequireOk(node.Chain().AppendBlock(SimBlockHash(SIM_BASE_HEIGHT + 1), std::move(facts)), "AppendBlock");
+    RequireOk(node.SealSlot(), "SealSlot 1");
+    const Result<std::vector<unsigned char>> bytes{alice->Transfer("t", 1, bob, rusd, 9, 1)};
+    RequireOk(bytes, "Transfer");
+    const Result<admission::AdmissionReply> first{node.Admitter().Admit(*bytes)};
+    RequireOk(first, "Admit");
+    BOOST_REQUIRE(first->code == AdmissionCode::ADMITTED);
+    Result<ActionV2> action{ActionV2::Decode(*bytes, node.Profile())};
+    RequireOk(action, "Decode");
+    RequireOk(node.SealSlot(), "SealSlot 2 (includes the transfer)");
+    RequireOk(node.SealSlot(), "SealSlot 3");
+    const std::optional<admission::PoolEntryStatus> before{node.Pool().Status(action->Id())};
+    BOOST_REQUIRE(before.has_value() && before->status == admission::PoolStatus::INCLUDED);
+    const uint256 head_before{node.Owner().Head()->HeaderHash()};
+
+    RequireOk(node.Restart(), "Restart");
+    BOOST_CHECK(!node.Fenced());
+    BOOST_CHECK(node.Owner().Head()->HeaderHash() == head_before);
+    // The read service has the replayed slots: the head is readable at once, the transfer's inclusion is proved.
+    BOOST_CHECK(node.Read().PublishedHeight() == std::optional<uint64_t>{3});
+    const Result<net::ActionStatusReply> status{node.Api().GetAction(*action)};
+    RequireOk(status, "GetAction after the restart");
+    BOOST_CHECK(status->status == net::ApiActionStatus::INCLUDED);
+    // The pool has the INCLUDED record again, so the exact resend is DUPLICATE (A3), not answered by A5/A6.
+    const std::optional<admission::PoolEntryStatus> after{node.Pool().Status(action->Id())};
+    BOOST_REQUIRE(after.has_value());
+    BOOST_CHECK(after->status == admission::PoolStatus::INCLUDED);
+    BOOST_CHECK(after->included == before->included);
+    BOOST_CHECK_EQUAL(node.Pool().HeadHeight(), 3U);
+    const Result<admission::AdmissionReply> resend{node.Admitter().Admit(*bytes)};
+    RequireOk(resend, "Admit the resend");
+    BOOST_CHECK_MESSAGE(resend->code == AdmissionCode::DUPLICATE, "resend after the restart: " + std::string{ToString(resend->code)});
+    // The rebuild wrote nothing: the journal still ends with APPLIED 3, and the node seals on from there.
+    const Result<std::vector<storage::JournalRecord>> records{node.CommitJournal().ReadAll()};
+    RequireOk(records, "commit ReadAll");
+    BOOST_CHECK_EQUAL(records->size(), 6U); // DECISION and APPLIED for slots 1 to 3
+    RequireOk(node.SealSlot(), "SealSlot 4");
+    BOOST_CHECK_EQUAL(node.Owner().Head()->Header().height, 4U);
+}
+
+BOOST_AUTO_TEST_CASE(a_restart_past_the_retention_window_rebuilds_what_the_live_pool_kept)
+{
+    // The rebuild starts max(retention_slots, outcome_index_slots, view_slots) = 1,024 slots below the committed head:
+    // an action included in slot 2 was evicted by the live pool at slot 1,026 and stays evicted, one included near the
+    // head is retained, and the restarted pool and read service agree with the live ones.
+    TraceRecorder trace;
+    Result<std::unique_ptr<SimNode>> created{SimNode::Create(SimNodeConfig{}, trace)};
+    RequireOk(created, "SimNode::Create");
+    SimNode& node{**created};
+    const std::vector<MarketDescriptor> markets{node.Markets().begin(), node.Markets().end()};
+    Result<SimClient> alice{SimClient::Create("alice", node.Profile(), node.Domain(), node.Seats(), markets)};
+    RequireOk(alice, "SimClient::Create");
+    const AccountId bob{SimClient::AccountOf("bob").value()};
+    const AssetId rusd{SimAsset("rUSD")};
+    std::vector<Fact> facts;
+    for (const AccountId& to : {alice->Account(), bob}) {
+        DepositFact fact;
+        fact.cursor = FactCursor{SIM_BASE_HEIGHT + 1, static_cast<uint32_t>(facts.size())};
+        fact.outpoint = Outpoint{SimLabelHash("fm2/test/sim_node/sto03w/" + std::to_string(facts.size())), 0};
+        fact.account = to;
+        fact.asset = rusd;
+        fact.amount = 1'000'000;
+        facts.push_back(Fact{fact});
+    }
+    RequireOk(node.Chain().AppendBlock(SimBlockHash(SIM_BASE_HEIGHT + 1), std::move(facts)), "AppendBlock");
+    RequireOk(node.SealSlot(), "SealSlot 1");
+    const auto include = [&](uint64_t nonce) {
+        const uint64_t head{node.Owner().Head()->Header().height};
+        const Result<std::vector<unsigned char>> bytes{alice->Transfer("t" + std::to_string(nonce), nonce, bob, rusd, 1, head)};
+        RequireOk(bytes, "Transfer");
+        const Result<admission::AdmissionReply> reply{node.Admitter().Admit(*bytes)};
+        RequireOk(reply, "Admit");
+        BOOST_REQUIRE(reply->code == AdmissionCode::ADMITTED);
+        RequireOk(node.SealSlot(), "SealSlot (includes the transfer)");
+        return ActionV2::Decode(*bytes, node.Profile()).value().Id();
+    };
+    const ActionId old_id{include(1)}; // slot 2
+    while (node.Owner().Head()->Header().height < 1'028) RequireOk(node.SealSlot(), "SealSlot (heartbeat)");
+    const ActionId recent_id{include(2)}; // slot 1,029
+    RequireOk(node.SealSlot(), "SealSlot 1,030");
+    BOOST_REQUIRE_EQUAL(node.Owner().Head()->Header().height, 1'030U);
+    const auto snapshot = [&] {
+        return std::tuple{node.Pool().Status(old_id), node.Pool().Status(recent_id), node.Pool().IncludedRecords(),
+                          node.Pool().TerminalRecords(), node.Pool().HeadHeight(), node.Read().PublishedHeight()};
+    };
+    const auto live{snapshot()};
+    BOOST_CHECK(!std::get<0>(live).has_value());
+    BOOST_REQUIRE(std::get<1>(live).has_value());
+    BOOST_CHECK(std::get<1>(live)->status == admission::PoolStatus::INCLUDED);
+
+    RequireOk(node.Restart(), "Restart");
+    const auto restarted{snapshot()};
+    BOOST_CHECK(std::get<0>(restarted) == std::get<0>(live));
+    BOOST_REQUIRE(std::get<1>(restarted).has_value());
+    // The same INCLUDED record; only its PendingRef is gone (the restarted pool never held the action, O-71).
+    BOOST_CHECK(std::get<1>(restarted)->status == admission::PoolStatus::INCLUDED);
+    BOOST_CHECK(std::get<1>(restarted)->included == std::get<1>(live)->included);
+    BOOST_CHECK_EQUAL(std::get<1>(restarted)->height, std::get<1>(live)->height);
+    BOOST_CHECK(!std::get<1>(restarted)->pending.has_value());
+    BOOST_CHECK_EQUAL(std::get<2>(restarted), std::get<2>(live));
+    BOOST_CHECK_EQUAL(std::get<3>(restarted), std::get<3>(live));
+    BOOST_CHECK_EQUAL(std::get<4>(restarted), std::get<4>(live));
+    BOOST_CHECK(std::get<5>(restarted) == std::get<5>(live));
+    RequireOk(node.SealSlot(), "SealSlot 1,031");
 }
 
 BOOST_AUTO_TEST_SUITE_END()

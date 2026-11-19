@@ -143,6 +143,8 @@ inline constexpr std::string_view SEAT_SYNC_CERT_HEADER{"fetched certificate nam
 inline constexpr std::string_view SEAT_SYNC_CERT{"fetched certificate does not verify"};                        //!< (VERIFY_FAILED)
 inline constexpr std::string_view SEAT_SYNC_CONFLICT{"fetched decision conflicts with this seat's decision"};   //!< (EQUIVOCATION_REFUSED)
 inline constexpr std::string_view SEAT_SYNC_UNSOLICITED{"sync reply nobody asked for"};                         //!< (INVALID_INPUT)
+inline constexpr std::string_view SEAT_REBUILD_GAP{"a committed slot has no DECISION record to replay"};       //!< (INVARIANT)
+inline constexpr std::string_view SEAT_REBUILD_HEAD{"the rebuild replay ends at another head than Restore"};    //!< (INVARIANT)
 
 /** What the owner of a node observes and may inject (the simulator's trace
  * and fault plan; a daemon's log). Every method has a no-op default and is
@@ -231,8 +233,9 @@ public:
      * is the seat set this node belongs to (seat self_seat's key must be
      * `ikm`'s: SEAT_BAD_KEY) and `genesis` the head every component starts
      * from. With `restart` the logs are recovered and the state restored from
-     * the commit journal (M4-STO-01; a decided-but-unapplied tail is
-     * NotImplemented M4-STO-03).
+     * the commit journal (M4-STO-01), the retained slots replayed into the
+     * read service and the pool, and a decided-but-unapplied tail applied
+     * (M4-STO-03's first halves; see Restart).
      */
     static Result<std::unique_ptr<SeatNode>> Create(const SeatNodeConfig& config, const SeatNodeParts& parts, const SeatSet& seats,
                                                     const state::HeadView& genesis, bool restart = false);
@@ -299,11 +302,27 @@ public:
     //! The agreement's view of the slot in flight (k > 1).
     std::optional<agreement::PbftStatus> AgreementStatus();
     /** A crash and restart: the journals and the chain stay; the logs are
-     * rebuilt by Recover, the state by Restore over the commit journal
-     * (NotImplemented M4-STO-03 while a decided slot is unapplied), the read
-     * service, pool, admission, lanes, API, signer and agreement are fresh;
-     * the agreement resumes its durable view state and starts its timers at
-     * the last Tick (O-99).
+     * rebuilt by Recover, the state by Restore over the commit journal.
+     * Admission, lanes, API, signer and agreement are fresh; the agreement
+     * resumes its durable view state and starts its timers at the last Tick
+     * (O-99). The read service and the pool start at the first slot they
+     * retain, max(pool retention_slots, read outcome_index_slots and
+     * view_slots) below the committed head (or the genesis), and the restart
+     * replays the committed slots from the genesis on a second StateOwner:
+     * each one's DECISION record is re-executed, its decision token named
+     * again (AppendDecision is idempotent), applied under the authority its
+     * header names (its APPLIED record is durable, so check 3 passed when it
+     * was applied) and its APPLIED record named again (AppendApplied is
+     * idempotent), and from the first retained slot on Confirm's
+     * DurableApplied publishes its view and gives the pool its INCLUDED
+     * records, exactly as the live slot did (O-71: an exact resend is
+     * DUPLICATE again). Nothing is written; the replayed head must be the
+     * restored one (INVARIANT SEAT_REBUILD_HEAD), a decided slot below it
+     * without its DECISION record is INVARIANT SEAT_REBUILD_GAP, and any
+     * other error of the replay is the restart's. PROVISIONAL until the
+     * snapshot base of M4-STO-03 bounds both replays. Then a decided slot
+     * without APPLIED is re-executed and applied under the current authority
+     * (ApplyUnappliedTail; a refusal fences, O-89). The stream hub is fresh.
      */
     Result<void> Restart();
     uint32_t SeatCount() const { return m_config.seat_count; }
@@ -348,6 +367,8 @@ private:
     Result<SealReport> Finish(uint64_t height, state::Candidate candidate, agreement::Decision decision, std::vector<ActionId> taken);
     //! Build (or rebuild, on restart) every component after the journals and the chain.
     Result<void> BuildComponents(bool restart);
+    //! A restart's replay of the committed slots into the read service and the pool from slot base + 1 on (see Restart).
+    Result<void> RebuildRetained(uint64_t base);
     //! A restart's decided-but-unapplied DECISIONs after the committed head, re-executed and applied in order
     //! (check 3 under the current authority, B-APPLIED, publication); a refusal fences and keeps the head (O-89).
     Result<void> ApplyUnappliedTail();
