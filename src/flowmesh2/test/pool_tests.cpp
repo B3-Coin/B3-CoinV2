@@ -123,7 +123,8 @@ BOOST_AUTO_TEST_CASE(create_limits_and_registries)
     // Registries: integers and names are append-only.
     const std::vector<std::pair<PoolStatus, std::string_view>> statuses{
         {PoolStatus::PENDING, "PENDING"}, {PoolStatus::IN_PROPOSAL, "IN_PROPOSAL"}, {PoolStatus::INCLUDED, "INCLUDED"},
-        {PoolStatus::NONCE_USED, "NONCE_USED"}, {PoolStatus::NONCE_TOO_LOW, "NONCE_TOO_LOW"}, {PoolStatus::EXPIRED, "EXPIRED"}};
+        {PoolStatus::NONCE_USED, "NONCE_USED"}, {PoolStatus::NONCE_TOO_LOW, "NONCE_TOO_LOW"}, {PoolStatus::EXPIRED, "EXPIRED"},
+        {PoolStatus::EXCLUDED, "EXCLUDED"}};
     for (size_t i{0}; i < statuses.size(); ++i) {
         BOOST_CHECK_EQUAL(static_cast<int>(statuses[i].first), static_cast<int>(i + 1));
         BOOST_CHECK(admission::IsKnown(statuses[i].first));
@@ -131,9 +132,9 @@ BOOST_AUTO_TEST_CASE(create_limits_and_registries)
         BOOST_CHECK_EQUAL(admission::IsTerminal(statuses[i].first), i >= 2);
     }
     BOOST_CHECK(!admission::IsKnown(static_cast<PoolStatus>(0)));
-    BOOST_CHECK(!admission::IsKnown(static_cast<PoolStatus>(7)));
-    BOOST_CHECK(!admission::IsTerminal(static_cast<PoolStatus>(7)));
-    BOOST_CHECK_EQUAL(admission::ToString(static_cast<PoolStatus>(7)), "UNKNOWN");
+    BOOST_CHECK(!admission::IsKnown(static_cast<PoolStatus>(8)));
+    BOOST_CHECK(!admission::IsTerminal(static_cast<PoolStatus>(8)));
+    BOOST_CHECK_EQUAL(admission::ToString(static_cast<PoolStatus>(8)), "UNKNOWN");
     const std::vector<std::pair<InsertResult, std::string_view>> results{{InsertResult::INSERTED, "INSERTED"},
                                                                          {InsertResult::DUPLICATE, "DUPLICATE"},
                                                                          {InsertResult::NONCE_PENDING, "NONCE_PENDING"},
@@ -443,6 +444,37 @@ BOOST_AUTO_TEST_CASE(in_proposal_returns_to_pending_when_another_slot_commits)
     BOOST_CHECK_EQUAL(status.height, 0U);
     PoolRig::Sealed next{r.Seal()};
     BOOST_CHECK_EQUAL(next.report.included, 1U);
+}
+
+BOOST_AUTO_TEST_CASE(exclude_ends_one_taken_entry)
+{
+    // M4-ADM-03: only an IN_PROPOSAL entry of the slot being built can be excluded; it becomes terminal EXCLUDED at
+    // the pool's head height, leaves the live maps (its nonce is free again), and an exact resend is admitted again.
+    PoolRig r;
+    r.Fund();
+    const auto x{SmallPlace(r.Actions(), "alice", 1)};
+    const auto y{SmallPlace(r.Actions(), "bob", 1)};
+    BOOST_REQUIRE(r.Insert(x).result == InsertResult::INSERTED);
+    RequireFailure(r.pool->Exclude(2, IdOfBytes(x)), ErrorCode::INVALID_INPUT, admission::POOL_EXCLUDE_NOT_TAKEN, "PENDING");
+    RequireOk(r.pool->TakeForSlot(2, 10), "TakeForSlot");
+    BOOST_REQUIRE(r.Insert(y).result == InsertResult::INSERTED); // PENDING, not in slot 2's proposal
+    RequireFailure(r.pool->Exclude(3, IdOfBytes(x)), ErrorCode::ORDER_VIOLATION, admission::POOL_TAKE_HEIGHT, "height = head + 2");
+    RequireFailure(r.pool->Exclude(2, IdOfBytes(y)), ErrorCode::INVALID_INPUT, admission::POOL_EXCLUDE_NOT_TAKEN, "not taken");
+    RequireFailure(r.pool->Exclude(2, ActionId{uint256::ONE}), ErrorCode::INVALID_INPUT, admission::POOL_EXCLUDE_NOT_TAKEN, "unknown");
+    const uint64_t head{r.pool->HeadHeight()};
+    RequireOk(r.pool->Exclude(2, IdOfBytes(x)), "Exclude");
+    const admission::PoolEntryStatus status{RequireStatus(*r.pool, IdOfBytes(x))};
+    BOOST_CHECK(status.status == PoolStatus::EXCLUDED);
+    BOOST_CHECK_EQUAL(status.height, head);
+    BOOST_CHECK(status.pending.has_value());
+    BOOST_CHECK_EQUAL(r.pool->Size(), 1U);
+    BOOST_CHECK_EQUAL(r.pool->TerminalRecords(), 1U);
+    BOOST_CHECK(!r.pool->FindById(IdOfBytes(x)).has_value());
+    RequireFailure(r.pool->Exclude(2, IdOfBytes(x)), ErrorCode::INVALID_INPUT, admission::POOL_EXCLUDE_NOT_TAKEN, "twice");
+    // The record follows the other terminal records' rules; an exact resend replaces it with a new live entry.
+    BOOST_CHECK(r.Insert(x).result == InsertResult::INSERTED);
+    BOOST_CHECK(RequireStatus(*r.pool, IdOfBytes(x)).status == PoolStatus::PENDING);
+    BOOST_CHECK_EQUAL(r.pool->TerminalRecords(), 0U);
 }
 
 BOOST_AUTO_TEST_CASE(on_committed_refusals_change_nothing)

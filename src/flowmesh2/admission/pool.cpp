@@ -28,6 +28,7 @@ bool IsKnown(PoolStatus status)
     case PoolStatus::NONCE_USED:
     case PoolStatus::NONCE_TOO_LOW:
     case PoolStatus::EXPIRED:
+    case PoolStatus::EXCLUDED:
         return true;
     }
     return false;
@@ -40,6 +41,7 @@ bool IsTerminal(PoolStatus status)
     case PoolStatus::NONCE_USED:
     case PoolStatus::NONCE_TOO_LOW:
     case PoolStatus::EXPIRED:
+    case PoolStatus::EXCLUDED:
         return true;
     case PoolStatus::PENDING:
     case PoolStatus::IN_PROPOSAL:
@@ -57,6 +59,7 @@ std::string_view ToString(PoolStatus status)
     case PoolStatus::NONCE_USED: return "NONCE_USED";
     case PoolStatus::NONCE_TOO_LOW: return "NONCE_TOO_LOW";
     case PoolStatus::EXPIRED: return "EXPIRED";
+    case PoolStatus::EXCLUDED: return "EXCLUDED";
     }
     return "UNKNOWN";
 }
@@ -194,6 +197,26 @@ Result<TakenSlot> ActionPool::TakeForSlot(uint64_t next_height, size_t max, cons
         taken.originals.push_back(it->second.original);
     }
     return Ok(std::move(taken));
+}
+
+Result<void> ActionPool::Exclude(uint64_t next_height, const ActionId& id)
+{
+    LOCK(m_mutex);
+    if (m_head_height == UINT64_MAX || next_height != m_head_height + 1) return Error{ErrorCode::ORDER_VIOLATION, POOL_TAKE_HEIGHT};
+    const auto live{m_live.find(id)};
+    if (live == m_live.end() || live->second.status != PoolStatus::IN_PROPOSAL || live->second.proposal_height != next_height) {
+        return Error{ErrorCode::INVALID_INPUT, POOL_EXCLUDE_NOT_TAKEN};
+    }
+    Terminal record;
+    record.status = PoolStatus::EXCLUDED;
+    record.pending = live->second.ref;
+    record.height = m_head_height;
+    EraseLive(live);
+    // Live entries and terminal records are disjoint (Insert removes the record of a re-admitted action).
+    m_terminal.emplace(id, std::move(record));
+    m_other_order.emplace_back(m_head_height, id);
+    ++m_other_count;
+    return Ok();
 }
 
 Result<CommitReport> ActionPool::OnCommitted(const DurableApplied& applied, const state::HeadView& head,

@@ -73,7 +73,15 @@
  *  2. ActionPool::TakeForSlot(head + 1, max_actions_per_slot, the hooks'
  *     withhold filter);
  *  3. StateOwner::Preview(committed head, {batch authority, anchor, range,
- *     fact bytes, taken originals});
+ *     fact bytes, taken originals}). When it gives no candidate with an
+ *     error that does not fence (other than STALE_PARENT) and the same slot
+ *     without actions has one, the actions cause it (M4-ADM-03, O-34): the
+ *     first taken action, in admission order, whose addition to the actions
+ *     before it gives no candidate (found by bisection over those prefixes)
+ *     becomes terminal EXCLUDED (ActionPool::Exclude; the hooks see
+ *     pool.exclude) and the slot is previewed again without it, at most
+ *     MAX_SLOT_EXCLUSIONS times per slot. A slot its facts break excludes
+ *     nothing and returns the error;
  *  4. NodeHooks::AfterPreview (the simulator's authority bump and its
  *     commit-barrier mapping check);
  *  5. Agreement::Propose(candidate, batch authority) and TakeDecision
@@ -86,8 +94,9 @@
  * moved the head, STORAGE_FATAL, FENCED, AUTHORITY_CHANGED,
  * EQUIVOCATION_REFUSED, INVARIANT and ORDER_VIOLATION also fence the node
  * (Admission::Fence); BUSY, NEED_DATA and a refusal of the slot's inputs
- * (for example an engine error one action causes, O-34) do not, and the
- * slot is tried again. After Apply moved the head, EVERY error of steps 7
+ * (for example an engine error a chain fact causes, O-34, or one action
+ * MAX_SLOT_EXCLUSIONS exclusions did not reach) do not, and the slot is
+ * tried again. After Apply moved the head, EVERY error of steps 7
  * to 9 fences the node, because the commit log, the read service or the
  * pool would disagree with the head on every later call (O-90). A fenced
  * node's new submissions get HALTED, reads stay live on the last
@@ -108,6 +117,9 @@
 namespace flowmesh2::seat {
 
 struct SealedSlot;
+
+//! Most actions one slot's step 3 excludes (M4-ADM-03); each costs at most one Preview per bisection step and one after.
+inline constexpr size_t MAX_SLOT_EXCLUSIONS{8};
 
 // Static details (ErrorCode in parentheses).
 inline constexpr std::string_view SEAT_POLL_BUSY{"the chain adapter answered BUSY"};                         //!< (BUSY)
@@ -324,6 +336,14 @@ private:
     Result<SealReport> SealNext(const std::shared_ptr<const state::HeadView>& head, uint64_t height);
     //! Steps 0 to 4: poll, take, preview and the hooks' step; the candidate and the taken ids.
     Result<std::pair<state::Candidate, std::vector<ActionId>>> Prepare(const std::shared_ptr<const state::HeadView>& head, uint64_t height);
+    /** Step 3's exclusion (M4-ADM-03): `inputs` with `taken`'s originals gave
+     * `failed`. Returns `failed` unless the slot without actions has a
+     * candidate; otherwise excludes breaking actions (removing them from
+     * `taken` and `inputs`) until a Preview succeeds, fails otherwise, or
+     * MAX_SLOT_EXCLUSIONS were excluded, and returns that last Preview.
+     */
+    Result<state::Candidate> ExcludeBreakingActions(const state::HeadView& head, uint64_t height, state::SlotInputs& inputs,
+                                                    admission::TakenSlot& taken, const Error& failed);
     //! Steps 6 to 9: apply, APPLIED, publish, pool; the sealed slot goes to the hooks.
     Result<SealReport> Finish(uint64_t height, state::Candidate candidate, agreement::Decision decision, std::vector<ActionId> taken);
     //! Build (or rebuild, on restart) every component after the journals and the chain.

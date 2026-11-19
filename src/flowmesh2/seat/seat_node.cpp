@@ -8,6 +8,7 @@
 #include <flowmesh2/core/facts.h>
 
 #include <algorithm>
+#include <cstddef>
 #include <string>
 #include <utility>
 
@@ -249,15 +250,66 @@ Result<std::pair<state::Candidate, std::vector<ActionId>>> SeatNode::Prepare(con
         inputs.body.facts.push_back(std::move(bytes).value());
     }
     inputs.body.originals = taken->originals;
-    // An engine error that one action causes (O-34) is not fenced: the slot is
-    // retried, and excluding that action is M4-ADM-03.
+    // An engine error that one action causes (O-34) leaves that action out (M4-ADM-03); one a fact causes is returned
+    // unfenced and the slot is retried.
     Result<state::Candidate> candidate{m_owner->Preview(state::ParentRef::Committed(*head), inputs)};
+    if (!candidate.has_value() && !taken->ids.empty() && !FencesNode(candidate.error().code) &&
+        candidate.error().code != ErrorCode::STALE_PARENT) {
+        const Error failed{candidate.error()};
+        candidate = ExcludeBreakingActions(*head, height, inputs, *taken, failed);
+    }
     if (!candidate.has_value()) return FenceOn(candidate.error());
     Hooks().Record("state.preview", "slot=" + std::to_string(height) + ",header=" + candidate->Header().Hash().GetHex());
 
     // 4. The hooks' step between Preview and Propose (the simulator's authority bump and fault mapping check).
     if (const Result<void> after{Hooks().AfterPreview(height)}; !after.has_value()) return FenceOn(after.error());
     return Ok(std::pair{std::move(candidate).value(), taken->ids});
+}
+
+Result<state::Candidate> SeatNode::ExcludeBreakingActions(const state::HeadView& head, uint64_t height, state::SlotInputs& inputs,
+                                                          admission::TakenSlot& taken, const Error& failed)
+{
+    const state::ParentRef parent{state::ParentRef::Committed(head)};
+    // The slot with the first n taken actions (admission order; the engine's result does not depend on body order).
+    const auto preview_first = [&](size_t n) {
+        inputs.body.originals.assign(taken.originals.begin(), taken.originals.begin() + static_cast<std::ptrdiff_t>(n));
+        return m_owner->Preview(parent, inputs);
+    };
+    // Without actions the slot must have a candidate, or a fact (not an action) breaks it: nothing is excluded.
+    if (!preview_first(0).has_value()) {
+        inputs.body.originals = taken.originals;
+        return failed;
+    }
+    Error last{failed};
+    for (size_t excluded{0}; excluded < MAX_SLOT_EXCLUSIONS; ++excluded) {
+        // The first `lo` actions give a candidate, the first `hi` none; then action lo is one whose addition breaks it.
+        size_t lo{0};
+        size_t hi{taken.originals.size()};
+        while (hi - lo > 1) {
+            const size_t mid{lo + (hi - lo) / 2};
+            if (preview_first(mid).has_value()) {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        const ActionId id{taken.ids[lo]};
+        if (const Result<void> out{m_pool->Exclude(height, id)}; !out.has_value()) {
+            inputs.body.originals = taken.originals;
+            return out.error();
+        }
+        Hooks().Record("pool.exclude", "slot=" + std::to_string(height) + ",action=" + id.id.GetHex() + "," +
+                                           std::string{ToString(last.code)} + "," + std::string{last.detail});
+        taken.ids.erase(taken.ids.begin() + static_cast<std::ptrdiff_t>(lo));
+        taken.originals.erase(taken.originals.begin() + static_cast<std::ptrdiff_t>(lo));
+        inputs.body.originals = taken.originals;
+        Result<state::Candidate> again{m_owner->Preview(parent, inputs)};
+        if (again.has_value() || taken.ids.empty() || FencesNode(again.error().code) || again.error().code == ErrorCode::STALE_PARENT) {
+            return again;
+        }
+        last = again.error();
+    }
+    return last;
 }
 
 Result<void> SeatNode::ApplyUnappliedTail()

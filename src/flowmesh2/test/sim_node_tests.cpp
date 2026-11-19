@@ -13,8 +13,12 @@
 
 #include <flowmesh2/admission/admission.h>
 #include <flowmesh2/admission/pool.h>
+#include <flowmesh2/core/account_leaf.h>
 #include <flowmesh2/core/action.h>
+#include <flowmesh2/core/facts.h>
 #include <flowmesh2/core/result.h>
+#include <flowmesh2/ledger/ledger.h>
+#include <flowmesh2/net/client_api.h>
 #include <flowmesh2/sim/faults.h>
 #include <flowmesh2/sim/sim_client.h>
 #include <flowmesh2/sim/sim_node.h>
@@ -259,6 +263,99 @@ BOOST_AUTO_TEST_CASE(a_restart_after_a_check_3_refusal_keeps_the_live_head_and_s
     BOOST_CHECK_EQUAL(records->size(), 3U); // no APPLIED 2
     RequireCodeAndDetail(rig.node->SealSlot(), ErrorCode::FENCED, SIM_FENCED, "SealSlot after the restart");
     BOOST_CHECK_EQUAL(rig.SignedVotesAt(2), 1U);
+}
+
+BOOST_AUTO_TEST_CASE(an_action_that_breaks_its_slot_is_left_out_and_the_slot_seals)
+{
+    // M4-ADM-03 (O-34, O-90): bob holds MAX_LEAF_ASSETS assets, so alice's TRANSFER of rUSD to him makes the ledger
+    // refuse the whole slot (OVERSIZE, no candidate). That error does not fence; the action stayed IN_PROPOSAL, was
+    // taken again by every later slot, and no slot sealed again, carol's good transfer never included. The node now
+    // leaves that one action out: the slot seals with carol's transfer, alice's is terminal EXCLUDED, and the API
+    // answers UNKNOWN for a terminal pool status instead of PENDING. A slot that a chain fact breaks excludes nothing.
+    TraceRecorder trace;
+    Result<std::unique_ptr<SimNode>> created{SimNode::Create(SimNodeConfig{}, trace)};
+    RequireOk(created, "SimNode::Create");
+    SimNode& node{**created};
+    const std::vector<MarketDescriptor> markets{node.Markets().begin(), node.Markets().end()};
+    const auto client = [&](const std::string& name) {
+        Result<SimClient> made{SimClient::Create(name, node.Profile(), node.Domain(), node.Seats(), markets)};
+        RequireOk(made, "SimClient::Create " + name);
+        return std::move(made).value();
+    };
+    SimClient alice{client("alice")};
+    SimClient carol{client("carol")};
+    const AccountId bob{SimClient::AccountOf("bob").value()};
+    const AssetId rusd{SimAsset("rUSD")};
+    const auto deposit = [](std::vector<Fact>& facts, uint32_t height, const AccountId& to, const AssetId& asset, Atoms amount) {
+        DepositFact fact;
+        fact.cursor = FactCursor{height, static_cast<uint32_t>(facts.size())};
+        fact.outpoint = Outpoint{SimLabelHash("fm2/test/sim_node/adm03/" + std::to_string(height) + "/" + std::to_string(facts.size())), 0};
+        fact.account = to;
+        fact.asset = asset;
+        fact.amount = amount;
+        facts.push_back(Fact{fact});
+    };
+    std::vector<Fact> block1;
+    deposit(block1, SIM_BASE_HEIGHT + 1, alice.Account(), rusd, 1'000'000);
+    deposit(block1, SIM_BASE_HEIGHT + 1, carol.Account(), rusd, 1'000'000);
+    for (size_t i{0}; i < MAX_LEAF_ASSETS; ++i) {
+        deposit(block1, SIM_BASE_HEIGHT + 1, bob, SimAsset("fm2/test/adm03/" + std::to_string(i)), 1);
+    }
+    RequireOk(node.Chain().AppendBlock(SimBlockHash(SIM_BASE_HEIGHT + 1), std::move(block1)), "AppendBlock 1");
+    RequireOk(node.SealSlot(), "SealSlot 1");
+
+    const auto admit = [&](const Result<std::vector<unsigned char>>& bytes, std::string_view what) {
+        RequireOk(bytes, std::string{what});
+        const Result<admission::AdmissionReply> reply{node.Admitter().Admit(*bytes)};
+        RequireOk(reply, "Admit " + std::string{what});
+        BOOST_REQUIRE_MESSAGE(reply->code == AdmissionCode::ADMITTED, std::string{what} + " not admitted");
+        Result<ActionV2> action{ActionV2::Decode(*bytes, node.Profile())};
+        RequireOk(action, "Decode " + std::string{what});
+        return std::move(action).value();
+    };
+    const ActionV2 bad{admit(alice.Transfer("bad", 1, bob, rusd, 5, 1), "alice's transfer to bob")};
+    const ActionV2 good{admit(carol.Transfer("good", 1, alice.Account(), rusd, 7, 1), "carol's transfer to alice")};
+
+    const size_t events{trace.Size()};
+    const Result<SealReport> sealed{node.SealSlot()};
+    RequireOk(sealed, "SealSlot 2 (alice's transfer left out)");
+    BOOST_CHECK_EQUAL(sealed->originals, 1U);
+    const std::optional<admission::PoolEntryStatus> good_status{node.Pool().Status(good.Id())};
+    BOOST_REQUIRE(good_status.has_value());
+    BOOST_CHECK(good_status->status == admission::PoolStatus::INCLUDED);
+    const read::IncludedRef only_outcome{2, 0}; // the slot's only outcome
+    BOOST_CHECK(good_status->included == std::optional<read::IncludedRef>{only_outcome});
+    const std::optional<admission::PoolEntryStatus> bad_status{node.Pool().Status(bad.Id())};
+    BOOST_REQUIRE(bad_status.has_value());
+    BOOST_CHECK(bad_status->status == admission::PoolStatus::EXCLUDED);
+    BOOST_CHECK(admission::IsTerminal(admission::PoolStatus::EXCLUDED));
+    BOOST_CHECK_EQUAL(bad_status->height, 1U); // the committed head the slot was built on
+    BOOST_CHECK_EQUAL(node.Pool().Size(), 0U);
+    bool traced{false};
+    const std::vector<TraceEvent> all{trace.Events()};
+    for (size_t i{events}; i < all.size(); ++i) traced |= all[i].Step() == "pool.exclude";
+    BOOST_CHECK(traced);
+    const Result<net::ActionStatusReply> answer{node.Api().GetAction(bad)};
+    RequireOk(answer, "GetAction bad");
+    BOOST_CHECK(answer->status == net::ApiActionStatus::UNKNOWN);
+    BOOST_CHECK_EQUAL(answer->reason, net::API_UNKNOWN_TERMINAL_UNPROVEN);
+    // Nothing of alice's reached bob, and the node goes on.
+    const ledger::AccountState* bob_state{node.Owner().Head()->State().engine.ledger.Find(bob)};
+    BOOST_REQUIRE(bob_state != nullptr);
+    BOOST_CHECK_EQUAL(bob_state->balances.size(), MAX_LEAF_ASSETS);
+    RequireOk(node.SealSlot(), "SealSlot 3");
+
+    // A chain fact that breaks the slot (a 257th asset deposited to bob) is no action's fault: nothing is excluded and
+    // the error comes back as before (O-34: certified refusals of facts are M2-LED-07).
+    const ActionV2 later{admit(carol.Transfer("later", 2, alice.Account(), rusd, 3, 3), "carol's second transfer")};
+    std::vector<Fact> block2;
+    deposit(block2, SIM_BASE_HEIGHT + 2, bob, SimAsset("fm2/test/adm03/extra"), 1);
+    RequireOk(node.Chain().AppendBlock(SimBlockHash(SIM_BASE_HEIGHT + 2), std::move(block2)), "AppendBlock 2");
+    RequireError(node.SealSlot(), ErrorCode::OVERSIZE, "SealSlot 4 (a fact breaks the slot)");
+    BOOST_CHECK(!node.Fenced());
+    const std::optional<admission::PoolEntryStatus> later_status{node.Pool().Status(later.Id())};
+    BOOST_REQUIRE(later_status.has_value());
+    BOOST_CHECK(!admission::IsTerminal(later_status->status));
 }
 
 BOOST_AUTO_TEST_SUITE_END()

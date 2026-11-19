@@ -44,10 +44,12 @@
  *   proposal by TakeForSlot; still in the pool until a slot commits);
  * - terminal: INCLUDED (a certified slot executed it), NONCE_USED (another
  *   action used its nonce), NONCE_TOO_LOW (the account's window moved past
- *   its nonce) and EXPIRED (height > ref_slot + max_delay, so no later slot
+ *   its nonce), EXPIRED (height > ref_slot + max_delay, so no later slot
  *   can include it; the same rule VerifyExpired and the read service use,
- *   O-63). Every live entry ends in exactly one terminal status or stays
- *   live; nothing is dropped silently (DUR-6).
+ *   O-63) and EXCLUDED (M4-ADM-03: the slot being built has a candidate
+ *   without it and none with it, so the proposer left it out; see Exclude).
+ *   Every live entry ends in exactly one terminal status or stays live;
+ *   nothing is dropped silently (DUR-6).
  *
  * Invariants kept by every method (checked by the tests):
  * - at most one live entry per ActionId and per (account, nonce), so the
@@ -103,6 +105,7 @@ inline constexpr std::string_view POOL_ORIGINAL_MALFORMED{"committed original do
 inline constexpr std::string_view POOL_OUTCOME_MISSING{"committed original without exactly one action outcome"};   //!< (INVALID_INPUT)
 inline constexpr std::string_view POOL_ACCOUNT_MISSING{"a live entry's account is absent at the committed head"};  //!< (INVARIANT)
 inline constexpr std::string_view POOL_APPLIED_MISMATCH{"APPLIED token of another slot, header or state root"};     //!< (VERIFY_FAILED)
+inline constexpr std::string_view POOL_EXCLUDE_NOT_TAKEN{"excluded action is not in the proposal of that slot"};   //!< (INVALID_INPUT)
 
 struct PoolLimits {
     size_t capacity{0};          //!< live (PENDING or IN_PROPOSAL) entries; Insert answers POOL_FULL beyond
@@ -121,9 +124,10 @@ enum class PoolStatus : uint8_t {
     NONCE_USED = 4,    //!< terminal: another action used its nonce
     NONCE_TOO_LOW = 5, //!< terminal: the account's window moved past its nonce
     EXPIRED = 6,       //!< terminal: height > ref_slot + max_delay
+    EXCLUDED = 7,      //!< terminal: with it the slot being built had no candidate (M4-ADM-03)
 };
 bool IsKnown(PoolStatus status);
-//! True for INCLUDED, NONCE_USED, NONCE_TOO_LOW and EXPIRED.
+//! True for INCLUDED, NONCE_USED, NONCE_TOO_LOW, EXPIRED and EXCLUDED.
 bool IsTerminal(PoolStatus status);
 //! Registry name; "UNKNOWN" for an unregistered value.
 std::string_view ToString(PoolStatus status);
@@ -242,6 +246,20 @@ public:
      */
     Result<TakenSlot> TakeForSlot(uint64_t next_height, size_t max, const WithholdFilter& withhold = {})
         EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+
+    /** M4-ADM-03: the proposer found that the slot at `next_height` has no
+     * candidate with the IN_PROPOSAL entry `id` and one without it (an
+     * engine error that one action causes, O-34), so the entry leaves the
+     * pool as terminal EXCLUDED, recorded at the pool's head height and kept
+     * like the other non-included terminal records (retention and
+     * terminal_capacity at the next OnCommitted). ORDER_VIOLATION
+     * POOL_TAKE_HEIGHT unless next_height is the pool's head height + 1;
+     * INVALID_INPUT POOL_EXCLUDE_NOT_TAKEN unless `id` is live and
+     * IN_PROPOSAL(next_height). Like those records it does not block an
+     * exact resend, which is admitted again and left out again by the slot
+     * it breaks; its nonce stays unused.
+     */
+    Result<void> Exclude(uint64_t next_height, const ActionId& id) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
 
     /** The state owner committed `head` (after B-APPLIED and read
      * publication), whose slot emitted `outcomes` (in emission order) from
