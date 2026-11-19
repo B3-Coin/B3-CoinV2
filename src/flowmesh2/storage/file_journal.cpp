@@ -115,8 +115,11 @@ void CloseFd(int fd)
 //! Whether `path` is a regular file. A stat error other than "it does not exist" stays in `ec`.
 bool RegularFileExists(const fs::path& path, std::error_code& ec)
 {
-    const std::filesystem::file_status status{std::filesystem::status(path, ec)};
+    // symlink_status: a symlink is never followed, here or by the opens (O_NOFOLLOW). It is an error (ELOOP, the errno
+    // O_NOFOLLOW gives), whatever it points to, so no check depends on the target (Codex review round 10).
+    const std::filesystem::file_status status{std::filesystem::symlink_status(path, ec)};
     if (ec == std::errc::no_such_file_or_directory || ec == std::errc::not_a_directory) ec.clear();
+    if (!ec && std::filesystem::is_symlink(status)) ec = std::make_error_code(std::errc::too_many_symbolic_link_levels);
     return !ec && std::filesystem::is_regular_file(status);
 }
 
@@ -376,7 +379,9 @@ Result<std::unique_ptr<FileJournal>> FileJournal::OpenLocked(const fs::path& dir
         if (!fs::remove(leftover, ec) || ec) return Error{ErrorCode::STORAGE_FATAL, JOURNAL_SEGMENT_CREATE};
     }
     const fs::path first{dir / fs::u8path(FIRST_SEGMENT_NAME)};
-    if (!fs::is_regular_file(first, ec) || ec) return Error{ErrorCode::INVALID_INPUT, JOURNAL_SEGMENT_MISSING};
+    const bool first_present{RegularFileExists(first, ec)};
+    if (ec) return Error{ErrorCode::STORAGE_FATAL, JOURNAL_SEGMENT_READ}; // a symlink, or a stat error
+    if (!first_present) return Error{ErrorCode::INVALID_INPUT, JOURNAL_SEGMENT_MISSING};
     const uint64_t segment_bytes{fs::file_size(first, ec)};
     if (ec || segment_bytes < SEGMENT_PAGE_BYTES || segment_bytes > MAX_SEGMENT_BYTES || segment_bytes % SEGMENT_PAGE_BYTES != 0) {
         return Error{ErrorCode::STORAGE_FATAL, JOURNAL_SEGMENT_SIZE};

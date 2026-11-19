@@ -738,4 +738,43 @@ BOOST_AUTO_TEST_CASE(a_segment_or_lock_file_that_is_a_symlink_is_refused)
     BOOST_CHECK(!fs::exists(planted));
 }
 
+BOOST_AUTO_TEST_CASE(a_segment_symlink_is_refused_whatever_it_points_to)
+{
+    // Codex review round 10 (2026-11-19) of 865ac29d: the opens of OpenExisting do not follow a symlink, but the size
+    // and existence checks before them did, so the answer depended on the target: a dangling first segment was
+    // INVALID_INPUT JOURNAL_SEGMENT_MISSING, a wrong-sized target STORAGE_FATAL JOURNAL_SEGMENT_SIZE, a dangling later
+    // segment a gap (JOURNAL_SEGMENT_MISSING). Every segment symlink is now STORAGE_FATAL JOURNAL_SEGMENT_READ.
+    const TestDir root{"symlink_targets"};
+    const fs::path dir{root.Sub("journal")};
+    {
+        auto journal{MustCreate(dir, JournalRole::COMMIT, 5, SEGMENT_PAGE_BYTES)};
+        BOOST_CHECK_EQUAL(journal->Append(RecordType::DECISION, Bytes("d")).value(), 1U);
+        BOOST_CHECK_EQUAL(journal->Barrier().value(), 1U);
+    }
+    const fs::path small{root.Sub("elsewhere") / fs::u8path("small")};
+    {
+        std::ofstream out{static_cast<const std::filesystem::path&>(small), std::ios::binary};
+        out << "not a segment";
+    }
+    const fs::path missing{root.path / fs::u8path("missing")};
+    const auto refused = [&](const fs::path& link, const fs::path& target, const std::string& what) {
+        fs::create_symlink(target, link);
+        RequireRefusal(FileJournal::OpenExisting(dir, JournalRole::COMMIT, 5), ErrorCode::STORAGE_FATAL, JOURNAL_SEGMENT_READ, what);
+        BOOST_REQUIRE(fs::remove(link));
+    };
+    const fs::path first{dir / fs::u8path(FIRST_SEGMENT_NAME)};
+    const fs::path moved{root.Sub("kept") / fs::u8path(FIRST_SEGMENT_NAME)};
+    fs::rename(first, moved);
+    refused(first, missing, "a dangling first segment");
+    refused(first, small, "a first segment pointing at a wrong-sized file");
+    fs::rename(moved, first);
+    const fs::path later{dir / fs::u8path(SegmentFileName(1))};
+    if (std::filesystem::exists(std::filesystem::symlink_status(later))) BOOST_REQUIRE(fs::remove(later)); // the spare, if any
+    refused(later, missing, "a dangling later segment");
+    refused(later, small, "a later segment pointing at a wrong-sized file");
+    Result<std::unique_ptr<FileJournal>> reopened{FileJournal::OpenExisting(dir, JournalRole::COMMIT, 5)};
+    RequireStorageOk(reopened, "reopen without the symlinks");
+    BOOST_CHECK_EQUAL((*reopened)->Status().durable_seq, 1U);
+}
+
 BOOST_AUTO_TEST_SUITE_END()
