@@ -227,27 +227,33 @@ void ActionPool::AddOther(const ActionId& id, Terminal record)
     ++m_other_count;
 }
 
+std::map<ActionId, ActionPool::Terminal>::iterator ActionPool::Ordered(const OtherEntry& entry)
+{
+    const auto it{m_terminal.find(entry.id)};
+    if (it == m_terminal.end() || it->second.status == PoolStatus::INCLUDED || it->second.serial != entry.serial) return m_terminal.end();
+    return it;
+}
+
 void ActionPool::EvictOther(uint64_t height, CommitReport* report)
 {
-    // The record an entry orders, or end() for a stale entry.
-    const auto current = [&](const OtherEntry& entry) {
-        const auto it{m_terminal.find(entry.id)};
-        if (it == m_terminal.end() || it->second.status == PoolStatus::INCLUDED || it->second.serial != entry.serial) return m_terminal.end();
-        return it;
-    };
     // Retention: keep a record of slot s while height - s < retention_slots.
     while (!m_other_order.empty() &&
            (height - m_other_order.front().height >= m_limits.retention_slots || m_other_count > m_limits.terminal_capacity)) {
         const OtherEntry front{m_other_order.front()};
         m_other_order.pop_front();
-        if (const auto it{current(front)}; it != m_terminal.end()) {
+        if (const auto it{Ordered(front)}; it != m_terminal.end()) {
             m_terminal.erase(it);
             --m_other_count;
             if (report != nullptr) ++report->evicted;
         }
     }
     if (m_other_order.size() > 2 * m_other_count + POOL_STALE_ORDER_SLACK) {
-        std::erase_if(m_other_order, [&](const OtherEntry& entry) { return current(entry) == m_terminal.end(); });
+        // A loop, not erase_if with a lambda: the thread-safety analysis does not see the lock inside a lambda.
+        std::deque<OtherEntry> kept;
+        for (const OtherEntry& entry : m_other_order) {
+            if (Ordered(entry) != m_terminal.end()) kept.push_back(entry);
+        }
+        m_other_order = std::move(kept);
     }
 }
 

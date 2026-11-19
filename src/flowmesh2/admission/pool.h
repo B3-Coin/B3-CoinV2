@@ -331,6 +331,8 @@ private:
     };
 
     void EraseLive(std::map<ActionId, Entry>::iterator it) EXCLUSIVE_LOCKS_REQUIRED(m_mutex);
+    //! The record `entry` orders, or m_terminal's end() for a stale entry.
+    std::map<ActionId, Terminal>::iterator Ordered(const OtherEntry& entry) EXCLUSIVE_LOCKS_REQUIRED(m_mutex);
     //! Records a terminal status other than INCLUDED for `id` (no record of it may exist) and queues its entry.
     void AddOther(const ActionId& id, Terminal record) EXCLUSIVE_LOCKS_REQUIRED(m_mutex);
     /** Evicts, oldest first, the records other than INCLUDED that are past
