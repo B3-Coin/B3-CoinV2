@@ -117,8 +117,8 @@ InsertReply ActionPool::Insert(const VerifiedAction& action, uint64_t snapshot_h
     if (m_live.size() >= m_limits.capacity) return InsertReply{InsertResult::POOL_FULL, std::nullopt, std::nullopt};
 
     if (terminal != m_terminal.end()) {
-        // A NONCE_USED, NONCE_TOO_LOW or EXPIRED record of a re-admitted action; its
-        // order entries become stale and are skipped at eviction.
+        // A NONCE_USED, NONCE_TOO_LOW, EXPIRED or EXCLUDED record of a re-admitted action;
+        // its order entry becomes stale (EvictOther skips and compacts it).
         m_terminal.erase(terminal);
         --m_other_count;
     }
@@ -213,10 +213,42 @@ Result<void> ActionPool::Exclude(uint64_t next_height, const ActionId& id)
     record.height = m_head_height;
     EraseLive(live);
     // Live entries and terminal records are disjoint (Insert removes the record of a re-admitted action).
-    m_terminal.emplace(id, std::move(record));
-    m_other_order.emplace_back(m_head_height, id);
-    ++m_other_count;
+    AddOther(id, std::move(record));
+    // Capacity at once: a slot retried without a commit may exclude again and again (Codex review round 10).
+    EvictOther(m_head_height, nullptr);
     return Ok();
+}
+
+void ActionPool::AddOther(const ActionId& id, Terminal record)
+{
+    record.serial = m_next_serial++;
+    m_other_order.push_back(OtherEntry{record.height, id, record.serial});
+    m_terminal.emplace(id, std::move(record));
+    ++m_other_count;
+}
+
+void ActionPool::EvictOther(uint64_t height, CommitReport* report)
+{
+    // The record an entry orders, or end() for a stale entry.
+    const auto current = [&](const OtherEntry& entry) {
+        const auto it{m_terminal.find(entry.id)};
+        if (it == m_terminal.end() || it->second.status == PoolStatus::INCLUDED || it->second.serial != entry.serial) return m_terminal.end();
+        return it;
+    };
+    // Retention: keep a record of slot s while height - s < retention_slots.
+    while (!m_other_order.empty() &&
+           (height - m_other_order.front().height >= m_limits.retention_slots || m_other_count > m_limits.terminal_capacity)) {
+        const OtherEntry front{m_other_order.front()};
+        m_other_order.pop_front();
+        if (const auto it{current(front)}; it != m_terminal.end()) {
+            m_terminal.erase(it);
+            --m_other_count;
+            if (report != nullptr) ++report->evicted;
+        }
+    }
+    if (m_other_order.size() > 2 * m_other_count + POOL_STALE_ORDER_SLACK) {
+        std::erase_if(m_other_order, [&](const OtherEntry& entry) { return current(entry) == m_terminal.end(); });
+    }
 }
 
 Result<CommitReport> ActionPool::OnCommitted(const DurableApplied& applied, const state::HeadView& head,
@@ -332,9 +364,7 @@ Result<CommitReport> ActionPool::OnCommitted(const DurableApplied& applied, cons
         EraseLive(live);
         // Live entries and terminal records are disjoint (Insert removes the
         // record of a re-admitted action), so there is no record to replace.
-        m_terminal.emplace(id, std::move(record));
-        m_other_order.emplace_back(height, id);
-        ++m_other_count;
+        AddOther(id, std::move(record));
         if (verdict == PoolStatus::NONCE_USED) ++report.nonce_used;
         if (verdict == PoolStatus::NONCE_TOO_LOW) ++report.nonce_too_low;
         if (verdict == PoolStatus::EXPIRED) ++report.expired;
@@ -352,16 +382,7 @@ Result<CommitReport> ActionPool::OnCommitted(const DurableApplied& applied, cons
             ++report.evicted;
         }
     }
-    while (!m_other_order.empty() && (!retained(m_other_order.front().first) || m_other_count > m_limits.terminal_capacity)) {
-        const auto [record_height, id] = m_other_order.front();
-        m_other_order.pop_front();
-        const auto it{m_terminal.find(id)};
-        if (it != m_terminal.end() && it->second.status != PoolStatus::INCLUDED && it->second.height == record_height) {
-            m_terminal.erase(it);
-            --m_other_count;
-            ++report.evicted;
-        }
-    }
+    EvictOther(height, &report);
     return Ok(report);
 }
 
@@ -399,6 +420,12 @@ size_t ActionPool::TerminalRecords() const
 {
     LOCK(m_mutex);
     return m_other_count;
+}
+
+size_t ActionPool::TerminalOrderEntries() const
+{
+    LOCK(m_mutex);
+    return m_other_order.size();
 }
 
 } // namespace flowmesh2::admission

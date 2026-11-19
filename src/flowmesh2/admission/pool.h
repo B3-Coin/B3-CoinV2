@@ -105,6 +105,8 @@ inline constexpr std::string_view POOL_ORIGINAL_MALFORMED{"committed original do
 inline constexpr std::string_view POOL_OUTCOME_MISSING{"committed original without exactly one action outcome"};   //!< (INVALID_INPUT)
 inline constexpr std::string_view POOL_ACCOUNT_MISSING{"a live entry's account is absent at the committed head"};  //!< (INVARIANT)
 inline constexpr std::string_view POOL_APPLIED_MISMATCH{"APPLIED token of another slot, header or state root"};     //!< (VERIFY_FAILED)
+//! Stale entries the terminal order queue may hold beyond its records before it is compacted.
+inline constexpr size_t POOL_STALE_ORDER_SLACK{64};
 inline constexpr std::string_view POOL_EXCLUDE_NOT_TAKEN{"excluded action is not in the proposal of that slot"};   //!< (INVALID_INPUT)
 
 struct PoolLimits {
@@ -251,8 +253,10 @@ public:
      * candidate with the IN_PROPOSAL entry `id` and one without it (an
      * engine error that one action causes, O-34), so the entry leaves the
      * pool as terminal EXCLUDED, recorded at the pool's head height and kept
-     * like the other non-included terminal records (retention and
-     * terminal_capacity at the next OnCommitted). ORDER_VIOLATION
+     * like the other non-included terminal records: terminal_capacity is
+     * enforced at once (the oldest records go first), retention at the next
+     * OnCommitted, so a slot retried without a commit holds no more records
+     * than a committed one. ORDER_VIOLATION
      * POOL_TAKE_HEIGHT unless next_height is the pool's head height + 1;
      * INVALID_INPUT POOL_EXCLUDE_NOT_TAKEN unless `id` is live and
      * IN_PROPOSAL(next_height). Like those records it does not block an
@@ -298,6 +302,8 @@ public:
     //! Retained INCLUDED records and other terminal records (diagnostics for tests).
     size_t IncludedRecords() const EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
     size_t TerminalRecords() const EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+    //! Entries of the queue that orders the non-INCLUDED terminal records, stale ones included (diagnostics for tests).
+    size_t TerminalOrderEntries() const EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
 
 private:
     ActionPool(const PoolLimits& limits, const ProfileParams& profile, uint64_t head_height);
@@ -315,9 +321,24 @@ private:
         std::optional<read::IncludedRef> included;
         std::array<unsigned char, ACTION_SIG_BYTES> sig{}; //!< INCLUDED: the included original's signature
         uint64_t height{0};
+        uint64_t serial{0}; //!< not INCLUDED: the serial of its entry in m_other_order
+    };
+    //! An entry of m_other_order; stale once its record is gone or replaced (a re-admitted action's old entry).
+    struct OtherEntry {
+        uint64_t height{0};
+        ActionId id;
+        uint64_t serial{0};
     };
 
     void EraseLive(std::map<ActionId, Entry>::iterator it) EXCLUSIVE_LOCKS_REQUIRED(m_mutex);
+    //! Records a terminal status other than INCLUDED for `id` (no record of it may exist) and queues its entry.
+    void AddOther(const ActionId& id, Terminal record) EXCLUSIVE_LOCKS_REQUIRED(m_mutex);
+    /** Evicts, oldest first, the records other than INCLUDED that are past
+     * retention at `height` or above terminal_capacity (counted in `report`
+     * when given), then drops the stale entries once they outnumber the
+     * records by more than POOL_STALE_ORDER_SLACK.
+     */
+    void EvictOther(uint64_t height, CommitReport* report) EXCLUSIVE_LOCKS_REQUIRED(m_mutex);
 
     const PoolLimits m_limits;
     const ProfileParams m_profile;
@@ -331,8 +352,9 @@ private:
     std::map<std::pair<AccountId, uint64_t>, ActionId> m_by_nonce GUARDED_BY(m_mutex);      //!< live
     std::map<ActionId, Terminal> m_terminal GUARDED_BY(m_mutex);
     std::deque<std::pair<uint64_t, ActionId>> m_included_order GUARDED_BY(m_mutex);  //!< (height, id), oldest first
-    std::deque<std::pair<uint64_t, ActionId>> m_other_order GUARDED_BY(m_mutex);     //!< (height, id), oldest first
+    std::deque<OtherEntry> m_other_order GUARDED_BY(m_mutex);                       //!< oldest first, stale entries included
     size_t m_other_count GUARDED_BY(m_mutex){0};
+    uint64_t m_next_serial GUARDED_BY(m_mutex){1};
 };
 
 } // namespace flowmesh2::admission

@@ -477,6 +477,48 @@ BOOST_AUTO_TEST_CASE(exclude_ends_one_taken_entry)
     BOOST_CHECK_EQUAL(r.pool->TerminalRecords(), 0U);
 }
 
+BOOST_AUTO_TEST_CASE(exclusion_records_are_bounded_between_commits)
+{
+    // Codex review round 10 (2026-11-19): Exclude added terminal records and order entries, but only OnCommitted
+    // enforced terminal_capacity, so a slot retried without a commit held any number of EXCLUDED records. A
+    // re-admitted action left its old order entry behind, so take/exclude/resend cycles grew the order queue without
+    // bound, and that stale entry matched the action's newer record, which capacity eviction then removed too early.
+    PoolRigOptions options;
+    admission::PoolLimits limits{admission::PoolLimits::FromProfile(options.rig.profile)};
+    limits.terminal_capacity = 2;
+    options.limits = limits;
+    PoolRig r{options};
+    r.Fund();
+    const auto x{SmallPlace(r.Actions(), "alice", 1)};
+    const auto y{SmallPlace(r.Actions(), "bob", 1)};
+    const auto z{SmallPlace(r.Actions(), "alice", 2)};
+    const auto take_and_exclude = [&](const std::vector<unsigned char>& bytes) {
+        BOOST_REQUIRE(r.Insert(bytes).result == InsertResult::INSERTED);
+        RequireOk(r.pool->TakeForSlot(2, 10), "TakeForSlot");
+        RequireOk(r.pool->Exclude(2, IdOfBytes(bytes)), "Exclude");
+    };
+    // x excluded, resent (its record goes, its order entry stays), then y and x excluded again: x's record is now newer
+    // than y's. A third record (z) is one above the capacity, so the oldest record, y's, is evicted at once.
+    take_and_exclude(x);
+    take_and_exclude(x);
+    BOOST_CHECK_EQUAL(r.pool->TerminalRecords(), 1U);
+    BOOST_REQUIRE(r.Insert(x).result == InsertResult::INSERTED);
+    BOOST_REQUIRE(r.Insert(y).result == InsertResult::INSERTED);
+    RequireOk(r.pool->TakeForSlot(2, 10), "TakeForSlot x y");
+    RequireOk(r.pool->Exclude(2, IdOfBytes(y)), "Exclude y");
+    RequireOk(r.pool->Exclude(2, IdOfBytes(x)), "Exclude x");
+    take_and_exclude(z);
+    BOOST_CHECK_EQUAL(r.pool->TerminalRecords(), 2U);
+    BOOST_CHECK(!r.pool->Status(IdOfBytes(y)).has_value());
+    BOOST_CHECK(RequireStatus(*r.pool, IdOfBytes(x)).status == PoolStatus::EXCLUDED);
+    BOOST_CHECK(RequireStatus(*r.pool, IdOfBytes(z)).status == PoolStatus::EXCLUDED);
+    // Any number of exclude/resend cycles at one head keeps the order queue within a bound of the records it orders.
+    for (int i{0}; i < 500; ++i) take_and_exclude(z);
+    BOOST_CHECK_EQUAL(r.pool->TerminalRecords(), 2U);
+    BOOST_CHECK_LE(r.pool->TerminalOrderEntries(), 2 * r.pool->TerminalRecords() + admission::POOL_STALE_ORDER_SLACK);
+    BOOST_CHECK(RequireStatus(*r.pool, IdOfBytes(x)).status == PoolStatus::EXCLUDED);
+}
+
 BOOST_AUTO_TEST_CASE(on_committed_refusals_change_nothing)
 {
     PoolRig r;
