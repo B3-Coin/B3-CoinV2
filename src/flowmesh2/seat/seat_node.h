@@ -76,17 +76,24 @@
  *     fact bytes, taken originals}). When it gives no candidate with an
  *     error that does not fence (other than STALE_PARENT) and the same slot
  *     without actions has one, the actions cause it (M4-ADM-03, O-34). The
- *     node finds the first taken action, in admission order, whose addition
- *     to the actions before it gives no candidate (exponential search, then
- *     bisection, over those prefixes). That action is terminal EXCLUDED
- *     (ActionPool::Exclude; the hooks see pool.exclude) only if it gives no
- *     candidate alone with the slot's facts; otherwise the failure needs
- *     the actions before it, and it is only left out of this slot
- *     (pool.defer: it stays in the pool and is taken again). The slot is
- *     then previewed again without it. When MAX_SLOT_PREVIEWS previews are
- *     spent, the slot is the longest prefix known to have a candidate (at
- *     least the facts alone) and the rest are left out the same way, so an
- *     action never stops sealing, and an action waits only for the actions
+ *     node finds a boundary action: in admission order, the actions before
+ *     it give a candidate and adding it gives none (exponential search,
+ *     then bisection, over those prefixes; without monotonicity this is a
+ *     boundary, not necessarily the first). The slot is then previewed
+ *     again without it. If it gives a candidate alone with the slot's
+ *     facts, the failure needs the actions before it, and it is only left
+ *     out of this slot (pool.defer: it stays in the pool and is taken
+ *     again). If it gives none alone it is a suspect. Once the slot's
+ *     actions are settled, each suspect, in admission order, is previewed
+ *     with them: with a candidate it joins the slot, without one it is
+ *     terminal EXCLUDED (ActionPool::Exclude; the hooks see pool.exclude),
+ *     matching EXCLUDED's definition (the slot being built has a candidate
+ *     without it and none with it). It may still succeed after a later
+ *     commit; an exact resend is admitted again. When MAX_SLOT_PREVIEWS
+ *     previews are spent (one per suspect is held back for this check), the
+ *     slot is the longest prefix known to have a candidate (at least the
+ *     facts alone) and the rest are left out the same way. So an action
+ *     never stops sealing, and an action waits only for the actions
  *     admitted before it (resends and new actions queue behind it). A slot
  *     its facts break leaves nothing out and returns the error;
  *  4. NodeHooks::AfterPreview (the simulator's authority bump and its
@@ -364,10 +371,11 @@ private:
     /** Step 3's leaving out (M4-ADM-03): `inputs` with `taken`'s originals
      * gave `failed`. Returns `failed` unless the slot without actions has a
      * candidate. Otherwise removes breaking actions from `taken` and
-     * `inputs` (excluded or deferred, see the file comment) and returns the
-     * candidate of what is left, unless a Preview fails with an error that
-     * fences the node or STALE_PARENT, which is returned with `inputs` back
-     * at `taken`'s originals.
+     * `inputs` (excluded or deferred, see the file comment; a suspect that
+     * the settled slot takes is appended) and returns the candidate of what
+     * is left, unless a Preview fails with an error that fences the node or
+     * STALE_PARENT, which is returned with `inputs` back at `taken`'s
+     * originals.
      */
     Result<state::Candidate> LeaveOutBreakingActions(const state::HeadView& head, uint64_t height, state::SlotInputs& inputs,
                                                      admission::TakenSlot& taken, const Error& failed);

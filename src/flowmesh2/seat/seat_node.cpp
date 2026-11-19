@@ -277,7 +277,12 @@ Result<state::Candidate> SeatNode::LeaveOutBreakingActions(const state::HeadView
 {
     const state::ParentRef parent{state::ParentRef::Committed(head)};
     size_t previews{0};
-    // The slot with `originals` (admission order; the engine's result does not depend on body order).
+    // Actions that broke the slot alone, in admission order: checked against the settled slot at the end.
+    std::vector<std::pair<ActionId, std::vector<unsigned char>>> suspects;
+    // One preview per suspect is held back for that check, and room for the suspect the next probe may find, so step 3
+    // spends at most MAX_SLOT_PREVIEWS.
+    const auto budget_left = [&] { return previews + suspects.size() + 1 < MAX_SLOT_PREVIEWS; };
+    // The slot with `originals` (the engine's result does not depend on body order).
     const auto preview = [&](std::vector<std::vector<unsigned char>> originals) {
         ++previews;
         inputs.body.originals = std::move(originals);
@@ -302,10 +307,10 @@ Result<state::Candidate> SeatNode::LeaveOutBreakingActions(const state::HeadView
     // Invariant: the first `lo` taken actions give the candidate `valid`, and all of them (more than lo) give `last`.
     size_t lo{0};
     Error last{failed};
-    while (previews < MAX_SLOT_PREVIEWS) {
+    while (budget_left()) {
         // The boundary: the first lo give a candidate, the first hi none. Exponential search from lo, then bisection.
         size_t hi{taken.originals.size()};
-        for (size_t step{1}; lo + step < hi && previews < MAX_SLOT_PREVIEWS; step *= 2) {
+        for (size_t step{1}; lo + step < hi && budget_left(); step *= 2) {
             Result<state::Candidate> probe{first(lo + step)};
             if (!probe.has_value()) {
                 if (ends(probe.error())) return stop(probe.error());
@@ -315,7 +320,7 @@ Result<state::Candidate> SeatNode::LeaveOutBreakingActions(const state::HeadView
             lo += step;
             valid = std::move(probe);
         }
-        while (hi - lo > 1 && previews < MAX_SLOT_PREVIEWS) {
+        while (hi - lo > 1 && budget_left()) {
             const size_t mid{lo + (hi - lo) / 2};
             Result<state::Candidate> probe{first(mid)};
             if (probe.has_value()) {
@@ -329,26 +334,28 @@ Result<state::Candidate> SeatNode::LeaveOutBreakingActions(const state::HeadView
         }
         if (hi - lo > 1) break; // the budget ran out before the boundary was found
         // Action lo breaks the slot after the first lo. Alone (for lo = 0 that is the probe just made) it either gives no
-        // candidate, so it is the cause and terminal; or it needs the actions before it, so it only waits for a later slot.
+        // candidate, a suspect, or it needs the actions before it, so it only waits for a later slot.
         bool alone_breaks{lo == 0};
         if (lo > 0) {
-            if (previews >= MAX_SLOT_PREVIEWS) break;
+            if (!budget_left()) break;
             Result<state::Candidate> alone{preview({taken.originals[lo]})};
             if (!alone.has_value() && ends(alone.error())) return stop(alone.error());
             alone_breaks = !alone.has_value();
         }
-        const ActionId id{taken.ids[lo]};
         if (alone_breaks) {
-            if (const Result<void> out{m_pool->Exclude(height, id)}; !out.has_value()) return stop(out.error());
-            trace("pool.exclude", id, last);
+            suspects.emplace_back(taken.ids[lo], taken.originals[lo]);
         } else {
-            trace("pool.defer", id, last);
+            trace("pool.defer", taken.ids[lo], last);
         }
         taken.ids.erase(taken.ids.begin() + static_cast<std::ptrdiff_t>(lo));
         taken.originals.erase(taken.originals.begin() + static_cast<std::ptrdiff_t>(lo));
-        if (taken.originals.size() == lo || previews >= MAX_SLOT_PREVIEWS) break;
+        if (taken.originals.size() == lo || !budget_left()) break;
         Result<state::Candidate> again{first(taken.originals.size())};
-        if (again.has_value()) return again;
+        if (again.has_value()) {
+            lo = taken.originals.size();
+            valid = std::move(again);
+            break;
+        }
         if (ends(again.error())) return stop(again.error());
         last = again.error();
     }
@@ -357,6 +364,26 @@ Result<state::Candidate> SeatNode::LeaveOutBreakingActions(const state::HeadView
     for (size_t i{lo}; i < taken.ids.size(); ++i) trace("pool.defer", taken.ids[i], last);
     taken.ids.resize(lo);
     taken.originals.resize(lo);
+    // Each suspect against the settled slot: it joins the slot if that has a candidate with it, else it is excluded.
+    // With no actions settled that preview is the one that found it, so it is not made again.
+    for (auto& [id, original] : suspects) {
+        Error refusal{last};
+        if (!taken.originals.empty()) {
+            std::vector<std::vector<unsigned char>> with{taken.originals};
+            with.push_back(original);
+            Result<state::Candidate> joined{preview(std::move(with))};
+            if (joined.has_value()) {
+                taken.ids.push_back(id);
+                taken.originals.push_back(std::move(original));
+                valid = std::move(joined);
+                continue;
+            }
+            if (ends(joined.error())) return stop(joined.error());
+            refusal = joined.error();
+        }
+        if (const Result<void> out{m_pool->Exclude(height, id)}; !out.has_value()) return stop(out.error());
+        trace("pool.exclude", id, refusal);
+    }
     inputs.body.originals = taken.originals;
     return valid;
 }
