@@ -364,25 +364,49 @@ Result<state::Candidate> SeatNode::LeaveOutBreakingActions(const state::HeadView
     for (size_t i{lo}; i < taken.ids.size(); ++i) trace("pool.defer", taken.ids[i], last);
     taken.ids.resize(lo);
     taken.originals.resize(lo);
-    // Each suspect against the settled slot: it joins the slot if that has a candidate with it, else it is excluded.
-    // With no actions settled that preview is the one that found it, so it is not made again.
+    // Each suspect against the slot, to a fixed point: one with a candidate joins the slot, and because that changes the
+    // slot, every other suspect's earlier failure no longer counts and it is checked again (Codex review round 12). A
+    // suspect is excluded only by a failure against the final slot; one the budget leaves unchecked against it is
+    // deferred. With no actions settled, a suspect's check is the alone preview that found it, so it is not made again.
+    struct Suspect {
+        ActionId id;
+        std::vector<unsigned char> original;
+        std::optional<Error> refusal; //!< the failure against the current slot, if checked against it
+        bool joined{false};
+    };
+    std::vector<Suspect> pending;
+    pending.reserve(suspects.size());
     for (auto& [id, original] : suspects) {
-        Error refusal{last};
-        if (!taken.originals.empty()) {
+        pending.push_back(Suspect{id, std::move(original), taken.originals.empty() ? std::optional<Error>{last} : std::nullopt, false});
+    }
+    for (bool changed{true}; changed;) {
+        changed = false;
+        for (Suspect& suspect : pending) {
+            if (suspect.joined || suspect.refusal.has_value() || previews >= MAX_SLOT_PREVIEWS) continue;
             std::vector<std::vector<unsigned char>> with{taken.originals};
-            with.push_back(original);
+            with.push_back(suspect.original);
             Result<state::Candidate> joined{preview(std::move(with))};
-            if (joined.has_value()) {
-                taken.ids.push_back(id);
-                taken.originals.push_back(std::move(original));
-                valid = std::move(joined);
+            if (!joined.has_value()) {
+                if (ends(joined.error())) return stop(joined.error());
+                suspect.refusal = joined.error();
                 continue;
             }
-            if (ends(joined.error())) return stop(joined.error());
-            refusal = joined.error();
+            taken.ids.push_back(suspect.id);
+            taken.originals.push_back(suspect.original);
+            valid = std::move(joined);
+            suspect.joined = true;
+            changed = true;
+            for (Suspect& other : pending) other.refusal.reset();
         }
-        if (const Result<void> out{m_pool->Exclude(height, id)}; !out.has_value()) return stop(out.error());
-        trace("pool.exclude", id, refusal);
+    }
+    for (const Suspect& suspect : pending) {
+        if (suspect.joined) continue;
+        if (!suspect.refusal.has_value()) {
+            trace("pool.defer", suspect.id, last);
+            continue;
+        }
+        if (const Result<void> out{m_pool->Exclude(height, suspect.id)}; !out.has_value()) return stop(out.error());
+        trace("pool.exclude", suspect.id, *suspect.refusal);
     }
     inputs.body.originals = taken.originals;
     return valid;

@@ -604,6 +604,83 @@ BOOST_AUTO_TEST_CASE(an_action_that_breaks_its_slot_alone_but_not_with_the_seale
     BOOST_CHECK(!bob_state->balances.contains(freed));
 }
 
+BOOST_AUTO_TEST_CASE(a_suspect_excluded_before_another_joined_is_checked_again)
+{
+    // Codex review round 12 of M4-ADM-03 (2026-11-19): suspects were checked once each, in admission order, so one
+    // that a later suspect's joining would have made valid was already excluded. Bob and frank hold MAX_LEAF_ASSETS
+    // assets each. Alice sends bob rUSD (a); bob sends frank his whole balance of one asset (b); frank sends gina his
+    // whole balance of one of his (c); dave sends erin, also full, rUSD (d). In the canonical order c runs before b,
+    // and b before a: c frees an entry for b, and b one for a. Checked against the settled slot {c}, a failed and was
+    // excluded before b joined, although the slot {c, b} takes it. Now the checks repeat until a pass adds nothing,
+    // so the slot is {c, b, a} and only d is excluded.
+    Adm03Rig r;
+    SimClient alice{r.Client("alice")};
+    SimClient bob{r.Client("bob")};
+    SimClient frank{r.Client("frank")};
+    SimClient dave{r.Client("dave")};
+    BOOST_REQUIRE(bob.Account() == r.bob);
+    const AccountId erin{SimClient::AccountOf("erin").value()};
+    const AccountId gina{SimClient::AccountOf("gina").value()};
+    r.Deposit(alice.Account(), r.rusd, 1'000'000);
+    r.Deposit(dave.Account(), r.rusd, 1'000'000);
+    r.Deposit(gina, SimAsset("fm2/test/adm03b/gina"), 1);
+    const auto frank_asset = [](size_t i) { return SimAsset("fm2/test/adm03b/frank/" + std::to_string(i)); };
+    for (size_t i{0}; i < MAX_LEAF_ASSETS; ++i) {
+        r.Deposit(frank.Account(), frank_asset(i), 1);
+        r.Deposit(erin, SimAsset("fm2/test/adm03b/erin/" + std::to_string(i)), 1);
+    }
+    r.SealDeposits();
+    const std::shared_ptr<const state::HeadView> head{r.node->Owner().Head()};
+    const uint64_t ref{head->Header().height};
+    const uint64_t height{ref + 1};
+    const auto key = [&](const std::vector<unsigned char>& bytes) {
+        Result<ActionV2> action{ActionV2::Decode(bytes, r.node->Profile())};
+        RequireOk(action, "Decode");
+        return engine::OrderKey(head->HeaderHash(), height, action->Id());
+    };
+    const auto signed_bytes = [](Result<std::vector<unsigned char>> bytes) {
+        RequireOk(bytes, "Transfer");
+        return std::move(bytes).value();
+    };
+    // b: bob's whole balance of one asset to frank, who lacks it.
+    const AssetId bobs{SimAsset("fm2/test/adm03b/0")};
+    const std::vector<unsigned char> b{signed_bytes(bob.Transfer("b", 1, frank.Account(), bobs, 1, ref))};
+    // c: frank's whole balance of the first of his assets whose transfer runs before b.
+    std::optional<std::vector<unsigned char>> c;
+    for (size_t i{0}; !c.has_value(); ++i) {
+        BOOST_REQUIRE(i < 64);
+        std::vector<unsigned char> bytes{signed_bytes(frank.Transfer("c" + std::to_string(i), 1, gina, frank_asset(i), 1, ref))};
+        if (key(bytes) < key(b)) c = std::move(bytes);
+    }
+    // a: alice's rUSD to bob, the amount ground until it runs after b.
+    std::optional<std::vector<unsigned char>> a;
+    Atoms paid{0};
+    for (Atoms amount{5}; !a.has_value(); ++amount) {
+        BOOST_REQUIRE(amount < 100);
+        std::vector<unsigned char> bytes{signed_bytes(alice.Transfer("a" + std::to_string(amount), 1, r.bob, r.rusd, amount, ref))};
+        if (key(b) < key(bytes)) {
+            a = std::move(bytes);
+            paid = amount;
+        }
+    }
+    const ActionV2 paying{r.Admit(*a, "a")};
+    const ActionV2 freeing_bob{r.Admit(b, "b")};
+    const ActionV2 freeing_frank{r.Admit(*c, "c")};
+    const ActionV2 breaking{r.Admit(dave.Transfer("d", 1, erin, r.rusd, 1, ref), "d")};
+
+    const Result<SealReport> sealed{r.node->SealSlot()};
+    RequireOk(sealed, "SealSlot 2");
+    BOOST_CHECK_EQUAL(sealed->originals, 3U);
+    BOOST_CHECK(r.StatusOf(paying) == admission::PoolStatus::INCLUDED);
+    BOOST_CHECK(r.StatusOf(freeing_bob) == admission::PoolStatus::INCLUDED);
+    BOOST_CHECK(r.StatusOf(freeing_frank) == admission::PoolStatus::INCLUDED);
+    BOOST_CHECK(r.StatusOf(breaking) == admission::PoolStatus::EXCLUDED);
+    const ledger::AccountState* bob_state{r.node->Owner().Head()->State().engine.ledger.Find(r.bob)};
+    BOOST_REQUIRE(bob_state != nullptr);
+    BOOST_CHECK_EQUAL(bob_state->BalanceOf(r.rusd).available, paid);
+    BOOST_CHECK_EQUAL(bob_state->balances.size(), MAX_LEAF_ASSETS);
+}
+
 BOOST_AUTO_TEST_CASE(a_restart_rebuilds_the_retained_pool_records_and_reads)
 {
     // M4-STO-03's pool rebuild (O-71): a restarted seat built its pool and read service empty at the replayed head, so

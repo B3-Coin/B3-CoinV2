@@ -85,12 +85,16 @@
  *     out of this slot (pool.defer: it stays in the pool and is taken
  *     again). If it gives none alone it is a suspect. Once the slot's
  *     actions are settled, each suspect, in admission order, is previewed
- *     with them: with a candidate it joins the slot, without one it is
- *     terminal EXCLUDED (ActionPool::Exclude; the hooks see pool.exclude),
- *     matching EXCLUDED's definition (the slot being built has a candidate
- *     without it and none with it). It may still succeed after a later
- *     commit; an exact resend is admitted again. When MAX_SLOT_PREVIEWS
- *     previews are spent (one per suspect is held back for this check), the
+ *     with them: with a candidate it joins the slot. A join changes the
+ *     slot, so the checks repeat until a pass adds nothing; a suspect that
+ *     fails against that final slot is terminal EXCLUDED
+ *     (ActionPool::Exclude; the hooks see pool.exclude), matching
+ *     EXCLUDED's definition (the slot being built has a candidate without
+ *     it and none with it), and one the budget left unchecked against it is
+ *     left out (pool.defer). An excluded action may still succeed after a
+ *     later commit; an exact resend is admitted again. When
+ *     MAX_SLOT_PREVIEWS previews are spent (one per suspect is held back for
+ *     the first pass of these checks), the
  *     slot is the longest prefix known to have a candidate (at least the
  *     facts alone) and the rest are left out the same way. So an action
  *     never stops sealing, and an action waits only for the actions
