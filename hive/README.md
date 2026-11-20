@@ -75,21 +75,69 @@ layer that replaces FlowMesh V1. FlowMesh V2 runs on regtest networks only,
 and the page says so everywhere: nothing on it is a mainnet market. It needs
 no running B3 node and no wallet.
 
-**Two views of one page.** The switch at the top right chooses how much the
-page shows, and B3 Hive remembers it. Both views use the same account, the
-same market and the same approval window.
+**Two views of one page.** The switch in the page's header chooses how much
+the page shows, and B3 Hive remembers it. Both views use the same account,
+the same market and the same approval window.
 
 - *Simple* is one card: buy or sell, what you pay, what you receive. The
   page works out an immediate order from the order book and gives it a price
   limit, so a buy can never cost more than the card says and a sale never
   goes below the price shown. Either box can be typed in; the other follows.
-  If prices move before the order arrives, it trades what still fits and
-  drops the rest. The result is one sentence built from the confirmed fills:
-  what was bought or sold, for how much, and what was left out and why.
-- *Pro* adds the order book, a price and a depth chart, the list of trades,
-  and an order form with a price of the user's own: limit orders (good till
-  cancelled, immediate or cancel, post only) and an immediate order against
-  the book, with the open orders and the history beside them.
+  The button names the trade and its money ("Buy 0.004 B3 for 404 rUSD") and
+  says under it that approval comes first. Three lines above it are the
+  receipt: what you pay or receive, the price, the fee. A number is exact
+  when the order's own limit makes it so; when the order reaches past the
+  best price it reads "about", with the bound next to it ("never more than",
+  "at least"). The price line also names what the other direction gets at
+  that moment ("if you were selling: 98 000"), so the gap between buying
+  and selling is in sight before a trade. A budget that does not come out
+  even says where the rest goes, or why it is left when the order reaches
+  several prices. Whatever the card offers in place of the typed amount is
+  worded as a change of the amount ("Change to 0.005 B3"), never as a
+  second button that buys, and says first what it would cost. A warning
+  appears only when the order reaches prices five percent or more from the
+  best one: it names the best price, how much there is at it, the furthest
+  price and the difference in money, says that the sum above has that in
+  already, and offers the amount that gets the best price only, with its
+  cost. Below that, one sentence says what the reach costs. The order
+  arrives in about a second; if prices move before then it trades what
+  still fits, perhaps nothing, and nothing is left waiting. The card says
+  so above the button. The result is one sentence built from the
+  confirmed fills: what was bought or sold, for how much, and what was left
+  out and why. A request that was not approved leaves a note above the
+  button: nothing happened and no money moved.
+- *Pro* is for an order at a price of the user's own. At the default window
+  size the order book, the order form and the open orders are on one screen;
+  the price chart, the depth chart and the list of the market's trades share
+  one card below them, and a wide window puts that card between the book
+  and the form. The book lists price, amount and the amounts summed
+  from the best price, with a dot at a price where an order of the account
+  waits; it shows five to ten prices a side, by the room the window gives.
+  The form takes a limit order or an immediate one against the book.
+  What a limit order does with the part that cannot trade at once is one of
+  three choices in sight: it waits (good till cancelled), it is dropped
+  (immediate or cancel), or the whole order may only wait (post only). A
+  line under them says what the order would do against the book as it
+  stands ("0.024 B3 trades at once, at 101 000 rUSD, for 2 424 rUSD, and
+  the other 0.006 B3 waits"), then what its own price guarantees: the most
+  it can cost or the least all of it brings, and the fee. An order that
+  would be refused as the book stands, a post-only order that could trade,
+  is not offered: the button says so and the line names the price it
+  needs. An immediate order says what is sent in its place (a limit order
+  at the furthest price it needs, the rest dropped), with its average
+  price, the estimate, the bound and the fee. While a request from the
+  form is under way its steps stand where the summary was, above the
+  button; its result stays there until the form is changed. The open
+  orders are a table (placed, side, price, amount, filled) with a cancel
+  button on each row. A cancellation names what still waits of the order,
+  and its result says what it gave back, from the confirmed change of the
+  balances.
+
+The wording of both views and of the approval window is a set of pure
+functions (`web/src/fm2words.ts`) with their own tests: what a form's
+button says and why it is off, what an order would do right now, the
+question the approval window asks, and the sentence for every way a
+request can end.
 
 **Units.** Amounts are in the asset's own unit and prices are for one whole
 unit of the base asset (`101 000 rUSD per B3`), on the page, in the approval
@@ -107,12 +155,15 @@ key, as `fm2-cli --pins` takes it). The two files can also be chosen one by
 one. Both are trust inputs; nothing is taken from a seat. Seats must be on
 this computer (loopback addresses). Each connection is TLS 1.3 and trusts
 exactly its seat's pinned key. B3 Hive remembers the two paths and connects
-by itself the next time the page opens.
+by itself the next time the page opens. FlowMesh V2 has no public network,
+so most people have no such folder: the card says that in the open, and
+that nothing is wrong on their side.
 
 **Getting started.** Until the account holds funds, the page shows the steps
 that are left in place of the trading form: create the account (one click),
 then get test funds. On a test network funds come from whoever runs it, so
-that step shows the account number to hand over; the page notices the
+that step shows the account number to hand over, says that the number is
+safe to share, and names the assets the network has; the page notices the
 deposit by itself and opens the form.
 
 **The account.** B3 Hive creates one key per network and keeps it, with the
@@ -143,11 +194,27 @@ start when the page connects. The page says "validator" for a seat.
 
 **Sending.** An order, a cancellation, cancel-all and a transfer are drafted
 by the core and shown in the approval window; nothing is signed before
-approval, and one request waits there at a time. An approved action is
-signed once, written to the outbox on disk, and then posted to every seat.
+approval, and one request waits there at a time. The window asks one
+question whose title carries the bound ("Buy 0.004 B3 for at most 404
+rUSD?"), says in a few sentences what approving does and whether it can be
+undone, and states only what the order guarantees, never an estimate. It
+knows the order and not the book, so the page may have said "about 2 933"
+where the window says "at least 2 879": amounts read "up to", a sale's
+floor reads "for all of it", and each line says which way the true amount
+can differ, so that the two do not read as two prices. An order that waits
+is approved with "Place the order", since it promises no trade. The other
+button is named by what it leaves as it is ("Don't buy", "Keep the
+order"), and the page uses the same name. Exact lots and ticks, the
+account and the validity window are under Details. While a request waits,
+the page says so, with a button that brings the window back and one that
+takes the request back (`fm2_withdraw`, which can only remove a FlowMesh
+request that is still undecided); every other form says that another
+request waits for approval. An approved action is signed once, written to the
+outbox on disk, and then posted to every seat.
 After a crash or a lost connection the same bytes are posted again; a second
 signature is never made. The History list is the outbox: each row is a
-sentence about what happened, and opens to the slot, the exact size and the
+sentence about what happened, and opens to the confirmed fills behind it
+(amount, price, value and fee of each), the slot, the exact size and the
 action's id. A row still waiting shows what the seats last said.
 
 **When things go wrong.** The page says what it is waiting for instead of
@@ -165,7 +232,9 @@ after a fill while B3 Hive was closed, the page says so.
 **Not offered.** Withdrawals (the regtest rules refuse them) and decimals
 for assets other than B3 (the genesis document names none). The engine has
 no market order; the page's immediate order is an immediate-or-cancel limit
-order priced from the book.
+order priced from the book. It has no stop orders and no way to change an
+order in place, and it serves no statistics of a day's trading (change,
+high, low, volume), so the page shows none of these.
 
 To try it, start a regtest cluster with the node tools (`fm2-keygen`,
 `fm2-devchain`, `fm2d`; see `src/flowmesh2/README.md`), put its
@@ -218,7 +287,8 @@ Linux and Windows packages as unsigned artifacts.
   the outbox). One of them scans the sources and fails when a page calls an
   RPC the whitelist does not allow.
 - `npm test`: the pages' pure functions (number formatting, the trading
-  formats, the staking outlook).
+  formats, the Trade page's and the approval window's wording, the staking
+  outlook).
 - `HIVE_FM2_CLUSTER=DIR cargo test --test fm2_live -- --ignored --nocapture`:
   the FlowMesh V2 client against a running `fm2d` cluster whose
   `genesis.json` and `pins.json` are in `DIR`. It creates an account, waits
@@ -257,6 +327,14 @@ These are not decided here. Each needs a ruling from the project owners.
 - **The trading key**: FlowMesh V2 accounts are plain keys with no link to
   a B3 wallet. Before any network of value, the key needs encryption and a
   backup story, or a derivation from the wallet.
+- **Trading without a window per action**: every order and every
+  cancellation is approved in the approval window. Frequent traders will
+  ask for a session in which orders up to a limit are signed without it.
+  That changes what the approval window guarantees, so it is a decision
+  about the signing model, not a page setting.
+- **Order types the engine does not have**: stop orders and changing an
+  order in place would have to be built in the client (watching prices,
+  cancelling and placing again) or in FlowMesh. Neither is done.
 - **First translation languages**: the app is English only.
 - **Remote access**: whether B3 Hive may reach a node or a FlowMesh API on
   another machine, and how that connection is authenticated.
