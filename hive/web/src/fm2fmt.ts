@@ -156,6 +156,20 @@ export function priceText(ticks: bigint, m: Market): string {
   return `${price(ticks, m)} ${priceUnit(m)}`;
 }
 
+/** What `lots` traded for `gross` quote atoms come to for what `priceFor`
+ *  names, rounded to the quote's smallest unit: an average, where `price`
+ *  is one level's exact price. */
+export function averagePrice(gross: bigint, lots: bigint, m: Market): string {
+  const traded = lots * lot(m);
+  if (traded <= 0n) return amount(0n, m.quote);
+  return amount((gross * basis(m).atoms + traded / 2n) / traded, m.quote);
+}
+
+/** "101 111 rUSD per B3". */
+export function averageText(gross: bigint, lots: bigint, m: Market): string {
+  return `${averagePrice(gross, lots, m)} ${priceUnit(m)}`;
+}
+
 /** A typed price as ticks; null unless it is a whole number of ticks above
  *  zero. */
 export function parsePrice(text: string, m: Market): bigint | null {
@@ -173,6 +187,22 @@ export function nearestPrice(text: string, m: Market): bigint | null {
   const step = basis(m).step;
   const ticks = (atoms + step / 2n) / step;
   return ticks > 0n ? ticks : 1n;
+}
+
+/** The decimals one lot of a market's base needs: 3 for a lot of 0.001.
+ *  A column of amounts printed with at least these lines up, and 0.04 no
+ *  longer looks smaller than 0.025. */
+export function lotPlaces(m: Market): number {
+  const text = plain(lot(m), m.base);
+  const dot = text.indexOf(".");
+  return dot < 0 ? 0 : text.length - dot - 1;
+}
+
+/** The decimals an asset's balance is shown with, at least: those of the
+ *  smallest step it trades in on this network, so that a balance keeps its
+ *  length when a trade changes it (50.026, then 50.030). */
+export function assetPlaces(asset: Asset, markets: Market[]): number {
+  return markets.filter((m) => m.base.id === asset.id).reduce((most, m) => Math.max(most, lotPlaces(m)), 0);
 }
 
 /** The step amounts move in, e.g. "0.001 B3". */
@@ -218,14 +248,15 @@ export function depth(levels: Level[]): Depth[] {
   });
 }
 
-/** The gap between the best bid and the best ask, and its share of the ask
- *  in hundredths of a percent; null when a side is empty or they cross. */
+/** The gap between the best bid and the best ask, and its share of the
+ *  price halfway between them in hundredths of a percent; null when a side
+ *  is empty or they cross. */
 export function spread(bids: Level[], asks: Level[]): { ticks: bigint; bps: bigint } | null {
   if (!bids.length || !asks.length) return null;
   const bid = BigInt(bids[0].price_ticks);
   const ask = BigInt(asks[0].price_ticks);
   if (ask <= bid) return null;
-  return { ticks: ask - bid, bps: ((ask - bid) * 10_000n) / ask };
+  return { ticks: ask - bid, bps: ((ask - bid) * 20_000n) / (ask + bid) };
 }
 
 /** Hundredths of a percent as a percentage: 123 -> "1.23%". */
@@ -436,9 +467,9 @@ export function refusal(name: string): string {
 }
 
 const TIF: Record<string, string> = {
-  gtc: "Waits until it is filled or cancelled",
-  ioc: "Trades at once, the rest is dropped",
-  post_only: "Only ever waits in the book (post only)",
+  gtc: "Good till cancelled (GTC): what cannot trade at once waits",
+  ioc: "Immediate or cancel (IOC): what cannot trade at once is dropped",
+  post_only: "Post only: it may only wait, and is refused if it could trade at once",
 };
 
 /** How long an order stays, in words. */

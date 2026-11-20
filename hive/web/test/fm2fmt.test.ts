@@ -5,10 +5,14 @@ import { test } from "node:test";
 import {
   amount,
   amountText,
+  assetPlaces,
+  averagePrice,
+  averageText,
   baseAtoms,
   decimals,
   depth,
   feeRate,
+  lotPlaces,
   lotText,
   lotsIn,
   maxLots,
@@ -169,8 +173,9 @@ test("a ladder's depth and spread", () => {
     { ticks: 101n, lots: 34n, total: 34n, orders: 2 },
     { ticks: 103n, lots: 5n, total: 39n, orders: 1 },
   ]);
-  assert.deepEqual(spread(bids, asks), { ticks: 3n, bps: 297n });
-  assert.equal(percent(297n), "2.97%");
+  // 3 on a middle of 99.5.
+  assert.deepEqual(spread(bids, asks), { ticks: 3n, bps: 301n });
+  assert.equal(percent(301n), "3.01%");
   assert.equal(percent(5n), "0.05%");
   assert.equal(spread([], asks), null);
   assert.equal(spread([level(101, 1)], asks), null);
@@ -316,13 +321,47 @@ test("selling for an amount takes the fewest lots that bring it after the fee", 
   assert.equal(thin.short, "funds");
 });
 
+test("an average price is for the same unit as a level's price", () => {
+  // 34 lots at 101 and 2 at 103 come to 3 640 for 0.036 B3.
+  assert.equal(averagePrice(3640n, 36n, B3_RUSD), `101${G}111`);
+  assert.equal(averageText(3640n, 36n, B3_RUSD), `101${G}111 rUSD per B3`);
+  // At one price it is that price, and half an atom rounds up.
+  assert.equal(averagePrice(505n, 5n, B3_RUSD), price(101n, B3_RUSD));
+  assert.equal(averagePrice(2644n, 27n, B3_RUSD), `97${G}926`); // 97 925.9
+  assert.equal(averagePrice(1n, 2n, TOK_RUSD), "1"); // 0.5 rUSD a TOK
+  assert.equal(averagePrice(0n, 0n, B3_RUSD), "0");
+});
+
+test("amounts line up when they are printed with the decimals of a step", () => {
+  assert.equal(lotPlaces(B3_RUSD), 3); // 0.001 B3
+  assert.equal(lotPlaces(ODD), 4); // 0.0003 B3
+  assert.equal(lotPlaces(TOK_RUSD), 0);
+  // 0.04 is not smaller than 0.025 once both have three decimals.
+  assert.equal(amount(40_000_000n, B3, lotPlaces(B3_RUSD)), "0.040");
+  assert.equal(amount(25_000_000n, B3, lotPlaces(B3_RUSD)), "0.025");
+  // A balance keeps its length when a trade changes it, and loses nothing
+  // that is finer than a step.
+  const places = assetPlaces(B3, [B3_RUSD, TOK_RUSD, ODD]);
+  assert.equal(places, 4);
+  assert.equal(assetPlaces(B3, [B3_RUSD, TOK_RUSD]), 3);
+  assert.equal(amount(50_026_000_000n, B3, 3), "50.026");
+  assert.equal(amount(50_030_000_000n, B3, 3), "50.030");
+  assert.equal(amount(50_026_500_000n, B3, 3), "50.0265");
+  // An asset that is only ever a quote, or has no decimals, stays as it is.
+  assert.equal(assetPlaces(RUSD, [B3_RUSD, TOK_RUSD]), 0);
+  assert.equal(assetPlaces(TOK, [B3_RUSD, TOK_RUSD]), 0);
+  assert.equal(amount(495_487n, RUSD, 3), `495${G}487`);
+});
+
 test("codes and ids read as words", () => {
   assert.equal(outcomeText("FILLED"), "Filled");
   assert.equal(outcomeText("REJ_WOULD_CROSS"), "Refused: a post-only order may not trade at once");
   assert.equal(outcomeText("SOMETHING_NEW"), "SOMETHING_NEW");
   assert.equal(refusal("REJ_NO_RECIPIENT"), "the account it was sent to does not exist on this network yet");
   assert.equal(refusal("REJ_NEW"), "the network answered REJ_NEW");
-  assert.equal(tifText("gtc"), "Waits until it is filled or cancelled");
+  assert.equal(tifText("gtc"), "Good till cancelled (GTC): what cannot trade at once waits");
+  assert.equal(tifText("ioc"), "Immediate or cancel (IOC): what cannot trade at once is dropped");
+  assert.equal(tifText("post_only"), "Post only: it may only wait, and is refused if it could trade at once");
   assert.equal(tifText("fok"), "fok");
   assert.equal(shortId("ab".repeat(32)), "abababab…ababab");
   assert.equal(shortId("abcdef"), "abcdef");
