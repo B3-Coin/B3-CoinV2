@@ -1,0 +1,118 @@
+{
+  "format": "fm2-genesis/1",
+  "network": {
+    "chain": "regtest",
+    "magic": "f2514d10",
+    "domain": "5c12138c1b4f1f57b4934f7e6674fdf8d8b8096063c27a33fbc3c778dab37f92"
+  },
+  "mesh_magic": "7fbb7984",
+  "base": {
+    "height": 129,
+    "hash": "62cc5e4da841162bce98a2a2a0de55c2c0da3e96d3088fb4a4f5baa11666ace8"
+  },
+  "facts_start": {
+    "height": 130,
+    "index": 0
+  },
+  "seats": [
+    {
+      "index": 0,
+      "bls_pubkey": "a72219c07e6702c27c58e6edc32c819e55e545029126c8128054956792bd2a9964b6c7882ea1e0d658bec24a6964bb42",
+      "pop": "adbc648d629687bac8ac76e3e896e91cfd472d8fc53af149e73c00f5e45b42215924b8e6e34b1762e04167cd2cb2612d091795fa8e17f0c5a72144f3009ef307094ea690da00e1e31d1082359f3a541ecebbcb49975c2519666714a611b2b0de",
+      "mesh": {
+        "address": "127.0.0.1",
+        "port": 25649
+      },
+      "api": {
+        "address": "127.0.0.1",
+        "port": 28800
+      },
+      "endpoint_record": {
+        "transport_key": "279ee4866bfa3c7a5d6fb1584f9d5b5d7c3ebfd22d383ccb590ccf62c03b4efd",
+        "valid_from_epoch": 0,
+        "valid_until_epoch": 0,
+        "counter": 1,
+        "signature": "829e437ae8b9e42b9d02ef9d9a3a750d42ec52fa02014030de2f414ab494f85822bb1def2f6b1b2a4ae937cee02e8ae10310e0e2b2c3be9f15fb9baffe6a30cdcb82e08cfe6f70e9299b38e0ff4fe3533bbb10bfa65921cc1c9bc3913979968a"
+      }
+    },
+    {
+      "index": 1,
+      "bls_pubkey": "ac0189e111a3a9546ab96aebab7ed7e57db12a2cc72275830cec3f22731a9058a161b5151a851081629434bf470a0920",
+      "pop": "8a9f5b408fb4b92da3f9648fa4afeef8c317dcbe9ff8c18e712922fa51387f0fc673de214611e88fb6051572a5e511e014f6962913add29595c8a1bfedb81a1d363222621de49cee8db826cd29fe9dd3e5687f76ec64d1f3dd21feeb4389915d",
+      "mesh": {
+        "address": "127.0.0.1",
+        "port": 25650
+      },
+      "api": {
+        "address": "127.0.0.1",
+        "port": 28801
+      },
+      "endpoint_record": {
+        "transport_key": "e52f7b70647bcca37e1daec78c0be2bd695c16085e3b0d7d11da7cd92bb1e08a",
+        "valid_from_epoch": 0,
+        "valid_until_epoch": 0,
+        "counter": 1,
+        "signature": "a7af677abe7d505d5d5ec2f9de6c9d15aebafee22c28617c845df705125777368919f5ec26e50690b9549c5ea8a9fc380844ae32e5e2f755e6285886dc4a01dfd820c7e5edbfa6850120cb5ac3164aeff1977035729ee625df2816db33c4e425"
+      }
+    },
+    {
+      "index": 2,
+      "bls_pubkey": "a173a65aaf1d36727d38d5a194ff820d8e27d7adffa147597c3a04bd0c247841a7f8d6c1ba5e93b79ebe1af70b5c15e8",
+      "pop": "aa89b622fc5c932e342ba44635633c41ab3ca051ffa00f306367e8fc046089aa6fcf55bc909671cf927924277f278b7017e95313274f490f91c420b81880993b346a8fe88ac72f8035876e016cf5d39fd4f22153a64b7bed9ef4ae9748358d17",
+      "mesh": {
+        "address": "127.0.0.1",
+        "port": 25651
+      },
+      "api": {
+        "address": "127.0.0.1",
+        "port": 28802
+      },
+      "endpoint_record": {
+        "transport_key": "0c6c5e31d819f33a760f252386fdab52b6b9d176e287cc40484353bc443a6d64",
+        "valid_from_epoch": 0,
+        "valid_until_epoch": 0,
+        "counter": 1,
+        "signature": "b71384066d6000095fa6034720c48cd374ba9d71f689a102d4a27027b01ed079e1692d56e31573f2f697c8aa0394008c148d0d980f906bbc0f20da2a4c02411e3cbbc3bef76e9bef3e6b53ada4fa8b821e95f38a18b96faf009aa3217590e29d"
+      }
+    },
+    {
+      "index": 3,
+      "bls_pubkey": "a9710868813ddfd6fc636ebee536964c38718cab45a2a2274dfa5e30280cbbed66ae04971eaa77592accc99fa2bca25b",
+      "pop": "8a3126fcd906b3682a66254dc9ce922e2cf156fc6760e727ecf0431b94dfd3527caef50f1e6965a06947fb2640292ebb14786938878963592debb59350402c5e600f317c44aefc484bf39064365b9d57a25e1bfaf3e2d335560f02efa46bdb2e",
+      "mesh": {
+        "address": "127.0.0.1",
+        "port": 25652
+      },
+      "api": {
+        "address": "127.0.0.1",
+        "port": 28803
+      },
+      "endpoint_record": {
+        "transport_key": "3ac14a5888839d432bf651c86af3bb84a701650939291ce5537e725610e0ea5f",
+        "valid_from_epoch": 0,
+        "valid_until_epoch": 0,
+        "counter": 1,
+        "signature": "b72eb891a3c112e7d1b5937825980cc3ae65dfac114c8f2860743cccfb5e00dcb34ba65ca8680d75c434fb75ea172e0c0ffe844a6637be0206d13407d710a416c7946c80777fd0f5c85961f6cd84c8314cc1accc7428a57d05558f61b4ce47f5"
+      }
+    }
+  ],
+  "assets": {
+    "B3": "0000000000000000000000000000000000000000000000000000000000000000",
+    "TOK": "ece944fe09ae5543e6500ba1968b600aeb524e738f4e83c474373c21e1ecf83b",
+    "rUSD": "edd75bb25b00ba6a43c65ecf3f7c127ff730923177418b258eafc17a03dd3964"
+  },
+  "markets": [
+    {
+      "base": "B3",
+      "quote": "rUSD",
+      "base_atoms_per_lot": 1000000,
+      "quote_atoms_per_tick": 1
+    },
+    {
+      "base": "TOK",
+      "quote": "rUSD",
+      "base_atoms_per_lot": 1,
+      "quote_atoms_per_tick": 10
+    }
+  ]
+}

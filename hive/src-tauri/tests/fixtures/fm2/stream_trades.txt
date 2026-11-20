@@ -1,0 +1,20 @@
+id: 14175714238730386179:1:440
+event: snapshot
+data: {"cursor":"14175714238730386179:1:440","kind":"snapshot","head_slot":440,"channel":"trades","market":"89e36bf079571cf562b1b340c2b29d332f58aec4d4bb97008744d891b2521931","fills":[]}
+
+event: heartbeat
+data: {}
+
+id: 14175714238730386179:2:442
+event: delta
+data: {"cursor":"14175714238730386179:2:442","kind":"delta","head_slot":442,"channel":"trades","market":"89e36bf079571cf562b1b340c2b29d332f58aec4d4bb97008744d891b2521931","fills":[{"maker":"7afb2a97e79a85f73619a55e5ffba6676d141cac376ceadd5a9a0ea8da3fea51","taker":"fc836323bcf30ab7d2373a3d5eb6a83ca30bd9e81819eaa67ddc928baeda4ade","market":"89e36bf079571cf562b1b340c2b29d332f58aec4d4bb97008744d891b2521931","taker_side":"buy","price_ticks":100,"lots":1,"quote_atoms":100,"seller_fee":0}]}
+
+event: heartbeat
+data: {}
+
+event: heartbeat
+data: {}
+
+event: heartbeat
+data: {}
+

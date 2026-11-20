@@ -4,7 +4,11 @@
 
 pub mod bytes;
 pub mod crypto;
+pub mod genesis;
 pub mod hash;
+pub mod reply;
+pub mod types;
+pub mod verify;
 
 /// Why an operation of the client failed.
 #[derive(Clone, Debug, PartialEq, Eq)]

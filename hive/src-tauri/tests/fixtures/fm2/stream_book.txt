@@ -1,0 +1,7 @@
+id: 14175714238730386179:1:415
+event: snapshot
+data: {"cursor":"14175714238730386179:1:415","kind":"snapshot","head_slot":415,"channel":"book","market":"89e36bf079571cf562b1b340c2b29d332f58aec4d4bb97008744d891b2521931","bids":[],"asks":[{"price_ticks":100,"lots":6,"orders":1}]}
+
+event: heartbeat
+data: {}
+
