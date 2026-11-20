@@ -657,16 +657,11 @@
                       <div class="btn-row"><button class="btn btn-secondary" type="submit" id="tr-connect-go">Connect</button></div>
                     </form>
                   </details>
-                  <details class="disc disc--boxed">
-                    <summary>
-                      <svg class="i-sm caret" aria-hidden="true"><use href="/icons.svg#i-chevron-right" /></svg>
-                      <span>I have no network folder</span>
-                    </summary>
-                    <div class="disc-body stack t-sm muted">
-                      <p>Then there is nothing to trade on yet, and nothing is wrong on your side. FlowMesh is still being built and has no public network. This page opens up when someone who runs a test network gives you its folder.</p>
-                      <p>Sending, receiving and staking B3 work without it.</p>
-                    </div>
-                  </details>
+                  <div class="tr-nofolder t-sm">
+                    <strong>No folder?</strong>
+                    <p class="muted">Then there is nothing to trade on yet, and nothing is wrong on your side. FlowMesh is still being built and has no public network, so there is nothing to download or sign up for. This page opens up when someone who runs a test network gives you its folder.</p>
+                    <p class="muted">Sending, receiving and staking B3 work without it.</p>
+                  </div>
                   <p class="t-sm muted">B3 Hive remembers the network and connects by itself next time.</p>
                 </div>
                 <div class="tr-busy" id="tr-connect-busy" role="status" hidden>
@@ -711,17 +706,16 @@
             <section class="card tr-strip tr-pro-only" id="tr-strip" aria-label="Market" hidden>
               <label class="sr-only" for="tr-market">Market</label>
               <select class="select select-auto tr-market" id="tr-market"></select>
-              <div class="tr-lastbox" title="The price of the last trade this page saw. From the live view, not confirmed.">
+              <div class="tr-lastbox" title="The price of the last trade this page saw: green when a buyer took a seller's price, red when a seller took a buyer's, as in the list of trades. From the live view, not confirmed.">
                 <strong class="tr-last tnum" id="tr-last">—</strong>
                 <span class="t-xs muted" id="tr-last-unit"></span>
               </div>
               <dl class="tr-stats">
                 <div><dt>Highest bid</dt><dd><button class="tr-stat-pick tr-up tnum" type="button" id="tr-best-bid" title="Use this price">—</button></dd></div>
                 <div><dt>Lowest ask</dt><dd><button class="tr-stat-pick tr-down tnum" type="button" id="tr-best-ask" title="Use this price">—</button></dd></div>
-                <div><dt>Spread</dt><dd class="tnum" id="tr-spread-stat">—</dd></div>
                 <div><dt title="Amounts move in steps of this size (one lot).">Amount step</dt><dd class="tnum" id="tr-lot">—</dd></div>
                 <div><dt title="Prices move in steps of this size (one tick).">Price step</dt><dd class="tnum" id="tr-tick">—</dd></div>
-                <div><dt title="The seller pays it out of what the sale brings. Buyers pay nothing.">Seller's fee</dt><dd class="tnum" id="tr-fee-stat">—</dd></div>
+                <div><dt title="Taken from what a sale brings, in the asset it is paid in, rounded up to that asset's smallest unit once for each order: a sale that brings anything pays at least one such unit. Buyers pay nothing, and placing or cancelling an order costs nothing.">Seller's fee</dt><dd class="tnum" id="tr-fee-stat">—</dd></div>
               </dl>
             </section>
 
@@ -748,7 +742,7 @@
                         <span class="tr-cell-have tnum" id="tr-pay-have"></span>
                       </div>
                       <div class="tr-cell-main">
-                        <input class="tr-cell-input" id="tr-pay" inputmode="decimal" spellcheck="false" placeholder="0" aria-describedby="tr-swap-hint" />
+                        <input class="tr-cell-input" id="tr-pay" inputmode="decimal" spellcheck="false" placeholder="Type an amount" aria-describedby="tr-swap-hint" />
                         <span class="tr-asset">
                           <span class="tr-hex" id="tr-pay-hex" aria-hidden="true"></span>
                           <select class="tr-asset-pick" id="tr-pay-asset" aria-label="What you pay with"></select>
@@ -779,10 +773,14 @@
                       </div>
                     </div>
                     <dl class="tr-quote" id="tr-quote"></dl>
+                    <p class="tr-promise t-sm muted" id="tr-swap-promise"></p>
                     <p class="tr-hint t-sm" id="tr-swap-hint" aria-live="polite"></p>
                     <div class="banner banner-warning tr-inline" id="tr-swap-warn" role="status" hidden></div>
-                    <button class="btn btn-primary btn-block tr-go" type="submit" id="tr-swap-go" disabled>Enter an amount</button>
-                    <p class="t-xs muted tr-swap-foot" id="tr-swap-foot">You check it once more in a small window. Nothing is signed before you approve it there.</p>
+                    <div class="banner banner-info tr-inline" id="tr-swap-note" role="status" hidden></div>
+                    <button class="btn btn-primary btn-block tr-go" type="submit" id="tr-swap-go" disabled>
+                      <span class="tr-go-text" id="tr-swap-go-text">Enter an amount</span>
+                      <span class="tr-go-sub" id="tr-swap-go-sub" hidden>You approve it in a small window first</span>
+                    </button>
                   </form>
                   <div class="tr-flow" id="tr-swap-flow" role="status" aria-live="polite" hidden></div>
                   <details class="disc tr-how" id="tr-how">
@@ -792,6 +790,7 @@
                     </summary>
                     <div class="disc-body stack t-sm muted">
                       <p>You trade with orders other people left waiting, at their prices, the best one first. The price on this card comes from those orders.</p>
+                      <p>Buying costs a little more than selling brings at the same moment: sellers ask more than buyers offer, and the gap between them is nobody's fee. So buying and selling straight back loses that gap.</p>
                       <p>Your trade is sent with a price limit. It can never cost more than this card says, or sell for less. If prices move before it arrives, it trades what still fits and drops the rest. What was not used stays yours.</p>
                       <p>It takes a second or two. The result shown here is confirmed by the network's validators together, never by one of them alone.</p>
                       <p>To leave an order waiting at a price of your own, switch to Pro at the top right.</p>
@@ -803,7 +802,7 @@
                 <section class="card tr-book-card tr-pro-only" aria-label="Order book">
                   <div class="card-head tr-card-head">
                     <h2 class="tr-h">Order book</h2>
-                    <span class="badge badge-neutral" title="The book arrives from one validator as it changes. It carries no proof, so read it as an estimate.">Live view</span>
+                    <span class="badge badge-neutral" id="tr-book-live">Live view</span>
                     <span class="badge badge-warning" id="tr-book-stale" hidden title="The live view is not arriving right now.">Paused</span>
                     <div class="tr-seg" role="group" aria-label="Sides shown">
                       <button class="tr-seg-btn" type="button" id="tr-show-both" aria-pressed="true" title="Sellers and buyers"><span class="tr-ico tr-ico-both" aria-hidden="true"></span><span class="sr-only">Both sides</span></button>
@@ -812,26 +811,26 @@
                     </div>
                   </div>
                   <div class="tr-book" id="tr-book" data-show="both">
-                    <div class="tr-book-row tr-book-labels t-xs muted"><span id="tr-book-price">Price</span><span class="num" id="tr-book-amount">Amount</span><span class="num" title="The running total from the best price down to this one">Total</span></div>
-                    <div class="tr-side-label t-xs muted" id="tr-asks-label">Sellers (asks)</div>
-                    <div class="tr-asks" id="tr-asks"></div>
+                    <div class="tr-book-row tr-book-labels t-xs muted"><span id="tr-book-price">Price</span><span class="num" id="tr-book-amount">Amount</span><span class="num" id="tr-book-sum" title="The amounts added up, from the best price to this one">Sum</span></div>
+                    <div class="tr-asks" id="tr-asks" role="group" aria-label="Sellers (asks), the lowest price last"></div>
                     <div class="tr-mid">
-                      <strong class="tr-mid-last tnum" id="tr-mid-last">—</strong>
-                      <span class="t-xs muted tnum" id="tr-spread">—</span>
+                      <span class="t-xs muted">Last</span>
+                      <strong class="tr-mid-last tnum" id="tr-mid-last" title="The price of the last trade this page saw. From the live view.">—</strong>
+                      <span class="t-xs muted tnum" id="tr-spread" title="The spread: the lowest ask less the highest bid, and that as a share of the price halfway between them.">—</span>
                     </div>
-                    <div class="tr-bids" id="tr-bids"></div>
-                    <div class="tr-side-label t-xs muted" id="tr-bids-label">Buyers (bids)</div>
+                    <div class="tr-bids" id="tr-bids" role="group" aria-label="Buyers (bids), the highest price first"></div>
                   </div>
                   <p class="tr-note t-xs muted" id="tr-book-note"></p>
                 </section>
               </div>
 
               <div class="tr-col tr-col-mid tr-pro-only" id="tr-col-mid">
-                <section class="card tr-chart-card" aria-label="Chart">
+                <section class="card tr-chart-card" aria-label="Chart and trades">
                   <div class="card-head tr-card-head">
-                    <div class="tr-texttabs" role="tablist" aria-label="Chart">
+                    <div class="tr-texttabs" role="tablist" aria-label="Chart or trades">
                       <button class="tr-texttab" type="button" role="tab" id="tr-view-price" aria-selected="true">Price</button>
                       <button class="tr-texttab" type="button" role="tab" id="tr-view-depth" aria-selected="false">Depth</button>
+                      <button class="tr-texttab" type="button" role="tab" id="tr-view-trades" aria-selected="false">Trades</button>
                     </div>
                     <span class="t-xs muted" id="tr-chart-caption"></span>
                   </div>
@@ -843,7 +842,16 @@
                     <span class="tr-lasttag tnum" id="tr-lasttag" hidden></span>
                     <p class="tr-chart-empty t-sm muted" id="tr-chart-empty"></p>
                   </div>
-                  <div class="between t-xs muted tnum tr-chart-foot"><span id="tr-chart-first"></span><span id="tr-chart-mid"></span><span id="tr-chart-last"></span></div>
+                  <div class="between t-xs muted tnum tr-chart-foot" id="tr-chart-foot"><span id="tr-chart-first"></span><span id="tr-chart-mid"></span><span id="tr-chart-last"></span></div>
+                  <div class="tr-tape" id="tr-trades" hidden>
+                    <div class="table-wrap">
+                      <table class="tbl tbl-compact">
+                        <thead><tr><th title="When this page received it, by this computer's clock.">Seen</th><th class="num" id="tr-trades-price">Price</th><th class="num" id="tr-trades-amount">Amount</th><th class="num" id="tr-trades-value">Value</th><th></th></tr></thead>
+                        <tbody id="tr-trades-rows"></tbody>
+                      </table>
+                    </div>
+                    <p class="tr-list-empty t-sm muted" id="tr-trades-note"></p>
+                  </div>
                 </section>
               </div>
 
@@ -855,11 +863,13 @@
                     <button class="tr-side-btn tr-side-sell" type="button" role="tab" id="tr-sell" aria-selected="false">Sell</button>
                   </div>
                   <form class="tr-form" id="tr-form" novalidate autocomplete="off">
+                    <div class="tr-form-top">
                     <div class="tr-texttabs tr-types" role="tablist" aria-label="Kind of order">
                       <button class="tr-texttab" type="button" role="tab" id="tr-kind-limit" aria-selected="true" title="An order at a price you choose.">Limit</button>
                       <button class="tr-texttab" type="button" role="tab" id="tr-kind-market" aria-selected="false" title="Trades at once against the book. B3 Hive sets a price limit from the book, so it cannot cost more than shown.">Market</button>
                     </div>
                     <div class="tr-avbl t-xs"><span class="muted">Available</span><span class="tnum" id="tr-avbl">—</span></div>
+                    </div>
                     <div class="tr-in" id="tr-price-row">
                       <label class="tr-in-label" for="tr-price">Price</label>
                       <button class="tr-stepper" type="button" data-for="tr-price" data-dir="-1" tabindex="-1" aria-label="One price step lower">−</button>
@@ -891,40 +901,34 @@
                       <span class="tr-in-unit" id="tr-total-unit"></span>
                     </div>
                     <div class="tr-tif" id="tr-tif-row">
-                      <label class="sr-only" for="tr-tif">What happens to what does not trade at once</label>
-                      <select class="select select-sm" id="tr-tif" title="What happens to what does not trade at once">
-                        <option value="gtc">Good till cancelled: the rest waits</option>
-                        <option value="ioc">Immediate or cancel: the rest is dropped</option>
-                        <option value="post_only">Post only: all of it must wait</option>
-                      </select>
+                      <span class="t-xs muted" id="tr-tif-label">What cannot trade at once</span>
+                      <div class="tr-tif-seg" id="tr-tif" role="group" aria-labelledby="tr-tif-label">
+                        <button class="tr-tif-btn" type="button" data-tif="gtc" aria-pressed="true" title="Good till cancelled (GTC): the rest waits in the order book until it trades or you cancel it.">Waits <abbr>GTC</abbr></button>
+                        <button class="tr-tif-btn" type="button" data-tif="ioc" aria-pressed="false" title="Immediate or cancel (IOC): the rest is dropped, and what it would have cost stays yours.">Is dropped <abbr>IOC</abbr></button>
+                        <button class="tr-tif-btn" type="button" data-tif="post_only" aria-pressed="false" title="Post only: the order may only wait in the order book. If it could trade at once, the network refuses all of it.">Post only</button>
+                      </div>
                     </div>
                     <dl class="tr-sum" id="tr-summary"></dl>
                     <p class="t-xs tr-form-error" id="tr-form-error" aria-live="polite" hidden></p>
                     <div class="banner banner-warning tr-inline" id="tr-form-warn" role="status" hidden></div>
-                    <button class="btn btn-block tr-go" type="submit" id="tr-review" disabled>Buy</button>
                     <div class="tr-flow tr-flow-compact" id="tr-ticket-flow" role="status" aria-live="polite" hidden></div>
+                    <button class="btn btn-block tr-go" type="submit" id="tr-review" disabled>Buy</button>
                   </form>
                 </section>
 
                 <section class="card tr-account" id="tr-account" aria-labelledby="tr-account-title">
                   <div class="card-head tr-card-head">
                     <h2 class="tr-h" id="tr-account-title">Your account</h2>
-                    <span class="t-xs muted" id="tr-account-proof"></span>
+                    <span class="t-xs muted">Test funds, not real money</span>
                   </div>
                   <div class="tr-balances" id="tr-balances"></div>
+                  <p class="tr-proof t-xs muted" id="tr-account-proof" hidden></p>
                   <p class="tr-note t-sm muted" id="tr-account-note" hidden></p>
                   <div class="tr-account-actions" id="tr-account-actions">
-                    <button class="btn btn-secondary btn-sm" type="button" id="tr-funds-open"><svg class="i-sm" aria-hidden="true"><use href="/icons.svg#i-arrow-down" /></svg>Add funds</button>
-                    <button class="btn btn-secondary btn-sm" type="button" id="tr-send-open"><svg class="i-sm" aria-hidden="true"><use href="/icons.svg#i-arrow-up" /></svg>Send</button>
+                    <button class="btn btn-secondary btn-sm" type="button" id="tr-funds-open"><svg class="i-sm" aria-hidden="true"><use href="/icons.svg#i-arrow-down" /></svg>Get test funds</button>
+                    <button class="btn btn-secondary btn-sm" type="button" id="tr-send-open"><svg class="i-sm" aria-hidden="true"><use href="/icons.svg#i-arrow-up" /></svg>Send test funds</button>
                   </div>
                   <div class="tr-flow tr-flow-compact" id="tr-account-flow" role="status" aria-live="polite" hidden></div>
-                  <div class="tr-account-id" id="tr-account-id-box" hidden>
-                    <span class="t-xs muted">Account number</span>
-                    <div class="copyfield">
-                      <span class="val" id="tr-account-id"></span>
-                      <button class="btn btn-ghost btn-sm" type="button" id="tr-account-copy">Copy</button>
-                    </div>
-                  </div>
                 </section>
               </div>
             </div>
@@ -932,10 +936,9 @@
             <!-- Your orders, what you did, and (in Pro) the market's trades. Moved between the columns by the view. -->
             <section class="card tr-lists" id="tr-lists" data-tab="orders" hidden>
               <div class="card-head tr-card-head tr-lists-tabs">
-                <div class="tr-texttabs" role="tablist" aria-label="Your orders and the market's trades">
+                <div class="tr-texttabs" role="tablist" aria-label="Your orders and your history">
                   <button class="tr-texttab" type="button" role="tab" id="tr-tab-orders" aria-selected="true" aria-controls="tr-orders">Open orders <span class="tr-count" id="tr-orders-count" hidden></span></button>
                   <button class="tr-texttab" type="button" role="tab" id="tr-tab-activity" aria-selected="false" aria-controls="tr-activity">History <span class="tr-count tr-count-warn" id="tr-activity-count" hidden></span></button>
-                  <button class="tr-texttab" type="button" role="tab" id="tr-tab-trades" aria-selected="false" aria-controls="tr-trades">Market trades</button>
                 </div>
               </div>
               <div class="tr-list-block" id="tr-orders" aria-labelledby="tr-orders-title">
@@ -957,15 +960,6 @@
                   <button class="btn btn-ghost btn-sm" type="button" id="tr-activity-refresh" title="Asks every validator again about what is still waiting.">Check again</button>
                 </div>
               </div>
-              <div class="tr-list-block" id="tr-trades" aria-labelledby="tr-tab-trades">
-                <div class="table-wrap">
-                  <table class="tbl tbl-compact">
-                    <thead><tr><th title="When this page received it, by this computer's clock.">Seen</th><th class="num" id="tr-trades-price">Price</th><th class="num" id="tr-trades-amount">Amount</th><th class="num" id="tr-trades-value">Value</th><th></th></tr></thead>
-                    <tbody id="tr-trades-rows"></tbody>
-                  </table>
-                </div>
-                <p class="tr-list-empty t-sm muted" id="tr-trades-note"></p>
-              </div>
             </section>
 
           </div>
@@ -975,13 +969,13 @@
               <div class="modal" role="dialog" aria-modal="true" aria-labelledby="tr-funds-title">
                 <div class="modal-head">
                   <div>
-                    <h2 id="tr-funds-title">Add funds</h2>
-                    <div class="sub">Test funds, on a test network</div>
+                    <h2 id="tr-funds-title">Get test funds</h2>
+                    <div class="sub">They have no value and cost nothing</div>
                   </div>
                   <button class="btn btn-ghost btn-icon" type="button" id="tr-funds-close" aria-label="Close"><svg class="i" aria-hidden="true"><use href="/icons.svg#i-close" /></svg></button>
                 </div>
                 <div class="modal-body stack">
-                  <p>On this test network, funds come from whoever runs it. Give them your account number and say what you need.</p>
+                  <p>On this test network, funds come from whoever runs it: the person who gave you the network folder. Send them this account number and say which funds you want. <span id="tr-funds-assets"></span>The number is safe to share.</p>
                   <div class="copyfield copyfield--wrap">
                     <span class="val" id="tr-funds-account"></span>
                     <button class="btn btn-primary btn-sm" type="button" id="tr-funds-copy">Copy</button>
@@ -1005,7 +999,7 @@
               <div class="modal" role="dialog" aria-modal="true" aria-labelledby="tr-send-title">
                 <div class="modal-head">
                   <div>
-                    <h2 id="tr-send-title">Send to another account</h2>
+                    <h2 id="tr-send-title">Send test funds to another account</h2>
                     <div class="sub">Inside this test network</div>
                   </div>
                   <button class="btn btn-ghost btn-icon" type="button" id="tr-send-close" aria-label="Close"><svg class="i" aria-hidden="true"><use href="/icons.svg#i-close" /></svg></button>

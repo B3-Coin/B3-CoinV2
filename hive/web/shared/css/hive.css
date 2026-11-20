@@ -126,6 +126,9 @@ ol.checklist { list-style: none; margin: 0; padding: 0; }
 
 /* The network, and how much the page shows */
 .tr-bar { display: flex; align-items: center; justify-content: space-between; gap: var(--space-3); flex-wrap: wrap; }
+/* In the page's header (trade.ts puts it there while the header shows). */
+.page-head > .tr-bar { flex: none; align-self: center; margin-left: auto; }
+.page-head > .tr-bar .tr-net-panel { left: auto; right: 0; width: min(460px, calc(100vw - 2 * var(--space-5))); }
 .tr-net { position: relative; }
 .tr-net-chip {
   display: inline-flex; align-items: center; gap: var(--space-2);
@@ -240,7 +243,10 @@ ol.checklist { list-style: none; margin: 0; padding: 0; }
   color: var(--text); font-family: var(--font-sans); font-size: var(--text-2xl); font-weight: 650;
   letter-spacing: -0.01em; font-variant-numeric: tabular-nums;
 }
-.tr-cell-input::placeholder { color: var(--text-muted); opacity: 0.45; }
+.tr-cell-input::placeholder { color: var(--text-muted); opacity: 0.6; }
+/* The first field says what to do with it, in words small enough to fit. */
+#tr-pay::placeholder { font-size: var(--text-lg); font-weight: 500; letter-spacing: 0; }
+.tr-cell-main { cursor: text; }
 .tr-asset {
   flex: none; display: inline-flex; align-items: center; gap: 6px;
   padding: 5px 4px 5px 8px;
@@ -286,20 +292,32 @@ ol.checklist { list-style: none; margin: 0; padding: 0; }
 .tr-quote > div { display: flex; justify-content: space-between; align-items: baseline; gap: var(--space-3); }
 .tr-quote dt { color: var(--text-muted); }
 .tr-quote dd { margin: 0; text-align: right; font-weight: 600; font-variant-numeric: tabular-nums; }
-.tr-quote .is-promise dd { color: var(--accent-text); }
+.tr-quote > div { flex-wrap: wrap; row-gap: 0; }
+.tr-quote-note { flex-basis: 100%; text-align: right; font-size: var(--text-xs); color: var(--text-muted); font-variant-numeric: tabular-nums; }
+.tr-promise { margin: 0; text-wrap: pretty; }
+.tr-proof { margin: 0; padding: 0 var(--space-4) var(--space-2); }
+.tr-promise:empty { display: none; }
 .tr-hint { margin: 0; color: var(--text-muted); }
 .tr-hint:empty { display: none; }
-.tr-hint .link, .tr-row-meta .link { color: var(--accent-text); text-decoration: underline; font: inherit; padding: 0; }
-.tr-swap-foot { margin: 0; text-align: center; }
+.tr-hint .link, .tr-row-meta .link, .tr-flow-links .link { color: var(--accent-text); text-decoration: underline; font: inherit; padding: 0; }
+.tr-flow-links .link:disabled { color: var(--text-muted); text-decoration: none; }
+/* In a banner a link keeps the banner's own colour. */
+.tr-page .banner .link { color: inherit; text-decoration: underline; font: inherit; font-weight: 600; padding: 0; }
+/* Two lines in one button: what it does, and that it is not final. */
+.tr-go { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 1px; line-height: 1.25; }
+.tr-go-sub { font-size: var(--text-xs); font-weight: 500; opacity: 0.85; }
 .tr-how { margin: 0; }
 .tr-how p { margin: 0; }
 
 /* The button that sends a trade for review */
 .tr-go { min-height: 44px; font-weight: 700; }
 .tr-swap .tr-go { min-height: 48px; font-size: var(--text-md); border: 0; }
-.tr-swap[data-side="buy"] .tr-go { background: var(--success); color: var(--success-on); }
-.tr-swap[data-side="sell"] .tr-go { background: var(--danger); color: var(--danger-on); }
-.tr-swap .tr-go:hover:not(:disabled) { filter: brightness(1.08); }
+/* The simple view wears the hive's own colour on both sides. Green and
+   red are a trader's convention, kept for Pro: to someone new, a red
+   button says "danger", not "sell". */
+.tr-swap .tr-go { background: var(--accent); color: var(--accent-on); padding-block: 6px; }
+.tr-swap .tr-go:hover:not(:disabled) { background: var(--accent-hover); }
+.tr-swap .tr-side-btn[aria-selected="true"] { background: var(--accent); color: var(--accent-on); }
 .tr-ticket .tr-go { border: 0; }
 .tr-ticket[data-side="buy"] .tr-go { background: var(--success); color: var(--success-on); }
 .tr-ticket[data-side="sell"] .tr-go { background: var(--danger); color: var(--danger-on); }
@@ -324,6 +342,10 @@ ol.checklist { list-style: none; margin: 0; padding: 0; }
   padding: var(--space-3) var(--space-4);
   border: 1px solid var(--border); border-radius: var(--radius-md); background: var(--bg-subtle);
 }
+.tr-flow-result > div { flex: 1; min-width: 0; }
+.tr-flow-close { flex: none; display: grid; place-items: center; width: 24px; height: 24px; margin: -2px -4px 0 0; padding: 0; border-radius: var(--radius-sm); color: var(--text-muted); }
+.tr-flow-close:hover { color: var(--text); }
+.tr-flow-result .tr-flow-close .i-sm { margin: 0; color: inherit; }
 .tr-flow-result strong { display: block; font-size: var(--text-md); }
 .tr-flow-result .i { flex: none; margin-top: 1px; }
 .tr-flow-result[data-tone="success"] { background: var(--success-bg); border-color: var(--success-border); }
@@ -349,17 +371,20 @@ ol.checklist { list-style: none; margin: 0; padding: 0; }
 .tr-flow-compact { padding: 0; gap: var(--space-2); font-size: var(--text-sm); }
 .tr-flow-compact .tr-flow-result { padding: var(--space-2) var(--space-3); border-radius: var(--radius-sm); }
 .tr-flow-compact .tr-flow-result strong { font-size: var(--text-sm); }
-.tr-flow-line { display: flex; align-items: center; gap: var(--space-2); color: var(--text-muted); }
+.tr-flow-line { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-1) var(--space-3); color: var(--text-muted); }
+.tr-flow-line > .tr-flow-text { flex: 1 1 14em; min-width: 0; }
+.tr-flow-line > .spinner { flex: none; }
+.tr-flow-links { flex: none; display: flex; gap: var(--space-3); white-space: nowrap; }
 .tr-account > .tr-flow-compact { padding: 0 var(--space-4) var(--space-3); }
 .tr-list-block > .tr-flow-compact { padding: var(--space-3) var(--space-4) 0; }
 
 /* Pro: the market */
-.tr-strip { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2) var(--space-5); padding: var(--space-2) var(--space-4); }
+.tr-strip { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2) var(--space-4); padding: var(--space-2) var(--space-4); }
 .tr-market { font-weight: 700; font-size: var(--text-lg); border-color: transparent; background-color: transparent; padding-left: 0; }
 .tr-market:hover { border-color: var(--border); }
 .tr-lastbox { display: flex; flex-direction: column; line-height: 1.15; }
 .tr-last { font-size: var(--text-xl); font-weight: 700; }
-.tr-stats { display: flex; flex-wrap: wrap; gap: var(--space-2) var(--space-5); margin: 0; }
+.tr-stats { display: flex; flex-wrap: wrap; gap: var(--space-2) var(--space-4); margin: 0; }
 .tr-stats > div { display: flex; flex-direction: column; gap: 1px; }
 .tr-stats dt { font-size: var(--text-xs); color: var(--text-muted); }
 .tr-stats dd { margin: 0; font-size: var(--text-sm); font-weight: 600; }
@@ -397,13 +422,11 @@ ol.checklist { list-style: none; margin: 0; padding: 0; }
 .tr-ico-bids::before, .tr-ico-bids::after { background: var(--success); }
 .tr-ico-asks::before, .tr-ico-asks::after { background: var(--danger); }
 .tr-book { padding: 0 var(--space-2) var(--space-1); font-variant-numeric: tabular-nums; }
-.tr-book[data-show="bids"] .tr-asks, .tr-book[data-show="bids"] #tr-asks-label,
-.tr-book[data-show="asks"] .tr-bids, .tr-book[data-show="asks"] #tr-bids-label { display: none; }
+.tr-book[data-show="bids"] .tr-asks, .tr-book[data-show="asks"] .tr-bids { display: none; }
 .tr-asks { display: flex; flex-direction: column; justify-content: flex-end; min-height: calc(5 * 22px); }
 .tr-book[data-show="asks"] .tr-asks { min-height: 0; }
 .tr-bids { min-height: calc(5 * 22px); }
 .tr-book[data-show="bids"] .tr-bids { min-height: 0; }
-.tr-side-label { padding: 2px var(--space-2); }
 .tr-book-row {
   position: relative;
   display: grid; grid-template-columns: 1.2fr 1fr 1fr; gap: var(--space-2);
@@ -472,7 +495,12 @@ button.tr-book-row { width: 100%; text-align: left; }
 .tr-side-buy[aria-selected="true"] { background: var(--success); color: var(--success-on); }
 .tr-side-sell[aria-selected="true"] { background: var(--danger); color: var(--danger-on); }
 .tr-form { display: flex; flex-direction: column; gap: var(--space-2); padding: var(--space-2) var(--space-3) var(--space-3); }
-.tr-avbl { display: flex; justify-content: space-between; gap: var(--space-2); }
+/* The kind of order on the left, what there is to spend on the right. */
+.tr-form-top { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 2px var(--space-3); }
+.tr-avbl { display: flex; gap: 6px; margin-left: auto; white-space: nowrap; }
+/* A warning in the form is a note beside the numbers, not a headline:
+   the button under it stays in sight. */
+.tr-form .banner { padding: 6px var(--space-2); font-size: var(--text-xs); line-height: 1.4; border-radius: 8px; }
 /* An input with its label inside on the left and unit on the right. */
 .tr-in {
   display: flex; align-items: center; gap: 4px;
@@ -494,7 +522,17 @@ button.tr-book-row { width: 100%; text-align: left; }
   border-radius: 5px; color: var(--text-muted); font-size: 15px; line-height: 1;
 }
 .tr-stepper:hover { background: var(--bg-card); color: var(--text); }
-.tr-tif .select { width: 100%; font-size: var(--text-sm); }
+/* What an order does with what cannot trade at once: three choices in
+   sight, each with the trader's name for it. */
+.tr-tif { display: flex; flex-direction: column; gap: 4px; }
+.tr-tif-seg { display: grid; grid-template-columns: auto auto auto; gap: 3px; padding: 3px; background: var(--bg-subtle); border: 1px solid var(--border); border-radius: var(--radius-sm); }
+.tr-tif-btn { min-height: 26px; padding: 0 6px; border-radius: 5px; font-size: var(--text-xs); font-weight: 600; color: var(--text-muted); white-space: nowrap; }
+.tr-tif-btn abbr { font-weight: 500; opacity: 0.75; text-decoration: none; }
+.tr-tif-btn:hover { color: var(--text); }
+.tr-tif-btn[aria-pressed="true"] { background: var(--bg-elevated); color: var(--text); box-shadow: 0 0 0 1px var(--border-strong); }
+/* The shared focus ring is a shadow too: a pressed button's own shadow
+   must not take its place. */
+.tr-mode-btn:focus-visible, .tr-tif-btn:focus-visible { box-shadow: var(--focus-ring); }
 
 /* Share slider with five marks; filled to the thumb in the side's colour. */
 .tr-slider { position: relative; padding: 2px 44px 2px 0; --pct: 0%; --c: var(--success); }
@@ -520,6 +558,8 @@ button.tr-book-row { width: 100%; text-align: left; }
 .tr-sum { margin: 0; display: grid; gap: 4px; font-size: var(--text-xs); }
 .tr-sum:empty { display: none; }
 .tr-sum > div { display: flex; justify-content: space-between; gap: var(--space-2); }
+.tr-sum > .tr-sum-now { display: block; color: var(--text); text-wrap: pretty; }
+.tr-sum > .tr-sum-warn { color: var(--warning); }
 .tr-sum dt { color: var(--text-muted); }
 .tr-sum dd { margin: 0; font-weight: 600; text-align: right; font-variant-numeric: tabular-nums; }
 
@@ -538,21 +578,28 @@ button.tr-book-row { width: 100%; text-align: left; }
 
 /* Your orders, what you did, the market's trades */
 .tr-lists { overflow: hidden; }
+.tr-orders-table td { vertical-align: middle; white-space: nowrap; }
+.tr-orders-table th, .tr-orders-table td { padding-inline: var(--space-2); }
+.tr-orders-table th:first-child, .tr-orders-table td:first-child { padding-left: var(--space-4); }
+.tr-orders-table th:last-child, .tr-orders-table td:last-child { padding-right: var(--space-3); }
+.tr-orders-table .btn { min-height: 28px; }
 .tr-page[data-mode="simple"] .tr-lists-tabs,
-.tr-page[data-mode="simple"] #tr-trades,
 .tr-page[data-mode="simple"] .tr-lists:not([data-has-orders]) #tr-orders,
 .tr-page[data-mode="pro"] .tr-list-title,
 .tr-page[data-mode="pro"] .tr-lists:not([data-tab="orders"]) #tr-orders,
-.tr-page[data-mode="pro"] .tr-lists:not([data-tab="activity"]) #tr-activity,
-.tr-page[data-mode="pro"] .tr-lists:not([data-tab="trades"]) #tr-trades { display: none; }
+.tr-page[data-mode="pro"] .tr-lists:not([data-tab="activity"]) #tr-activity { display: none; }
 .tr-page[data-mode="simple"] .tr-list-block + .tr-list-block { border-top: 1px solid var(--border); }
 .tr-list-title { font-size: var(--text-sm); font-weight: 650; margin: 0; padding: var(--space-3) var(--space-4) 0; }
 .tr-list-block > .banner { margin: var(--space-3) var(--space-4) 0; }
 .tr-list-empty { margin: 0; padding: var(--space-3) var(--space-4) var(--space-4); }
 .tr-list-empty:empty { display: none; }
 .tr-list-foot { display: flex; flex-wrap: wrap; gap: var(--space-2); padding: var(--space-2) var(--space-3) var(--space-3); }
-.tr-lists .tbl th { font-size: var(--text-xs); font-weight: 600; color: var(--text-muted); text-transform: none; letter-spacing: 0; }
+.tr-lists .tbl th, .tr-tape .tbl th { font-size: var(--text-xs); font-weight: 600; color: var(--text-muted); text-transform: none; letter-spacing: 0; }
 .tr-lists .tbl td, .tr-lists .tbl th { padding-block: 7px; }
+/* The market's trades, in the chart's place and about its height. */
+.tr-tape .table-wrap { max-height: 250px; overflow-y: auto; }
+.tr-tape .tbl td, .tr-tape .tbl th { padding-block: 4px; }
+.tr-tape .tbl thead th { position: sticky; top: 0; background: var(--bg-card); z-index: 1; }
 #view-trade .tbl td.num, #view-trade .tbl th.num { white-space: nowrap; }
 .tr-row { border-bottom: 1px solid var(--border); }
 .tr-row:last-child { border-bottom: 0; }
@@ -635,3 +682,18 @@ details.tr-row[open] .tr-row-trail .caret { rotate: 90deg; }
 #chain.is-stale #sync-badge { opacity: 0.55; }
 .card-stale { margin: 0; padding: var(--space-2) var(--space-4) 0; }
 
+
+/* The connect card says in the open what to do without a network folder. */
+.tr-nofolder { display: grid; gap: var(--space-1); padding: var(--space-3) var(--space-4); border: 1px solid var(--border); border-radius: var(--radius-sm); }
+.tr-nofolder p { margin: 0; }
+
+/* The trades behind one history row. */
+.tr-fills { font-size: var(--text-xs); }
+.tr-fills th, .tr-fills td { padding: 4px var(--space-2); white-space: nowrap; }
+.tr-fills th:first-child, .tr-fills td:first-child { padding-left: 0; }
+.tr-fills th:last-child, .tr-fills td:last-child { padding-right: 0; }
+.tr-fills tbody tr:hover td { background: none; }
+
+/* In the simple view a sale is not a warning: its mark is plain. */
+.tr-page[data-mode="simple"] .tr-row-lead[data-tone="buy"],
+.tr-page[data-mode="simple"] .tr-row-lead[data-tone="sell"] { background: var(--bg-subtle); color: var(--text-muted); }

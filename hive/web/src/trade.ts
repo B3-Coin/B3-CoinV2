@@ -24,9 +24,12 @@ import { trapDialog } from "./a11y";
 import {
   amount,
   amountText,
+  assetPlaces,
+  averageText,
   baseAtoms,
   depth,
   feeRate,
+  lotPlaces,
   lotText,
   lotsIn,
   maxLots,
@@ -56,7 +59,7 @@ import {
   type Plan,
   type Want,
 } from "./fm2fmt";
-import { advise, numberProblem, size, tell, type Offer, type Row, type Told } from "./fm2words";
+import { OWN_ORDER, WAITING, advise, numberProblem, outlook, size, tell, type Advice, type Fill, type Offer, type Row, type Told } from "./fm2words";
 
 // ---- what the core sends (src-tauri/src/fm2/view.rs, src/trade.rs) ---------
 
@@ -121,6 +124,8 @@ type Trade = { at: number; slot: string; takerSide: "buy" | "sell"; ticks: bigin
 const TRADES_KEPT = 300;
 /** Book levels shown per side when both sides show. */
 const BOOK_ROWS = 10;
+/** The height of one row of the book, as the stylesheet sets it. */
+const BOOK_ROW_PX = 22;
 /** A row that is new in the book flashes for this long. */
 const FLASH_MS = 800;
 /** Validators are asked for their status this often while the page is open. */
@@ -157,12 +162,22 @@ let side: "buy" | "sell" = "buy";
 let driver: "pay" | "get" = "pay";
 /** Simple: said once after the user rejected a trade, until they go on. */
 let afterReject = false;
+/** What the simple card last said, for the review that follows its button. */
+let swapSaid: Advice | null = null;
+/** The simple card's first field takes the cursor once, when it appears. */
+let wantFocus = false;
+/** What an order with a price of its own does with what cannot trade at
+ *  once: wait (good till cancelled), drop it (immediate or cancel), or
+ *  only ever wait (post only). */
+let stay: "gtc" | "ioc" | "post_only" = "gtc";
+/** How many columns the page has room for (hive.css: 740px and 1180px). */
+let columns: 1 | 2 | 3 = 2;
 /** Pro: an order at the user's price, or at once against the book. */
 let kind: "limit" | "market" = "limit";
 /** Pro: the user typed the total, so the amount follows it. */
 let totalLed = false;
 let bookShow: "both" | "bids" | "asks" = "both";
-let chartView: "price" | "depth" = "price";
+let chartView: "price" | "depth" | "trades" = "price";
 let historyShown = 6;
 const shown = { asks: new Set<string>(), bids: new Set<string>() };
 
@@ -175,6 +190,12 @@ type Flow = {
   origin: Origin;
   /** What is under way, e.g. "Buying 0.005 B3". */
   verb: string;
+  /** What the button says that takes the request back before it is
+   *  approved. "Cancel", except for a cancellation, where that would read
+   *  as its opposite. */
+  back: string;
+  /** What the order form asked for when the request was made. */
+  form: string;
   stage: "review" | "sent" | "done";
   draft: string;
   label: string | null;
@@ -280,6 +301,10 @@ function clock(ms: number): string {
   return `${two(d.getHours())}:${two(d.getMinutes())}:${two(d.getSeconds())}`;
 }
 
+/** A balance with its unit, with the decimals the asset trades in, so that
+ *  it keeps its length from one trade to the next. */
+const held = (atoms: bigint, asset: Asset): string => `${amount(atoms, asset, assetPlaces(asset, info?.markets ?? []))} ${unit(asset)}`;
+
 /** What this account can spend of an asset; null when no validator has
  *  proved the account. */
 function available(asset: Asset): bigint | null {
@@ -293,6 +318,8 @@ const ready = (): boolean => !!info?.account && !!account?.proved;
 
 /** Something waits in the approval window: one at a time. */
 const pending = (): boolean => [...flows.values()].some((f) => f.stage === "review");
+/** Whether the request that waits there was made from the trading form. */
+const ownWaits = (): boolean => flows.get("trade")?.stage === "review";
 
 /** How the network is doing, in words for the top of the page. */
 function network(): { state: "ok" | "wait" | "bad"; text: string; notice: string } {
@@ -322,12 +349,25 @@ function network(): { state: "ok" | "wait" | "bad"; text: string; notice: string
 
 export function startTrade(): void {
   active = true;
+  placeBar();
   void enter();
 }
+
+/** The page's bar (the network, and the choice of view) sits in the page's
+ *  header while the Trade page is open and the header shows: the header
+ *  has the room, and the page needs the height. */
+const HEADER_SHOWS = matchMedia("(min-width: 640px)");
+function placeBar(): void {
+  const head = document.querySelector<HTMLElement>(".page-head");
+  if (active && head && HEADER_SHOWS.matches) head.append(el("tr-bar"));
+  else el("tr-notice").before(el("tr-bar"));
+}
+HEADER_SHOWS.addEventListener("change", placeBar);
 
 export function stopTrade(): void {
   if (!active) return;
   active = false;
+  placeBar();
   closeDialog();
   el<HTMLDetailsElement>("tr-net").open = false;
   invoke("fm2_unwatch").catch(() => {});
@@ -339,6 +379,7 @@ export function tradeMaskChanged(): void {
 }
 
 async function enter(): Promise<void> {
+  wantFocus = true;
   if (!wired) {
     wired = true;
     await wire();
@@ -479,13 +520,12 @@ function setMode(next: "simple" | "pro", save: boolean): void {
   el("tr-page").dataset.mode = next;
   el("tr-mode-simple").setAttribute("aria-pressed", String(!pro));
   el("tr-mode-pro").setAttribute("aria-pressed", String(pro));
-  // The lists sit under the chart in Pro and under the account in Simple;
-  // what is left to do takes the place of the form it stands in for.
-  (pro ? el("tr-col-mid") : el("tr-col-side")).append(el("tr-lists"));
+  // What is left to do takes the place of the form it stands in for.
+  placeLists();
   el("tr-lists").hidden = false;
   if (pro) el("tr-col-side").prepend(el("tr-start"));
   else el("tr-col-main").prepend(el("tr-start"));
-  for (const id of ["tr-orders", "tr-activity", "tr-trades"]) {
+  for (const id of ["tr-orders", "tr-activity"]) {
     if (pro) el(id).setAttribute("role", "tabpanel");
     else el(id).removeAttribute("role");
   }
@@ -494,6 +534,25 @@ function setMode(next: "simple" | "pro", save: boolean): void {
   if (save && flows.get("trade")?.stage === "done") flows.delete("trade");
   if (save) invoke("set_ui_trade_pro", { pro }).catch(() => {});
   render();
+  // The other view is another page under the same header: it starts at its
+  // top, not where the first one was left.
+  if (save) document.scrollingElement?.scrollTo({ top: 0 });
+}
+
+/** The orders and the history sit under the account in Simple. In Pro
+ *  they sit under the chart when the page has three columns and under the
+ *  order book, above the chart, when it has two: the book, the order form
+ *  and the open orders belong on one screen, and a chart that starts when
+ *  the page connects can wait below them. In one column they follow the
+ *  order form, which follows the book. */
+function placeLists(): void {
+  const lists = el("tr-lists");
+  if (mode === "pro" && columns === 1) {
+    if (lists.previousElementSibling !== el("tr-ticket")) el("tr-ticket").after(lists);
+    return;
+  }
+  const home = el(mode === "simple" ? "tr-col-side" : columns === 3 ? "tr-col-mid" : "tr-col-main");
+  if (lists.parentElement !== home || lists !== home.lastElementChild) home.append(lists);
 }
 
 /** Opens Pro on an order at a price of the user's own. */
@@ -612,6 +671,7 @@ function render(): void {
   renderSwap();
   renderTicket();
   renderFlows();
+  takeCursor();
 }
 
 function renderBar(): void {
@@ -720,7 +780,7 @@ function renderStart(): void {
         2,
         "Create your trading account",
         h("p", "muted", "One click. B3 Hive makes a key for this test network and keeps it on this computer. It signs what you do here, and only after you approve it."),
-        h("p", "t-sm muted", "On a test network the key is kept unencrypted, so this account must never hold anything of value."),
+        h("p", "t-sm muted", "The account holds test funds only. They have no value, so its key is kept on this computer without a password."),
         act,
       ),
       step("pending", 3, "Get test funds"),
@@ -730,10 +790,22 @@ function renderStart(): void {
     const field = h("div", "copyfield copyfield--wrap");
     const copy = action("Copy", "btn btn-primary btn-sm", () => copyTo(info?.account ?? "", copy));
     field.append(h("span", "val", info.account), copy);
-    act.append(field, h("p", "t-sm muted", "There is nothing else to do here. This page shows the funds by itself as soon as the network confirms them."), operatorHelp());
+    act.append(
+      field,
+      h("p", "t-sm muted", "The number is safe to share: all anyone can do with it is send funds to this account."),
+      h("p", "t-sm muted", "There is nothing else to do here. This page shows the funds by itself as soon as the network confirms them."),
+      operatorHelp(),
+    );
+    const listed = assetNames();
     steps.push(
       step("done", 2, "Create your trading account"),
-      step("active", 3, "Get test funds", h("p", "muted", "On a test network, funds come from whoever runs it. Send them your account number and say what you need."), act),
+      step(
+        "active",
+        3,
+        "Get test funds",
+        h("p", "muted", `On a test network, funds come from whoever runs it: the person who gave you the network folder. Send them this account number and say which funds you want.${listed ? ` This network has ${listed}.` : ""}`),
+        act,
+      ),
     );
   }
   el("tr-start-steps").replaceChildren(...steps);
@@ -848,8 +920,8 @@ function renderSwap(): void {
     el(id).textContent = text;
     el(id).setAttribute("aria-selected", String(on));
   }
-  el("tr-pay-have").textContent = `You have ${masked(amountText(have, pay))}`;
-  el("tr-get-have").textContent = `You have ${masked(amountText(available(get) ?? 0n, get))}`;
+  el("tr-pay-have").textContent = `You have ${masked(held(have, pay))}`;
+  el("tr-get-have").textContent = `You have ${masked(held(available(get) ?? 0n, get))}`;
   const turn = `Turn it around: pay ${unit(get)}, receive ${unit(pay)}`;
   el("tr-flip-text").textContent = turn;
   el("tr-flip").title = turn;
@@ -864,23 +936,12 @@ function renderSwap(): void {
     else derived = buy ? plain(p.gross, m.quote) : plain(baseAtoms(p.lots, m), m.base);
   }
   if (follows.value !== derived) follows.value = derived;
-  // A buy's cost and a sale's proceeds depend on the prices it meets, so
-  // those are estimates; the amount of the base is what the order states.
-  el("tr-pay-label").textContent = !buy ? "You sell" : !filled ? "You pay" : driver === "pay" ? "You pay up to" : "You pay about";
-  el("tr-get-label").textContent = buy || !filled ? "You receive" : "You receive about";
-
   const offers = book ? (buy ? book.asks : book.bids) : [];
-  const lines: HTMLElement[] = [];
-  if (p && filled) {
-    lines.push(pair("Price", p.limit === p.best ? priceText(p.best, m) : `${price(p.best, m)} to ${priceText(p.limit, m)}`));
-    lines.push(pair("Fee", buy ? "None for buying" : `${amountText(p.fee, m.quote)} (${feeRate(info.fee_ppm)} of the sale)`));
-    lines.push(buy ? pair("You never pay more than", amountText(p.ceiling, m.quote), "is-promise") : pair("It sells only at", `${priceText(p.limit, m)} or better`, "is-promise"));
-  } else if (offers.length) {
-    lines.push(pair("Price now", priceText(BigInt(offers[0].price_ticks), m)));
-  }
-  el("tr-quote").replaceChildren(...lines);
-
-  // What the button says and the line under the card (fm2words.ts).
+  // The best price of the other direction: what selling pays while this
+  // card buys, and the other way round.
+  const across = book ? (buy ? book.bids : book.asks) : [];
+  // What a budget that did not come out even could buy with one piece more.
+  const up = p && p.lots > 0n && p.short === null && buy && q.want?.of === "quote" ? plan(side, { of: "base", atoms: baseAtoms(p.lots + 1n, m) }, offers, have, m, info.fee_ppm) : null;
   const said = advise({
     m,
     buy,
@@ -889,31 +950,73 @@ function renderSwap(): void {
     problem: q.problem,
     want: q.want,
     plan: p,
-    offered: offers.length > 0,
-    blocked: pending() ? "review" : network().state === "bad" ? "network" : !book || !links.get("book")?.live ? "prices" : "",
+    more: up && up.short === null ? up : null,
+    best: offers.length ? BigInt(offers[0].price_ticks) : 0n,
+    first: offers.length ? BigInt(offers[0].lots) : 0n,
+    other: across.length ? BigInt(across[0].price_ticks) : 0n,
+    own: !!p && p.lots > 0n && meetsOwn(m, buy, p.limit),
+    blocked: pending() ? (ownWaits() ? "review" : "elsewhere") : network().state === "bad" ? "network" : !book || !links.get("book")?.live ? "prices" : "",
+    feePpm: info.fee_ppm,
   });
-  const go = said.go;
-  const enabled = said.enabled;
+  swapSaid = said;
+  // A typed budget is a ceiling when it does not come out even, and what a
+  // trade costs or brings is an estimate when it reaches past the best
+  // price. The labels say so only then.
+  const sure = !p || p.limit === p.best;
+  const spare = buy && driver === "pay" && said.enabled && !!q.want && !!p && q.want.atoms > p.ceiling;
+  el("tr-pay-label").textContent = !buy ? "You sell" : spare ? "You pay up to" : said.enabled && !sure && driver === "get" ? "You pay about" : "You pay";
+  el("tr-get-label").textContent = !buy && said.enabled && !sure ? "You receive about" : "You receive";
+
+  el("tr-quote").replaceChildren(
+    ...said.lines.map((line) => {
+      const row = pair(line.key, line.value);
+      if (line.note) row.append(h("span", "tr-quote-note", line.note));
+      return row;
+    }),
+  );
+  el("tr-swap-promise").textContent = said.promise;
+
   const hint: Part[] = said.hint.map((part) => (typeof part === "string" ? part : { link: part.link, run: taking(part) }));
-  if (afterReject && !hint.length) hint.push("You rejected it. Nothing was signed, and nothing was sent.");
   keyed(el("tr-swap-hint"), hint.map((part) => (typeof part === "string" ? part : `[${part.link}]`)).join(""), () =>
     hint.map((part) => (typeof part === "string" ? document.createTextNode(part) : link(part.link, part.run))),
   );
+  // What became of a request that was just taken back: in a box of its
+  // own above the button, where the eye is when the form returns.
+  banner("tr-swap-note", "info", afterReject ? "You did not approve it, so nothing happened and no money moved." : "", "tr-inline");
+  // The warning, with the amount that avoids it at its end.
+  const warnBox = el("tr-swap-warn");
+  warnBox.hidden = said.warn.length === 0;
+  if (said.warn.length) bannerTone(warnBox, "warning", "tr-inline");
+  keyed(warnBox, said.warn.map((part) => (typeof part === "string" ? part : `[${part.link}]`)).join(""), () => {
+    // One run of text, so that the link stays in the sentence it ends.
+    const text = h("span");
+    text.append(...said.warn.map((part) => (typeof part === "string" ? part : link(part.link, taking(part)))));
+    return [text];
+  });
 
-  const warnings: string[] = [];
-  if (enabled && p) {
-    if (meetsOwn(m, buy, p.limit)) warnings.push("One of the orders this would trade with is your own. Trading with yourself changes nothing, and the seller's fee is still taken.");
-    const far = reach(p);
-    if (far >= FAR_BPS) warnings.push(`This is a large trade for this market. Its last part trades at a price ${percent(far)} ${buy ? "above" : "below"} the best one.`);
-  }
-  banner("tr-swap-warn", "warning", warnings.join(" "), "tr-inline");
-
-  const button = el<HTMLButtonElement>("tr-swap-go");
-  button.textContent = go;
-  button.disabled = !enabled;
-  el("tr-swap-foot").hidden = !enabled;
+  // The button names the trade and its money, and says that pressing it is
+  // not yet the trade.
+  el("tr-swap-go-text").textContent = said.go;
+  el("tr-swap-go-sub").hidden = !said.enabled;
+  el<HTMLButtonElement>("tr-swap-go").disabled = !said.enabled;
   const idle = have === 0n || !offers.length;
   for (const chip of document.querySelectorAll<HTMLButtonElement>("#tr-swap .tr-chip")) chip.disabled = idle;
+}
+
+/** The first thing to do on the simple card is to type an amount: the
+ *  cursor waits there when the card appears and when a request ends,
+ *  unless the user is somewhere else already. */
+function takeCursor(): void {
+  if (!wantFocus) return;
+  const field = el<HTMLInputElement>("tr-pay");
+  // The card is not there yet (the first steps, a request under way).
+  if (mode === "simple" && (flows.has("trade") || field.closest("[hidden]"))) return;
+  wantFocus = false;
+  // A dialog of this page is open: the cursor belongs to it.
+  if (mode !== "simple" || dialog) return;
+  const at = document.activeElement;
+  const busy = at instanceof HTMLElement && at !== document.body && at.isConnected && !at.closest("[hidden]") && (el("view-trade").contains(at) || el("tr-bar").contains(at));
+  if (!busy) field.focus({ preventScroll: true });
 }
 
 /** A share of what the account holds of the asset it pays with. */
@@ -934,17 +1037,21 @@ async function reviewSwap(): Promise<void> {
   const q = ask();
   if (!q?.p || q.p.lots === 0n || q.p.short !== null) return;
   const { m, buy, p } = q;
-  await offer("trade", `${buy ? "Buying" : "Selling"} ${size(p.lots, m)}`, () =>
-    invoke<string>("fm2_place_draft", { order: { market: m.id, side, tif: "ioc", price_ticks: p.limit.toString(), lots: p.lots.toString() } }),
+  if (!swapSaid?.enabled) return;
+  await offer(
+    "trade",
+    buy ? `Buying${swapSaid.go.slice(3)}` : `Selling${swapSaid.go.slice(4)}`,
+    () => invoke<string>("fm2_place_draft", { order: { market: m.id, side, tif: "ioc", price_ticks: p.limit.toString(), lots: p.lots.toString() } }),
+    buy ? "Don't buy" : "Don't sell",
   );
 }
 
 // ---- from review to the confirmed end --------------------------------------
 
 /** Asks the core for a draft and sends the user to the approval window. */
-async function offer(origin: Origin, verb: string, draft: () => Promise<string>): Promise<void> {
+async function offer(origin: Origin, verb: string, draft: () => Promise<string>, back = "Cancel"): Promise<void> {
   if (pending()) return;
-  const flow: Flow = { origin, verb, stage: "review", draft: "", label: null, sent: null, row: null, error: "", at: Date.now(), slow: false };
+  const flow: Flow = { origin, verb, back, form: ticketState(), stage: "review", draft: "", label: null, sent: null, row: null, error: "", at: Date.now(), slow: false };
   // Set before the core answers, so a second click finds it.
   flows.set(origin, flow);
   afterReject = false;
@@ -969,6 +1076,7 @@ export function tradeDecided(r: Decided): boolean {
   if (r.outcome === "rejected") {
     flows.delete(origin);
     afterReject = origin === "trade";
+    wantFocus = afterReject;
   } else if (r.outcome === "fm2" && r.sent) {
     flow.stage = "sent";
     flow.sent = r.sent;
@@ -1006,7 +1114,8 @@ function standing(label: string, m: Market): string {
   const rested = BigInt(o.rested_lots);
   const left = BigInt(o.remaining_lots);
   const since = rested > left ? rested - left : 0n;
-  return since > 0n ? `Since then ${size(since, m)} of it has traded, and ${size(left, m)} is still waiting.` : "It is still waiting.";
+  // A waiting order trades at its own price.
+  return since > 0n ? `Since then ${size(since, m)} of it has traded at ${priceText(BigInt(o.price_ticks), m)}, by the live view, and ${size(left, m)} is still waiting.` : "It is still waiting.";
 }
 
 function resultBox(tone: Told["result"], title: string, detail: string): HTMLDivElement {
@@ -1033,6 +1142,18 @@ function showApproval(): void {
   invoke("approval_show").catch(() => {});
 }
 
+/** Takes back a request that waits for approval. The core rejects it as
+ *  the approval window would, and this page hears of it the same way. */
+async function withdraw(flow: Flow, button: HTMLButtonElement): Promise<void> {
+  if (!flow.draft) return;
+  button.disabled = true;
+  try {
+    await invoke("fm2_withdraw", { id: flow.draft });
+  } catch {
+    // Decided in the window a moment ago: its result is on its way here.
+  }
+}
+
 async function sendAgain(flow: Flow, button: HTMLButtonElement): Promise<void> {
   if (!flow.label) return;
   button.disabled = true;
@@ -1048,6 +1169,14 @@ async function sendAgain(flow: Flow, button: HTMLButtonElement): Promise<void> {
   }
   button.disabled = false;
   renderFlows();
+}
+
+/** What the order form asks for, so that a form that was changed since a
+ *  request was made from it can be told from one that was not. */
+function ticketState(t: Ticket | null = ticket()): string {
+  if (!t) return "";
+  const limit = kind === "limit";
+  return [t.m.id, side, kind, limit ? stay : "", limit ? t.ticks : "", t.lots].join("|");
 }
 
 const flowBox = (origin: Origin): string => (origin === "trade" ? (mode === "simple" ? "tr-swap-flow" : "tr-ticket-flow") : origin === "orders" ? "tr-orders-flow" : "tr-account-flow");
@@ -1084,6 +1213,7 @@ function renderFlow(origin: Origin): void {
 function buildFlow(flow: Flow, full: boolean): Node[] {
   const done = () => {
     flows.delete(flow.origin);
+    wantFocus = flow.origin === "trade";
     render();
   };
   const nodes: Node[] = [];
@@ -1093,14 +1223,23 @@ function buildFlow(flow: Flow, full: boolean): Node[] {
       nodes.push(
         flowMark("window"),
         h("h3", "", "Check it in the small window"),
-        h("p", "muted", `A small window opened so you can check everything before ${what}. Approve it there to go ahead, or reject it. Nothing is signed until you approve.`),
+        h("p", "muted", `A small window opened so you can check everything before ${what}. Approve it there to go ahead. No money moves until you do.`),
       );
       const buttons = h("div", "btn-row");
-      buttons.append(action("Show the window again", "btn btn-secondary", showApproval));
+      const cancel = action(flow.back, "btn btn-ghost", () => void withdraw(flow, cancel));
+      cancel.disabled = !flow.draft;
+      buttons.append(action("Show the window again", "btn btn-secondary", showApproval), cancel);
       nodes.push(buttons);
     } else {
       const line = h("div", "tr-flow-line");
-      line.append(h("span", "", "Check it in the approval window. Nothing is signed until you approve. "), link("Show the window", showApproval));
+      const cancel = link(flow.back, () => void withdraw(flow, cancel));
+      cancel.disabled = !flow.draft;
+      cancel.title = "Takes the request back. Nothing is sent.";
+      const acts = h("span", "tr-flow-links");
+      acts.append(link("Show the window", showApproval), cancel);
+      // The order form shows the order itself: its line need not repeat it.
+      const lead = flow.origin === "trade" ? "Check" : `${flow.verb}: check`;
+      line.append(h("span", "tr-flow-text", `${lead} it in the approval window. Nothing happens until you approve it there.`), acts);
       nodes.push(line);
     }
     return nodes;
@@ -1125,7 +1264,7 @@ function buildFlow(flow: Flow, full: boolean): Node[] {
       const line = h("div", "tr-flow-line");
       const spinner = h("span", "spinner");
       spinner.setAttribute("aria-hidden", "true");
-      line.append(spinner, h("span", "", took > 0 ? `${flow.verb}: sent, waiting for the network to confirm it.` : `${flow.verb}: signed, but no validator has taken it yet.`));
+      line.append(spinner, h("span", "tr-flow-text", took > 0 ? `${flow.verb}: sent, waiting for the network to confirm it.` : `${flow.verb}: signed, but no validator has taken it yet.`));
       nodes.push(line);
     }
     const buttons = h("div", "btn-row");
@@ -1149,17 +1288,24 @@ function buildFlow(flow: Flow, full: boolean): Node[] {
     nodes.push(flowMark(told ? told.result : "danger"), h("h3", "", title));
     if (said) nodes.push(h("p", "muted", said));
     buttons.append(
-      action(told?.result === "success" ? "Done" : "Back", "btn btn-primary", () => {
+      action(told?.result === "success" ? "Close" : "Back to the form", "btn btn-secondary", () => {
         // After a trade that went through, the card starts empty again.
         if (told?.result === "success") clearInputs();
         done();
       }),
     );
   } else {
-    nodes.push(resultBox(told ? told.result : "danger", title, said));
-    buttons.append(action("Dismiss", "btn btn-ghost btn-sm", done));
+    // Closed from its own corner: a row for a button would push down
+    // what stands under it.
+    const box = resultBox(told ? told.result : "danger", title, said);
+    const close = action("", "tr-flow-close", done);
+    close.setAttribute("aria-label", "Dismiss");
+    close.title = "Dismiss";
+    close.append(icon("close", "i-sm"));
+    box.append(close);
+    nodes.push(box);
   }
-  nodes.push(buttons);
+  if (buttons.childElementCount) nodes.push(buttons);
   return nodes;
 }
 
@@ -1169,9 +1315,9 @@ function renderStrip(): void {
   const m = market;
   if (!m || !info) return;
   const last = trades[0];
-  const before = trades.find((t) => t.ticks !== last?.ticks);
   el("tr-last").textContent = last ? price(last.ticks, m) : "—";
-  el("tr-last").className = `tr-last tnum ${last && before ? (last.ticks > before.ticks ? "tr-up" : "tr-down") : ""}`;
+  // Coloured as the list of trades colours it: by who took whose price.
+  el("tr-last").className = `tr-last tnum ${last ? (last.takerSide === "buy" ? "tr-up" : "tr-down") : ""}`;
   el("tr-last-unit").textContent = last ? `Last price, ${priceUnit(m)}` : "No trade seen yet";
   const pick = (id: string, level: Level | undefined) => {
     const button = el<HTMLButtonElement>(id);
@@ -1180,12 +1326,25 @@ function renderStrip(): void {
   };
   pick("tr-best-bid", book?.bids[0]);
   pick("tr-best-ask", book?.asks[0]);
-  const gap = book ? spread(book.bids, book.asks) : null;
-  el("tr-spread-stat").textContent = gap ? `${price(gap.ticks, m)} (${percent(gap.bps)})` : "—";
   el("tr-lot").textContent = lotText(m);
   el("tr-tick").textContent = tickText(m);
-  el("tr-fee-stat").textContent = feeRate(info.fee_ppm);
+  // A sale that brings anything pays at least the smallest unit.
+  el("tr-fee-stat").textContent = `${feeRate(info.fee_ppm)}, at least ${amountText(1n, m.quote)}`;
 }
+
+/** How many prices of a side the book shows: ten where it has a column
+ *  of its own. Beside the order form it is as tall as the form in the
+ *  smallest window, so that the open orders under it start on the first
+ *  screen: five prices there, and one more for each two rows a taller
+ *  window adds. Above the form, in one column, five: the form comes next. */
+function bookRows(): number {
+  if (columns === 3) return BOOK_ROWS;
+  if (columns === 1) return BOOK_ROWS / 2;
+  const spare = Math.max(0, document.documentElement.clientHeight - 720);
+  return Math.min(BOOK_ROWS, BOOK_ROWS / 2 + Math.floor(spare / (2 * BOOK_ROW_PX)));
+}
+/** The count the book was last drawn with. */
+let bookDepth = 0;
 
 function renderBook(): void {
   const m = market;
@@ -1194,7 +1353,10 @@ function renderBook(): void {
   el("tr-book-stale").hidden = !book || !!links.get("book")?.live;
   el("tr-book-price").textContent = m ? `Price (${unit(m.quote)})` : "Price";
   el("tr-book-amount").textContent = m ? `Amount (${unit(m.base)})` : "Amount";
-  el("tr-book-note").textContent = book ? "Choose a price to use it in your order. A dot marks a price where an order of yours waits." : "Waiting for the live view.";
+  el("tr-book-sum").textContent = m ? `Sum (${unit(m.base)})` : "Sum";
+  el("tr-book-note").textContent = book ? "Sellers above, buyers below. Click a price to use it. A dot marks your own order." : "Waiting for the live view.";
+  const live = el("tr-book-live");
+  live.title = `What one validator reports right now${book ? `, as of slot ${book.slot}` : ""}. It carries no proof, so every number in it is an estimate, not yet confirmed by the network.`;
   if (!m || !book) {
     asks.replaceChildren();
     bids.replaceChildren();
@@ -1202,10 +1364,21 @@ function renderBook(): void {
     el("tr-spread").textContent = "";
     return;
   }
-  const rows = bookShow === "both" ? BOOK_ROWS : 2 * BOOK_ROWS;
+  const perSide = bookRows();
+  bookDepth = perSide;
+  // Twice as many for one side alone.
+  const rows = bookShow === "both" ? perSide : 2 * perSide;
   const askLevels = depth(book.asks).slice(0, rows);
   const bidLevels = depth(book.bids).slice(0, rows);
-  const own = new Set((account?.orders ?? []).filter((o) => o.market_id === m.id).map((o) => `${o.side === "sell" ? "asks" : "bids"}:${o.price_ticks}`));
+  if (book.asks.length > rows || book.bids.length > rows) el("tr-book-note").textContent += ` The best ${rows} prices of a side are shown.`;
+  // What this account has waiting at each price.
+  const own = new Map<string, bigint>();
+  for (const o of account?.orders ?? []) {
+    if (o.market_id !== m.id) continue;
+    const at = `${o.side === "sell" ? "asks" : "bids"}:${o.price_ticks}`;
+    own.set(at, (own.get(at) ?? 0n) + BigInt(o.remaining_lots));
+  }
+  const places = lotPlaces(m);
   // One depth scale for both sides.
   const deepest = [...askLevels, ...bidLevels].reduce((max, l) => (l.total > max ? l.total : max), 0n);
   const row = (level: (typeof askLevels)[number], which: "asks" | "bids", previous: Set<string>) => {
@@ -1214,20 +1387,22 @@ function renderBook(): void {
     const button = h("button", `tr-book-row tr-pick tr-${which === "asks" ? "ask" : "bid"}`);
     button.type = "button";
     button.dataset.level = `${which}:${key}`;
-    const mine = own.has(`${which}:${key}`);
-    if (mine) button.classList.add("tr-own");
+    const mine = own.get(`${which}:${key}`);
+    if (mine !== undefined) button.classList.add("tr-own");
     if (previous.size && !previous.has(key)) {
       button.classList.add("tr-flash");
       setTimeout(() => button.classList.remove("tr-flash"), FLASH_MS);
     }
     const part = deepest > 0n ? Number((level.total * 1000n) / deepest) / 10 : 0;
     button.style.setProperty("--depth", `${part}%`);
-    button.append(h("span", "tr-price", price(level.ticks, m)), h("span", "num", amount(baseAtoms(level.lots, m), m.base)), h("span", "num", amount(baseAtoms(level.total, m), m.base)));
-    button.title = `${level.orders} order${level.orders === 1 ? "" : "s"} at this price${mine ? ", one of them yours" : ""}`;
-    button.setAttribute(
-      "aria-label",
-      `${which === "asks" ? "Sellers at" : "Buyers at"} ${priceText(level.ticks, m)}, ${size(level.lots, m)}${mine ? ", includes an order of yours" : ""}. Use this price.`,
+    button.append(
+      h("span", "tr-price", price(level.ticks, m)),
+      h("span", "num", amount(baseAtoms(level.lots, m), m.base, places)),
+      h("span", "num", amount(baseAtoms(level.total, m), m.base, places)),
     );
+    const yours = mine !== undefined ? `, ${size(mine, m)} of it yours` : "";
+    button.title = `${which === "asks" ? "Sellers" : "Buyers"}: ${level.orders} order${level.orders === 1 ? "" : "s"} at this price${yours}. ${size(level.total, m)} from the best price to here.`;
+    button.setAttribute("aria-label", `${which === "asks" ? "Sellers at" : "Buyers at"} ${priceText(level.ticks, m)}, ${size(level.lots, m)}${yours}. Use this price.`);
     button.addEventListener("click", () => pickPrice(level.ticks));
     return button;
   };
@@ -1268,20 +1443,26 @@ function svg(tag: string, attrs: Record<string, string>): SVGElement {
 
 function renderChart(): void {
   const showPrice = chartView === "price";
+  const showTape = chartView === "trades";
+  // The list of trades takes the chart's place in the card.
+  el("tr-chart-box").hidden = showTape;
+  el("tr-chart-foot").hidden = showTape;
+  el("tr-trades").hidden = !showTape;
   // SVG elements have no hidden property: set the attribute.
   el("tr-chart").toggleAttribute("hidden", !showPrice);
-  el("tr-depth").toggleAttribute("hidden", showPrice);
-  el("tr-view-price").setAttribute("aria-selected", String(showPrice));
-  el("tr-view-depth").setAttribute("aria-selected", String(!showPrice));
+  el("tr-depth").toggleAttribute("hidden", chartView !== "depth");
+  for (const view of ["price", "depth", "trades"]) el(`tr-view-${view}`).setAttribute("aria-selected", String(view === chartView));
   const caption = el("tr-chart-caption");
-  caption.textContent = showPrice ? "Trades since this page connected" : "Orders waiting, by price";
-  caption.title = showPrice
-    ? "Each point is one trade the live view reported, in the order they arrived. FlowMesh keeps no price history, so the chart starts when this page connects."
-    : "The running total waiting at each price, as the live view reports the book.";
+  caption.textContent = showTape ? "Since this page connected, newest first" : showPrice ? "Trades since this page connected" : "Orders waiting, by price";
+  caption.title = showTape
+    ? "Each row is one trade the live view reported. FlowMesh keeps no list of earlier trades."
+    : showPrice
+      ? "Each point is one trade the live view reported, placed by the time it arrived. FlowMesh keeps no price history, so the chart starts when this page connects."
+      : "The running total waiting at each price, as the live view reports the book.";
   for (const id of ["tr-chart-high", "tr-chart-low", "tr-chart-first", "tr-chart-mid", "tr-chart-last"]) el(id).textContent = "";
   el("tr-lasttag").hidden = true;
   if (showPrice) renderPriceChart();
-  else renderDepthChart();
+  else if (!showTape) renderDepthChart();
 }
 
 function renderPriceChart(): void {
@@ -1304,7 +1485,12 @@ function renderPriceChart(): void {
   // Plot positions only; every label is formatted exactly from the BigInt.
   const range = Number(hi - lo) || 1;
   const right = W - TAG_ROOM;
-  const x = (i: number) => (points.length === 1 ? right / 2 : (i / (points.length - 1)) * (right - 2 * pad) + pad);
+  // Time runs along the chart: two trades a second apart sit together, and
+  // the clock times under its ends mean what they say. Trades all seen at
+  // one moment are spread evenly instead.
+  const span = points[points.length - 1].at - points[0].at;
+  const x = (i: number) =>
+    points.length === 1 ? right / 2 : (span > 0 ? (points[i].at - points[0].at) / span : i / (points.length - 1)) * (right - 2 * pad) + pad;
   const y = (p: bigint) => (hi === lo ? PRICE_BOTTOM / 2 : PRICE_BOTTOM - pad - (Number(p - lo) / range) * (PRICE_BOTTOM - 2 * pad));
 
   const defs = svg("defs", {});
@@ -1331,8 +1517,7 @@ function renderPriceChart(): void {
   const lastLine = svg("line", { class: "lastline", x1: "0", x2: String(W), y1: lastY.toFixed(1), y2: lastY.toFixed(1) });
   // The amounts traded, on their own scale below the prices.
   const most = points.reduce((a, t) => (t.lots > a ? t.lots : a), 0n);
-  const gapX = points.length === 1 ? 12 : ((right - 2 * pad) / (points.length - 1)) * 0.6;
-  const barW = Math.max(2, Math.min(12, gapX));
+  const barW = points.length > 40 ? 3 : 6;
   const room = H - PRICE_BOTTOM - 4;
   const bars = points.map((t, i) => {
     const tall = most > 0n ? (Number((t.lots * 1000n) / most) / 1000) * room : 0;
@@ -1341,8 +1526,9 @@ function renderPriceChart(): void {
   const dots = points.length <= 60 ? points.map((_, i) => svg("circle", { cx: x(i).toFixed(1), cy: y(prices[i]).toFixed(1), r: "2.5", fill: "var(--accent)" })) : [];
   chart.replaceChildren(defs, ...grid, ...bars, area, line, lastLine, ...dots);
 
-  el("tr-chart-high").textContent = price(hi, m);
-  el("tr-chart-low").textContent = hi === lo ? "" : price(lo, m);
+  const lastPrice = prices[prices.length - 1];
+  el("tr-chart-high").textContent = hi === lastPrice ? "" : price(hi, m);
+  el("tr-chart-low").textContent = lo === lastPrice ? "" : price(lo, m);
   const tag = el("tr-lasttag");
   tag.textContent = price(prices[prices.length - 1], m);
   tag.style.top = `${((lastY / H) * 100).toFixed(2)}%`;
@@ -1423,7 +1609,7 @@ function renderTrades(): void {
   el("tr-trades-note").textContent = !m
     ? ""
     : trades.length
-      ? "Trades as the live view reported them since this page connected, newest first. Green was a buyer taking a seller's price, red the other way round."
+      ? "Green was a buyer taking a seller's price, red the other way round. From the live view."
       : links.get("trades")?.live
         ? "No trade has happened in this market since this page connected. FlowMesh keeps no list of earlier trades."
         : "Waiting for the live view.";
@@ -1439,7 +1625,7 @@ function renderTrades(): void {
       tr.append(
         cell(clock(t.at), "tnum"),
         cell(price(t.ticks, m), `num tnum ${t.takerSide === "buy" ? "tr-up" : "tr-down"}`),
-        cell(amount(baseAtoms(t.lots, m), m.base), "num tnum"),
+        cell(amount(baseAtoms(t.lots, m), m.base, lotPlaces(m)), "num tnum"),
         cell(amount(t.quote, m.quote), "num tnum"),
         yours,
       );
@@ -1454,10 +1640,12 @@ function renderAccount(): void {
   if (!info) return;
   const a = account;
   const has = info.account !== null;
-  el("tr-account-id").textContent = info.account ?? "";
   const answered = !!a && a.seats.some((s) => s.height !== null);
   const proof = el("tr-account-proof");
-  proof.textContent = !has ? "" : !a ? "Reading" : a.proved ? "Confirmed" : answered ? "" : "No answer";
+  // Pro says as of when: a trader weighs a balance by its age.
+  const confirmed = mode === "pro" && a?.height ? `Confirmed by the network, as of slot ${whole(BigInt(a.height))}` : "Confirmed by the network";
+  proof.textContent = !has ? "" : !a ? "Reading your account" : a.proved ? confirmed : answered ? "" : "No validator answered";
+  proof.hidden = proof.textContent === "";
   proof.title = a
     ? [
         a.proved ? `As the network confirmed it in slot ${a.height}. B3 Hive checked the proof.` : "",
@@ -1470,11 +1658,14 @@ function renderAccount(): void {
     ...(a?.proved ? a.balances : []).map((b) => {
       const line = h("div", "tr-bal");
       const amounts = h("span", "tr-bal-amounts");
-      amounts.append(h("span", "tr-bal-free", masked(amount(BigInt(b.available), b.asset))));
+      const places = assetPlaces(b.asset, info?.markets ?? []);
+      const free = h("span", "tr-bal-free", masked(amount(BigInt(b.available), b.asset, places)));
+      free.title = "What you can trade or send right now.";
+      amounts.append(free);
       if (BigInt(b.reserved) > 0n) {
-        const held = h("span", "tr-bal-held", `and ${masked(amount(BigInt(b.reserved), b.asset))} in orders`);
-        held.title = "Set aside for your orders that are waiting. It comes back when an order is cancelled.";
-        amounts.append(held);
+        const set = h("span", "tr-bal-held", `plus ${masked(amount(BigInt(b.reserved), b.asset, places))} in open orders`);
+        set.title = "Set aside for your orders that are waiting. It comes back when an order is cancelled.";
+        amounts.append(set);
       }
       line.append(hex(b.asset), h("span", "tr-bal-name", unit(b.asset)), amounts);
       return line;
@@ -1494,8 +1685,9 @@ function renderAccount(): void {
   // Until there are funds, the steps beside this card hold the account
   // number and say how to get them.
   el("tr-account-actions").hidden = !ready();
-  el("tr-account-id-box").hidden = !ready();
-  el<HTMLButtonElement>("tr-send-open").disabled = pending() || !a?.balances.some((b) => BigInt(b.available) > 0n);
+  const send = el<HTMLButtonElement>("tr-send-open");
+  send.disabled = pending() || !a?.balances.some((b) => BigInt(b.available) > 0n);
+  send.title = pending() ? "Finish the request in the small window first." : "";
 }
 
 function renderOrders(): void {
@@ -1512,7 +1704,15 @@ function renderOrders(): void {
   mismatch.hidden = !a?.orders_mismatch;
   mismatch.textContent = a?.orders_mismatch ? "This list may be out of date: an order may have traded while B3 Hive was not watching. Your balances are confirmed and correct." : "";
   mismatch.title = a?.orders_mismatch ?? "";
-  el("tr-orders-empty").textContent = orders.length ? "" : "No orders are waiting. An order at a price of your own waits here until it trades or you cancel it.";
+  el("tr-orders-empty").textContent = orders.length
+    ? mode === "pro"
+      ? "An order is listed once the network has confirmed it. What has traded since then is from the live view."
+      : ""
+    : "No orders are waiting. An order at a price of your own waits here until it trades or you cancel it.";
+  if (mode === "pro" && orders.length) {
+    el("tr-orders-rows").replaceChildren(ordersTable(orders));
+    return;
+  }
   el("tr-orders-rows").replaceChildren(
     ...orders.map((o) => {
       const m = info?.markets.find((x) => x.id === o.market_id);
@@ -1563,6 +1763,62 @@ function renderOrders(): void {
       return item;
     }),
   );
+}
+
+/** The open orders as a trader reads them: one row of fields each. */
+function ordersTable(orders: Order[]): HTMLElement {
+  const several = new Set(orders.map((o) => o.market_id)).size > 1;
+  const table = h("table", "tbl tbl-compact tr-orders-table");
+  const head = h("tr");
+  const th = (text: string, cls = "") => {
+    const cell = h("th", cls, text);
+    cell.scope = "col";
+    return cell;
+  };
+  const placedHead = th("Placed");
+  placedHead.title = "When you approved it, by this computer's clock.";
+  head.append(placedHead, ...(several ? [th("Market")] : []), th("Side"), th("Price", "num"), th("Amount", "num"), th("Filled", "num"), th(""));
+  const thead = h("thead");
+  thead.append(head);
+  const body = h("tbody");
+  for (const o of orders) {
+    const m = info?.markets.find((x) => x.id === o.market_id);
+    const buy = o.side === "buy";
+    const placed = BigInt(o.placed_lots);
+    const left = BigInt(o.remaining_lots);
+    const done = placed > left ? placed - left : 0n;
+    const ticks = BigInt(o.price_ticks);
+    const created = account?.activity.find((r) => r.label === o.label)?.created;
+    const row = h("tr");
+    // The history keeps seconds; an order from another day shows its date.
+    const at = created ? new Date(created * 1000) : null;
+    const when = cell(at ? (at.toDateString() === new Date().toDateString() ? clock(created! * 1000) : at.toLocaleDateString()) : "—", "muted tnum");
+    when.title = `In the book since slot ${o.height}\nOrder ${o.order}`;
+    const sideCell = cell(buy ? "Buy" : "Sell", buy ? "tr-up" : "tr-down");
+    const filled = cell(m ? (done > 0n ? `${size(done, m)} (${Number((done * 100n) / placed)}%)` : "0%") : "", "num tnum");
+    if (m && done > 0n) filled.title = `${size(done, m)} has traded and ${size(left, m)} still waits. From the live view.`;
+    const act = h("td", "num");
+    const cancel = action(o.cancelling ? "Cancelling" : "Cancel", "btn btn-secondary btn-sm", () => void cancelOrder(o, m));
+    cancel.disabled = o.cancelling || pending();
+    if (o.cancelling) cancel.title = "The cancellation is signed and waits for the network. Until it is confirmed, the order can still trade.";
+    if (m) cancel.setAttribute("aria-label", `Cancel: ${buy ? "buy" : "sell"} ${size(placed, m)} at ${priceText(ticks, m)}`);
+    act.append(cancel);
+    row.append(
+      when,
+      ...(several ? [cell(o.market)] : []),
+      sideCell,
+      cell(m ? `${price(ticks, m)} ${unit(m.quote)}` : "", "num tnum"),
+      cell(m ? masked(size(placed, m)) : "", "num tnum"),
+      filled,
+      act,
+    );
+    if (m) row.title = `Still set aside: ${masked(buy ? amountText(quoteAtoms(left, ticks, m), m.quote) : size(left, m))}`;
+    body.append(row);
+  }
+  table.append(thead, body);
+  const wrap = h("div", "table-wrap");
+  wrap.append(table);
+  return wrap;
 }
 
 function renderActivity(): void {
@@ -1620,7 +1876,7 @@ function renderActivity(): void {
         fact("Kind of order", tifText(r.intent.tif));
         fact("Price limit", priceText(BigInt(r.intent.price_ticks), r.intent.market));
         fact(
-          "Exact size",
+          "Exactly",
           `${whole(BigInt(r.intent.lots))} lots at ${whole(BigInt(r.intent.price_ticks))} ticks`,
           false,
           `One lot is ${lotText(r.intent.market)}. One tick moves the price by ${tickText(r.intent.market)}.`,
@@ -1628,6 +1884,9 @@ function renderActivity(): void {
       }
       fact("Number", r.nonce, false, "This account's counter in the action, so that it can only ever happen once.");
       fact("Action", r.action_id, true);
+      // The trades behind the sentence, one row each, as the network
+      // confirmed them.
+      if (r.state === "included" && r.intent.action === "place" && r.fills.length) more.append(fillsTable(r.fills, r.intent.market, r.intent.side === "sell"));
       more.append(facts);
       if (r.state === "open") {
         const said = h("p", "muted", r.note || "No validator has answered about it yet.");
@@ -1644,13 +1903,52 @@ function renderActivity(): void {
   if (focused) list.querySelector<HTMLElement>(`details[data-label="${CSS.escape(focused)}"] > summary`)?.focus();
 }
 
+/** The trades a confirmed order made, one row each: what the one sentence
+ *  about it adds up. */
+function fillsTable(fills: Fill[], m: Market, sold: boolean): HTMLElement {
+  const table = h("table", "tbl tbl-compact tr-fills");
+  const head = h("tr");
+  const columns: [string, string][] = [
+    [sold ? "Sold" : "Bought", ""],
+    ["Price", "num"],
+    ["Value", "num"],
+  ];
+  if (sold) columns.push(["Fee", "num"]);
+  for (const [text, cls] of columns) {
+    const th = h("th", cls, text);
+    th.scope = "col";
+    if (text === "Fee") th.title = "The seller's fee is rounded up once for the whole order, so its parts do not each round up.";
+    head.append(th);
+  }
+  const thead = h("thead");
+  thead.append(head);
+  const body = h("tbody");
+  for (const f of fills) {
+    const row = h("tr");
+    row.append(
+      cell(size(BigInt(f.lots), m), "tnum"),
+      cell(`${price(BigInt(f.price_ticks), m)} ${unit(m.quote)}`, "num tnum"),
+      cell(amountText(BigInt(f.quote.atoms), m.quote), "num tnum"),
+    );
+    if (sold) row.append(cell(amountText(BigInt(f.fee_atoms ?? "0"), m.quote), "num tnum"));
+    body.append(row);
+  }
+  table.append(thead, body);
+  const wrap = h("div", "table-wrap");
+  wrap.append(table);
+  return wrap;
+}
+
 async function cancelOrder(o: Order, m: Market | undefined): Promise<void> {
-  const what = m ? `the order to ${o.side} ${size(BigInt(o.placed_lots), m)}` : "the order";
-  await offer("orders", `Cancelling ${what}`, () => invoke<string>("fm2_cancel_draft", { order: o.order }));
+  // Named as it was placed, with what is left of it when part has traded.
+  const placed = BigInt(o.placed_lots);
+  const left = BigInt(o.remaining_lots);
+  const what = m ? `the order to ${o.side} ${size(placed, m)}${left < placed ? `, of which ${size(left, m)} still waits` : ""}` : "the order";
+  await offer("orders", `Cancelling ${what}`, () => invoke<string>("fm2_cancel_draft", { order: o.order }), "Keep the order");
 }
 
 async function cancelAll(): Promise<void> {
-  await offer("orders", "Cancelling all orders", () => invoke<string>("fm2_cancel_all_draft"));
+  await offer("orders", "Cancelling all orders", () => invoke<string>("fm2_cancel_all_draft"), "Keep the orders");
 }
 
 async function postAgain(label: string, button: HTMLButtonElement, said: HTMLElement): Promise<void> {
@@ -1708,7 +2006,7 @@ function ticket(): Ticket | null {
       else if (p.short === "funds") t.error = `You have ${amountText(have, spend)} available. That is enough for ${size(p.lots, m)}.`;
       else {
         t.ticks = p.limit;
-        if (meetsOwn(m, buy, p.limit)) t.warnings.push("This would trade with an order of your own.");
+        if (meetsOwn(m, buy, p.limit)) t.warnings.push(OWN_ORDER);
         const far = reach(p);
         if (far >= FAR_BPS) t.warnings.push(`Its last part trades at a price ${percent(far)} ${buy ? "above" : "below"} the best one.`);
       }
@@ -1721,7 +2019,7 @@ function ticket(): Ticket | null {
     t.ticks = parsePrice(priceTyped, m);
     if (t.ticks === null && !t.error) t.error = nearestPrice(priceTyped, m) === null ? numberProblem(priceTyped, m.quote) : `Prices move in steps of ${tickText(m)}.`;
   }
-  const tif = el<HTMLSelectElement>("tr-tif").value;
+  const tif = stay;
   if (!t.error && t.ticks !== null && t.lots !== null) {
     const need = buy ? quoteAtoms(t.lots, t.ticks, m) : baseAtoms(t.lots, m);
     const waiting = account?.open_orders ?? null;
@@ -1733,13 +2031,13 @@ function ticket(): Ticket | null {
     if (best) {
       const top = BigInt(best.price_ticks);
       const crosses = buy ? t.ticks >= top : t.ticks <= top;
-      if (tif === "post_only" && crosses) {
-        t.warnings.push(`At this price it would trade at once, and the network refuses a post-only order that does. ${buy ? `Use a price below ${price(top, m)}.` : `Use a price above ${price(top, m)}.`}`);
-      } else if (crosses) {
+      // A post-only order that crosses is refused: the line about right
+      // now says so, and what price it needs.
+      if (crosses && tif !== "post_only") {
         const gap = buy ? t.ticks - top : top - t.ticks;
         const far = (gap * 10_000n) / top;
         if (far >= THROUGH_BPS) t.warnings.push(`Your price is ${percent(far)} ${buy ? "above the lowest ask" : "below the highest bid"}. It trades at the book's prices, up to yours.`);
-        if (meetsOwn(m, buy, t.ticks)) t.warnings.push("This would trade with an order of your own.");
+        if (meetsOwn(m, buy, t.ticks)) t.warnings.push(OWN_ORDER);
       }
     }
   }
@@ -1762,63 +2060,132 @@ function renderTicket(): void {
   el("tr-amount-unit").textContent = unit(m.base);
   el("tr-total-unit").textContent = unit(m.quote);
   const spend = buy ? m.quote : m.base;
-  el("tr-avbl").textContent = masked(amountText(have, spend));
+  el("tr-avbl").textContent = masked(held(have, spend));
 
   // The total follows price and amount, unless the user is typing it.
   const total = el<HTMLInputElement>("tr-total");
   if (!atOnce && !totalLed && document.activeElement !== total) {
-    total.value = t.ticks !== null && t.lots !== null ? plain(quoteAtoms(t.lots, t.ticks, m), m.quote) : "";
+    total.value = t.ticks !== null && t.lots !== null ? amount(quoteAtoms(t.lots, t.ticks, m), m.quote) : "";
   }
 
-  const lines: HTMLElement[] = [];
-  const tif = el<HTMLSelectElement>("tr-tif").value;
+  for (const button of document.querySelectorAll<HTMLButtonElement>("#tr-tif [data-tif]")) button.setAttribute("aria-pressed", String(button.dataset.tif === stay));
+  // Away from the keyboard, a number reads in groups like every other on
+  // the page, so a zero too many shows.
+  const grouped = (id: string, text: string | null) => {
+    const input = el<HTMLInputElement>(id);
+    if (text !== null && document.activeElement !== input && input.value.trim() !== "" && input.value !== text) input.value = text;
+  };
+  grouped("tr-price", !atOnce && t.ticks !== null ? price(t.ticks, m) : null);
+  grouped("tr-amount", t.lots !== null ? amount(baseAtoms(t.lots, m), m.base) : null);
+
+  const rounded = `${feeRate(info.fee_ppm)}, rounded up`;
+  // A sale's floor holds for the whole amount: less sold brings less.
+  const LEAST = "For all of it you receive at least";
+  let lines: HTMLElement[] = [];
+  // The order as typed would be refused as the book stands.
+  let refused = false;
   if (atOnce && t.p && t.p.lots > 0n && !t.error) {
-    lines.push(pair("Price limit", priceText(t.p.limit, m)));
-    if (buy) lines.push(pair("You pay about", amountText(t.p.gross, m.quote)), pair("Never more than", amountText(t.p.ceiling, m.quote)));
-    else lines.push(pair("You receive about", amountText(t.p.gross - t.p.fee, m.quote)), pair("Seller's fee", `${amountText(t.p.fee, m.quote)} (${feeRate(info.fee_ppm)})`));
+    const sure = t.p.limit === t.p.best;
+    // The engine has no market order: say what is sent in its place, where
+    // its limit comes from, and what becomes of what cannot trade.
+    const sent = h("div", "tr-sum-now");
+    sent.textContent = `Sent as a limit order at ${priceText(t.p.limit, m)}, the ${buy ? "highest" : "lowest"} price it needs in the book right now. What cannot trade at once is dropped.`;
+    sent.title = "For a limit of your own, use Limit with \"Is dropped IOC\".";
+    lines.push(sent);
+    if (!sure) lines.push(pair("Average price", `about ${averageText(t.p.gross, t.p.lots, m)}`));
+    if (buy) {
+      lines.push(
+        pair(sure ? "You pay" : "You pay about", amountText(sure ? t.p.ceiling : t.p.gross, m.quote)),
+        pair("You pay at most", amountText(t.p.ceiling, m.quote)),
+        pair("Fee", "None for buying"),
+      );
+    } else {
+      const worst = quoteAtoms(t.p.lots, t.p.limit, m);
+      lines.push(
+        pair(sure ? "You receive" : "You receive about", amountText(t.p.gross - t.p.fee, m.quote)),
+        pair(LEAST, amountText(worst - sellerFee(worst, info.fee_ppm), m.quote)),
+        pair("Seller's fee", `${amountText(t.p.fee, m.quote)} (${rounded})`),
+      );
+    }
   } else if (!atOnce && t.ticks !== null && t.lots !== null) {
     const quote = quoteAtoms(t.lots, t.ticks, m);
     const fee = sellerFee(quote, info.fee_ppm);
-    if (buy) lines.push(pair(tif === "ioc" ? "You pay at most" : "Set aside for it", amountText(quote, m.quote)), pair("Fee", "None for buying"));
-    else lines.push(pair("You receive at least", amountText(quote - fee, m.quote)), pair("Seller's fee", `${amountText(fee, m.quote)} at this price (${feeRate(info.fee_ppm)})`));
+    // What it would do against the book as it stands, then what its own
+    // price guarantees.
+    const now = h("div", "tr-sum-now");
+    const said = book && links.get("book")?.live ? outlook(side, stay, t.ticks, t.lots, buy ? book.asks : book.bids, m) : null;
+    now.textContent = said ? said.text : "The live view is not arriving, so what it would do right now is unknown.";
+    if (!said || said.refused) now.classList.add("tr-sum-warn");
+    now.title = "From the live view: an estimate.";
+    lines.push(now);
+    refused = !!said?.refused && !t.error;
+    // An order that would be refused promises nothing: no bounds under it.
+    if (refused) {
+      // (the line above says why, and what price it needs)
+    } else if (buy) {
+      const most = pair("You pay at most", amountText(quote, m.quote));
+      if (stay !== "ioc") most.title = "Set aside from your balance while the order waits.";
+      lines.push(most, pair("Fee", "None for buying"));
+    } else {
+      lines.push(pair(LEAST, amountText(quote - fee, m.quote)), pair("Seller's fee", `${amountText(fee, m.quote)} at this price (${rounded})`));
+    }
   }
+  // While a request from this form is under way, its steps stand where the
+  // summary was: above the button, on the first screen. Its result stays
+  // there until the form is changed: from then on the form is about the
+  // next order, and the result is in the history.
+  const last = flows.get("trade");
+  if (mode === "pro" && last?.stage === "done" && last.form !== ticketState(t)) {
+    flows.delete("trade");
+    renderFlow("trade");
+  }
+  const flowing = flows.has("trade");
+  if (flowing) lines = [];
   el("tr-summary").replaceChildren(...lines);
 
   const errorBox = el("tr-form-error");
-  errorBox.hidden = t.error === "";
+  errorBox.hidden = t.error === "" || flowing;
   errorBox.textContent = t.error;
-  banner("tr-form-warn", "warning", t.ok ? t.warnings.join(" ") : "", "tr-inline");
+  banner("tr-form-warn", "warning", t.ok && !refused && !flowing ? t.warnings.join(" ") : "", "tr-inline");
 
   const button = el<HTMLButtonElement>("tr-review");
   const verb = buy ? "Buy" : "Sell";
   const lots = atOnce ? (t.p?.lots ?? null) : t.lots;
   const stopped = network().state === "bad";
   button.textContent = pending()
-    ? "Waiting for your approval"
+    ? ownWaits()
+      ? WAITING.own
+      : WAITING.other
     : stopped
       ? "Waiting for the network"
       : atOnce && !links.get("book")?.live
         ? "Waiting for live prices"
-        : t.ok && lots
+        : refused
+          ? "Would be refused right now"
+          : t.ok && lots
           ? atOnce
             ? `${verb} ${size(lots, m)} now`
-            : `${verb} ${size(lots, m)} at ${price(t.ticks ?? 0n, m)}`
+            : `${verb} ${size(lots, m)} at ${price(t.ticks ?? 0n, m)} ${unit(m.quote)}`
           : t.error
             ? // The line above the button says what is wrong.
               `${verb} ${unit(m.base)}`
             : atOnce
               ? "Enter an amount"
               : "Enter a price and an amount";
-  button.disabled = !t.ok || pending() || stopped;
+  button.disabled = !t.ok || refused || pending() || stopped;
 
   // The slider is a share of what the available balance pays for.
+  el("tr-slider").title = atOnce
+    ? "A share of the most that can trade at once: what you have available, or everything on offer if that is less."
+    : "A share of what you have available.";
   const most = mostLots(t);
   const slider = el<HTMLInputElement>("tr-pct");
   slider.disabled = most === 0n;
   const pct = most > 0n && lots ? Math.min(100, Number((lots * 100n) / most)) : 0;
   if (document.activeElement !== slider) slider.value = String(pct);
   el("tr-slider").style.setProperty("--pct", `${pct}%`);
-  el("tr-pct-out").textContent = `${pct}%`;
+  // A share too small to round to one percent is still not nothing.
+  el("tr-pct-out").textContent = pct === 0 && most > 0n && lots ? "<1%" : `${pct}%`;
   for (const mark of document.querySelectorAll<HTMLElement>("#tr-slider [data-pct]")) mark.classList.toggle("on", Number(mark.dataset.pct) <= pct && pct > 0);
 }
 
@@ -1911,9 +2278,10 @@ async function reviewOrder(): Promise<void> {
   const lots = atOnce ? t.p?.lots : t.lots;
   const ticks = atOnce ? t.p?.limit : t.ticks;
   if (!lots || !ticks) return;
-  const tif = atOnce ? "ioc" : el<HTMLSelectElement>("tr-tif").value;
+  const tif = atOnce ? "ioc" : stay;
   const verb = tif === "ioc" ? `${buy ? "Buying" : "Selling"} ${size(lots, m)}` : `Placing an order to ${side} ${size(lots, m)}`;
-  await offer("trade", verb, () => invoke<string>("fm2_place_draft", { order: { market: m.id, side, tif, price_ticks: ticks.toString(), lots: lots.toString() } }));
+  const back = tif !== "ioc" ? "Don't place it" : buy ? "Don't buy" : "Don't sell";
+  await offer("trade", verb, () => invoke<string>("fm2_place_draft", { order: { market: m.id, side, tif, price_ticks: ticks.toString(), lots: lots.toString() } }), back);
 }
 
 // ---- dialogs: add funds, send ----------------------------------------------
@@ -1937,8 +2305,16 @@ function closeDialog(): void {
   dialog = null;
 }
 
+/** The network's assets as a list in a sentence: "B3, TOK and rUSD". */
+function assetNames(): string {
+  const names = (info?.assets ?? []).map((a) => unit(a));
+  return names.length > 1 ? `${names.slice(0, -1).join(", ")} and ${names[names.length - 1]}` : (names[0] ?? "");
+}
+
 function openFunds(): void {
   if (!info?.account) return;
+  const listed = assetNames();
+  el("tr-funds-assets").textContent = listed ? `This network has ${listed}. ` : "";
   el("tr-funds-account").textContent = info.account;
   el("tr-faucet").textContent = faucet();
   openDialog("tr-funds-backdrop", "tr-funds-copy");
@@ -1999,7 +2375,7 @@ async function reviewSend(): Promise<void> {
   const to = el<HTMLInputElement>("tr-send-to").value.trim().toLowerCase();
   if (atoms === null || atoms === 0n) return;
   closeDialog();
-  await offer("account", `Sending ${amountText(atoms, asset)}`, () => invoke<string>("fm2_transfer_draft", { to, asset: asset.id, amount: atoms.toString() }));
+  await offer("account", `Sending ${amountText(atoms, asset)}`, () => invoke<string>("fm2_transfer_draft", { to, asset: asset.id, amount: atoms.toString() }), "Don't send");
 }
 
 // ---- wiring ----------------------------------------------------------------
@@ -2007,9 +2383,9 @@ async function reviewSend(): Promise<void> {
 type BookEvent = { seat: number; market: string; slot: string; bids: Level[]; asks: Level[] };
 type TradesEvent = { seat: number; market: string; slot: string; fills: { taker_side: "buy" | "sell"; price_ticks: string; lots: string; quote_atoms: string; mine: "maker" | "taker" | null }[] };
 
-function selectTab(tab: "orders" | "activity" | "trades"): void {
+function selectTab(tab: "orders" | "activity"): void {
   el("tr-lists").dataset.tab = tab;
-  for (const name of ["orders", "activity", "trades"]) el(`tr-tab-${name}`).setAttribute("aria-selected", String(name === tab));
+  for (const name of ["orders", "activity"]) el(`tr-tab-${name}`).setAttribute("aria-selected", String(name === tab));
 }
 
 async function wire(): Promise<void> {
@@ -2146,7 +2522,7 @@ async function wire(): Promise<void> {
   });
 
   // Lists.
-  for (const tab of ["orders", "activity", "trades"] as const) el(`tr-tab-${tab}`).addEventListener("click", () => selectTab(tab));
+  for (const tab of ["orders", "activity"] as const) el(`tr-tab-${tab}`).addEventListener("click", () => selectTab(tab));
   el("tr-cancel-all").addEventListener("click", () => void cancelAll());
   el("tr-activity-more").addEventListener("click", () => {
     historyShown += 20;
@@ -2171,6 +2547,7 @@ async function wire(): Promise<void> {
   for (const [id, view] of [
     ["tr-view-price", "price"],
     ["tr-view-depth", "depth"],
+    ["tr-view-trades", "trades"],
   ] as const) {
     el(id).addEventListener("click", () => {
       chartView = view;
@@ -2232,9 +2609,39 @@ async function wire(): Promise<void> {
       renderTicket();
     });
   }
-  for (const id of ["tr-price", "tr-amount", "tr-total"]) el(id).addEventListener("blur", () => settle(id));
+  for (const id of ["tr-price", "tr-amount", "tr-total"]) {
+    el(id).addEventListener("blur", () => settle(id));
+    // While it is typed, a number is plain digits. Its groups come back
+    // when the field is left.
+    el<HTMLInputElement>(id).addEventListener("focus", (e) => {
+      const input = e.target as HTMLInputElement;
+      const digits = input.value.replace(/[\s\u00a0\u202f]/g, "");
+      if (digits !== input.value) input.value = digits;
+    });
+  }
   el("tr-total").addEventListener("input", totalTyped);
-  el("tr-tif").addEventListener("change", renderTicket);
+  for (const button of document.querySelectorAll<HTMLButtonElement>("#tr-tif [data-tif]")) {
+    button.addEventListener("click", () => {
+      stay = button.dataset.tif as typeof stay;
+      renderTicket();
+    });
+  }
+  // The lists move when the page gains or loses its third column.
+  new ResizeObserver(() => {
+    const wide = el("tr-page").clientWidth;
+    // Hidden with the page: nothing to learn from a width of nothing.
+    if (wide === 0) return;
+    const now = wide >= 1180 ? 3 : wide >= 740 ? 2 : 1;
+    if (now === columns) return;
+    columns = now;
+    if (!info) return;
+    placeLists();
+    renderBook();
+  }).observe(el("tr-page"));
+  // A taller window gives the book more prices.
+  window.addEventListener("resize", () => {
+    if (info && mode === "pro" && bookRows() !== bookDepth) renderBook();
+  });
   el("tr-pct").addEventListener("input", (e) => setPart(Number((e.target as HTMLInputElement).value)));
   for (const mark of document.querySelectorAll<HTMLElement>("#tr-slider [data-pct]")) {
     mark.addEventListener("click", () => {
@@ -2247,9 +2654,6 @@ async function wire(): Promise<void> {
   });
 
   // The account and its dialogs.
-  el("tr-account-copy").addEventListener("click", () => {
-    if (info?.account) copyTo(info.account, el("tr-account-copy"));
-  });
   el("tr-funds-open").addEventListener("click", openFunds);
   el("tr-funds-copy").addEventListener("click", () => {
     if (info?.account) copyTo(info.account, el("tr-funds-copy"));
