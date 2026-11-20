@@ -75,12 +75,45 @@ layer that replaces FlowMesh V1. FlowMesh V2 runs on regtest networks only,
 and the page says so everywhere: nothing on it is a mainnet market. It needs
 no running B3 node and no wallet.
 
-**Connecting.** The page asks for two files from whoever runs the network:
-the genesis document (`fm2-genesis/1`: seats, assets, markets) and the pins
-file (the SHA-256 of each seat's certificate key, as `fm2-cli --pins` takes
-it). Both are trust inputs; nothing is taken from a seat. Seats must be on
+**Two views of one page.** The switch at the top right chooses how much the
+page shows, and B3 Hive remembers it. Both views use the same account, the
+same market and the same approval window.
+
+- *Simple* is one card: buy or sell, what you pay, what you receive. The
+  page works out an immediate order from the order book and gives it a price
+  limit, so a buy can never cost more than the card says and a sale never
+  goes below the price shown. Either box can be typed in; the other follows.
+  If prices move before the order arrives, it trades what still fits and
+  drops the rest. The result is one sentence built from the confirmed fills:
+  what was bought or sold, for how much, and what was left out and why.
+- *Pro* adds the order book, a price and a depth chart, the list of trades,
+  and an order form with a price of the user's own: limit orders (good till
+  cancelled, immediate or cancel, post only) and an immediate order against
+  the book, with the open orders and the history beside them.
+
+**Units.** Amounts are in the asset's own unit and prices are for one whole
+unit of the base asset (`101 000 rUSD per B3`), on the page, in the approval
+window and in the results; one set of functions formats all three
+(`web/src/fm2fmt.ts`). The engine's lots and ticks are called steps on the
+page ("B3 trades in steps of 0.001 B3") and appear as exact integers only
+under Details in the approval window and in a history row. The genesis
+document names decimals for B3 only, so other assets are shown as whole
+numbers of their smallest unit.
+
+**Connecting.** The page asks once for the network's folder, which holds the
+two files an operator hands out: `genesis.json` (`fm2-genesis/1`: seats,
+assets, markets) and `pins.json` (the SHA-256 of each seat's certificate
+key, as `fm2-cli --pins` takes it). The two files can also be chosen one by
+one. Both are trust inputs; nothing is taken from a seat. Seats must be on
 this computer (loopback addresses). Each connection is TLS 1.3 and trusts
-exactly its seat's pinned key.
+exactly its seat's pinned key. B3 Hive remembers the two paths and connects
+by itself the next time the page opens.
+
+**Getting started.** Until the account holds funds, the page shows the steps
+that are left in place of the trading form: create the account (one click),
+then get test funds. On a test network funds come from whoever runs it, so
+that step shows the account number to hand over; the page notices the
+deposit by itself and opens the form.
 
 **The account.** B3 Hive creates one key per network and keeps it, with the
 outbox, in its config folder under `fm2/<network>/`. The key file is plain
@@ -101,18 +134,27 @@ document before the page sees it (`fm2/verify.rs`, the rules of
 - "expired" is shown only with the proof that no slot can include the
   action any more.
 
-The order book and the trade list come from one seat's live feed, which
-carries no proof. They are labelled as that seat's report. FlowMesh V2
-serves no price history, so the chart and the trade list start when the page
-connects.
+The page calls this *confirmed*. The order book and the trade list come from
+one seat's live feed, which carries no proof; the page calls that the *live
+view* and treats everything read from it as an estimate. That is why every
+order, also the one the Simple view builds, carries a price limit of its
+own. FlowMesh V2 serves no price history, so the chart and the trade list
+start when the page connects. The page says "validator" for a seat.
 
-**Sending.** An order (limit, immediate-or-cancel, post-only), a
-cancellation, cancel-all and a transfer are drafted by the core and shown in
-the approval window; nothing is signed before approval. An approved action
-is signed once, written to the outbox on disk, and then posted to every
-seat. After a crash or a lost connection the same bytes are posted again; a
-second signature is never made. The Activity tab is the outbox: each row
-shows what the seats last said until a certified result arrives.
+**Sending.** An order, a cancellation, cancel-all and a transfer are drafted
+by the core and shown in the approval window; nothing is signed before
+approval, and one request waits there at a time. An approved action is
+signed once, written to the outbox on disk, and then posted to every seat.
+After a crash or a lost connection the same bytes are posted again; a second
+signature is never made. The History list is the outbox: each row is a
+sentence about what happened, and opens to the slot, the exact size and the
+action's id. A row still waiting shows what the seats last said.
+
+**When things go wrong.** The page says what it is waiting for instead of
+offering a button that cannot work: no seller or buyer on the other side,
+an amount below one step or beyond the book or the balance (with the amount
+that would work, one click away), live prices not arriving, or too few
+validators answering to confirm anything.
 
 **Open orders.** FlowMesh V2 has no query for an account's orders. The page
 rebuilds them from the account's certified results and the fills a seat
@@ -120,13 +162,15 @@ reported since, and checks the list against the certified account (its count
 of open orders and its reserved balances). When they disagree, for example
 after a fill while B3 Hive was closed, the page says so.
 
-**Not offered.** Withdrawals (the regtest rules refuse them), market orders
-(the engine has none) and decimals for assets other than B3 (the genesis
-document names none, so those amounts are shown in atoms).
+**Not offered.** Withdrawals (the regtest rules refuse them) and decimals
+for assets other than B3 (the genesis document names none). The engine has
+no market order; the page's immediate order is an immediate-or-cancel limit
+order priced from the book.
 
 To try it, start a regtest cluster with the node tools (`fm2-keygen`,
-`fm2-devchain`, `fm2d`; see `src/flowmesh2/README.md`), connect with its
-`genesis.json` and a pins file, create the account, and credit it with
+`fm2-devchain`, `fm2d`; see `src/flowmesh2/README.md`), put its
+`genesis.json` and a `pins.json` in one folder, choose that folder on the
+Trade page, create the account, and credit it with
 `fm2-devchain ... deposit <account> <asset> <atoms>`.
 
 The signing and certificate code is the node's own: `build.rs` compiles
