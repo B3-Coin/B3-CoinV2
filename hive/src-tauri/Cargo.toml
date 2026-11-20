@@ -11,6 +11,10 @@ name = "b3_hive"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
+# Compiles the repository's own src/secp256k1 and src/blst for the FlowMesh
+# V2 client (src/fm2/crypto.rs): the libraries the node uses, no new crate.
+# cc is already in the lock file (ring and zstd build with it).
+cc = "1"
 
 [dependencies]
 tauri = { version = "2", features = [] }
@@ -32,3 +36,8 @@ qrcode = { version = "0.14", default-features = false }
 # Native file pickers, opened by the core only (no capability gives the
 # pages the dialog): restore and legacy import need a path the node opens.
 tauri-plugin-dialog = "2"
+# The FlowMesh V2 client's TLS session trusts one pinned
+# SubjectPublicKeyInfo per seat (src/fm2/http.rs). Both crates are the
+# versions ureq already brings; nothing new is downloaded.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-webpki = { version = "0.103", default-features = false, features = ["ring", "std"] }

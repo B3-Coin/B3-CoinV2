@@ -10,6 +10,7 @@ pub mod cli;
 pub mod console;
 pub mod drafts;
 pub mod flowmesh;
+pub mod fm2;
 pub mod folder;
 pub mod history;
 pub mod node;

@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 fn main() {
     generate_convert_params();
+    build_node_crypto();
 
     // tauri-build embeds the window and taskbar icon from icons/icon.ico but
     // does not watch the file, so a new icon kept the old one until a clean
@@ -99,6 +100,66 @@ fn main() {
         ]),
     ))
     .expect("failed to run tauri-build");
+}
+
+/// The FlowMesh V2 client signs with BIP340 and checks BLS12-381 seat
+/// certificates (src/fm2/crypto.rs). It uses the node's own libraries,
+/// compiled here from the repository: src/secp256k1 with the build options
+/// of src/secp256k1/CMakeLists.txt, and src/blst as cmake/blst.cmake builds
+/// it (upstream's assembly on x86_64 and aarch64, the pure-C path elsewhere).
+fn build_node_crypto() {
+    let manifest = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap());
+    let src = manifest.join("../../src");
+    let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+    let msvc = std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc");
+
+    let secp = src.join("secp256k1");
+    println!("cargo:rerun-if-changed={}", secp.join("src").display());
+    cc::Build::new()
+        .include(&secp)
+        .include(secp.join("include"))
+        .include(secp.join("src"))
+        .define("SECP256K1_STATIC", None)
+        .define("ENABLE_MODULE_EXTRAKEYS", "1")
+        .define("ENABLE_MODULE_SCHNORRSIG", "1")
+        .define("ECMULT_WINDOW_SIZE", "15")
+        .define("COMB_BLOCKS", "43")
+        .define("COMB_TEETH", "6")
+        .file(secp.join("src/secp256k1.c"))
+        .file(secp.join("src/precomputed_ecmult.c"))
+        .file(secp.join("src/precomputed_ecmult_gen.c"))
+        .warnings(false)
+        .compile("b3hive_secp256k1");
+
+    let blst = src.join("blst");
+    println!("cargo:rerun-if-changed={}", blst.join("src").display());
+    println!("cargo:rerun-if-changed={}", blst.join("build").display());
+    let mut build = cc::Build::new();
+    build.file(blst.join("src/server.c")).warnings(false);
+    let with_assembly = arch == "x86_64" || (arch == "aarch64" && !msvc);
+    if !with_assembly {
+        build.define("__BLST_NO_ASM__", None);
+    } else if msvc {
+        // Upstream build.bat: every build/win64/*-x86_64.asm through ml64.
+        let mut files: Vec<PathBuf> = std::fs::read_dir(blst.join("build/win64"))
+            .expect("cannot list src/blst/build/win64")
+            .filter_map(|entry| entry.ok().map(|e| e.path()))
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.ends_with("-x86_64.asm"))
+            })
+            .collect();
+        files.sort();
+        assert!(!files.is_empty(), "no MASM sources in src/blst/build/win64");
+        build.files(files).define("__BLST_PORTABLE__", None);
+    } else {
+        build
+            .file(blst.join("build/assembly.S"))
+            .define("__BLST_PORTABLE__", None)
+            .flag_if_supported("-fno-builtin");
+    }
+    build.compile("b3hive_blst");
 }
 
 /// The console converts typed arguments exactly as b3coin-cli and the Qt
