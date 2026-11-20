@@ -442,7 +442,7 @@ mod tests {
             .unwrap();
         assert_eq!(leaf.open_orders, 1);
         assert_eq!(leaf.used_nonces, [1]);
-        // 1,000 B3 deposited, 10 lots of 0.01 B3 reserved, 4 of them sold.
+        // 100 B3 deposited, 10 lots of 0.001 B3 reserved, 4 of them sold.
         assert_eq!(
             (leaf.balances[0].available, leaf.balances[0].reserved),
             (99_990_000_000, 6_000_000)

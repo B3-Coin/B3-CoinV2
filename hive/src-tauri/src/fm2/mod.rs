@@ -12,6 +12,7 @@ pub mod outbox;
 pub mod reply;
 pub mod types;
 pub mod verify;
+pub mod view;
 
 /// Why an operation of the client failed.
 #[derive(Clone, Debug, PartialEq, Eq)]

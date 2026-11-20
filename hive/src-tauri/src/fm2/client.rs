@@ -478,6 +478,30 @@ impl Session {
         self.outbox().entries().to_vec()
     }
 
+    /// Bytes of a half-written last record the outbox dropped when opened.
+    pub fn recovered_bytes(&self) -> u64 {
+        self.outbox().recovered_bytes
+    }
+
+    /// The labels without a certified end, oldest first.
+    pub fn open_labels(&self) -> Vec<String> {
+        self.outbox()
+            .entries()
+            .iter()
+            .filter(|entry| entry.result.is_none())
+            .map(|entry| entry.label.clone())
+            .collect()
+    }
+
+    /// The ids of every action this outbox signed.
+    pub fn action_ids(&self) -> Vec<H256> {
+        self.outbox()
+            .entries()
+            .iter()
+            .map(|entry| entry.action.id())
+            .collect()
+    }
+
     pub fn seen_fills(&self) -> Vec<SeenFill> {
         self.outbox().fills().to_vec()
     }
