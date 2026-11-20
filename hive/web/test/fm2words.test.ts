@@ -9,8 +9,11 @@ import {
   ordered,
   outlook,
   question,
+  reachNote,
   size,
+  sliderNote,
   tell,
+  throughNote,
   type Advice,
   type Asking,
   type Drafted,
@@ -611,6 +614,34 @@ const drafted = (intent: Intent): Drafted => ({ chain: "regtest", domain: "fm2-r
 const keys = (facts: Fact[]): string[] => facts.map((f) => f.key);
 const DETAILS = ["Trading account", "Valid for", "When you approve", "Network"];
 
+test("the order form's notes on an order's reach say how much, how far and which way", () => {
+  const buying = (lots: bigint) => plan("buy", { of: "base", atoms: baseAtoms(lots, M) }, ASKS, RICH, M, 100);
+  const selling = (lots: bigint) => plan("sell", { of: "base", atoms: baseAtoms(lots, M) }, BIDS, RICH, M, 100);
+  // An immediate buy of 0.04: 0.034 at the best price, 101, and the other
+  // 0.006 at up to 110, which is 9 of 101 above it.
+  assert.equal(reachNote("buy", buying(40n), 34n, M), `0.006 B3 of it costs more than the best price, up to 110${G}000 rUSD per B3: 8.91% above it.`);
+  // One price step past the best one is under two percent: no note.
+  assert.equal(reachNote("buy", buying(36n), 34n, M), "");
+  assert.equal(reachNote("buy", buying(34n), 34n, M), "");
+  // A sale of 0.03: 0.025 at 98, the rest down to 90.
+  assert.equal(reachNote("sell", selling(30n), 25n, M), `0.005 B3 of it sells below the best price, down to 90${G}000 rUSD per B3: 8.16% below it.`);
+  assert.equal(reachNote("sell", selling(27n), 25n, M), "");
+
+  // A limit of the user's own far through the book: it trades at the
+  // book's prices, and its own price is the furthest it may go, which is
+  // up for a buy and down for a sale.
+  assert.equal(throughNote("buy", 107n, 101n), "Your price is 5.94% above the lowest ask. It trades at the book's prices, up to yours.");
+  assert.equal(throughNote("sell", 93n, 98n), "Your price is 5.10% below the highest bid. It trades at the book's prices, down to yours.");
+  // Not far enough, at the best price, short of it, or against nothing.
+  for (const [side, ticks, top] of [["buy", 106n, 101n], ["buy", 101n, 101n], ["buy", 90n, 101n], ["sell", 94n, 98n], ["sell", 120n, 98n], ["buy", 500n, 0n]] as const) {
+    assert.equal(throughNote(side, ticks, top), "", `${side} ${ticks} ${top}`);
+  }
+
+  // The slider's whole, when the book holds less than the balance pays for.
+  assert.equal(sliderNote("buy", 139n, M), "100% is 0.139 B3: all that is for sale right now.");
+  assert.equal(sliderNote("sell", 39n, M), "100% is 0.039 B3: all that buyers want right now.");
+});
+
 test("the approval window asks about an immediate order with the bound its limit gives", () => {
   const buy = question(drafted(place("buy", "ioc", 101, 4)));
   assert.equal(buy.title, "Buy 0.004 B3 for at most 404 rUSD?");
@@ -665,7 +696,7 @@ test("the approval window says what an order that waits sets aside", () => {
   assert.deepEqual(keys(buy.facts), ["You buy up to", "You pay at most", "Price limit", "What cannot trade at once"]);
   assert.equal(buy.facts[0].hint, "Whenever sellers accept your price. That can be all of it, part of it, or none.");
   assert.equal(buy.facts[1].hint, "Set aside while the order waits. Buyers pay no fee.");
-  assert.equal(buy.facts[3].value, "Waits in the order book until it trades or you cancel it");
+  assert.equal(buy.facts[3].value, "Waits until it trades or you cancel it");
   assert.equal(buy.approve, "Place the order");
   assert.equal(buy.reject, "Don't place it");
 

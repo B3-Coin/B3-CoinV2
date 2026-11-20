@@ -218,6 +218,13 @@ ol.checklist { list-style: none; margin: 0; padding: 0; }
 /* Simple: pay one thing, receive another */
 .tr-swap { overflow: hidden; }
 .tr-swap-form { display: flex; flex-direction: column; gap: var(--space-3); padding: var(--space-4); }
+/* In a short window, the default one among them, the card closes up so
+   that its button stays in sight under a hint of three lines. */
+@media (max-height: 780px) {
+  .tr-swap-form { gap: var(--space-2); padding-top: var(--space-3); }
+  .tr-swap .tr-cell { padding-block: 10px; }
+  .tr-swap .tr-flip { margin-block: calc(-1 * var(--space-2) - 9px); }
+}
 /* Buy or sell: the first thing to choose, and the colour of the button
    that does it. */
 .tr-swap-sides {

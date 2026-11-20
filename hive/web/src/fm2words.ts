@@ -13,6 +13,7 @@ import {
   feeRate,
   lotText,
   outcomeText,
+  percent,
   price,
   priceText,
   quoteAtoms,
@@ -247,6 +248,46 @@ export function tell(row: Row, standing: (label: string, m: Market) => string = 
  *  about almost every trade that leaves the best price; below it the same
  *  facts are a plain sentence under the card. */
 export const WIDE_BPS = 500n;
+
+/** From how far past the best price the order form marks an immediate
+ *  order, in hundredths of a percent. Lower than the simple card's bar:
+ *  the form's reader has the book beside it and asked for the detail. */
+export const FAR_BPS = 200n;
+
+/** The order form's warning for an immediate order that reaches that far:
+ *  how much of it trades past the best price, and how far it goes. `first`
+ *  is what waits at the best price. Empty below the bar. */
+export function reachNote(side: "buy" | "sell", p: Plan, first: bigint, m: Market): string {
+  const far = reach(p);
+  if (far < FAR_BPS || p.lots <= first) return "";
+  const beyond = size(p.lots - first, m);
+  return side === "buy"
+    ? `${beyond} of it costs more than the best price, up to ${priceText(p.limit, m)}: ${percent(far)} above it.`
+    : `${beyond} of it sells below the best price, down to ${priceText(p.limit, m)}: ${percent(far)} below it.`;
+}
+
+/** From how far through the best price of the other side a limit of the
+ *  user's own gets a warning in the order form. */
+export const THROUGH_BPS = 500n;
+
+/** The order form's warning for such a limit: `ticks` is the limit, `top`
+ *  the best price it would trade against. It trades at the prices in the
+ *  book, and the limit is as far as it may go: up for a buy, down for a
+ *  sale. Empty when the limit does not reach the book, or not that far. */
+export function throughNote(side: "buy" | "sell", ticks: bigint, top: bigint): string {
+  const buy = side === "buy";
+  if (top <= 0n) return "";
+  // Below zero when the limit stops short of the book: no note then either.
+  const far = ((buy ? ticks - top : top - ticks) * 10_000n) / top;
+  if (far < THROUGH_BPS) return "";
+  return `Your price is ${percent(far)} ${buy ? "above the lowest ask" : "below the highest bid"}. It trades at the book's prices, ${buy ? "up" : "down"} to yours.`;
+}
+
+/** What the amount slider's 100% is when the book, and not the balance,
+ *  sets the most an immediate order can be: less than "Available" says. */
+export function sliderNote(side: "buy" | "sell", most: bigint, m: Market): string {
+  return `100% is ${size(most, m)}: all that ${side === "buy" ? "is for sale" : "buyers want"} right now.`;
+}
 
 /** Something the line under the card offers to do in one click. */
 export type Offer = { link: string; act: "use"; lots: bigint } | { link: string; act: "funds" | "pro" };
@@ -600,7 +641,7 @@ export function question(a: Drafted): Question {
         { key: buy ? "You buy up to" : "You sell up to", value: what, hint: `Whenever ${others} accept your price. That can be all of it, part of it, or none.` },
         ...sold,
         bound,
-        waits ? { key: "What cannot trade at once", value: "Waits in the order book until it trades or you cancel it" } : { key: "If it could trade at once", value: "The network refuses all of it" },
+        waits ? { key: "What cannot trade at once", value: "Waits until it trades or you cancel it" } : { key: "If it could trade at once", value: "The network refuses all of it" },
       ],
       more: [...exact, ...more],
       // An order that waits promises no trade: the button places it.

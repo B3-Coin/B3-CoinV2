@@ -45,7 +45,6 @@ import {
   priceText,
   priceUnit,
   quoteAtoms,
-  reach,
   sellerFee,
   shortId,
   spread,
@@ -59,7 +58,7 @@ import {
   type Plan,
   type Want,
 } from "./fm2fmt";
-import { OWN_ORDER, WAITING, advise, money, numberProblem, outlook, size, tell, type Advice, type Fill, type Offer, type Row, type Told } from "./fm2words";
+import { OWN_ORDER, WAITING, advise, money, numberProblem, outlook, reachNote, size, sliderNote, tell, throughNote, type Advice, type Fill, type Offer, type Row, type Told } from "./fm2words";
 
 // ---- what the core sends (src-tauri/src/fm2/view.rs, src/trade.rs) ---------
 
@@ -132,11 +131,6 @@ const FLASH_MS = 800;
 const HEALTH_MS = 5000;
 /** After this long without a confirmed end, the page says it is slow. */
 const SLOW_MS = 10_000;
-/** A trade whose last price is this far from the best one is called large,
- *  in hundredths of a percent. */
-const FAR_BPS = 200n;
-/** A limit price this far through the best one gets a warning. */
-const THROUGH_BPS = 500n;
 const MASK = "••••";
 
 let active = false;
@@ -2020,15 +2014,8 @@ function ticket(): Ticket | null {
       else {
         t.ticks = p.limit;
         if (meetsOwn(m, buy, p.limit)) t.warnings.push(OWN_ORDER);
-        const far = reach(p);
-        if (far >= FAR_BPS) {
-          const beyond = p.lots - BigInt(offers[0].lots);
-          t.warnings.push(
-            buy
-              ? `${size(beyond, m)} of it costs more than the best price, up to ${priceText(p.limit, m)}: ${percent(far)} above it.`
-              : `${size(beyond, m)} of it sells below the best price, down to ${priceText(p.limit, m)}: ${percent(far)} below it.`,
-          );
-        }
+        const far = reachNote(side, p, BigInt(offers[0].lots), m);
+        if (far) t.warnings.push(far);
       }
     }
     t.ok = !t.error && !!t.p && t.p.lots > 0n && t.p.short === null && !!links.get("book")?.live;
@@ -2054,9 +2041,8 @@ function ticket(): Ticket | null {
       // A post-only order that crosses is refused: the line about right
       // now says so, and what price it needs.
       if (crosses && tif !== "post_only") {
-        const gap = buy ? t.ticks - top : top - t.ticks;
-        const far = (gap * 10_000n) / top;
-        if (far >= THROUGH_BPS) t.warnings.push(`Your price is ${percent(far)} ${buy ? "above the lowest ask" : "below the highest bid"}. It trades at the book's prices, up to yours.`);
+        const far = throughNote(side, t.ticks, top);
+        if (far) t.warnings.push(far);
         if (meetsOwn(m, buy, t.ticks)) t.warnings.push(OWN_ORDER);
       }
     }
@@ -2211,7 +2197,7 @@ function renderTicket(): void {
   // "Available" says, and the form says what it is.
   const note = el("tr-slider-note");
   note.hidden = !(atOnce && byBook);
-  note.textContent = note.hidden ? "" : `100% is ${size(most, m)}: all that ${buy ? "is for sale" : "buyers want"} right now.`;
+  note.textContent = note.hidden ? "" : sliderNote(side, most, m);
   const slider = el<HTMLInputElement>("tr-pct");
   slider.disabled = most === 0n;
   const pct = most > 0n && lots ? Math.min(100, Number((lots * 100n) / most)) : 0;
