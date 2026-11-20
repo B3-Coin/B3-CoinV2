@@ -125,13 +125,19 @@ the same market and the same approval window.
   is not offered: the button says so and the line names the price it
   needs. An immediate order says what is sent in its place (a limit order
   at the furthest price it needs, the rest dropped), with its average
-  price, the estimate, the bound and the fee. While a request from the
+  price, the estimate, the bound and the fee, and its button carries the
+  estimate as the Simple view's does. While a request from the
   form is under way its steps stand where the summary was, above the
-  button; its result stays there until the form is changed. The open
-  orders are a table (placed, side, price, amount, filled) with a cancel
-  button on each row. A cancellation names what still waits of the order,
-  and its result says what it gave back, from the confirmed change of the
-  balances.
+  button; its result stays there until the form is changed, and follows
+  the order: once an order it placed has traded or been cancelled, it
+  says so. The open orders are a table (placed, side, price, amount,
+  filled) with a cancel button on each row. A cancellation names what
+  still waits of the order, and its result says what it gave back, from
+  the confirmed change of the balances. One request waits for approval at
+  a time; a button that is off for that reason says so when pointed at.
+  The amount slider is a share of what the balance pays for; for an
+  immediate order that is more than the book holds, the form says what
+  100% is.
 
 The wording of both views and of the approval window is a set of pure
 functions (`web/src/fm2words.ts`) with their own tests: what a form's
@@ -214,7 +220,8 @@ outbox on disk, and then posted to every seat.
 After a crash or a lost connection the same bytes are posted again; a second
 signature is never made. The History list is the outbox: each row is a
 sentence about what happened, and opens to the confirmed fills behind it
-(amount, price, value and fee of each), the slot, the exact size and the
+(amount, price, value and fee of each, with the rule that one order pays
+one fee, rounded up once), the slot, the size in lots and ticks and the
 action's id. A row still waiting shows what the seats last said.
 
 **When things go wrong.** The page says what it is waiting for instead of
