@@ -8,6 +8,7 @@
 #include <flowmesh2/core/facts.h>
 
 #include <algorithm>
+#include <cstddef>
 #include <string>
 #include <utility>
 
@@ -105,8 +106,13 @@ Result<void> SeatNode::BuildComponents(bool restart)
     Result<std::unique_ptr<read::ReadService>> read{read::ReadService::Create(limits, m_config.profile)};
     if (!read.has_value()) return read.error();
     m_read = std::move(read).value();
-    Result<std::unique_ptr<admission::ActionPool>> pool{
-        admission::ActionPool::Create(admission::PoolLimits::FromProfile(m_config.profile), m_config.profile, head->Header().height)};
+    // A restart's pool starts at the first slot the pool and the read service retain; RebuildRetained brings both to
+    // the committed head (M4-STO-03's pool rebuild, O-71).
+    const admission::PoolLimits pool_limits{admission::PoolLimits::FromProfile(m_config.profile)};
+    const uint64_t committed{head->Header().height};
+    const uint64_t window{std::max<uint64_t>({pool_limits.retention_slots, limits.outcome_index_slots, limits.view_slots})};
+    const uint64_t base{restart ? committed - std::min(committed, window) : committed};
+    Result<std::unique_ptr<admission::ActionPool>> pool{admission::ActionPool::Create(pool_limits, m_config.profile, base)};
     if (!pool.has_value()) return pool.error();
     m_pool = std::move(pool).value();
     Result<std::unique_ptr<admission::Admission>> admission{
@@ -129,6 +135,7 @@ Result<void> SeatNode::BuildComponents(bool restart)
     // refusal keeps the head where it is and fences the node, which then starts and serves reads (O-89: that height is
     // never re-decided with another header); a storage failure is the restart's error.
     if (restart) {
+        if (const Result<void> rebuilt{RebuildRetained(base)}; !rebuilt.has_value()) return rebuilt.error();
         if (const Result<void> tail{ApplyUnappliedTail()}; !tail.has_value()) {
             Hooks().Record("restart.tail", std::string{ToString(tail.error().code)} + "," + std::string{tail.error().detail});
             if (tail.error().code == ErrorCode::STORAGE_FATAL || tail.error().code == ErrorCode::INVARIANT) return tail.error();
@@ -249,15 +256,206 @@ Result<std::pair<state::Candidate, std::vector<ActionId>>> SeatNode::Prepare(con
         inputs.body.facts.push_back(std::move(bytes).value());
     }
     inputs.body.originals = taken->originals;
-    // An engine error that one action causes (O-34) is not fenced: the slot is
-    // retried, and excluding that action is M4-ADM-03.
+    // An engine error that actions cause (O-34) leaves them out (M4-ADM-03); one a fact causes is returned unfenced and
+    // the slot is retried.
     Result<state::Candidate> candidate{m_owner->Preview(state::ParentRef::Committed(*head), inputs)};
+    if (!candidate.has_value() && !taken->ids.empty() && !FencesNode(candidate.error().code) &&
+        candidate.error().code != ErrorCode::STALE_PARENT) {
+        const Error failed{candidate.error()};
+        candidate = LeaveOutBreakingActions(*head, height, inputs, *taken, failed);
+    }
     if (!candidate.has_value()) return FenceOn(candidate.error());
     Hooks().Record("state.preview", "slot=" + std::to_string(height) + ",header=" + candidate->Header().Hash().GetHex());
 
     // 4. The hooks' step between Preview and Propose (the simulator's authority bump and fault mapping check).
     if (const Result<void> after{Hooks().AfterPreview(height)}; !after.has_value()) return FenceOn(after.error());
     return Ok(std::pair{std::move(candidate).value(), taken->ids});
+}
+
+Result<state::Candidate> SeatNode::LeaveOutBreakingActions(const state::HeadView& head, uint64_t height, state::SlotInputs& inputs,
+                                                           admission::TakenSlot& taken, const Error& failed)
+{
+    const state::ParentRef parent{state::ParentRef::Committed(head)};
+    size_t previews{0};
+    // Actions that broke the slot alone, in admission order: checked against the settled slot at the end.
+    std::vector<std::pair<ActionId, std::vector<unsigned char>>> suspects;
+    // One preview per suspect is held back for that check, and room for the suspect the next probe may find, so step 3
+    // spends at most MAX_SLOT_PREVIEWS.
+    const auto budget_left = [&] { return previews + suspects.size() + 1 < MAX_SLOT_PREVIEWS; };
+    // The slot with `originals` (the engine's result does not depend on body order).
+    const auto preview = [&](std::vector<std::vector<unsigned char>> originals) {
+        ++previews;
+        inputs.body.originals = std::move(originals);
+        return m_owner->Preview(parent, inputs);
+    };
+    const auto first = [&](size_t n) {
+        return preview({taken.originals.begin(), taken.originals.begin() + static_cast<std::ptrdiff_t>(n)});
+    };
+    // An error that ends the search: it fences the node, or the head moved.
+    const auto ends = [](const Error& error) { return FencesNode(error.code) || error.code == ErrorCode::STALE_PARENT; };
+    const auto stop = [&](const Error& error) {
+        inputs.body.originals = taken.originals;
+        return Result<state::Candidate>{error};
+    };
+    const auto trace = [&](std::string_view step, const ActionId& id, const Error& error) {
+        Hooks().Record(step, "slot=" + std::to_string(height) + ",action=" + id.id.GetHex() + "," + std::string{ToString(error.code)} +
+                                 "," + std::string{error.detail});
+    };
+    // Without actions the slot must have a candidate, or a fact (not an action) breaks it: nothing is left out.
+    Result<state::Candidate> valid{first(0)};
+    if (!valid.has_value()) return stop(failed);
+    // Invariant: the first `lo` taken actions give the candidate `valid`, and all of them (more than lo) give `last`.
+    size_t lo{0};
+    Error last{failed};
+    while (budget_left()) {
+        // The boundary: the first lo give a candidate, the first hi none. Exponential search from lo, then bisection.
+        size_t hi{taken.originals.size()};
+        for (size_t step{1}; lo + step < hi && budget_left(); step *= 2) {
+            Result<state::Candidate> probe{first(lo + step)};
+            if (!probe.has_value()) {
+                if (ends(probe.error())) return stop(probe.error());
+                hi = lo + step;
+                break;
+            }
+            lo += step;
+            valid = std::move(probe);
+        }
+        while (hi - lo > 1 && budget_left()) {
+            const size_t mid{lo + (hi - lo) / 2};
+            Result<state::Candidate> probe{first(mid)};
+            if (probe.has_value()) {
+                lo = mid;
+                valid = std::move(probe);
+            } else if (ends(probe.error())) {
+                return stop(probe.error());
+            } else {
+                hi = mid;
+            }
+        }
+        if (hi - lo > 1) break; // the budget ran out before the boundary was found
+        // Action lo breaks the slot after the first lo. Alone (for lo = 0 that is the probe just made) it either gives no
+        // candidate, a suspect, or it needs the actions before it, so it only waits for a later slot.
+        bool alone_breaks{lo == 0};
+        if (lo > 0) {
+            if (!budget_left()) break;
+            Result<state::Candidate> alone{preview({taken.originals[lo]})};
+            if (!alone.has_value() && ends(alone.error())) return stop(alone.error());
+            alone_breaks = !alone.has_value();
+        }
+        if (alone_breaks) {
+            suspects.emplace_back(taken.ids[lo], taken.originals[lo]);
+        } else {
+            trace("pool.defer", taken.ids[lo], last);
+        }
+        taken.ids.erase(taken.ids.begin() + static_cast<std::ptrdiff_t>(lo));
+        taken.originals.erase(taken.originals.begin() + static_cast<std::ptrdiff_t>(lo));
+        if (taken.originals.size() == lo || !budget_left()) break;
+        Result<state::Candidate> again{first(taken.originals.size())};
+        if (again.has_value()) {
+            lo = taken.originals.size();
+            valid = std::move(again);
+            break;
+        }
+        if (ends(again.error())) return stop(again.error());
+        last = again.error();
+    }
+    // The slot is the first lo, whose candidate was seen; the rest stay in the pool (IN_PROPOSAL until the slot commits,
+    // then PENDING) and a later slot takes them again.
+    for (size_t i{lo}; i < taken.ids.size(); ++i) trace("pool.defer", taken.ids[i], last);
+    taken.ids.resize(lo);
+    taken.originals.resize(lo);
+    // Each suspect against the slot, to a fixed point: one with a candidate joins the slot, and because that changes the
+    // slot, every other suspect's earlier failure no longer counts and it is checked again (Codex review round 12). A
+    // suspect is excluded only by a failure against the final slot; one the budget leaves unchecked against it is
+    // deferred. With no actions settled, a suspect's check is the alone preview that found it, so it is not made again.
+    struct Suspect {
+        ActionId id;
+        std::vector<unsigned char> original;
+        std::optional<Error> refusal; //!< the failure against the current slot, if checked against it
+        bool joined{false};
+    };
+    std::vector<Suspect> pending;
+    pending.reserve(suspects.size());
+    for (auto& [id, original] : suspects) {
+        pending.push_back(Suspect{id, std::move(original), taken.originals.empty() ? std::optional<Error>{last} : std::nullopt, false});
+    }
+    for (bool changed{true}; changed;) {
+        changed = false;
+        for (Suspect& suspect : pending) {
+            if (suspect.joined || suspect.refusal.has_value() || previews >= MAX_SLOT_PREVIEWS) continue;
+            std::vector<std::vector<unsigned char>> with{taken.originals};
+            with.push_back(suspect.original);
+            Result<state::Candidate> joined{preview(std::move(with))};
+            if (!joined.has_value()) {
+                if (ends(joined.error())) return stop(joined.error());
+                suspect.refusal = joined.error();
+                continue;
+            }
+            taken.ids.push_back(suspect.id);
+            taken.originals.push_back(suspect.original);
+            valid = std::move(joined);
+            suspect.joined = true;
+            changed = true;
+            for (Suspect& other : pending) other.refusal.reset();
+        }
+    }
+    for (const Suspect& suspect : pending) {
+        if (suspect.joined) continue;
+        if (!suspect.refusal.has_value()) {
+            trace("pool.defer", suspect.id, last);
+            continue;
+        }
+        if (const Result<void> out{m_pool->Exclude(height, suspect.id)}; !out.has_value()) return stop(out.error());
+        trace("pool.exclude", suspect.id, *suspect.refusal);
+    }
+    inputs.body.originals = taken.originals;
+    return valid;
+}
+
+Result<void> SeatNode::RebuildRetained(uint64_t base)
+{
+    const std::shared_ptr<const state::HeadView> restored{m_owner->Head()};
+    const uint64_t committed{restored->Header().height};
+    if (committed == base) return Ok(); // nothing committed yet
+    Result<std::unique_ptr<state::StateOwner>> created{state::StateOwner::Create(m_config.profile, m_genesis, m_commit_journal->InstanceId())};
+    if (!created.has_value()) return created.error();
+    state::StateOwner& replayer{**created};
+    for (uint64_t height{1}; height <= committed; ++height) {
+        const std::optional<std::vector<unsigned char>> bytes{m_commit_log->DecisionRecordAt(height)};
+        if (!bytes.has_value()) return Error{ErrorCode::INVARIANT, SEAT_REBUILD_GAP};
+        Result<storage::DecisionRecord> record{storage::DecisionRecord::Decode(*bytes, m_config.profile)};
+        if (!record.has_value()) return record.error();
+        Result<state::Candidate> candidate{replayer.Reexecute(record->header, record->body)};
+        if (!candidate.has_value()) return candidate.error();
+        const std::vector<OutcomeV2> outcomes{candidate->Outcomes()};
+        // The DECISION record is durable: AppendDecision names it again (idempotent), as in ApplyUnappliedTail.
+        Result<storage::PendingDecision> pending{m_commit_log->AppendDecision(record->header, record->certificate, record->body)};
+        if (!pending.has_value()) return pending.error();
+        Result<DurableDecision> decision{m_commit_log->Confirm(*pending)};
+        if (!decision.has_value()) return decision.error();
+        // Its APPLIED record is durable too (height <= the committed head), so check 3 passed under the authority the
+        // header names: applying under that authority on the replayer gives the slot's receipt.
+        Result<state::AppliedSlot> applied{replayer.Apply(std::move(candidate).value(), *decision, record->header.Authority())};
+        if (!applied.has_value()) return applied.error();
+        if (height <= base) continue;
+        // AppendApplied names the durable APPLIED record again (idempotent); Confirm gives the slot's DurableApplied.
+        Result<storage::PendingApplied> pending_applied{m_commit_log->AppendApplied(applied->receipt)};
+        if (!pending_applied.has_value()) return pending_applied.error();
+        Result<DurableApplied> token{m_commit_log->Confirm(*pending_applied)};
+        if (!token.has_value()) return token.error();
+        Result<std::shared_ptr<const read::SlotView>> view{read::SlotView::Build(*applied->head, record->certificate, outcomes)};
+        if (!view.has_value()) return view.error();
+        if (const Result<void> published{m_read->Publish(*token, *view)}; !published.has_value()) return published.error();
+        Result<admission::CommitReport> report{m_pool->OnCommitted(*token, *applied->head, outcomes, record->body)};
+        if (!report.has_value()) return report.error();
+    }
+    const std::shared_ptr<const state::HeadView> replayed{replayer.Head()};
+    if (replayed->HeaderHash() != restored->HeaderHash() || replayed->CertHash() != restored->CertHash() ||
+        !(replayed->State() == restored->State())) {
+        return Error{ErrorCode::INVARIANT, SEAT_REBUILD_HEAD};
+    }
+    Hooks().Record("restart.rebuild", "from=" + std::to_string(base + 1) + ",to=" + std::to_string(committed));
+    return Ok();
 }
 
 Result<void> SeatNode::ApplyUnappliedTail()
@@ -341,6 +539,10 @@ Result<uint64_t> SeatNode::ProposeSlot()
 {
     if (m_pbft == nullptr) return Error{ErrorCode::INVALID_INPUT, SEAT_MULTI_SEAT};
     if (!m_pbft->IsLeader()) return Error{ErrorCode::INVALID_INPUT, SEAT_NOT_LEADER};
+    // The view holds this seat's proposal already (resumed after a restart, ARCHITECTURE.md 17.3 item 15(a), or proposed
+    // before): the retry timer resends it. Prepare would take pool actions for a candidate Propose then refuses as
+    // ORDER_VIOLATION PBFT_PROPOSAL_PENDING, which fences the node.
+    if (m_pbft->Status().proposal_accepted) return Error{ErrorCode::BUSY, SEAT_PROPOSAL_IN_FLIGHT};
     // A NEW_VIEW selected a header: re-propose it when this seat holds it, with the parent certificate the header binds; fetch
     // it (Tick) when not. A fresh candidate would be refused in either case (PBFT_NEW_VIEW_SELECTED; O-101).
     if (const std::optional<uint256> selected{m_pbft->SelectedHeader()}; selected.has_value()) {
@@ -403,6 +605,10 @@ Result<void> SeatNode::Tick(uint64_t now_ms)
     if (!behind && !needs_proposal) {
         m_sync.pending_peer.reset();
         return Ok();
+    }
+    if (m_sync.progressed) {
+        m_sync.progressed = false;
+        if (m_sync.pending_peer.has_value()) m_sync.sent_ms = m_now_ms; // the request in flight is still answering
     }
     if (m_sync.pending_peer.has_value() && m_now_ms - m_sync.sent_ms < m_sync.backoff_ms) return Ok();
     if (m_sync.pending_peer.has_value()) m_sync.backoff_ms = std::min(m_sync.backoff_ms * 2, m_config.sync_backoff_max_ms);
@@ -518,7 +724,12 @@ Result<void> SeatNode::OnBulk(const net::InboundFrame& frame)
         m_sync.backoff_ms = m_config.sync_backoff_ms;
         if (last_of_batch) {
             m_sync.pending_peer.reset(); // the batch is complete: the driver asks for the next one at the next tick
-        } else if (!solicited && m_sync.pending_peer.has_value() && m_sync.pending_slot == reply->slot) {
+        } else if (solicited) {
+            // The batch is still arriving: its retry period runs from its latest record that applied, not from the send
+            // (review workflow of 2026-11-18). Only a record that moved the head counts; the next Tick stamps it (OnFrame
+            // does not see the clock), so the period is never shortened.
+            if (m_owner->Head()->Header().height == reply->slot) m_sync.progressed = true;
+        } else if (m_sync.pending_peer.has_value() && m_sync.pending_slot == reply->slot) {
             m_sync.pending_peer.reset(); // a push answered the pending request: it is moot
         }
         return Ok();

@@ -459,7 +459,16 @@ void TcpSeatMesh::Impl::OnReadable(Conn& conn)
     size_t budget{cfg.limits.read_bytes_per_step};
     for (;;) {
         if (budget == 0) return;
-        if (conn.state == ConnState::OPEN && conn.peer.has_value() && InboxFull(*conn.peer)) return;
+        // Frames held back by a full inbox go first. Reading before them grew rbuf by a chunk for every slot Poll freed,
+        // until the cap below closed an honest peer and lost every frame it held (review workflow of 2026-11-18). After
+        // this, rbuf holds less than one packet unless the inbox is full again, and then nothing more is read. (Process
+        // pushes a frame before it checks the cap, so it is only called below the cap, as in Step.)
+        const auto held{[&] { return conn.state == ConnState::OPEN && conn.peer.has_value() && InboxFull(*conn.peer); }};
+        if (held()) return;
+        if (!conn.rbuf.empty()) {
+            Process(conn);
+            if (conn.closed || held()) return;
+        }
         const size_t want{std::min(sizeof(buf), budget)};
         const ssize_t n{conn.sock->Recv(buf, want, 0)};
         if (n > 0) {

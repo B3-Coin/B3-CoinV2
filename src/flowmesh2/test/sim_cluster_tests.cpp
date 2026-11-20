@@ -15,9 +15,13 @@
 
 #include <boost/test/unit_test.hpp>
 
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
+#include <type_traits>
+#include <utility>
+#include <variant>
 #include <vector>
 
 /** The multi-node simulation (M4-SIM-01) and its fault hooks (M4-SIM-02):
@@ -146,6 +150,39 @@ BOOST_AUTO_TEST_CASE(a_partition_without_a_quorum_decides_nothing_until_it_heals
     BOOST_CHECK_GT(trace.Size(), 0U);
 }
 
+BOOST_AUTO_TEST_CASE(a_leader_restarted_after_proposing_resumes_instead_of_fencing)
+{
+    // ARCHITECTURE.md 17.3 item 15(a), through SeatNode: the leader proposes, crashes (its frames lost) and restarts over its
+    // journals while the chain moved on. Before, its next ProposeSlot built a fresh candidate, the signer log answered
+    // PROPOSAL_CONFLICT for (epoch, slot, view) and the node fenced. Now it resumes the durable proposal: ProposeSlot is
+    // BUSY (the retry timer resends it) and the slot decides the original header.
+    TraceRecorder trace;
+    Result<std::unique_ptr<SimCluster>> created{SimCluster::Create(4, SimNodeConfig{}, trace)};
+    RequireOk(created, "SimCluster::Create(4)");
+    SimCluster& cluster{**created};
+    for (size_t i{0}; i < 4; ++i) RequireOk(cluster.Node(i).Chain().AppendBlock(SimBlockHash(SIM_BASE_HEIGHT + 1), {}), "AppendBlock");
+    const std::optional<uint32_t> leader{cluster.Leader()};
+    BOOST_REQUIRE(leader.has_value());
+    RequireOk(cluster.Node(*leader).ProposeSlot(), "ProposeSlot");
+    RequireOk(cluster.RestartNode(*leader), "RestartNode");
+    for (size_t i{0}; i < 4; ++i) RequireOk(cluster.Node(i).Chain().AppendBlock(SimBlockHash(SIM_BASE_HEIGHT + 2), {}), "AppendBlock");
+    SimNode& node{cluster.Node(*leader)};
+    const std::optional<agreement::PbftStatus> status{node.AgreementStatus()};
+    BOOST_REQUIRE(status.has_value());
+    BOOST_CHECK(status->proposal_accepted); // before: false
+    RequireError(node.ProposeSlot(), ErrorCode::BUSY, "a ProposeSlot after the restart (SEAT_PROPOSAL_IN_FLIGHT)");
+    BOOST_REQUIRE(!node.Fenced()); // before: fenced on PROPOSAL_CONFLICT
+    bool all{false};
+    for (uint64_t now{1}; now < 2'000 && !all; ++now) {
+        RequireOk(cluster.Pump(now), "Pump");
+        all = true;
+        for (size_t i{0}; i < 4; ++i) all = all && cluster.Node(i).Owner().Head()->Header().height == 1;
+    }
+    BOOST_REQUIRE_MESSAGE(all, "slot 1 did not decide");
+    for (size_t i{0}; i < 4; ++i) BOOST_CHECK(!cluster.Node(i).Fenced());
+    for (size_t i{1}; i < 4; ++i) BOOST_CHECK(cluster.Node(i).Owner().Head()->HeaderHash() == cluster.Node(0).Owner().Head()->HeaderHash());
+}
+
 BOOST_AUTO_TEST_CASE(an_inconsistent_fault_plan_is_refused)
 {
     FaultPlan plan;
@@ -202,7 +239,143 @@ size_t CountEvents(const TraceRecorder& trace, std::string_view kind, std::strin
     return n;
 }
 
+//! The slot an agreement frame is about; nullopt for evidence or bytes that do not decode.
+std::optional<uint64_t> SlotOf(const std::vector<unsigned char>& bytes, const ProfileParams& profile)
+{
+    const Result<agreement::Message> decoded{agreement::DecodeMessage(bytes, profile)};
+    if (!decoded.has_value()) return std::nullopt;
+    return std::visit(
+        [](const auto& message) -> std::optional<uint64_t> {
+            using T = std::decay_t<decltype(message)>;
+            if constexpr (std::is_same_v<T, agreement::Proposal>) {
+                return message.header.height;
+            } else if constexpr (std::is_same_v<T, agreement::Vote> || std::is_same_v<T, agreement::ViewChange> ||
+                                 std::is_same_v<T, agreement::NewView>) {
+                return message.slot;
+            } else {
+                return std::nullopt;
+            }
+        },
+        *decoded);
+}
+
+//! Drain the fabric: the DECISIONS_REQUESTs `from` sent, as (receiver, request); every other frame is dropped.
+std::vector<std::pair<uint32_t, net::DecisionsRequest>> TakeRequests(SimCluster& cluster, uint32_t from, const ProfileParams& profile)
+{
+    std::vector<std::pair<uint32_t, net::DecisionsRequest>> out;
+    for (const net::InProcessFrame& frame : cluster.Fabric()->Drain()) {
+        if (frame.from != from || frame.lane != net::Lane::BULK) continue;
+        const Result<net::SyncMessage> decoded{net::DecodeSync(frame.bytes, profile)};
+        if (!decoded.has_value()) continue;
+        if (const auto* request{std::get_if<net::DecisionsRequest>(&*decoded)}) out.emplace_back(frame.to, *request);
+    }
+    return out;
+}
+
 } // namespace
+
+BOOST_AUTO_TEST_CASE(a_seat_catching_up_does_not_ask_again_while_a_slow_batch_still_applies)
+{
+    // Review workflow of 2026-11-18 (Low): the retry period of a catch-up request ran from its send, so a batch whose eight
+    // replies took longer than sync_backoff_ms (250 ms) was asked for again from the next peer while it still applied, and
+    // each later record of the first batch (taken as a push) freed that request for yet another one. Seat 3 misses twelve
+    // slots; seat 0's eight replies reach it one per 100 ms, a Tick before each.
+    TraceRecorder trace;
+    SimNodeConfig config;
+    config.faults.partition = {{0, 1, 2}, {3}};
+    Result<std::unique_ptr<SimCluster>> created{SimCluster::Create(4, config, trace)};
+    RequireOk(created, "SimCluster::Create(4)");
+    SimCluster& cluster{**created};
+    for (size_t i{0}; i < 4; ++i) RequireOk(cluster.Node(i).Chain().AppendBlock(SimBlockHash(SIM_BASE_HEIGHT + 1), {}), "AppendBlock");
+    constexpr uint64_t MISSED{12}; // more than one batch: seat 3 is still behind when the first batch ends
+    uint64_t now{1};
+    now = DriveUntil(cluster, now, MISSED, {0, 1, 2}, 120'000);
+    for (uint32_t i{0}; i < 3; ++i) BOOST_REQUIRE_EQUAL(cluster.Node(i).Owner().Head()->Header().height, MISSED);
+    BOOST_REQUIRE_EQUAL(cluster.Node(3).Owner().Head()->Header().height, 0U);
+    const ProfileParams& profile{cluster.Node(0).Profile()};
+
+    // No Pump from here on: every frame goes through this test's hands, and seat 3's agreement frames reach nobody (so no
+    // peer pushes it a decision). Whatever the last Pump left queued is dropped.
+    (void)cluster.Fabric()->Drain();
+    // Seats 0..2 work on slot MISSED + 1; the first such frame from each of two of them is kept for seat 3: f + 1 = 2 claims
+    // beyond its head.
+    std::map<uint32_t, net::InProcessFrame> claims;
+    for (const uint64_t deadline{now + 20'000}; claims.size() < 2 && now < deadline; ++now) {
+        for (uint32_t i{0}; i < 3; ++i) {
+            SimNode& node{cluster.Node(i)};
+            const std::optional<agreement::PbftStatus> status{node.AgreementStatus()};
+            if (node.IsLeader() && status.has_value() && !status->proposal_accepted && !status->decided) (void)node.ProposeSlot();
+        }
+        for (const net::InProcessFrame& frame : cluster.Fabric()->Drain()) {
+            if (frame.from == 3 || frame.lane == net::Lane::BULK) continue;
+            if (frame.to == 3) {
+                const std::optional<uint64_t> slot{SlotOf(frame.bytes, profile)};
+                if (slot.has_value() && *slot > MISSED) claims.try_emplace(frame.from, frame);
+                continue;
+            }
+            (void)cluster.Node(frame.to).OnFrame(net::InboundFrame{frame.from, frame.lane, frame.bytes});
+        }
+        for (uint32_t i{0}; i < 3; ++i) (void)cluster.Node(i).Tick(now);
+    }
+    BOOST_REQUIRE_GE(claims.size(), 2U); // one drain may bring all three
+    seat::SeatNode& behind{cluster.Node(3).Seat()};
+    // A future slot's message is refused, but its slot is noted as the sender's claim first (PbftAgreement::OnMessage).
+    for (const auto& [from, frame] : claims) (void)behind.OnFrame(net::InboundFrame{from, frame.lane, frame.bytes});
+    (void)cluster.Fabric()->Drain();
+    const size_t requests_before{CountEvents(trace, "sync.request")};
+    const size_t refusals_before{CountEvents(trace, "sync.refuse")};
+
+    // One request for the first batch, to seat 0 (round robin from seat 0).
+    uint64_t t{now};
+    RequireOk(behind.Tick(t), "Tick: seat 3 is behind");
+    const std::vector<std::pair<uint32_t, net::DecisionsRequest>> first{TakeRequests(cluster, 3, profile)};
+    BOOST_REQUIRE_EQUAL(first.size(), 1U);
+    BOOST_CHECK_EQUAL(first[0].first, 0U);
+    BOOST_CHECK_EQUAL(first[0].second.from_slot, 1U);
+    BOOST_CHECK_EQUAL(first[0].second.max, net::MAX_SYNC_DECISIONS);
+    const Result<std::vector<unsigned char>> asked{net::EncodeSync(first[0].second, profile)};
+    RequireOk(asked, "EncodeSync");
+    RequireOk(cluster.Node(0).OnFrame(net::InboundFrame{3, net::Lane::BULK, *asked}), "seat 0 serves the request");
+    std::vector<net::InProcessFrame> replies;
+    for (net::InProcessFrame& frame : cluster.Fabric()->Drain()) {
+        if (frame.from == 0 && frame.to == 3 && frame.lane == net::Lane::BULK) replies.push_back(std::move(frame));
+    }
+    BOOST_REQUIRE_EQUAL(replies.size(), size_t{net::MAX_SYNC_DECISIONS});
+
+    // One reply per 100 ms: the batch takes 800 ms, more than three retry periods, and applies all along.
+    std::vector<std::pair<uint32_t, net::DecisionsRequest>> again;
+    for (size_t i{0}; i < replies.size(); ++i) {
+        t += 100;
+        RequireOk(behind.Tick(t), "Tick");
+        RequireOk(behind.OnFrame(net::InboundFrame{0, net::Lane::BULK, replies[i].bytes}), "reply " + std::to_string(i + 1));
+        BOOST_CHECK_EQUAL(cluster.Node(3).Owner().Head()->Header().height, static_cast<uint64_t>(i + 1));
+        for (const auto& request : TakeRequests(cluster, 3, profile)) again.push_back(request);
+    }
+    BOOST_CHECK_MESSAGE(again.empty(), "asked again " << again.size() << " times while the batch applied"); // before: 4
+    BOOST_CHECK_EQUAL(cluster.Node(3).Owner().Head()->Header().height, uint64_t{net::MAX_SYNC_DECISIONS});
+
+    // The batch is complete: the next Tick asks the next peer for the next batch.
+    t += 100;
+    RequireOk(behind.Tick(t), "Tick after the batch");
+    const std::vector<std::pair<uint32_t, net::DecisionsRequest>> second{TakeRequests(cluster, 3, profile)};
+    BOOST_REQUIRE_EQUAL(second.size(), 1U);
+    BOOST_CHECK_EQUAL(second[0].first, 1U);
+    BOOST_CHECK_EQUAL(second[0].second.from_slot, uint64_t{net::MAX_SYNC_DECISIONS} + 1);
+    // Nobody answers it: the retry period still runs from the send and doubles (250 ms, then 500 ms).
+    RequireOk(behind.Tick(t + 249), "Tick");
+    BOOST_CHECK(TakeRequests(cluster, 3, profile).empty());
+    RequireOk(behind.Tick(t + 250), "Tick");
+    const std::vector<std::pair<uint32_t, net::DecisionsRequest>> retry{TakeRequests(cluster, 3, profile)};
+    BOOST_REQUIRE_EQUAL(retry.size(), 1U);
+    BOOST_CHECK_EQUAL(retry[0].first, 2U);
+    RequireOk(behind.Tick(t + 749), "Tick");
+    BOOST_CHECK(TakeRequests(cluster, 3, profile).empty());
+    RequireOk(behind.Tick(t + 750), "Tick");
+    BOOST_CHECK_EQUAL(TakeRequests(cluster, 3, profile).size(), 1U);
+    BOOST_CHECK_EQUAL(CountEvents(trace, "sync.request") - requests_before, 4U);
+    BOOST_CHECK_EQUAL(CountEvents(trace, "sync.refuse"), refusals_before);
+    BOOST_CHECK(!cluster.Node(3).Fenced());
+}
 
 BOOST_AUTO_TEST_CASE(a_seat_alone_behind_a_partition_catches_up_by_fetching_decisions)
 {

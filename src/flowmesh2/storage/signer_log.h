@@ -214,6 +214,15 @@ public:
      * construction: the log read it back from its journal.
      */
     std::optional<SignedVoteRecord> SignedVote(const VoteKey& key) const;
+    /** The last ACCEPTED_PROPOSAL this log appended or recovered (journal
+     * order), header and body, if its key is `key` (ARCHITECTURE.md 17.3 item
+     * 15(a)): a leader restarted in the view it proposed in resends exactly
+     * that proposal instead of a second header for the key. Only the last
+     * record is kept in memory (one body, at most
+     * AcceptedProposalRecord::MaxEncodedSize); an older key answers nullopt
+     * although the journal holds it. A copy each call: for the restart path.
+     */
+    std::optional<AcceptedProposalRecord> AcceptedProposal(const ProposalKey& key) const;
     //! Journal::Barrier of the signer journal (B-INTENT, B-VOTE).
     Result<uint64_t> Barrier() { return m_journal->Barrier(); }
     //! Journal::Confirm: B-INTENT.
@@ -270,6 +279,7 @@ private:
 
     Journal* m_journal;
     std::map<ProposalKey, ProposalEntry> m_proposals;
+    std::optional<AcceptedProposalRecord> m_last_proposal; //!< the last ACCEPTED_PROPOSAL appended or recovered
     std::map<VoteKey, VoteEntry> m_votes;
     std::optional<ViewStateRecord> m_view_state;
     uint64_t m_view_state_seq{0};

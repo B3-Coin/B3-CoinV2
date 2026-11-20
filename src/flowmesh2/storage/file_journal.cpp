@@ -56,13 +56,14 @@ Result<void> WriteAllAt(int fd, std::span<const unsigned char> bytes, uint64_t o
     return Ok();
 }
 
-//! Read the whole file at `path` (at most `max_bytes`); STORAGE_FATAL if it cannot be opened or read.
+//! Read the whole file at `path` (at most `max_bytes`); STORAGE_FATAL if it cannot be opened or read. A symlink is not
+//! followed (refused): every file of a journal is opened with O_NOFOLLOW, as the rebirth journal's segments were.
 Result<std::vector<unsigned char>> ReadWholeFile(const fs::path& path, uint64_t max_bytes)
 {
 #ifdef WIN32
     const int fd{_wopen(path.c_str(), _O_RDONLY | _O_BINARY)};
 #else
-    const int fd{open(path.c_str(), O_RDONLY | O_CLOEXEC)};
+    const int fd{open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW)};
 #endif
     if (fd < 0) return Error{ErrorCode::STORAGE_FATAL, JOURNAL_SEGMENT_READ};
     std::vector<unsigned char> out;
@@ -114,8 +115,11 @@ void CloseFd(int fd)
 //! Whether `path` is a regular file. A stat error other than "it does not exist" stays in `ec`.
 bool RegularFileExists(const fs::path& path, std::error_code& ec)
 {
-    const std::filesystem::file_status status{std::filesystem::status(path, ec)};
+    // symlink_status: a symlink is never followed, here or by the opens (O_NOFOLLOW). It is an error (ELOOP, the errno
+    // O_NOFOLLOW gives), whatever it points to, so no check depends on the target (Codex review round 10).
+    const std::filesystem::file_status status{std::filesystem::symlink_status(path, ec)};
     if (ec == std::errc::no_such_file_or_directory || ec == std::errc::not_a_directory) ec.clear();
+    if (!ec && std::filesystem::is_symlink(status)) ec = std::make_error_code(std::errc::too_many_symbolic_link_levels);
     return !ec && std::filesystem::is_regular_file(status);
 }
 
@@ -141,7 +145,8 @@ std::optional<uint64_t> SegmentIndexOf(std::string_view name)
 }
 
 //! Create or open `<dir>/.lock` and take an exclusive, non-blocking lock on it (review of 2026-11-16, defect 6):
-//! BUSY JOURNAL_DIR_LOCKED while another FileJournal, in this process or another, holds it.
+//! BUSY JOURNAL_DIR_LOCKED while another FileJournal, in this process or another, holds it. A `.lock` that is a symlink
+//! is STORAGE_FATAL JOURNAL_DIR_LOCK: nothing is created or locked where it points.
 Result<int> LockJournalDir(const fs::path& dir)
 {
     const fs::path lock_path{dir / fs::u8path(std::string{LOCK_FILE_NAME})};
@@ -150,7 +155,7 @@ Result<int> LockJournalDir(const fs::path& dir)
     if (fd < 0) return Error{ErrorCode::STORAGE_FATAL, JOURNAL_DIR_LOCK};
     return Ok(fd); // no advisory lock on this branch, which is not compiled on this host (O-24 pattern)
 #else
-    const int fd{open(lock_path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600)};
+    const int fd{open(lock_path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600)};
     if (fd < 0) return Error{ErrorCode::STORAGE_FATAL, JOURNAL_DIR_LOCK};
     if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
         const int saved{errno};
@@ -281,16 +286,44 @@ Result<std::unique_ptr<FileJournal>> FileJournal::CreateNewWithCommitHook(const 
     }
     std::error_code ec;
     if (!fs::is_directory(empty_dir, ec) || ec) return Error{ErrorCode::INVALID_INPUT, JOURNAL_DIR_MISSING};
-    const fs::directory_iterator first{empty_dir, ec};
-    if (ec) return Error{ErrorCode::INVALID_INPUT, JOURNAL_DIR_MISSING};
-    if (first != fs::directory_iterator{}) return Error{ErrorCode::INVALID_INPUT, JOURNAL_DIR_NOT_EMPTY};
+    // Empty, or what an interrupted CreateNew leaves: the lock file and segment leftovers under their temporary names.
+    // No segment was ever renamed into place there, so nothing was committed (review workflow of 2026-11-18 over R7: the
+    // CLI outbox, which creates when segment 0 is absent, used to be refused that directory on every later run).
+    const auto leftovers{[&]() -> Result<std::vector<fs::path>> {
+        std::vector<fs::path> found;
+        for (fs::directory_iterator it{empty_dir, ec}; !ec && it != fs::directory_iterator{}; it.increment(ec)) {
+            const std::string name{fs::PathToString(it->path().filename())};
+            if (name == LOCK_FILE_NAME) continue;
+            std::error_code type_ec;
+            const bool temporary{name.size() == 16 && name.ends_with(".tmp") && SegmentIndexOf(std::string_view{name}.substr(0, 12)).has_value() &&
+                                 it->is_regular_file(type_ec) && !type_ec};
+            if (!temporary) return Error{ErrorCode::INVALID_INPUT, JOURNAL_DIR_NOT_EMPTY};
+            found.push_back(it->path());
+        }
+        if (ec) return Error{ErrorCode::INVALID_INPUT, JOURNAL_DIR_MISSING};
+        return Ok(std::move(found));
+    }};
+    if (const Result<std::vector<fs::path>> before{leftovers()}; !before.has_value()) return before.error();
 
     const Result<int> lock{LockJournalDir(empty_dir)};
     if (!lock.has_value()) return lock.error();
+    // Again under the lock, which another creator held until it finished or crashed; only then are the leftovers removed.
+    const Result<std::vector<fs::path>> found{leftovers()};
+    if (!found.has_value()) {
+        CloseFd(*lock);
+        return found.error();
+    }
+    for (const fs::path& leftover : *found) {
+        if (!fs::remove(leftover, ec) || ec) {
+            CloseFd(*lock);
+            return Error{ErrorCode::STORAGE_FATAL, JOURNAL_SEGMENT_CREATE};
+        }
+    }
     const Result<int> fd{CreateSegment(empty_dir, 0, segment_bytes)};
     if (!fd.has_value()) {
+        // The lock file stays: unlinked after the unlock, a creator that took the lock in between would hold it on a gone
+        // inode while a later opener locked a new `.lock` (Codex review of 2026-11-18). CreateNew takes the directory again.
         CloseFd(*lock);
-        fs::remove(empty_dir / fs::u8path(std::string{LOCK_FILE_NAME}), ec); // the directory is empty again
         return fd.error();
     }
     return Ok(std::unique_ptr<FileJournal>{new FileJournal{role, instance_id, observer, empty_dir, *lock, *fd, segment_bytes, commit}});
@@ -308,7 +341,7 @@ int OpenSegmentForWriting(const fs::path& path)
 #ifdef WIN32
     return _wopen(path.c_str(), _O_RDWR | _O_BINARY);
 #else
-    return open(path.c_str(), O_RDWR | O_CLOEXEC);
+    return open(path.c_str(), O_RDWR | O_CLOEXEC | O_NOFOLLOW);
 #endif
 }
 
@@ -346,7 +379,9 @@ Result<std::unique_ptr<FileJournal>> FileJournal::OpenLocked(const fs::path& dir
         if (!fs::remove(leftover, ec) || ec) return Error{ErrorCode::STORAGE_FATAL, JOURNAL_SEGMENT_CREATE};
     }
     const fs::path first{dir / fs::u8path(FIRST_SEGMENT_NAME)};
-    if (!fs::is_regular_file(first, ec) || ec) return Error{ErrorCode::INVALID_INPUT, JOURNAL_SEGMENT_MISSING};
+    const bool first_present{RegularFileExists(first, ec)};
+    if (ec) return Error{ErrorCode::STORAGE_FATAL, JOURNAL_SEGMENT_READ}; // a symlink, or a stat error
+    if (!first_present) return Error{ErrorCode::INVALID_INPUT, JOURNAL_SEGMENT_MISSING};
     const uint64_t segment_bytes{fs::file_size(first, ec)};
     if (ec || segment_bytes < SEGMENT_PAGE_BYTES || segment_bytes > MAX_SEGMENT_BYTES || segment_bytes % SEGMENT_PAGE_BYTES != 0) {
         return Error{ErrorCode::STORAGE_FATAL, JOURNAL_SEGMENT_SIZE};

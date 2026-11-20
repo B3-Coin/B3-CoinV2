@@ -836,6 +836,18 @@ void Restart(Cluster& c, uint32_t i)
     seat.pbft = std::move(pbft).value();
 }
 
+//! A real restart's signer log, rebuilt from the SIGNER journal's durable records (SignerLog::Recover, as SeatNode does) and
+//! assigned in place (the rig's SeatSigner points at rig->signer_log); then the agreement (Restart).
+void RestartRecovered(Cluster& c, uint32_t i)
+{
+    Seat& seat{c.At(i)};
+    seat.pbft.reset();
+    Result<storage::SignerLog> recovered{storage::SignerLog::Recover(*seat.rig->signer_journal, seat.rig->profile)};
+    RequireOk(recovered, "SignerLog::Recover");
+    seat.rig->signer_log = std::move(recovered).value();
+    Restart(c, i);
+}
+
 } // namespace
 
 BOOST_AUTO_TEST_CASE(the_proposal_leaves_only_after_accepted_proposal_is_durable)
@@ -968,6 +980,57 @@ BOOST_AUTO_TEST_CASE(a_seat_restarted_before_signing_its_report_signs_and_sends_
     }
 }
 
+BOOST_AUTO_TEST_CASE(a_seat_restarted_in_view_zero_keeps_its_preparation)
+{
+    // A seat that prepared in view 0 and restarted came back without its preparation: view 0 writes no VIEW_STATE, and
+    // ResumeViewState returned before it read the commit log's preparations, although pbft.h says a restart reads
+    // HighestPrepared. Its next report then carried none. Its commit log still held the PreparedQC, and it may have signed
+    // COMMIT for that header; q reports without the preparation let a NEW_VIEW select nothing and the slot decide another
+    // header.
+    Cluster c{4};
+    c.AppendBlock(130, {Fact{DepositAtCursor(FactCursor{130, 0}, "d0")}});
+    const uint32_t leader{c.Leader()};
+    const uint32_t restarted{(leader + 2) % 4};
+    const state::Candidate candidate{c.At(leader).rig->Preview(c.InputsFromChain(leader))};
+    RequireOk(c.At(leader).pbft->Propose(candidate, c.Authority()), "Propose");
+    const Filter drop_commits{[](uint32_t, uint32_t, const std::vector<unsigned char>& frame) { return !IsCommitVote(frame); }};
+    c.Deliver(drop_commits);
+    BOOST_CHECK(c.refusals.empty());
+    BOOST_REQUIRE(c.At(restarted).pbft->Status().prepared);
+    BOOST_REQUIRE(c.At(restarted).rig->commit_log.HighestPrepared(1).has_value());
+    Restart(c, restarted);
+    {
+        const PbftStatus status{c.At(restarted).pbft->Status()};
+        BOOST_CHECK_EQUAL(status.view, 0U);
+        BOOST_CHECK(!status.changing);
+        BOOST_CHECK(status.prepared); // from its commit log
+    }
+    // Its view-1 report carries the view-0 preparation of the candidate.
+    std::vector<ViewChange> reports;
+    c.At(restarted).mesh->on_transmit = [&](const RecordingMesh::Sent& s) {
+        if (TypeOf(s.frame) != MessageType::VIEW_CHANGE) return;
+        Result<Message> decoded{DecodeMessage(s.frame, c.At(restarted).rig->profile)};
+        RequireOk(decoded, "DecodeMessage");
+        reports.push_back(std::get<ViewChange>(*decoded));
+    };
+    const uint64_t timeout{PbftConfig{}.view_timeout_floor_ms};
+    c.Tick(timeout, drop_commits);
+    c.At(restarted).mesh->on_transmit = nullptr;
+    BOOST_CHECK(c.refusals.empty());
+    BOOST_REQUIRE(!reports.empty());
+    for (const ViewChange& report : reports) {
+        BOOST_CHECK_EQUAL(report.new_view, 1U);
+        BOOST_REQUIRE(report.prepared.has_value());
+        BOOST_CHECK_EQUAL(report.prepared->view, 0U);
+        BOOST_CHECK(report.prepared->cert.header_hash == candidate.Header().Hash());
+    }
+    // View 1 decides the prepared header.
+    c.Tick(timeout + PbftConfig{}.retry_ms);
+    BOOST_CHECK(c.refusals.empty());
+    for (uint32_t i{0}; i < 4; ++i) BOOST_CHECK(c.At(i).pbft->Status().decided);
+    BOOST_CHECK(c.ApplyDecisions() == candidate.Header().Hash());
+}
+
 BOOST_AUTO_TEST_CASE(reports_are_bounded_per_seat_and_replays_are_dropped_before_verification)
 {
     // Review of 2026-11-16, R6: reports were kept per attacker-chosen target view with no cap, and every report and vote
@@ -988,12 +1051,12 @@ BOOST_AUTO_TEST_CASE(reports_are_bounded_per_seat_and_replays_are_dropped_before
     Seat& seat0{c.At(0)};
     for (uint64_t target{2}; target <= 101; ++target) RequireOk(seat0.pbft->OnMessage(1, report_from(1, target, true)), "a report");
     PbftStatus status{seat0.pbft->Status()};
-    BOOST_CHECK_EQUAL(status.reports_held, 1U); // the highest target only
+    BOOST_CHECK_EQUAL(status.reports_held, 2U); // the seat's two highest targets, 100 and 101 (REPORTS_PER_SEAT)
     BOOST_CHECK_EQUAL(status.view, 0U);
     BOOST_CHECK(!status.changing);
-    // A lower target from that seat after a higher one is stale.
+    // A lower target from that seat below the two it keeps is stale.
     RequireOk(seat0.pbft->OnMessage(1, report_from(1, 50, true)), "a stale lower target");
-    BOOST_CHECK_EQUAL(seat0.pbft->Status().reports_held, 1U);
+    BOOST_CHECK_EQUAL(seat0.pbft->Status().reports_held, 2U);
     // The held report again with a broken signature: known (seat, target), dropped before any verification.
     RequireOk(seat0.pbft->OnMessage(1, report_from(1, 101, false)), "a replay with a broken signature");
     // A report not held with a broken signature is still refused.
@@ -1001,13 +1064,280 @@ BOOST_AUTO_TEST_CASE(reports_are_bounded_per_seat_and_replays_are_dropped_before
     BOOST_REQUIRE(!forged.has_value());
     BOOST_CHECK(forged.error().code == ErrorCode::VERIFY_FAILED);
     BOOST_CHECK(forged.error().detail == PBFT_REPORT_SIGNATURE);
-    BOOST_CHECK_EQUAL(seat0.pbft->Status().reports_held, 1U);
+    BOOST_CHECK_EQUAL(seat0.pbft->Status().reports_held, 2U);
     // f + 1 = 2 reports for target 101 synchronise seat 0 into CHANGING 101; nothing below the target is kept.
     RequireOk(seat0.pbft->OnMessage(2, report_from(2, 101, true)), "the second report");
     status = seat0.pbft->Status();
     BOOST_CHECK_EQUAL(status.view, 101U);
     BOOST_CHECK(status.changing);
-    BOOST_CHECK_EQUAL(status.reports_held, 3U); // seats 1 and 2 and its own
+    BOOST_CHECK_EQUAL(status.reports_held, 3U); // seats 1 and 2 and its own (EnterChanging erased seat 1's 100)
+}
+
+namespace {
+//! A signed VIEW_CHANGE of `seat` for slot 1 of epoch 0 naming `target`, as cluster `c`'s seat 0 decodes it.
+std::vector<unsigned char> ReportFrom(Cluster& c, uint32_t seat, uint64_t target, bool valid = true)
+{
+    ViewChange report;
+    report.epoch = 0;
+    report.slot = 1;
+    report.new_view = target;
+    report.seat = seat;
+    const uint256 digest{ViewChangeDigest(c.Domain(), report)};
+    report.signature = BlsKeyFromLabel(SeatLabel("s" + std::to_string(seat))).Sign(std::span<const unsigned char>{digest.data(), digest.size()}).Compressed();
+    if (!valid) report.signature.front() ^= 1;
+    return EncodeMessage(Message{report}, c.At(0).rig->profile).value();
+}
+} // namespace
+
+BOOST_AUTO_TEST_CASE(same_target_reports_survive_a_seats_higher_target)
+{
+    // Review workflow of 2026-11-18: ba5f43f0's supersede rule kept only each seat's highest target, so a seat that
+    // moved on erased the lower report that PROTOCOL.md's same-target f + 1 synchronisation (:102, :122-123, :181) counts.
+    Cluster c{4};
+    Seat& x{c.At(0)};
+    // Seat 1 moved through targets 1, 2 and 3; seat 2 reached target 2 and stopped there.
+    for (const uint64_t target : {1, 2, 3}) RequireOk(x.pbft->OnMessage(1, ReportFrom(c, 1, target)), "a report from seat 1");
+    BOOST_CHECK_EQUAL(x.pbft->Status().reports_held, 2U); // seat 1's two highest targets, 2 and 3
+    RequireOk(x.pbft->OnMessage(2, ReportFrom(c, 2, 2)), "a report from seat 2");
+    BOOST_CHECK_EQUAL(x.pbft->Status().view, 2U); // before: 0 (seat 1's target 2 was erased when its target 3 arrived)
+    // Control: the same two target-2 reports on their own synchronise a fresh seat into view 2.
+    Cluster control{4};
+    RequireOk(control.At(0).pbft->OnMessage(1, ReportFrom(control, 1, 2)), "control: seat 1 at target 2");
+    RequireOk(control.At(0).pbft->OnMessage(2, ReportFrom(control, 2, 2)), "control: seat 2 at target 2");
+    BOOST_CHECK_EQUAL(control.At(0).pbft->Status().view, 2U);
+}
+
+BOOST_AUTO_TEST_CASE(reports_keep_each_seats_two_highest_targets)
+{
+    // REPORTS_PER_SEAT = 2, whatever the arrival order; what falls below a seat's kept targets costs no verification.
+    Cluster c{4};
+    Seat& x{c.At(0)};
+    for (const uint64_t target : {3, 1, 4, 2}) RequireOk(x.pbft->OnMessage(1, ReportFrom(c, 1, target)), "a report from seat 1");
+    BOOST_CHECK_EQUAL(x.pbft->Status().reports_held, 2U); // 3 and 4
+    RequireOk(x.pbft->OnMessage(1, ReportFrom(c, 1, 1, false)), "a broken report below the kept targets, dropped unverified");
+    BOOST_CHECK_EQUAL(x.pbft->Status().reports_held, 2U);
+    // Seat 1's 2 is not kept, so seat 2 at 2 does not synchronise; at 3, kept, it does.
+    RequireOk(x.pbft->OnMessage(2, ReportFrom(c, 2, 2)), "seat 2 at 2");
+    BOOST_CHECK_EQUAL(x.pbft->Status().view, 0U);
+    RequireOk(x.pbft->OnMessage(2, ReportFrom(c, 2, 3)), "seat 2 at 3");
+    BOOST_CHECK_EQUAL(x.pbft->Status().view, 3U);
+}
+
+BOOST_AUTO_TEST_CASE(a_leader_restarted_in_its_view_resends_its_proposal)
+{
+    // ARCHITECTURE.md 17.3 item 15(a): a leader restarted in the view it proposed in came back without its proposal, so its
+    // next candidate was a second header for (epoch, slot, view): the signer log answered PROPOSAL_CONFLICT and SeatNode
+    // fenced the node. Slot 2, so the rebuilt proposal must carry the parent certificate its header binds. The proposal and
+    // the leader's PREPARE reach nobody before the crash.
+    Cluster c{4};
+    c.AppendBlock(130, {Fact{DepositAtCursor(FactCursor{130, 0}, "d0")}});
+    const uint32_t first{c.Leader()};
+    BOOST_REQUIRE_LT(first, 4U);
+    const state::Candidate one{c.At(first).rig->Preview(c.InputsFromChain(first))};
+    RequireOk(c.At(first).pbft->Propose(one, c.Authority()), "Propose slot 1");
+    c.Deliver();
+    BOOST_REQUIRE(c.refusals.empty());
+    BOOST_REQUIRE(c.ApplyDecisions(one, first) == one.Header().Hash());
+
+    const uint32_t leader{c.Leader()};
+    BOOST_REQUIRE_LT(leader, 4U);
+    Seat& seat{c.At(leader)};
+    const state::Candidate candidate{seat.rig->Preview(c.InputsFromChain(leader))};
+    BOOST_REQUIRE_EQUAL(candidate.Header().height, 2U);
+    BOOST_REQUIRE(!candidate.Header().parent_cert_hash.IsNull());
+    RequireOk(seat.pbft->Propose(candidate, c.Authority()), "Propose slot 2");
+    std::vector<unsigned char> original;
+    for (const RecordingMesh::Sent& s : seat.mesh->sent) {
+        if (TypeOf(s.frame) == MessageType::PROPOSAL) original = s.frame;
+    }
+    BOOST_REQUIRE(!original.empty());
+    seat.mesh->sent.clear(); // lost with the crash
+    const uint64_t written{seat.rig->signer_journal->Status().appended_seq};
+
+    RestartRecovered(c, leader);
+    {
+        const PbftStatus status{seat.pbft->Status()};
+        BOOST_CHECK_EQUAL(status.slot, 2U);
+        BOOST_CHECK_EQUAL(status.view, 0U);
+        BOOST_CHECK(status.leader);
+        BOOST_REQUIRE(status.proposal_accepted);     // before: false, nothing resumed the durable ACCEPTED_PROPOSAL
+        BOOST_CHECK_EQUAL(status.prepare_votes, 1U); // its own PREPARE, from the signer log
+    }
+    BOOST_CHECK_EQUAL(seat.rig->signer_journal->Status().appended_seq, written); // resumed: nothing signed or written
+    // New chain facts during the downtime give a fresh candidate: refused in memory (before: PROPOSAL_CONFLICT, the fence).
+    c.AppendBlock(131, {Fact{DepositAtCursor(FactCursor{131, 0}, "d1")}});
+    const state::Candidate another{seat.rig->Preview(c.InputsFromChain(leader))};
+    BOOST_REQUIRE(another.Header().Hash() != candidate.Header().Hash());
+    RequireRefusal(seat.pbft->Propose(another, c.Authority()), ErrorCode::ORDER_VIOLATION, PBFT_PROPOSAL_PENDING, "a fresh candidate after the restart");
+    BOOST_CHECK_EQUAL(seat.rig->signer_journal->Status().appended_seq, written);
+
+    // The retry timer resends the exact proposal, byte for byte, and the slot decides it.
+    std::vector<std::vector<unsigned char>> resent;
+    seat.mesh->on_transmit = [&](const RecordingMesh::Sent& s) {
+        if (TypeOf(s.frame) == MessageType::PROPOSAL) resent.push_back(s.frame);
+    };
+    c.Tick(PbftConfig{}.retry_ms);
+    seat.mesh->on_transmit = nullptr;
+    BOOST_CHECK(c.refusals.empty());
+    BOOST_REQUIRE_EQUAL(resent.size(), 3U);
+    for (const std::vector<unsigned char>& frame : resent) BOOST_CHECK(frame == original);
+    for (uint32_t i{0}; i < 4; ++i) BOOST_CHECK(c.At(i).pbft->Status().decided);
+    BOOST_CHECK(c.ApplyDecisions() == candidate.Header().Hash());
+}
+
+BOOST_AUTO_TEST_CASE(a_leader_restarted_before_its_prepare_signs_it)
+{
+    // The other window of 17.3 item 15(a): ACCEPTED_PROPOSAL durable (item 11's barrier), then the crash before the proposal
+    // or the PREPARE left. Staged by writing the record and the barrier the leader writes first.
+    Cluster c{4};
+    c.AppendBlock(130, {Fact{DepositAtCursor(FactCursor{130, 0}, "d0")}});
+    const uint32_t leader{c.Leader()};
+    BOOST_REQUIRE_LT(leader, 4U);
+    Seat& seat{c.At(leader)};
+    const uint64_t epoch{c.Authority().epoch};
+    const state::Candidate candidate{seat.rig->Preview(c.InputsFromChain(leader))};
+    RequireOk(seat.rig->signer_log.AppendAcceptedProposal(storage::ProposalKey{epoch, 1, 0}, candidate.Header(), candidate.Body()), "ACCEPTED_PROPOSAL");
+    RequireOk(seat.rig->signer_log.Barrier(), "barrier");
+    RestartRecovered(c, leader);
+    BOOST_REQUIRE(seat.pbft->Status().proposal_accepted); // before: false
+    // The PREPARE is signed at the restart (B-INTENT, check 2, Sign, B-VOTE) and sent; the others hold it as an early vote.
+    BOOST_CHECK(seat.rig->signer_log.SignedStatement(storage::VoteKey{c.Domain(), epoch, 1, 0, storage::VotePhase::PREPARE}).has_value());
+    c.Deliver();
+    c.Tick(PbftConfig{}.retry_ms); // the proposal is resent
+    BOOST_CHECK(c.refusals.empty());
+    for (uint32_t i{0}; i < 4; ++i) BOOST_CHECK(c.At(i).pbft->Status().decided);
+    BOOST_CHECK(c.ApplyDecisions() == candidate.Header().Hash());
+}
+
+BOOST_AUTO_TEST_CASE(a_leader_restarted_after_its_commit_resends_it)
+{
+    // 17.3 item 15(a), the COMMIT window: every seat prepared and signed COMMIT, no COMMIT arrived, the leader restarted.
+    // It resumes its proposal with the PREPARE and COMMIT it signed (nothing new signed) and decides with the others.
+    Cluster c{4};
+    c.AppendBlock(130, {Fact{DepositAtCursor(FactCursor{130, 0}, "d0")}});
+    const uint32_t leader{c.Leader()};
+    BOOST_REQUIRE_LT(leader, 4U);
+    Seat& seat{c.At(leader)};
+    const state::Candidate candidate{seat.rig->Preview(c.InputsFromChain(leader))};
+    RequireOk(seat.pbft->Propose(candidate, c.Authority()), "Propose");
+    const Filter drop_commits{[](uint32_t, uint32_t, const std::vector<unsigned char>& frame) { return !IsCommitVote(frame); }};
+    c.Deliver(drop_commits);
+    BOOST_REQUIRE(c.refusals.empty());
+    for (uint32_t i{0}; i < 4; ++i) BOOST_REQUIRE(c.At(i).pbft->Status().prepared);
+    const uint64_t written{seat.rig->signer_journal->Status().appended_seq};
+    RestartRecovered(c, leader);
+    BOOST_REQUIRE(seat.pbft->Status().proposal_accepted); // before: false
+    BOOST_CHECK_EQUAL(seat.rig->signer_journal->Status().appended_seq, written); // its COMMIT came back from the log
+    c.Tick(PbftConfig{}.retry_ms); // every seat resends its COMMIT
+    BOOST_CHECK(c.refusals.empty());
+    for (uint32_t i{0}; i < 4; ++i) BOOST_CHECK_MESSAGE(c.At(i).pbft->Status().decided, "seat " << i << " decided"); // before: not the leader
+    BOOST_CHECK(c.ApplyDecisions() == candidate.Header().Hash());
+}
+
+BOOST_AUTO_TEST_CASE(a_seat_that_decided_a_height_never_prepares_another_header_for_it_in_a_new_epoch)
+{
+    // O-89 on the follower path (review workflow of 2026-11-18; unreachable from fm2d while its epoch is fixed at 0). Slot 1
+    // decides under epoch 0 and is never applied (check 3 refused it: the head stays at the genesis). The authority moves to
+    // epoch 1 and every agreement is rebuilt, as a restart after that refusal does: slot 1 starts again at (1, 1, 0) with no
+    // lock, since ResumeViewState skips the epoch-0 preparation. Only the leader path checked DecisionAt; a follower
+    // prepared the epoch-1 header for the decided height.
+    Cluster c{4};
+    c.AppendBlock(130, {Fact{DepositAtCursor(FactCursor{130, 0}, "d0")}});
+    const uint32_t first_leader{c.Leader()};
+    BOOST_REQUIRE_LT(first_leader, 4U);
+    const state::Candidate first{c.At(first_leader).rig->Preview(c.InputsFromChain(first_leader))};
+    RequireOk(c.At(first_leader).pbft->Propose(first, c.Authority()), "Propose slot 1 under epoch 0");
+    c.Deliver();
+    BOOST_REQUIRE(c.refusals.empty());
+    const uint256 decided{first.Header().Hash()};
+    for (uint32_t i{0}; i < 4; ++i) {
+        BOOST_REQUIRE(c.At(i).pbft->Status().decided);
+        BOOST_REQUIRE(c.At(i).rig->commit_log.DecisionAt(1).has_value());
+        BOOST_REQUIRE(c.At(i).rig->commit_log.DecisionAt(1)->header_hash == decided);
+    }
+    // No ApplyDecisions: decided but unapplied. The authority moves on every seat's chain; every agreement restarts.
+    for (uint32_t i{0}; i < 4; ++i) {
+        (void)c.At(i).rig->adapter->BumpAuthority();
+        Restart(c, i);
+        const PbftStatus status{c.At(i).pbft->Status()};
+        BOOST_REQUIRE_EQUAL(status.epoch, 1U);
+        BOOST_REQUIRE_EQUAL(status.slot, 1U);
+        BOOST_REQUIRE_EQUAL(status.view, 0U);
+        BOOST_REQUIRE(!status.prepared); // the epoch-0 preparation is not this instance's
+        BOOST_REQUIRE_EQUAL(c.At(i).rig->owner->Head()->Header().height, 0U);
+    }
+    const uint32_t leader{c.Leader()};
+    BOOST_REQUIRE_LT(leader, 4U);
+    const uint32_t target{(leader + 1) % 4};
+    const state::Candidate second{c.At(leader).rig->Preview(c.InputsFromChain(leader))};
+    BOOST_REQUIRE_EQUAL(second.Header().height, 1U);
+    BOOST_REQUIRE_EQUAL(second.Header().authority_epoch, 1U);
+    BOOST_REQUIRE(second.Header().Hash() != decided);
+    // The leader path refused it already.
+    RequireRefusal(c.At(leader).pbft->Propose(second, c.At(leader).rig->adapter->CurrentAuthority()), ErrorCode::EQUIVOCATION_REFUSED,
+                   PBFT_HEIGHT_DECIDED, "the decided leader proposes another header");
+    // The follower path: the proposal delivered as from the epoch-1 leader (a proposal is not signed).
+    Proposal proposal;
+    proposal.epoch = 1;
+    proposal.view = 0;
+    proposal.header = second.Header();
+    proposal.body = second.Body();
+    for (auto& s : c.seats) s->mesh->sent.clear();
+    Seat& seat{c.At(target)};
+    const uint64_t signer_before{seat.rig->signer_journal->Status().appended_seq};
+    RequireRefusal(seat.pbft->OnMessage(leader, EncodeMessage(Message{proposal}, seat.rig->profile).value()), ErrorCode::EQUIVOCATION_REFUSED,
+                   PBFT_HEIGHT_DECIDED, "another header for a decided height under a new epoch");
+    BOOST_CHECK_EQUAL(seat.rig->signer_journal->Status().appended_seq, signer_before); // no ACCEPTED_PROPOSAL, INTENT or SIGNED_VOTE
+    BOOST_CHECK(!seat.rig->signer_log.SignedVote(storage::VoteKey{c.Domain(), 1, 1, 0, storage::VotePhase::PREPARE}).has_value());
+    const PbftStatus status{seat.pbft->Status()};
+    BOOST_CHECK(!status.proposal_accepted);
+    BOOST_CHECK_EQUAL(status.prepare_votes, 0U);
+    BOOST_CHECK(!status.halted); // a local rule, not evidence
+    BOOST_CHECK(seat.mesh->sent.empty()); // no PREPARE left
+}
+
+BOOST_AUTO_TEST_CASE(a_decision_learnt_after_preparing_stops_the_commit_vote)
+{
+    // The COMMIT leg of O-89. A follower accepted and prepared the view's proposal; then its commit log gains a DECISION for
+    // that height with another header, as SeatNode::ApplyFetched writes one before Finish's check 3 can refuse it. The
+    // PREPARE quorum that arrives next must not make it sign COMMIT.
+    Cluster c{4};
+    c.AppendBlock(130, {Fact{DepositAtCursor(FactCursor{130, 0}, "d0")}});
+    const uint32_t leader{c.Leader()};
+    BOOST_REQUIRE_LT(leader, 4U);
+    const state::Candidate candidate{c.At(leader).rig->Preview(c.InputsFromChain(leader))};
+    RequireOk(c.At(leader).pbft->Propose(candidate, c.Authority()), "Propose");
+    c.Deliver([](uint32_t, uint32_t, const std::vector<unsigned char>& frame) { return TypeOf(frame) == MessageType::PROPOSAL; });
+    for (auto& s : c.seats) s->mesh->sent.clear();
+    const uint32_t target{(leader + 1) % 4};
+    const uint32_t other{(leader + 2) % 4};
+    Seat& seat{c.At(target)};
+    BOOST_REQUIRE(seat.pbft->Status().proposal_accepted);
+    BOOST_REQUIRE_EQUAL(seat.pbft->Status().prepare_votes, 1U); // its own
+    // The staged DECISION (AppendDecision checks the certificate's header hash and the body, not the BLS aggregate).
+    const state::Candidate elsewhere{seat.rig->Preview(seat.rig->Inputs(c.Authority(), 1, "decided-elsewhere"))};
+    BOOST_REQUIRE_EQUAL(elsewhere.Header().height, 1U);
+    BOOST_REQUIRE(elsewhere.Header().Hash() != candidate.Header().Hash());
+    SlotCertificate cert;
+    cert.header_hash = elsewhere.Header().Hash();
+    const std::vector<uint32_t> signers{0, 1, 2};
+    cert.bitmap = SlotCertificate::MakeBitmap(4, signers).value();
+    RequireOk(seat.rig->commit_log.AppendDecision(elsewhere.Header(), cert, elsewhere.Body()), "the staged DECISION");
+    RequireOk(seat.rig->commit_log.Barrier(), "B-DECISION");
+    // Two more PREPAREs for the accepted header make the quorum: the PreparedQC forms, the COMMIT is not signed.
+    const uint256 hash{candidate.Header().Hash()};
+    const uint256 digest{PrepareDigest(c.Domain(), 0, 1, 0, hash)};
+    const ProfileParams& profile{seat.rig->profile};
+    const Vote from_leader{SignedVote("s" + std::to_string(leader), leader, storage::VotePhase::PREPARE, 0, 0, 1, hash, digest)};
+    const Vote from_other{SignedVote("s" + std::to_string(other), other, storage::VotePhase::PREPARE, 0, 0, 1, hash, digest)};
+    RequireOk(seat.pbft->OnMessage(leader, EncodeMessage(Message{from_leader}, profile).value()), "the leader's PREPARE");
+    RequireRefusal(seat.pbft->OnMessage(other, EncodeMessage(Message{from_other}, profile).value()), ErrorCode::EQUIVOCATION_REFUSED,
+                   PBFT_HEIGHT_DECIDED, "COMMIT for another header than the decided one");
+    BOOST_CHECK(seat.pbft->Status().prepared); // the PreparedQC is a proof, not a signature
+    BOOST_CHECK(!seat.rig->signer_log.SignedVote(storage::VoteKey{c.Domain(), 0, 1, 0, storage::VotePhase::COMMIT}).has_value());
+    BOOST_CHECK_EQUAL(seat.pbft->Status().commit_votes, 0U);
+    BOOST_CHECK(!seat.pbft->Status().halted);
+    BOOST_CHECK(seat.mesh->sent.empty()); // no COMMIT left
 }
 
 BOOST_AUTO_TEST_SUITE_END()

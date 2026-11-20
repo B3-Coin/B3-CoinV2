@@ -112,7 +112,10 @@
  * it signed), INVALID_INPUT JOURNAL_SEGMENT_MISSING; a segment whose size is
  * not the first's or not a whole-page size in range STORAGE_FATAL
  * (JOURNAL_SEGMENT_SIZE); a stat error STORAGE_FATAL (JOURNAL_SEGMENT_READ),
- * never the end of the numbering. A missing spare (the empty segment after
+ * never the end of the numbering. A segment or `.lock` that is a symlink is
+ * never followed, whatever it points to (no check before the open follows
+ * it either): STORAGE_FATAL (JOURNAL_SEGMENT_READ, JOURNAL_DIR_LOCK).
+ * A missing spare (the empty segment after
  * the last record) is not a gap. After a reopen the spare segment exists,
  * as after a barrier. The logs rebuild their indexes from ReadAll
  * (SignerLog::Recover, CommitLog::Recover); state replays the DECISION

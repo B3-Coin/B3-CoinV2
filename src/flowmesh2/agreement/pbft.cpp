@@ -231,13 +231,19 @@ Result<void> PbftAgreement::ProposeSelected(const SlotHeaderV2& header, const Sl
 Result<void> PbftAgreement::ResumeViewState(const state::HeadView& head)
 {
     (void)head;
-    const std::optional<storage::ViewStateRecord> state{m_signer_log.ViewState()};
-    if (!state.has_value() || state->slot != m_slot.slot || state->epoch != m_slot.epoch) return Ok();
-    m_slot.view = state->view;
-    if (const std::optional<storage::PreparedQcRecord> prepared{m_commit_log.HighestPrepared(m_slot.slot)}) {
-        const Result<SlotCertificate> cert{SlotCertificate::Decode(prepared->qc)};
-        if (cert.has_value()) m_slot.prepared = PreparedCert{prepared->view, *cert};
+    // The slot's highest durable preparation of this epoch, read whatever the view. View 0 writes no VIEW_STATE, and the
+    // early return below used to come first: a seat that prepared in view 0 and restarted forgot its PreparedQC, so its
+    // next report carried none although it may have signed COMMIT for that header. A preparation of another epoch is
+    // not this instance's (its digest names that epoch) and is never carried.
+    for (const storage::PreparedQcRecord& prepared : m_commit_log.PreparedAt(m_slot.slot)) {
+        if (prepared.epoch != m_slot.epoch) continue;
+        if (m_slot.prepared.has_value() && prepared.view <= m_slot.prepared->view) continue;
+        const Result<SlotCertificate> cert{SlotCertificate::Decode(prepared.qc)};
+        if (cert.has_value()) m_slot.prepared = PreparedCert{prepared.view, *cert};
     }
+    const std::optional<storage::ViewStateRecord> state{m_signer_log.ViewState()};
+    if (!state.has_value() || state->slot != m_slot.slot || state->epoch != m_slot.epoch) return ResumeAccepted(); // view 0, ACTIVE
+    m_slot.view = state->view;
     const std::optional<std::vector<unsigned char>> new_view{m_signer_log.NewViewAccepted(state->epoch, state->slot, state->view)};
     if (state->view == 0 || new_view.has_value()) {
         m_slot.changing = false;
@@ -248,7 +254,7 @@ Result<void> PbftAgreement::ResumeViewState(const state::HeadView& head)
             }
         }
         Tell();
-        return Ok();
+        return ResumeAccepted();
     }
     // Durable VIEW_STATE without its NEW_VIEW: the seat was CHANGING. Its report, if signed, is in the signer log as
     // the digest it signed and the signature. The report is rebuilt from the durable preparations of this slot and
@@ -299,6 +305,89 @@ Result<void> PbftAgreement::ResumeViewState(const state::HeadView& head)
     m_slot.own_report_statement = OutboundVote::Recovered(*signed_report);
     m_slot.reports[m_slot.view].emplace(m_config.self_seat, report);
     return Ok();
+}
+
+Result<void> PbftAgreement::ResumeAccepted()
+{
+    // ARCHITECTURE.md 17.3 item 15(a): ACCEPTED_PROPOSAL of (epoch, slot, view) is durable before the proposal leaves (R4),
+    // so a fresh candidate after a restart was a second header for the key: PROPOSAL_CONFLICT, and SeatNode fenced the node.
+    // The leader resumes that proposal from the signer log instead, with its own durable votes; a vote it never signed is
+    // signed now, as its path would have (B-INTENT, check 2, Sign, B-VOTE). Anything that does not fit declines the resume
+    // and leaves the slot as it was before this change.
+    if (Fenced() || m_slot.changing || m_slot.accepted.has_value()) return Ok();
+    const Result<uint32_t> leader{LeaderOf(m_slot.view)};
+    if (!leader.has_value() || *leader != m_config.self_seat) return Ok();
+    const storage::ProposalKey key{m_slot.epoch, m_slot.slot, m_slot.view};
+    std::optional<storage::AcceptedProposalRecord> record{m_signer_log.AcceptedProposal(key)};
+    if (!record.has_value()) return Ok();
+    const std::shared_ptr<const state::HeadView> head{m_owner.Head()};
+    if (record->header.parent_hash != head->HeaderHash()) return Ok();
+    Proposal proposal;
+    proposal.epoch = m_slot.epoch;
+    proposal.view = m_slot.view;
+    proposal.header = std::move(record->header);
+    proposal.body = std::move(record->body);
+    if (!proposal.header.parent_cert_hash.IsNull()) {
+        // The header binds its parent certificate, which ACCEPTED_PROPOSAL does not hold. The leader's own candidate binds
+        // the head's (the commit log's, m_parent_cert); a re-proposed selection may bind another quorum's: that header is
+        // the view's selection, which ProposeSlot fetches and re-proposes idempotently (the same header for the key).
+        if (!m_parent_cert.has_value() || m_parent_cert->Hash() != proposal.header.parent_cert_hash) return Ok();
+        proposal.parent_cert = m_parent_cert;
+    }
+    if (const Result<void> shape{CheckProposal(proposal)}; !shape.has_value()) return shape.error();
+    const uint256 hash{proposal.header.Hash()};
+    // O-89, as ProposeHeaderBody: a height this commit log decided with another header is never signed again.
+    if (const std::optional<storage::DecisionRef> decided{m_commit_log.DecisionAt(m_slot.slot)};
+        decided.has_value() && decided->header_hash != hash) {
+        return Ok();
+    }
+    // Execute-then-vote, as for any proposal this seat signs: the body reproduces the header over this head.
+    if (const Result<state::Candidate> candidate{m_owner.Reexecute(proposal.header, proposal.body)}; !candidate.has_value()) {
+        return candidate.error();
+    }
+    // The same header again: the original token, nothing written.
+    Result<storage::PendingProposal> pending{m_signer_log.AppendAcceptedProposal(key, proposal.header, proposal.body)};
+    if (!pending.has_value()) return pending.error();
+    Result<std::vector<unsigned char>> bytes{EncodeMessage(Message{proposal}, m_profile)};
+    if (!bytes.has_value()) return bytes.error();
+    m_slot.accepted = proposal;
+    m_slot.accepted_pending = *pending;
+    m_slot.known_proposals.emplace(hash, proposal);
+    m_slot.own_proposal = std::move(bytes).value();
+    TightenDeadline();
+    Tell();
+    const auto own_vote{[&](storage::VotePhase phase, const storage::VoteSignature& signature) {
+        Vote vote;
+        vote.phase = phase;
+        vote.epoch = m_slot.epoch;
+        vote.view = m_slot.view;
+        vote.slot = m_slot.slot;
+        vote.header_hash = hash;
+        vote.seat = m_config.self_seat;
+        vote.signature = signature;
+        return vote;
+    }};
+    const storage::VoteKey prepare_key{m_domain, m_slot.epoch, m_slot.slot, m_slot.view, storage::VotePhase::PREPARE};
+    if (const std::optional<storage::SignedVoteRecord> prepare{m_signer_log.SignedVote(prepare_key)}) {
+        if (prepare->digest != PrepareDigest(m_domain, m_slot.epoch, m_slot.slot, m_slot.view, hash)) {
+            return Error{ErrorCode::VERIFY_FAILED, PBFT_PROPOSAL_RECOVERY};
+        }
+        m_slot.own_prepare = OutboundVote::Recovered(*prepare);
+        m_slot.prepares[m_config.self_seat] = own_vote(storage::VotePhase::PREPARE, prepare->signature);
+    } else if (const Result<void> voted{VotePrepare(proposal)}; !voted.has_value()) {
+        return voted.error();
+    }
+    const storage::VoteKey commit_key{m_domain, m_slot.epoch, m_slot.slot, m_slot.view, storage::VotePhase::COMMIT};
+    if (const std::optional<storage::SignedVoteRecord> commit{m_signer_log.SignedVote(commit_key)}) {
+        if (commit->digest != proposal.header.CommitDigest()) return Error{ErrorCode::VERIFY_FAILED, PBFT_PROPOSAL_RECOVERY};
+        m_slot.commit_voted = true;
+        m_slot.own_commit = OutboundVote::Recovered(*commit);
+        m_slot.commits[m_config.self_seat] = own_vote(storage::VotePhase::COMMIT, commit->signature);
+        return Ok();
+    }
+    // A PreparedQC of this view is durable before the COMMIT intent (restored by ResumeViewState from PreparedAt): sign it
+    // now. VoteCommit does nothing unless m_slot.prepared is of this view and MayCommit agrees.
+    return VoteCommit();
 }
 
 Result<void> PbftAgreement::SyncHead()
@@ -359,6 +448,9 @@ std::optional<uint256> PbftAgreement::SelectedHeader()
 Result<OutboundVote> PbftAgreement::SignVote(const storage::VoteKey& key, const uint256& digest, const storage::PendingProposal& proposal,
                                              const AuthorityVersion& authority)
 {
+    // O-89: a decision this log holds for the height, under any epoch, is the only header this seat signs there. Every
+    // PREPARE and COMMIT, leader and follower, comes through here; refused before B-INTENT.
+    if (const Result<void> undecided{CheckHeightUndecided(key.slot, proposal.Key().header_hash)}; !undecided.has_value()) return undecided.error();
     Result<storage::PendingIntent> intent{m_signer_log.AppendIntent(key, digest, proposal)};
     if (!intent.has_value()) return intent.error();
     // B-INTENT, authority check 2 (the INTENT stays durable, nothing is signed if the authority moved), Sign, B-VOTE.
@@ -430,6 +522,15 @@ Result<void> CheckCertificate(const SlotCertificate& cert, const uint256& digest
 Result<void> PbftAgreement::VerifyCertificate(const SlotCertificate& cert, const uint256& digest) const
 {
     return CheckCertificate(cert, digest, m_seats, PBFT_PREPARED_CERT);
+}
+
+Result<void> PbftAgreement::CheckHeightUndecided(uint64_t height, const uint256& header_hash) const
+{
+    if (const std::optional<storage::DecisionRef> decided{m_commit_log.DecisionAt(height)};
+        decided.has_value() && decided->header_hash != header_hash) {
+        return Error{ErrorCode::EQUIVOCATION_REFUSED, PBFT_HEIGHT_DECIDED};
+    }
+    return Ok();
 }
 
 Result<void> PbftAgreement::SendToAll(std::span<const unsigned char> message)
@@ -573,6 +674,8 @@ Result<void> PbftAgreement::OnProposal(uint32_t from, Proposal proposal)
         if (m_slot.accepted->header.Hash() == hash) return Ok(); // a retransmission
         return Error{ErrorCode::EQUIVOCATION_REFUSED, PBFT_DOUBLE_VOTE};
     }
+    // O-89 on the follower path: nothing is written or executed for another header of a decided height.
+    if (const Result<void> undecided{CheckHeightUndecided(proposal.header.height, hash)}; !undecided.has_value()) return undecided.error();
     const std::shared_ptr<const state::HeadView> head{m_owner.Head()};
     if (proposal.header.parent_hash != head->HeaderHash()) return Error{ErrorCode::STALE_PARENT, PBFT_PARENT};
     // The proposer's parent certificate: not necessarily this seat's (O-4b), but it must certify the head (O-98).
@@ -930,17 +1033,20 @@ Result<void> PbftAgreement::OnViewChangeReport(uint32_t from, const ViewChange& 
     if (report.seat != from) return Invalid(PBFT_VOTE_SEAT);
     if (report.new_view < m_slot.view) return Ok(); // an old target
     if (from != m_config.self_seat) {
-        // Bounded storage, and no BLS work for a report already held (review of 2026-11-16, R6): one report per seat per
-        // target, and above the current view one report per seat, its highest target (a seat that moved on supersedes its
-        // lower reports, as PBFT view changes do), so at most 2k - 1 reports are ever kept whatever targets a seat names.
+        // Bounded storage, and no BLS work for a report that is not kept (review of 2026-11-16, R6): one report per seat
+        // per target, and per seat its REPORTS_PER_SEAT highest targets, so at most 2k - 1 reports are ever kept whatever
+        // targets a seat names. Keeping one (ba5f43f0) lost the same-target f + 1 of PROTOCOL.md when a seat moved on
+        // (review workflow of 2026-11-18).
         if (const auto target{m_slot.reports.find(report.new_view)}; target != m_slot.reports.end() && target->second.contains(report.seat)) {
             return Ok(); // one report per seat per target
         }
-        if (report.new_view > m_slot.view) {
-            for (const auto& [target, by_seat] : m_slot.reports) {
-                if (target > report.new_view && by_seat.contains(report.seat)) return Ok(); // the seat reported a higher target already
-            }
+        size_t kept{0};
+        uint64_t lowest{0}; // the seat's lowest kept target (the map is ordered by target)
+        for (const auto& [target, by_seat] : m_slot.reports) {
+            if (!by_seat.contains(report.seat)) continue;
+            if (kept++ == 0) lowest = target;
         }
+        if (kept >= REPORTS_PER_SEAT && report.new_view < lowest) return Ok(); // below every target the seat has kept
         if (const Result<void> ok{VerifySeatSignature(report.seat, ViewChangeDigest(m_domain, report), report.signature, PBFT_REPORT_SIGNATURE)};
             !ok.has_value()) {
             return ok.error();
@@ -962,18 +1068,11 @@ Result<void> PbftAgreement::OnViewChangeReport(uint32_t from, const ViewChange& 
                 m_slot.prepared = report.prepared;
             }
         }
-        if (report.new_view > m_slot.view) {
-            // The seat's lower reports above the current view are superseded.
-            for (auto it{m_slot.reports.begin()}; it != m_slot.reports.end();) {
-                if (it->first > m_slot.view && it->first < report.new_view) {
-                    it->second.erase(report.seat);
-                    if (it->second.empty()) {
-                        it = m_slot.reports.erase(it);
-                        continue;
-                    }
-                }
-                ++it;
-            }
+        if (kept >= REPORTS_PER_SEAT) {
+            // The seat's lowest kept report gives way, only now that the new one verified (a seat evicts only its own).
+            const auto evicted{m_slot.reports.find(lowest)};
+            evicted->second.erase(report.seat);
+            if (evicted->second.empty()) m_slot.reports.erase(evicted);
         }
         m_slot.reports[report.new_view].emplace(report.seat, report);
     }

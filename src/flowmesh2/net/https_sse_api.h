@@ -90,10 +90,12 @@ struct HttpsSseConfig {
     std::string key_file;                      //!< PEM key
     bool dev_self_signed{false};               //!< REGTEST: generate into self_signed_dir when the files are empty
     std::string self_signed_dir;
+    // The connection limits count a connection from its accept to its close, whether or not it sent a request; one over
+    // a limit is closed before TLS (review R1).
     size_t max_connections_per_ip{10};         //!< PROVISIONAL
-    size_t max_new_connections_per_minute{30}; //!< per IP, PROVISIONAL
+    size_t max_new_connections_per_minute{30}; //!< per IP: admitted connections, and separately requests (429), PROVISIONAL
     size_t max_connections_per_netgroup{64};   //!< /16 IPv4, /48 IPv6, PROVISIONAL
-    size_t max_connections{256};               //!< every open request and stream, PROVISIONAL
+    size_t max_connections{256};               //!< every open connection, PROVISIONAL
     size_t max_subscriptions{256};             //!< open SSE streams, PROVISIONAL
     size_t max_body_bytes{64 * 1024};
     size_t max_header_bytes{8 * 1024};
@@ -109,8 +111,9 @@ struct HttpsSseStatus {
     size_t open_requests{0}; //!< POSTs waiting for the node
     size_t streams{0};
     uint64_t requests_served{0};
-    uint64_t refused{0};     //!< by a limit
+    uint64_t refused{0};     //!< by a limit (a connection closed before TLS, or a 429) or as not admitted (a 400)
     size_t stream_output_bytes{0}; //!< the most bytes queued to one SSE connection, sampled at the last pump
+    size_t limit_entries{0};       //!< entries of the per-address and per-netgroup connection counts, sampled at the last pump
 };
 
 class HttpsSseApi final : public ClientApi

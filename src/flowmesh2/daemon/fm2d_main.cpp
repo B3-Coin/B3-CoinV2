@@ -113,12 +113,16 @@ std::optional<std::array<unsigned char, 32>> ReadKeyFile(const fs::path& path)
     return out;
 }
 
-bool DirHasFiles(const fs::path& dir)
+//! A journal exists in `dir` once its first segment does, as for the CLI outbox. Any file used to count: a crash during the
+//! first start's CreateNew left `.lock` and `00000000.seg.tmp`, so every later start called OpenExisting, which refused
+//! the directory for its missing segment 0 (review workflow of 2026-11-18 over R7). CreateNew takes such a directory as
+//! empty; anything else in a directory without segment 0 it still refuses as not empty.
+bool HasJournal(const fs::path& dir)
 {
     std::error_code ec;
-    if (!fs::is_directory(dir, ec)) return false;
-    const fs::directory_iterator it{dir, ec};
-    return !ec && it != fs::directory_iterator{};
+    const fs::path first{dir / fs::u8path(std::string{storage::FIRST_SEGMENT_NAME})};
+    const bool present{std::filesystem::exists(static_cast<const std::filesystem::path&>(first), ec)};
+    return present || ec; // a stat error: try to open it, and let that report the error
 }
 
 //! The node's events into the log.
@@ -251,16 +255,22 @@ int main(int argc, char** argv)
     // Journals: new on the first start, recovered afterwards.
     const fs::path signer_dir{opt.datadir / fs::u8path("signer")};
     const fs::path commit_dir{opt.datadir / fs::u8path("commit")};
-    const bool restart{DirHasFiles(signer_dir) || DirHasFiles(commit_dir)};
+    // Either journal present: both must open. A signer journal that is gone while the commit journal is there is refused,
+    // never replaced by a fresh one that could sign again.
+    const bool restart{HasJournal(signer_dir) || HasJournal(commit_dir)};
     fs::create_directories(signer_dir, ec);
     fs::create_directories(commit_dir, ec);
     Result<std::unique_ptr<storage::FileJournal>> signer_journal{
         restart ? storage::FileJournal::OpenExisting(signer_dir, storage::JournalRole::SIGNER, 1)
                 : storage::FileJournal::CreateNew(signer_dir, storage::JournalRole::SIGNER, 1, storage::DEFAULT_SEGMENT_BYTES)};
     if (!signer_journal.has_value()) return Fail("signer journal", signer_journal.error());
+    // A crash between the two CreateNew calls of the first start leaves a signer journal and no commit journal. With no
+    // signer record at all this seat never signed anything, so a fresh commit journal loses nothing that safety rests on;
+    // with any record, the missing commit journal stays a refusal (review workflow of 2026-11-18 over R7).
+    const bool create_commit{!restart || (!HasJournal(commit_dir) && (*signer_journal)->Status().appended_seq == 0)};
     Result<std::unique_ptr<storage::FileJournal>> commit_journal{
-        restart ? storage::FileJournal::OpenExisting(commit_dir, storage::JournalRole::COMMIT, 2)
-                : storage::FileJournal::CreateNew(commit_dir, storage::JournalRole::COMMIT, 2, storage::DEFAULT_SEGMENT_BYTES)};
+        create_commit ? storage::FileJournal::CreateNew(commit_dir, storage::JournalRole::COMMIT, 2, storage::DEFAULT_SEGMENT_BYTES)
+                      : storage::FileJournal::OpenExisting(commit_dir, storage::JournalRole::COMMIT, 2)};
     if (!commit_journal.has_value()) return Fail("commit journal", commit_journal.error());
 
     // The chain: the shared dev chain file replayed into the fake adapter.
@@ -345,8 +355,13 @@ int main(int argc, char** argv)
         const fs::path ready_path{opt.datadir / fs::u8path("fm2d.ready")};
         const fs::path ready_tmp{opt.datadir / fs::u8path("fm2d.ready.tmp")};
         {
-            std::ofstream out{fs::PathToString(ready_tmp)};
+            // Checked before the rename: an open or write that failed (a full disk, something else at the temporary name)
+            // used to be renamed into place anyway, and fm2d reported ready without a ready file (review workflow of
+            // 2026-11-18).
+            std::ofstream out{fs::PathToString(ready_tmp), std::ios::trunc};
             out << ready.write() << "\n";
+            out.close();
+            if (!out) return Fail("ready file", Error{ErrorCode::STORAGE_FATAL, "could not write fm2d.ready.tmp"});
         }
         std::error_code rename_ec;
         fs::rename(ready_tmp, ready_path, rename_ec);

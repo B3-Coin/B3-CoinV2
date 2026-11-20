@@ -823,7 +823,10 @@ int CmdResend(const Options& opt, const Context& ctx, Outbox& outbox)
     size_t accepted{0};
     out.pushKV("admission", PostAll(ctx, entry->bytes, accepted));
     out.pushKV("accepted_by", U64(accepted));
-    if (!opt.wait || entry->result.has_value()) {
+    // A recorded FAILED (an earlier build wrote one) is not certified and does not end --wait: the client polls again, and a
+    // certified result may follow it in the outbox (review workflow of 2026-11-18, 08a).
+    const bool certified{entry->result.has_value() && entry->result->outcome != OutboxOutcome::FAILED};
+    if (!opt.wait || certified) {
         if (entry->result.has_value()) out.pushKV("recorded", Str(ToString(entry->result->outcome)));
         Print(out);
         return accepted > 0 ? 0 : 1;

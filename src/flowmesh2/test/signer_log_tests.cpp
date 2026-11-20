@@ -340,6 +340,30 @@ BOOST_AUTO_TEST_CASE(record_codecs_golden_and_exact)
     BOOST_CHECK(AcceptedProposalRecord::MaxEncodedSize(Profile()) <= MAX_RECORD_PAYLOAD_BYTES);
 }
 
+BOOST_AUTO_TEST_CASE(the_last_accepted_proposal_is_kept_with_its_body)
+{
+    // ARCHITECTURE.md 17.3 item 15(a): the log hands back the header and body of its last ACCEPTED_PROPOSAL, also after
+    // Recover; an older key is not kept in memory, and the idempotent re-append of an older key changes nothing.
+    SignerFixture f{17};
+    const StorageSlot slot{MakeStorageSlot(6, 2, "kept")};
+    const ProposalKey view0{2, 6, 0};
+    const ProposalKey view1{2, 6, 1};
+    const std::optional<AcceptedProposalRecord> record0{AcceptedProposalRecord{view0, slot.header, slot.body}};
+    const std::optional<AcceptedProposalRecord> record1{AcceptedProposalRecord{view1, slot.header, slot.body}};
+    BOOST_CHECK(!f.log.AcceptedProposal(view0).has_value());
+    (void)f.Accept(slot, 0);
+    BOOST_CHECK(f.log.AcceptedProposal(view0) == record0);
+    (void)f.Accept(slot, 1);
+    BOOST_CHECK(!f.log.AcceptedProposal(view0).has_value());
+    (void)f.Accept(slot, 0); // idempotent: the last record is still view 1's
+    BOOST_CHECK(f.log.AcceptedProposal(view1) == record1);
+    RequireStorageOk(f.log.Barrier(), "barrier");
+    Result<SignerLog> recovered{SignerLog::Recover(*f.journal, Profile())};
+    RequireStorageOk(recovered, "Recover");
+    BOOST_CHECK(recovered->AcceptedProposal(view1) == record1);
+    BOOST_CHECK(!recovered->AcceptedProposal(view0).has_value());
+}
+
 BOOST_AUTO_TEST_CASE(stubs_return_their_task_ids)
 {
     SignerFixture f{12};

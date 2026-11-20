@@ -145,6 +145,7 @@ Result<SignerLog> SignerLog::Recover(Journal& journal, const ProfileParams& prof
             const auto [it, inserted]{log.m_proposals.emplace(
                 decoded->key, ProposalEntry{header_hash, decoded->header.domain, decoded->header.CommitDigest(), record.seq})};
             if (!inserted) return inconsistent; // the log never writes a key twice
+            log.m_last_proposal = std::move(decoded).value();
             break;
         }
         case RecordType::INTENT: {
@@ -223,11 +224,19 @@ Result<PendingProposal> SignerLog::AppendAcceptedProposal(const ProposalKey& key
         if (it->second.header_hash != header_hash) return Error{ErrorCode::EQUIVOCATION_REFUSED, PROPOSAL_CONFLICT};
         return Ok(PendingProposal{m_journal->InstanceId(), it->second.seq, ref});
     }
-    const std::vector<unsigned char> payload{AcceptedProposalRecord{key, header, body}.Encode()};
+    AcceptedProposalRecord record{key, header, body};
+    const std::vector<unsigned char> payload{record.Encode()};
     Result<uint64_t> seq{m_journal->Append(RecordType::ACCEPTED_PROPOSAL, payload)};
     if (!seq.has_value()) return seq.error();
     m_proposals.emplace(key, ProposalEntry{header_hash, header.domain, header.CommitDigest(), *seq});
+    m_last_proposal = std::move(record);
     return Ok(PendingProposal{m_journal->InstanceId(), *seq, ref});
+}
+
+std::optional<AcceptedProposalRecord> SignerLog::AcceptedProposal(const ProposalKey& key) const
+{
+    if (!m_last_proposal.has_value() || m_last_proposal->key != key) return std::nullopt;
+    return m_last_proposal;
 }
 
 Result<PendingIntent> SignerLog::AppendStatementIntent(const VoteKey& key, const uint256& digest)

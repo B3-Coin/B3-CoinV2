@@ -83,9 +83,9 @@
  *     view only if its header is the selected one (or any valid header when
  *     nothing was prepared). A proposal that arrives before its NEW_VIEW
  *     waits (one per seat). Reports are kept one per seat per target and,
- *     above the current view, one per seat (its highest target), at most
- *     2k - 1 in all, and a report or vote already held costs no
- *     verification; a seat restarted while CHANGING rebuilds the report it
+ *     per seat, its REPORTS_PER_SEAT (2) highest targets, at most 2k - 1 in
+ *     all, and a report or vote already held, or below what a seat has
+ *     kept, costs no verification; a seat restarted while CHANGING rebuilds the report it
  *     signed from the signer log's digest and the durable preparations
  *     (VERIFY_FAILED PBFT_REPORT_RECOVERY when none reproduces it) and
  *     resends it (review of 2026-11-16, R5 and R6).
@@ -97,7 +97,9 @@
  * PreparedQC of the same view and header; the view never moves backwards
  * and never on one arbitrary report; the cross-epoch rule of O-89: a
  * height this commit log decided is never signed for another header,
- * whatever the epoch or view (PBFT_HEIGHT_DECIDED). Votes with a bad
+ * whatever the epoch or view (PBFT_HEIGHT_DECIDED): checked by the leader
+ * before ACCEPTED_PROPOSAL, by a follower before it accepts a proposal, and
+ * before every PREPARE or COMMIT intent (SignVote). Votes with a bad
  * signature, from the wrong seat, or for another header than the seat's
  * own earlier vote in the same key (a double vote) are refused
  * (PBFT_VOTE_SIGNATURE, PBFT_VOTE_SEAT, PBFT_DOUBLE_VOTE); evidence
@@ -125,7 +127,16 @@
  * for the current slot and resumes that view (ACTIVE if its NEW_VIEW was
  * accepted or it is view 0, CHANGING otherwise, re-sending the durable
  * report), the commit log's HighestPrepared, and the parent certificate
- * from the commit journal's last DECISION.
+ * from the commit journal's last DECISION. A leader restarted in the ACTIVE
+ * view it proposed in resumes that proposal from the signer log's last
+ * ACCEPTED_PROPOSAL (re-executed against the head first) with the PREPARE
+ * and COMMIT it signed, signing the ones it had not yet, and the retry timer
+ * resends them: a fresh candidate would be a second header for the key
+ * (PROPOSAL_CONFLICT, the node fenced; ARCHITECTURE.md 17.3 item 15(a)).
+ * At a view above 0 its NEW_VIEW is not resent (a peer that missed it holds
+ * the proposal pending, as before). Create fails, so the node does not
+ * start, when that resume cannot sign or the two logs disagree
+ * (VERIFY_FAILED PBFT_PROPOSAL_RECOVERY), as for the report above.
  *
  * Inclusion lists (M4-AGR-04), adaptive timeouts (M4-AGR-05), the restart
  * fence (M4-AGR-06), evidence (M4-AGR-07) and invalid-share exclusion
@@ -163,9 +174,17 @@ inline constexpr std::string_view PBFT_VIEW_STALE{"message for an older view"}; 
 inline constexpr std::string_view PBFT_NO_PROPOSAL{"no accepted proposal in this view"};                     //!< (ORDER_VIOLATION)
 inline constexpr std::string_view PBFT_PREPARED_MISMATCH{"the PreparedQC is not this view's or header's"};   //!< (INVALID_INPUT)
 inline constexpr std::string_view PBFT_REPORT_RECOVERY{"the signed view-change report cannot be rebuilt from the durable preparations"}; //!< (VERIFY_FAILED)
+inline constexpr std::string_view PBFT_PROPOSAL_RECOVERY{"a signed vote of the resumed proposal does not match it"};                  //!< (VERIFY_FAILED)
 
 //! Votes for a slot that arrive before its proposal are kept up to this many. PROVISIONAL.
 inline constexpr size_t MAX_EARLY_VOTES{64};
+/** View-change reports kept per other seat: its REPORTS_PER_SEAT highest targets (review workflow of 2026-11-18).
+ * Two is the least that keeps PROTOCOL.md's same-target f + 1 synchronisation of a laggard: the first honest seat to
+ * sign a target M timed out of M - 1 with q reports there, so f + 1 honest seats signed M - 1, and their latest target
+ * is M - 1 or M. With one, M evicts the M - 1 a laggard needs. At most REPORTS_PER_SEAT * (k - 1) + 1 = 2k - 1 reports
+ * are held (the + 1 is this seat's own: EnterChanging erases its lower targets). This is about the bound, not a proof
+ * of liveness in general. PROVISIONAL. */
+inline constexpr size_t REPORTS_PER_SEAT{2};
 
 /** The safety rules of one seat (M4-AGR-01). They read what the agreement
  * tells them (SetView, SetAccepted) and refuse what PROTOCOL.md forbids;
@@ -244,7 +263,7 @@ struct PbftStatus {
     uint32_t commit_votes{0};
     bool selected_missing{false}; //!< a NEW_VIEW selected a header this seat does not hold (the leader must fetch it, O-101)
     uint64_t ahead_hint{0};       //!< AheadHint() or 0: f + 1 peers claim a slot beyond this one (catch-up, O-101)
-    uint32_t reports_held{0};     //!< view-change reports kept for this slot over every target: at most 2k - 1 (R6)
+    uint32_t reports_held{0};     //!< view-change reports kept for this slot over every target: at most REPORTS_PER_SEAT * (k - 1) + 1 = 2k - 1 (R6)
 
     friend bool operator==(const PbftStatus&, const PbftStatus&) = default;
 };
@@ -345,6 +364,8 @@ private:
     Result<void> SyncHead();
     void StartSlot(const state::HeadView& head);
     Result<void> ResumeViewState(const state::HeadView& head);
+    //! The leader restarted in the ACTIVE view it proposed in: its durable ACCEPTED_PROPOSAL and own votes (17.3 item 15(a)).
+    Result<void> ResumeAccepted();
     uint64_t TimeoutMs(uint64_t view) const;
     //! Work showed up: the deadline becomes now + TimeoutMs(view) if that is sooner.
     void TightenDeadline();
@@ -384,6 +405,8 @@ private:
                                      std::string_view detail) const;
     Result<SlotCertificate> AggregateVotes(const std::map<uint32_t, Vote>& votes, const uint256& header_hash, const uint256& digest) const;
     Result<void> VerifyCertificate(const SlotCertificate& cert, const uint256& digest) const;
+    //! O-89 across epochs: Ok unless this commit log decided `height` with another header (EQUIVOCATION_REFUSED PBFT_HEIGHT_DECIDED).
+    Result<void> CheckHeightUndecided(uint64_t height, const uint256& header_hash) const;
     Result<void> SendToAll(std::span<const unsigned char> message);
     Result<void> SendVoteToAll(const OutboundVote& vote, const uint256& header_hash);
     Result<void> SendStatementToAll(const OutboundVote& statement, std::span<const unsigned char> message);

@@ -47,6 +47,18 @@ std::unique_ptr<B3dFinalizedAdapter> NewAdapter(const SeatSet& seats, uint32_t d
     return std::move(adapter).value();
 }
 
+//! The links of fork `fork` at heights first..last, the first hanging off `parent`.
+std::vector<HeaderLink> PathOf(uint32_t first, uint32_t last, const uint256& parent, std::string_view fork = "main")
+{
+    std::vector<HeaderLink> path;
+    uint256 previous{parent};
+    for (uint32_t height{first}; height <= last; ++height) {
+        path.push_back(HeaderLink{height, BlockHash(height, fork), previous});
+        previous = BlockHash(height, fork);
+    }
+    return path;
+}
+
 //! Block `height` of fork `fork` whose parent is `parent`.
 ChainBlock BlockOf(uint32_t height, const uint256& parent, std::vector<Fact> facts = {}, std::string_view fork = "main",
                    std::optional<SeatSet> seats = std::nullopt)
@@ -624,7 +636,7 @@ BOOST_AUTO_TEST_CASE(anchor_proofs_cover_the_header_path_to_the_finality_pin)
     BOOST_CHECK(proof.from == BASE);
     BOOST_CHECK(proof.anchor == (Anchor{134, BlockHash(134)}));
     BOOST_CHECK(proof.finalized == (Anchor{135, BlockHash(135)}));
-    BOOST_REQUIRE_EQUAL(proof.path.size(), 5U);
+    BOOST_REQUIRE_EQUAL(proof.path.size(), 6U); // 130..134 to the anchor, then 135, the pin
     for (size_t i{0}; i < proof.path.size(); ++i) {
         const uint32_t height{130 + static_cast<uint32_t>(i)};
         BOOST_CHECK_EQUAL(proof.path[i].height, height);
@@ -633,11 +645,11 @@ BOOST_AUTO_TEST_CASE(anchor_proofs_cover_the_header_path_to_the_finality_pin)
     }
     CheckOk(CheckAnchorProof(proof), "the adapter's proof checks");
 
-    // A proof of an anchor over itself has no path.
+    // A proof of an anchor over itself still carries the path up to the pin.
     Result<AnchorProof> same{adapter->ProveAnchor(Anchor{132, BlockHash(132)}, Anchor{132, BlockHash(132)})};
     RequireOk(same, "ProveAnchor(132, 132)");
-    BOOST_CHECK(same.value().path.empty());
-    CheckOk(CheckAnchorProof(same.value()), "empty path");
+    BOOST_CHECK_EQUAL(same.value().path.size(), 3U); // 133..135
+    CheckOk(CheckAnchorProof(same.value()), "the anchor is from, the path runs to the pin");
 
     // The answers of VerifyAnchor come first.
     RequireRefusal(adapter->ProveAnchor(Anchor{135, BlockHash(135)}, BASE), ErrorCode::NEED_DATA, chain::ANCHOR_UNKNOWN, "135 not usable");
@@ -653,9 +665,9 @@ BOOST_AUTO_TEST_CASE(anchor_proofs_cover_the_header_path_to_the_finality_pin)
     };
     forged([](AnchorProof& p) { p.path[2].parent = BlockHash(131, "b"); }, "a broken parent link");
     forged([](AnchorProof& p) { p.path[0].parent = BlockHash(128); }, "the first link does not hang off from");
-    forged([](AnchorProof& p) { p.path.back().hash = BlockHash(134, "b"); }, "the last link is not the anchor");
+    forged([](AnchorProof& p) { p.path[4].hash = BlockHash(134, "b"); p.path[5].parent = BlockHash(134, "b"); }, "the anchor's link is another block");
     forged([](AnchorProof& p) { p.path.pop_back(); }, "a short path");
-    forged([](AnchorProof& p) { p.path.push_back(HeaderLink{135, BlockHash(135), BlockHash(134)}); }, "a long path");
+    forged([](AnchorProof& p) { p.path.push_back(HeaderLink{136, BlockHash(136), BlockHash(135)}); }, "a long path");
     forged([](AnchorProof& p) { p.path[1].height = 140; }, "a height out of sequence");
     forged([](AnchorProof& p) { p.path[3].hash = uint256{}; p.path[4].parent = uint256{}; }, "a zero hash");
     forged([](AnchorProof& p) { p.from = Anchor{135, BlockHash(135)}; }, "from above the anchor");
@@ -665,6 +677,39 @@ BOOST_AUTO_TEST_CASE(anchor_proofs_cover_the_header_path_to_the_finality_pin)
         copy.finalized = Anchor{133, BlockHash(133)};
         RequireRefusal(CheckAnchorProof(copy), ErrorCode::VERIFY_FAILED, ANCHOR_PROOF_FINALITY, "finality pin below the anchor");
     }
+}
+
+BOOST_AUTO_TEST_CASE(anchor_proofs_tie_the_anchor_to_the_finality_pin)
+{
+    // Review of 2026-11-18 on f21f8d29: the path stopped at the anchor and only the pin's height was checked, so a proof
+    // under a pin on another fork, or under another block at the anchor's own height, passed. The path now runs from
+    // `from` through the anchor to the pin.
+    const SeatSet seats{TestSeats({"s0"})};
+    const auto adapter{NewAdapter(seats)};
+    Extend(*adapter, 136);
+    Finalize(*adapter, 135);
+    const Anchor anchor{134, BlockHash(134)};
+    const Anchor pin{135, BlockHash(135)};
+    Result<AnchorProof> proved{adapter->ProveAnchor(anchor, BASE)};
+    RequireOk(proved, "ProveAnchor(134, base)");
+    const AnchorProof expected{BASE, anchor, PathOf(130, 135, BASE.hash), pin};
+    BOOST_CHECK(proved.value() == expected); // through the anchor to the pin
+    CheckOk(CheckAnchorProof(proved.value()), "the adapter's proof");
+
+    const auto refused = [](const AnchorProof& proof, std::string_view detail, std::string_view what) {
+        RequireRefusal(CheckAnchorProof(proof), ErrorCode::VERIFY_FAILED, detail, what);
+    };
+    // The review's forgeries (a path that stops at the anchor) ...
+    refused(AnchorProof{BASE, anchor, PathOf(130, 134, BASE.hash), Anchor{135, BlockHash(135, "b")}}, ANCHOR_PROOF_PATH, "a pin on another fork");
+    refused(AnchorProof{BASE, anchor, PathOf(130, 134, BASE.hash), Anchor{134, BlockHash(134, "b")}}, ANCHOR_PROOF_FINALITY,
+            "another block at the anchor's height");
+    refused(AnchorProof{BASE, Anchor{134, BlockHash(134, "b")}, PathOf(130, 134, BASE.hash, "b"), pin}, ANCHOR_PROOF_PATH, "a fork's anchor under the true pin");
+    // ... and of the new shape.
+    refused(AnchorProof{BASE, anchor, PathOf(130, 135, BASE.hash), Anchor{135, BlockHash(135, "b")}}, ANCHOR_PROOF_FINALITY,
+            "the path ends at another block than the pin");
+    refused(AnchorProof{BASE, anchor, PathOf(130, 135, BASE.hash, "b"), Anchor{135, BlockHash(135, "b")}}, ANCHOR_PROOF_PATH, "the pin's path misses the anchor");
+    CheckOk(CheckAnchorProof(AnchorProof{BASE, BASE, {}, BASE}), "from, anchor and pin one block");
+    refused(AnchorProof{BASE, BASE, {}, Anchor{129, BlockHash(129, "b")}}, ANCHOR_PROOF_FINALITY, "an empty path under another block");
 }
 
 BOOST_AUTO_TEST_CASE(link_refusals_change_nothing)

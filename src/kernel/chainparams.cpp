@@ -413,9 +413,9 @@ public:
             throw std::runtime_error(
                 "invalid mainnet FN Genesis artifact: " + manifest_error);
         }
-        const uint256 pinned_domain{
+        constexpr uint256 pinned_domain{
             "6a48d15d8da05571e0e7afe5d49bfae0ca7cd71305297f04461603e92a2651a6"};
-        const uint256 pinned_root{
+        constexpr uint256 pinned_root{
             "e8f282a7dcaa9a8fbcfcc5c22ba4f456e5b50968fcf899aaacdaca65bef898ec"};
         const auto configured_domain{modern::ModernChainDomain(
             consensus.hashGenesisBlock, *consensus.legacy_final_hash)};

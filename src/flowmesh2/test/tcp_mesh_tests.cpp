@@ -574,4 +574,57 @@ BOOST_AUTO_TEST_CASE(a_flood_of_frames_stops_at_the_peers_inbox_cap)
     (*m0)->Stop();
 }
 
+BOOST_AUTO_TEST_CASE(a_slow_consumer_loses_no_frames_of_a_fast_peer)
+{
+    // Review workflow of 2026-11-18: with the peer's inbox full, the frames already read wait in the connection's buffer.
+    // Each time Poll freed one slot, OnReadable read another chunk before it processed what the buffer held, so the buffer
+    // grew by a chunk per frame taken until it passed max_frame_bytes + EXPANSION + READ_CHUNK. The mesh then closed an
+    // honest peer as one that "sends faster than we read", and every frame in that buffer and socket was lost. The buffer
+    // is now processed before the socket is read again.
+    Rig rig;
+    TcpMeshConfig c0{rig.ConfigFor(0)};
+    c0.limits.inbox_frames_per_peer = 8;
+    c0.mesh.max_frame_bytes = 4 * 1024; // a buffer cap of about 70 KB: seventy of the frames below
+    Result<std::unique_ptr<TcpSeatMesh>> m0{TcpSeatMesh::Create(c0)};
+    RequireOk(m0, "mesh 0");
+    Result<std::unique_ptr<TcpSeatMesh>> m1{TcpSeatMesh::Create(rig.ConfigFor(1))};
+    RequireOk(m1, "mesh 1");
+    RequireOk((*m1)->Send(0, Lane::ACTION, std::vector<unsigned char>(1'000, 0xff)), "seat 1 sends once");
+    BOOST_REQUIRE(WaitFrame(**m0).has_value());
+    constexpr unsigned FLOOD{400};
+    std::atomic<bool> sending{true};
+    std::thread sender{[&] {
+        for (unsigned i{0}; i < FLOOD && sending; ++i) {
+            std::vector<unsigned char> bytes(1'000, 0x5a);
+            bytes[0] = static_cast<unsigned char>(i);
+            bytes[1] = static_cast<unsigned char>(i >> 8);
+            while (sending) {
+                if ((*m1)->Send(0, Lane::ACTION, bytes).has_value()) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds{1});
+            }
+        }
+    }};
+    // Seat 0 takes one frame every 10 ms, slower than seat 1 sends: its inbox stays at the cap.
+    std::vector<unsigned> order;
+    const auto deadline{std::chrono::steady_clock::now() + std::chrono::seconds{30}};
+    while (order.size() < FLOOD && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds{10});
+        Result<std::optional<InboundFrame>> polled{(*m0)->Poll()};
+        if (!polled.has_value() || !polled->has_value()) continue;
+        const std::vector<unsigned char>& bytes{(*polled)->bytes};
+        BOOST_REQUIRE_EQUAL(bytes.size(), 1'000U);
+        order.push_back(static_cast<unsigned>(bytes[0]) | static_cast<unsigned>(bytes[1]) << 8);
+    }
+    sending = false;
+    sender.join();
+    BOOST_CHECK_EQUAL(order.size(), FLOOD);
+    for (unsigned i{0}; i < order.size(); ++i) {
+        if (order[i] == i) continue;
+        BOOST_ERROR("frame " << i << " arrived as " << order[i] << ": frames were lost");
+        break;
+    }
+    (*m1)->Stop();
+    (*m0)->Stop();
+}
+
 BOOST_AUTO_TEST_SUITE_END()

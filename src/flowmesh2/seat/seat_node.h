@@ -73,7 +73,33 @@
  *  2. ActionPool::TakeForSlot(head + 1, max_actions_per_slot, the hooks'
  *     withhold filter);
  *  3. StateOwner::Preview(committed head, {batch authority, anchor, range,
- *     fact bytes, taken originals});
+ *     fact bytes, taken originals}). When it gives no candidate with an
+ *     error that does not fence (other than STALE_PARENT) and the same slot
+ *     without actions has one, the actions cause it (M4-ADM-03, O-34). The
+ *     node finds a boundary action: in admission order, the actions before
+ *     it give a candidate and adding it gives none (exponential search,
+ *     then bisection, over those prefixes; without monotonicity this is a
+ *     boundary, not necessarily the first). The slot is then previewed
+ *     again without it. If it gives a candidate alone with the slot's
+ *     facts, the failure needs the actions before it, and it is only left
+ *     out of this slot (pool.defer: it stays in the pool and is taken
+ *     again). If it gives none alone it is a suspect. Once the slot's
+ *     actions are settled, each suspect, in admission order, is previewed
+ *     with them: with a candidate it joins the slot. A join changes the
+ *     slot, so the checks repeat until a pass adds nothing; a suspect that
+ *     fails against that final slot is terminal EXCLUDED
+ *     (ActionPool::Exclude; the hooks see pool.exclude), matching
+ *     EXCLUDED's definition (the slot being built has a candidate without
+ *     it and none with it), and one the budget left unchecked against it is
+ *     left out (pool.defer). An excluded action may still succeed after a
+ *     later commit; an exact resend is admitted again. When
+ *     MAX_SLOT_PREVIEWS previews are spent (one per suspect is held back for
+ *     the first pass of these checks), the
+ *     slot is the longest prefix known to have a candidate (at least the
+ *     facts alone) and the rest are left out the same way. So an action
+ *     never stops sealing, and an action waits only for the actions
+ *     admitted before it (resends and new actions queue behind it). A slot
+ *     its facts break leaves nothing out and returns the error;
  *  4. NodeHooks::AfterPreview (the simulator's authority bump and its
  *     commit-barrier mapping check);
  *  5. Agreement::Propose(candidate, batch authority) and TakeDecision
@@ -86,7 +112,7 @@
  * moved the head, STORAGE_FATAL, FENCED, AUTHORITY_CHANGED,
  * EQUIVOCATION_REFUSED, INVARIANT and ORDER_VIOLATION also fence the node
  * (Admission::Fence); BUSY, NEED_DATA and a refusal of the slot's inputs
- * (for example an engine error one action causes, O-34) do not, and the
+ * (for example an engine error a chain fact causes, O-34) do not, and the
  * slot is tried again. After Apply moved the head, EVERY error of steps 7
  * to 9 fences the node, because the commit log, the read service or the
  * pool would disagree with the head on every later call (O-90). A fenced
@@ -109,6 +135,9 @@ namespace flowmesh2::seat {
 
 struct SealedSlot;
 
+//! Most Previews step 3 spends leaving actions out of one slot (M4-ADM-03); each copies the head's state (M2-LED-10).
+inline constexpr size_t MAX_SLOT_PREVIEWS{64};
+
 // Static details (ErrorCode in parentheses).
 inline constexpr std::string_view SEAT_POLL_BUSY{"the chain adapter answered BUSY"};                         //!< (BUSY)
 inline constexpr std::string_view SEAT_POLL_NEED_DATA{"the chain adapter has no data at the cursor"};        //!< (NEED_DATA)
@@ -124,12 +153,15 @@ inline constexpr std::string_view SEAT_NO_AGREEMENT{"a one-seat node needs an ag
 inline constexpr std::string_view SEAT_PARTS_MISSING{"a node needs its chain adapter, journals and budget"};   //!< (INVALID_INPUT)
 inline constexpr std::string_view SEAT_SET_SIZE{"seat_count differs from the seat set"};                       //!< (INVALID_INPUT)
 inline constexpr std::string_view SEAT_SELECTED_MISSING{"the new view selected a header this seat must fetch first"}; //!< (NEED_DATA)
+inline constexpr std::string_view SEAT_PROPOSAL_IN_FLIGHT{"the view holds this seat's proposal already"};          //!< (BUSY)
 inline constexpr std::string_view SEAT_SYNC_SLOT{"fetched decision is not for the slot after the head"};        //!< (STALE_PARENT)
 inline constexpr std::string_view SEAT_SYNC_PARENT{"fetched decision does not build on the head"};              //!< (STALE_PARENT)
 inline constexpr std::string_view SEAT_SYNC_CERT_HEADER{"fetched certificate names another header"};            //!< (VERIFY_FAILED)
 inline constexpr std::string_view SEAT_SYNC_CERT{"fetched certificate does not verify"};                        //!< (VERIFY_FAILED)
 inline constexpr std::string_view SEAT_SYNC_CONFLICT{"fetched decision conflicts with this seat's decision"};   //!< (EQUIVOCATION_REFUSED)
 inline constexpr std::string_view SEAT_SYNC_UNSOLICITED{"sync reply nobody asked for"};                         //!< (INVALID_INPUT)
+inline constexpr std::string_view SEAT_REBUILD_GAP{"a committed slot has no DECISION record to replay"};       //!< (INVARIANT)
+inline constexpr std::string_view SEAT_REBUILD_HEAD{"the rebuild replay ends at another head than Restore"};    //!< (INVARIANT)
 
 /** What the owner of a node observes and may inject (the simulator's trace
  * and fault plan; a daemon's log). Every method has a no-op default and is
@@ -218,8 +250,9 @@ public:
      * is the seat set this node belongs to (seat self_seat's key must be
      * `ikm`'s: SEAT_BAD_KEY) and `genesis` the head every component starts
      * from. With `restart` the logs are recovered and the state restored from
-     * the commit journal (M4-STO-01; a decided-but-unapplied tail is
-     * NotImplemented M4-STO-03).
+     * the commit journal (M4-STO-01), the retained slots replayed into the
+     * read service and the pool, and a decided-but-unapplied tail applied
+     * (M4-STO-03's first halves; see Restart).
      */
     static Result<std::unique_ptr<SeatNode>> Create(const SeatNodeConfig& config, const SeatNodeParts& parts, const SeatSet& seats,
                                                     const state::HeadView& genesis, bool restart = false);
@@ -256,9 +289,10 @@ public:
      * (O-101): while f + 1 peers claim a slot beyond head + 1 this seat asks
      * the next peer round-robin for head + 1 and the slots after it, up to
      * net::MAX_SYNC_DECISIONS per request (one request in flight; a request
-     * stays pending until its last reply, and the retry period, doubling from
-     * sync_backoff_ms, holds the next one back while replies are empty or
-     * missing, so an empty reply never spins);
+     * stays pending until its last reply; its retry period runs from the send,
+     * or from the first Tick after its latest reply that moved the head, and
+     * doubles from sync_backoff_ms while replies are empty or missing, so an
+     * empty reply never spins and a slow batch is not asked for again);
      * a leader whose NEW_VIEW selected a header it does not hold asks for
      * that proposal the same way.
      */
@@ -285,11 +319,27 @@ public:
     //! The agreement's view of the slot in flight (k > 1).
     std::optional<agreement::PbftStatus> AgreementStatus();
     /** A crash and restart: the journals and the chain stay; the logs are
-     * rebuilt by Recover, the state by Restore over the commit journal
-     * (NotImplemented M4-STO-03 while a decided slot is unapplied), the read
-     * service, pool, admission, lanes, API, signer and agreement are fresh;
-     * the agreement resumes its durable view state and starts its timers at
-     * the last Tick (O-99).
+     * rebuilt by Recover, the state by Restore over the commit journal.
+     * Admission, lanes, API, signer and agreement are fresh; the agreement
+     * resumes its durable view state and starts its timers at the last Tick
+     * (O-99). The read service and the pool start at the first slot they
+     * retain, max(pool retention_slots, read outcome_index_slots and
+     * view_slots) below the committed head (or the genesis), and the restart
+     * replays the committed slots from the genesis on a second StateOwner:
+     * each one's DECISION record is re-executed, its decision token named
+     * again (AppendDecision is idempotent), applied under the authority its
+     * header names (its APPLIED record is durable, so check 3 passed when it
+     * was applied) and its APPLIED record named again (AppendApplied is
+     * idempotent), and from the first retained slot on Confirm's
+     * DurableApplied publishes its view and gives the pool its INCLUDED
+     * records, exactly as the live slot did (O-71: an exact resend is
+     * DUPLICATE again). Nothing is written; the replayed head must be the
+     * restored one (INVARIANT SEAT_REBUILD_HEAD), a decided slot below it
+     * without its DECISION record is INVARIANT SEAT_REBUILD_GAP, and any
+     * other error of the replay is the restart's. PROVISIONAL until the
+     * snapshot base of M4-STO-03 bounds both replays. Then a decided slot
+     * without APPLIED is re-executed and applied under the current authority
+     * (ApplyUnappliedTail; a refusal fences, O-89). The stream hub is fresh.
      */
     Result<void> Restart();
     uint32_t SeatCount() const { return m_config.seat_count; }
@@ -322,10 +372,23 @@ private:
     Result<SealReport> SealNext(const std::shared_ptr<const state::HeadView>& head, uint64_t height);
     //! Steps 0 to 4: poll, take, preview and the hooks' step; the candidate and the taken ids.
     Result<std::pair<state::Candidate, std::vector<ActionId>>> Prepare(const std::shared_ptr<const state::HeadView>& head, uint64_t height);
+    /** Step 3's leaving out (M4-ADM-03): `inputs` with `taken`'s originals
+     * gave `failed`. Returns `failed` unless the slot without actions has a
+     * candidate. Otherwise removes breaking actions from `taken` and
+     * `inputs` (excluded or deferred, see the file comment; a suspect that
+     * the settled slot takes is appended) and returns the candidate of what
+     * is left, unless a Preview fails with an error that fences the node or
+     * STALE_PARENT, which is returned with `inputs` back at `taken`'s
+     * originals.
+     */
+    Result<state::Candidate> LeaveOutBreakingActions(const state::HeadView& head, uint64_t height, state::SlotInputs& inputs,
+                                                     admission::TakenSlot& taken, const Error& failed);
     //! Steps 6 to 9: apply, APPLIED, publish, pool; the sealed slot goes to the hooks.
     Result<SealReport> Finish(uint64_t height, state::Candidate candidate, agreement::Decision decision, std::vector<ActionId> taken);
     //! Build (or rebuild, on restart) every component after the journals and the chain.
     Result<void> BuildComponents(bool restart);
+    //! A restart's replay of the committed slots into the read service and the pool from slot base + 1 on (see Restart).
+    Result<void> RebuildRetained(uint64_t base);
     //! A restart's decided-but-unapplied DECISIONs after the committed head, re-executed and applied in order
     //! (check 3 under the current authority, B-APPLIED, publication); a refusal fences and keeps the head (O-89).
     Result<void> ApplyUnappliedTail();
@@ -350,7 +413,8 @@ private:
         bool pending_proposal{false}; //!< the request in flight is a PROPOSAL_REQUEST
         uint64_t pending_slot{0};
         uint8_t pending_max{0}; //!< decisions the request in flight asked for (replies for pending_slot .. +pending_max-1 are its answers)
-        uint64_t sent_ms{0};
+        uint64_t sent_ms{0};   //!< the send, or the Tick after the latest reply of the request in flight that moved the head
+        bool progressed{false}; //!< a solicited reply moved the head since the last Tick: that Tick restarts the retry period
         uint64_t backoff_ms{0};
         uint32_t next_peer{0};
         std::map<uint32_t, std::pair<uint64_t, uint64_t>> pushed; //!< per peer: the last (slot, m_now_ms) a decision was pushed

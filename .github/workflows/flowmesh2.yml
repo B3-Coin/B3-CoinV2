@@ -95,6 +95,51 @@ jobs:
           path: ${{ runner.temp }}/fm2-evidence/guards
           if-no-files-found: error
 
+  # GCC as well as Clang (review of 2026-11-16, item 01; workflow of 2026-11-18): the first stage-2 push did not build
+  # under GCC (-Werror=unused-result, an undefined G_TRANSLATION_FUN), and no job here would have said so. Same
+  # configuration as `guards`, the compilers overridden (the later -D wins); Clang's thread-safety analysis stays
+  # the guards job's.
+  gcc:
+    if: startsWith(github.ref, 'refs/heads/rebirth') # rebirth and rebirth-* (review of 2026-11-16, question 3)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install build dependencies
+        timeout-minutes: 15
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends $FM2_APT gcc-14 g++-14
+      - name: Record source and toolchain
+        run: |
+          git rev-parse HEAD
+          g++-14 --version
+          cmake --version
+      - name: Configure
+        timeout-minutes: 10
+        run: cmake -S . -B build-fm2-gcc $FM2_CONFIGURE -DCMAKE_C_COMPILER=gcc-14 -DCMAKE_CXX_COMPILER=g++-14
+      - name: Build every fm2 target
+        timeout-minutes: 45
+        run: cmake --build build-fm2-gcc --target fm2_all --parallel "$(nproc)"
+      - name: ctest -L flowmesh2 under GCC
+        timeout-minutes: 20
+        run: |
+          python3 -I -B contrib/flowmesh2/evidence.py run --dir "$RUNNER_TEMP/fm2-evidence/gcc" \
+            --label ctest_flowmesh2 -- \
+            ctest --test-dir build-fm2-gcc -L flowmesh2 --no-tests=error --output-on-failure
+      - name: Verify the evidence bundle
+        if: always()
+        run: python3 -I -B contrib/flowmesh2/evidence.py verify --dir "$RUNNER_TEMP/fm2-evidence/gcc" --require-expectations
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fm2-evidence-gcc
+          path: ${{ runner.temp }}/fm2-evidence/gcc
+          if-no-files-found: error
+
   asan-ubsan:
     if: startsWith(github.ref, 'refs/heads/rebirth') # rebirth and rebirth-* (review of 2026-11-16, question 3)
     runs-on: ubuntu-24.04

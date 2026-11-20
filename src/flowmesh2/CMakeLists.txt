@@ -481,11 +481,14 @@ if(BUILD_FLOWMESH2)
   set_tests_properties(flowmesh2_unit PROPERTIES LABELS "flowmesh2;isolated;outline")
   fm2_test_timeout(flowmesh2_unit 120)
 
+  # Each run of test_flowmesh2 inside the checker gets flowmesh2_unit's own budget, scaled the same way.
+  math(EXPR fm2_inventory_run_timeout "120 * ${FM2_TEST_TIMEOUT_SCALE}")
   add_test(NAME flowmesh2_inventory
     COMMAND ${Python3_EXECUTABLE} -I -B ${FM2_CONTRIB}/check_inventory.py
       --binary $<TARGET_FILE:test_flowmesh2>
       --inventory ${CMAKE_CURRENT_SOURCE_DIR}/test/INVENTORY.txt
       --workdir ${FM2_TEST_TMP}/inventory
+      --run-timeout ${fm2_inventory_run_timeout}
       --selftest
   )
   set_tests_properties(flowmesh2_inventory PROPERTIES LABELS "flowmesh2;isolated;outline;lint")

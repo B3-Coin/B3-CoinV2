@@ -2,6 +2,9 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
+#include <flowmesh2/chain/chain_adapter.h>
+#include <flowmesh2/core/amount.h>
+#include <flowmesh2/core/body.h>
 #include <flowmesh2/core/hashes.h>
 #include <flowmesh2/dev/dev_chain_file.h>
 #include <flowmesh2/netio/genesis_doc.h>
@@ -18,9 +21,15 @@
 
 #include <boost/test/unit_test.hpp>
 
+#include <chrono>
 #include <fstream>
+#include <future>
 #include <string>
 #include <vector>
+
+#include <fcntl.h>
+#include <sys/file.h>
+#include <unistd.h>
 
 /** The genesis document and the dev chain file (M5-NODE-01, O-105): the
  * document round-trips, every party computes the same seat set and genesis
@@ -203,6 +212,120 @@ BOOST_AUTO_TEST_CASE(the_dev_chain_file_appends_tails_and_refuses_corruption)
     RequireRefusal(tail.Poll(), ErrorCode::STORAGE_FATAL, dev::DEVCHAIN_CORRUPT, "bad crc");
     RequireRefusal(dev::ReadDevChain(file), ErrorCode::STORAGE_FATAL, dev::DEVCHAIN_CORRUPT, "bad crc everywhere");
     fs::remove_all(dir);
+}
+
+BOOST_AUTO_TEST_CASE(the_dev_chain_file_takes_one_writer_and_cuts_a_torn_tail)
+{
+    // Review workflow of 2026-11-18: AppendDevChainBlock read the file, checked the height and appended with no lock, after
+    // whatever the file ended with. Two faucet calls at once could both append the same next height. After a writer that
+    // died mid-record, the next block went in behind the torn bytes: every reader then took the torn length over the new
+    // record, failed its CRC, and every seat tailing the file stopped for good. An append now holds an exclusive lock on
+    // the file from its read to its fsync, and cuts a torn tail it finds under the lock (only a dead writer leaves one).
+    const fs::path dir{fs::PathFromString(FM2_TEST_TMP_DIR) / fs::u8path("devchain_writer_tests")};
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    const auto block{[](uint32_t height) { return dev::DevChainBlock{height, dev::DevChainBlockHash(height), {}}; }};
+    // A writer that died four bytes into the record after block 130.
+    const fs::path torn{dir / fs::u8path("torn.log")};
+    RequireOk(dev::AppendDevChainBlock(torn, block(130)), "append 130");
+    {
+        const std::vector<unsigned char> payload{dev::EncodeDevChainBlock(block(131)).value()};
+        std::ofstream out{fs::PathToString(torn), std::ios::binary | std::ios::app};
+        const uint32_t len{static_cast<uint32_t>(payload.size())};
+        out.write(reinterpret_cast<const char*>(&len), 4); // little-endian host
+    }
+    BOOST_CHECK_EQUAL(dev::ReadDevChain(torn).value().size(), 1U); // the torn record waits, as a partial one does
+    RequireOk(dev::AppendDevChainBlock(torn, block(131)), "append after a torn tail");
+    const Result<std::vector<dev::DevChainBlock>> after_torn{dev::ReadDevChain(torn)};
+    BOOST_CHECK_MESSAGE(after_torn.has_value() && after_torn->size() == 2 && after_torn->back() == block(131),
+                        "the chain after the torn tail: " << (after_torn.has_value() ? std::to_string(after_torn->size()) + " blocks"
+                                                                                      : std::string{after_torn.error().detail}));
+    // One writer at a time: while another holds the file's lock, an append waits for it.
+    const fs::path shared{dir / fs::u8path("shared.log")};
+    RequireOk(dev::AppendDevChainBlock(shared, block(130)), "append 130");
+    const int held{::open(fs::PathToString(shared).c_str(), O_RDWR | O_CLOEXEC)};
+    BOOST_REQUIRE(held >= 0);
+    BOOST_REQUIRE_EQUAL(::flock(held, LOCK_EX), 0);
+    std::future<Result<void>> appending{std::async(std::launch::async, [&] { return dev::AppendDevChainBlock(shared, block(131)); })};
+    const uintmax_t one_block{fs::file_size(shared)};
+    BOOST_CHECK(appending.wait_for(std::chrono::milliseconds{300}) == std::future_status::timeout);
+    BOOST_CHECK_EQUAL(fs::file_size(shared), one_block); // nothing written (a read would wait for the lock too)
+    ::close(held); // the lock goes with it
+    RequireOk(appending.get(), "append once the lock is free");
+    BOOST_CHECK_EQUAL(dev::ReadDevChain(shared).value().size(), 2U);
+    // A writer that lost the race refuses its block instead of writing the height again.
+    RequireRefusal(dev::AppendDevChainBlock(shared, block(131)), ErrorCode::INVALID_INPUT, dev::DEVCHAIN_HEIGHT, "131 again");
+    fs::remove_all(dir);
+}
+
+BOOST_AUTO_TEST_CASE(a_dev_chain_reader_never_reads_across_a_writer)
+{
+    // Codex review of 2026-11-18 over 7d326476: readers took no lock, so a reader could read part of a torn record, then,
+    // after an append cut the tail and wrote the next record in its place, read on into the new bytes. The record it put
+    // together failed its CRC on a valid file: STORAGE_FATAL for an fm2d tailing it, or at its start. Readers now hold a
+    // shared lock on the file for their read, so an append (exclusive) never runs during one. ReadDevChain waits for
+    // the lock. A tail's Poll runs on fm2d's sealing thread every millisecond, so it does not wait: while a writer
+    // holds the file it finds nothing new, and it takes the block on a later poll (advisor review of 2026-11-18).
+    const fs::path dir{fs::PathFromString(FM2_TEST_TMP_DIR) / fs::u8path("devchain_reader_tests")};
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    const fs::path file{dir / fs::u8path("devchain.log")};
+    RequireOk(dev::AppendDevChainBlock(file, dev::DevChainBlock{130, dev::DevChainBlockHash(130), {}}), "append 130");
+    dev::DevChainTail tail{file};
+    const int held{::open(fs::PathToString(file).c_str(), O_RDWR | O_CLOEXEC)};
+    BOOST_REQUIRE(held >= 0);
+    BOOST_REQUIRE_EQUAL(::flock(held, LOCK_EX), 0); // what an append holds
+    std::future<Result<std::vector<dev::DevChainBlock>>> reading{std::async(std::launch::async, [&] { return dev::ReadDevChain(file); })};
+    std::future<Result<std::vector<dev::DevChainBlock>>> polling{std::async(std::launch::async, [&] { return tail.Poll(); })};
+    BOOST_CHECK(reading.wait_for(std::chrono::milliseconds{300}) == std::future_status::timeout);
+    const bool poll_returned{polling.wait_for(std::chrono::milliseconds{0}) == std::future_status::ready};
+    BOOST_CHECK_MESSAGE(poll_returned, "a poll waited for the writer's lock");
+    ::close(held);
+    BOOST_CHECK_EQUAL(reading.get().value().size(), 1U);
+    const Result<std::vector<dev::DevChainBlock>> while_held{polling.get()};
+    RequireOk(while_held, "Poll while the writer held the file");
+    if (poll_returned) BOOST_CHECK(while_held->empty());
+    const size_t polled_before{while_held->size()};
+    BOOST_CHECK_EQUAL(polled_before + tail.Poll().value().size(), 1U); // the block arrives once
+    fs::remove_all(dir);
+}
+
+BOOST_AUTO_TEST_CASE(the_faucet_check_refuses_a_block_no_seat_would_take)
+{
+    // Review workflow of 2026-11-18: R8 kept undecodable blocks out of the dev chain file, but the faucet still wrote
+    // blocks every fm2d refuses (more than MAX_SLOT_FACTS deposits, a protocol account) or that no slot can carry (an
+    // asset's deposits past MAX_ATOMS, O-34). A seat that tails such a file logs the refusal and never takes another
+    // block, and fails on every restart. CheckDevChainBlock answers what a seat would.
+    const GenesisDoc doc{TestGenesis()};
+    const SeatSet seats{doc.SeatSetOf().value()};
+    const AuthorityVersion authority{doc.Authority(RegtestProfile(), seats)};
+    const auto deposit{[](uint32_t height, uint32_t index, const std::string& who, Atoms amount) {
+        DepositFact fact;
+        fact.cursor = FactCursor{height, index};
+        fact.outpoint = dev::DevChainOutpoint(height, index);
+        fact.account = AccountId{LabelHash("fm2/test/devchain/" + who)};
+        fact.asset = AssetId::Native();
+        fact.amount = amount;
+        return Fact{fact};
+    }};
+    const auto check{[&](const std::vector<dev::DevChainBlock>& existing, const dev::DevChainBlock& block) {
+        return dev::CheckDevChainBlock(doc.network, authority, seats, doc.base, existing, block);
+    }};
+    // A block of MAX_SLOT_FACTS deposits is taken; one more is not.
+    dev::DevChainBlock full{130, dev::DevChainBlockHash(130), {}};
+    for (uint32_t i{0}; i < MAX_SLOT_FACTS; ++i) full.facts.push_back(deposit(130, i, "many", 1));
+    RequireOk(check({}, full), "MAX_SLOT_FACTS deposits");
+    full.facts.push_back(deposit(130, static_cast<uint32_t>(MAX_SLOT_FACTS), "many", 1));
+    RequireRefusal(check({}, full), ErrorCode::INVALID_INPUT, chain::BATCH_TOO_MANY, "one deposit too many");
+    // An asset's deposits up to MAX_ATOMS over the file are taken; one atom more is not, in another block or the same one.
+    const dev::DevChainBlock most{130, dev::DevChainBlockHash(130), {deposit(130, 0, "alice", MAX_ATOMS)}};
+    RequireOk(check({}, most), "MAX_ATOMS");
+    RequireRefusal(check({most}, dev::DevChainBlock{131, dev::DevChainBlockHash(131), {deposit(131, 0, "bob", 1)}}), ErrorCode::INVALID_INPUT,
+                   dev::DEVCHAIN_DEPOSIT_TOTAL, "one atom past MAX_ATOMS in the next block");
+    RequireRefusal(check({}, dev::DevChainBlock{130, dev::DevChainBlockHash(130), {deposit(130, 0, "alice", MAX_ATOMS - 1), deposit(130, 1, "bob", 2)}}),
+                   ErrorCode::INVALID_INPUT, dev::DEVCHAIN_DEPOSIT_TOTAL, "one atom past MAX_ATOMS in one block");
+    // A height the adapter does not expect next is refused too (its cursors name another block).
+    RequireCode(check({most}, dev::DevChainBlock{132, dev::DevChainBlockHash(132), {deposit(132, 0, "bob", 1)}}), ErrorCode::INVALID_INPUT, "a gap");
 }
 
 BOOST_AUTO_TEST_SUITE_END()

@@ -146,9 +146,9 @@ BOOST_AUTO_TEST_CASE(mainnet_first_corridor_checkpoint_accepts_only_exact_hash)
 {
     const auto params{CreateChainParams(ArgsManager{}, ChainType::MAIN)};
     const Consensus::Params& c{params->GetConsensus()};
-    const uint256 exact{
+    constexpr uint256 exact{
         "913fb38c75e0f12d8d5e6ea65a0ffce33a22a6908392a94661eab7c8506f6014"};
-    const uint256 wrong{
+    constexpr uint256 wrong{
         "913fb38c75e0f12d8d5e6ea65a0ffce33a22a6908392a94661eab7c8506f6015"};
 
     BOOST_CHECK(Consensus::ModernCheckpointAllows(c, 810'001, exact));
@@ -163,9 +163,9 @@ BOOST_AUTO_TEST_CASE(mainnet_recovery_anchor_checkpoint_accepts_only_exact_hash)
 {
     const auto params{CreateChainParams(ArgsManager{}, ChainType::MAIN)};
     const Consensus::Params& c{params->GetConsensus()};
-    const uint256 exact{
+    constexpr uint256 exact{
         "5dbb0e582be41444933d43c9dda576f15a2922a870c3fb9d1c47b84b473b1f75"};
-    const uint256 wrong{
+    constexpr uint256 wrong{
         "5dbb0e582be41444933d43c9dda576f15a2922a870c3fb9d1c47b84b473b1f74"};
 
     BOOST_CHECK(Consensus::ModernCheckpointAllows(c, 811'641, exact));

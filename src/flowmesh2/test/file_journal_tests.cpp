@@ -11,6 +11,7 @@
 #include <util/fs.h>
 
 #include <algorithm>
+#include <csignal>
 #include <cstdint>
 #include <fstream>
 #include <memory>
@@ -18,6 +19,7 @@
 #include <vector>
 
 #include <fcntl.h>
+#include <sys/resource.h>
 #include <unistd.h>
 
 using namespace flowmesh2;
@@ -595,6 +597,80 @@ BOOST_AUTO_TEST_CASE(a_crash_while_creating_a_segment_leaves_no_short_segment)
     }
 }
 
+BOOST_AUTO_TEST_CASE(a_crash_while_creating_the_first_segment_leaves_a_directory_create_accepts)
+{
+    // Review workflow of 2026-11-18 over R7: the fix above covered spare segments, not segment 0. A crash during
+    // CreateNew's fill leaves `.lock` and `00000000.seg.tmp`. No segment was ever renamed into place, so nothing was
+    // committed, but CreateNew refused the directory as not empty (the CLI outbox, which creates when segment 0 is
+    // absent, then failed on every later run), and OpenExisting refused it as missing segment 0. CreateNew now takes such
+    // a directory as empty, removes the leftovers under the lock, and creates the journal.
+    const TestDir root{"first_segment_tmp"};
+    const fs::path crashed{root.Sub("crashed")};
+    WriteFile(crashed / fs::u8path(".lock"), {});
+    WriteFile(crashed / fs::u8path(SegmentFileName(0) + ".tmp"), std::vector<unsigned char>(100, 0));
+    RequireRefusal(FileJournal::OpenExisting(crashed, JournalRole::COMMIT, 7), ErrorCode::INVALID_INPUT, JOURNAL_SEGMENT_MISSING, "no journal to open");
+    {
+        Result<std::unique_ptr<FileJournal>> created{FileJournal::CreateNew(crashed, JournalRole::COMMIT, 7, SEGMENT_PAGE_BYTES)};
+        RequireStorageOk(created, "create over an interrupted creation");
+        BOOST_CHECK_EQUAL((*created)->Append(RecordType::DECISION, Bytes("r")).value(), 1U);
+        BOOST_CHECK_EQUAL((*created)->Barrier().value(), 1U);
+    }
+    BOOST_CHECK(!fs::exists(crashed / fs::u8path(SegmentFileName(0) + ".tmp")));
+    Result<std::unique_ptr<FileJournal>> reopened{FileJournal::OpenExisting(crashed, JournalRole::COMMIT, 7)};
+    RequireStorageOk(reopened, "reopen");
+    BOOST_CHECK_EQUAL((*reopened)->Status().durable_seq, 1U);
+    reopened->reset();
+    // Only those two kinds of leftover: a journal's segment, or any other file, still makes the directory not empty, and
+    // nothing in it is touched.
+    const fs::path with_segment{root.Sub("with_segment")};
+    WriteFile(with_segment / fs::u8path(".lock"), {});
+    WriteFile(with_segment / fs::u8path(SegmentFileName(1) + ".tmp"), std::vector<unsigned char>(100, 0));
+    WriteFile(with_segment / fs::u8path(FIRST_SEGMENT_NAME), std::vector<unsigned char>(SEGMENT_PAGE_BYTES, 0));
+    RequireRefusal(FileJournal::CreateNew(with_segment, JournalRole::COMMIT, 7, SEGMENT_PAGE_BYTES), ErrorCode::INVALID_INPUT, JOURNAL_DIR_NOT_EMPTY, "a segment");
+    BOOST_CHECK(fs::exists(with_segment / fs::u8path(SegmentFileName(1) + ".tmp")));
+    const fs::path with_stray{root.Sub("with_stray")};
+    WriteFile(with_stray / fs::u8path(".lock"), {});
+    WriteFile(with_stray / fs::u8path(SegmentFileName(0) + ".tmp"), std::vector<unsigned char>(100, 0));
+    WriteFile(with_stray / fs::u8path("notes.seg.tmp"), Bytes("x"));
+    RequireRefusal(FileJournal::CreateNew(with_stray, JournalRole::COMMIT, 7, SEGMENT_PAGE_BYTES), ErrorCode::INVALID_INPUT, JOURNAL_DIR_NOT_EMPTY, "a stray file");
+    BOOST_CHECK(fs::exists(with_stray / fs::u8path(SegmentFileName(0) + ".tmp")));
+    // While another journal holds the lock, the leftovers are not touched either.
+    const fs::path locked{root.Sub("locked")};
+    {
+        auto holder{MustCreate(locked, JournalRole::COMMIT, 7, SEGMENT_PAGE_BYTES)};
+        fs::remove(holder->SegmentPath());
+        WriteFile(locked / fs::u8path(SegmentFileName(0) + ".tmp"), std::vector<unsigned char>(100, 0));
+        RequireRefusal(FileJournal::CreateNew(locked, JournalRole::COMMIT, 7, SEGMENT_PAGE_BYTES), ErrorCode::BUSY, JOURNAL_DIR_LOCKED, "locked");
+        BOOST_CHECK(fs::exists(locked / fs::u8path(SegmentFileName(0) + ".tmp")));
+    }
+}
+
+BOOST_AUTO_TEST_CASE(a_create_that_fails_keeps_its_lock_file)
+{
+    // Codex review of 2026-11-18 over 0bb5567d: when CreateSegment failed, CreateNew released the lock and then unlinked
+    // `.lock`. A creator that took the lock in between held it on the unlinked inode, and a later opener created and locked
+    // a fresh `.lock` beside it: two owners of one journal. Since 0bb5567d CreateNew takes a directory holding `.lock` and
+    // segment leftovers, so the lock file can stay. The failure here is a file-size limit below the segment's size.
+    const TestDir root{"failed_create"};
+    const fs::path dir{root.Sub("journal")};
+    rlimit saved{};
+    BOOST_REQUIRE_EQUAL(::getrlimit(RLIMIT_FSIZE, &saved), 0);
+    void (*const previous)(int){std::signal(SIGXFSZ, SIG_IGN)}; // a write past the limit fails with EFBIG instead
+    rlimit small{saved};
+    small.rlim_cur = SEGMENT_PAGE_BYTES;
+    BOOST_REQUIRE_EQUAL(::setrlimit(RLIMIT_FSIZE, &small), 0);
+    Result<std::unique_ptr<FileJournal>> failed{FileJournal::CreateNew(dir, JournalRole::SIGNER, 7, 4 * SEGMENT_PAGE_BYTES)};
+    BOOST_REQUIRE_EQUAL(::setrlimit(RLIMIT_FSIZE, &saved), 0);
+    std::signal(SIGXFSZ, previous);
+    BOOST_REQUIRE(!failed.has_value());
+    BOOST_CHECK(failed.error().code == ErrorCode::STORAGE_FATAL);
+    BOOST_CHECK(fs::exists(dir / fs::u8path(".lock")));
+    BOOST_CHECK(!fs::exists(dir / fs::u8path(FIRST_SEGMENT_NAME)));
+    // The directory is still one CreateNew takes.
+    Result<std::unique_ptr<FileJournal>> created{FileJournal::CreateNew(dir, JournalRole::SIGNER, 7, 4 * SEGMENT_PAGE_BYTES)};
+    RequireStorageOk(created, "create after the failure");
+}
+
 BOOST_AUTO_TEST_CASE(a_second_opener_of_a_journal_directory_is_refused)
 {
     // Review of 2026-11-16, defect 6: nothing stopped a second process (or a second FileJournal in this one) from
@@ -623,6 +699,82 @@ BOOST_AUTO_TEST_CASE(a_second_opener_of_a_journal_directory_is_refused)
         std::ofstream out{static_cast<const std::filesystem::path&>(stale / fs::u8path(".lock")), std::ios::binary};
     }
     RequireRefusal(FileJournal::OpenExisting(stale, JournalRole::SIGNER, 2), ErrorCode::INVALID_INPUT, JOURNAL_SEGMENT_MISSING, "a lock file alone");
+}
+
+BOOST_AUTO_TEST_CASE(a_segment_or_lock_file_that_is_a_symlink_is_refused)
+{
+    // Tier 3 review of 2026-11-18: the rebirth journal opened an existing segment with O_NOFOLLOW; stage 2's segments and
+    // `.lock` are opened through symlinks. A symlink planted in the journal directory then made the journal read and
+    // write another file, and a dangling `.lock` symlink made it create a file wherever the link pointed.
+    const TestDir root{"symlinks"};
+    const fs::path dir{root.Sub("journal")};
+    {
+        auto journal{MustCreate(dir, JournalRole::COMMIT, 5, SEGMENT_PAGE_BYTES)};
+        BOOST_CHECK_EQUAL(journal->Append(RecordType::DECISION, Bytes("d")).value(), 1U);
+        BOOST_CHECK_EQUAL(journal->Barrier().value(), 1U);
+    }
+    const fs::path segment{dir / fs::u8path(FIRST_SEGMENT_NAME)};
+    const fs::path moved{root.Sub("elsewhere") / fs::u8path(FIRST_SEGMENT_NAME)};
+    fs::rename(segment, moved);
+    fs::create_symlink(moved, segment);
+    RequireRefusal(FileJournal::OpenExisting(dir, JournalRole::COMMIT, 5), ErrorCode::STORAGE_FATAL, JOURNAL_SEGMENT_READ, "a segment symlink");
+    BOOST_REQUIRE(fs::remove(segment));
+    fs::rename(moved, segment);
+    {
+        Result<std::unique_ptr<FileJournal>> reopened{FileJournal::OpenExisting(dir, JournalRole::COMMIT, 5)};
+        RequireStorageOk(reopened, "reopen once the segment is a file again");
+        BOOST_CHECK_EQUAL((*reopened)->Status().durable_seq, 1U);
+    }
+    // A dangling `.lock` symlink: refused, and nothing is created where it points, by OpenExisting or by CreateNew.
+    const fs::path planted{root.path / fs::u8path("planted")};
+    BOOST_REQUIRE(fs::remove(dir / fs::u8path(".lock")));
+    fs::create_symlink(planted, dir / fs::u8path(".lock"));
+    RequireRefusal(FileJournal::OpenExisting(dir, JournalRole::COMMIT, 5), ErrorCode::STORAGE_FATAL, JOURNAL_DIR_LOCK, "a lock symlink");
+    BOOST_CHECK(!fs::exists(planted));
+    const fs::path fresh{root.Sub("fresh")};
+    fs::create_symlink(planted, fresh / fs::u8path(".lock"));
+    RequireRefusal(FileJournal::CreateNew(fresh, JournalRole::COMMIT, 5, SEGMENT_PAGE_BYTES), ErrorCode::STORAGE_FATAL, JOURNAL_DIR_LOCK,
+                   "a lock symlink in a new directory");
+    BOOST_CHECK(!fs::exists(planted));
+}
+
+BOOST_AUTO_TEST_CASE(a_segment_symlink_is_refused_whatever_it_points_to)
+{
+    // Codex review round 10 (2026-11-19) of 865ac29d: the opens of OpenExisting do not follow a symlink, but the size
+    // and existence checks before them did, so the answer depended on the target: a dangling first segment was
+    // INVALID_INPUT JOURNAL_SEGMENT_MISSING, a wrong-sized target STORAGE_FATAL JOURNAL_SEGMENT_SIZE, a dangling later
+    // segment a gap (JOURNAL_SEGMENT_MISSING). Every segment symlink is now STORAGE_FATAL JOURNAL_SEGMENT_READ.
+    const TestDir root{"symlink_targets"};
+    const fs::path dir{root.Sub("journal")};
+    {
+        auto journal{MustCreate(dir, JournalRole::COMMIT, 5, SEGMENT_PAGE_BYTES)};
+        BOOST_CHECK_EQUAL(journal->Append(RecordType::DECISION, Bytes("d")).value(), 1U);
+        BOOST_CHECK_EQUAL(journal->Barrier().value(), 1U);
+    }
+    const fs::path small{root.Sub("elsewhere") / fs::u8path("small")};
+    {
+        std::ofstream out{static_cast<const std::filesystem::path&>(small), std::ios::binary};
+        out << "not a segment";
+    }
+    const fs::path missing{root.path / fs::u8path("missing")};
+    const auto refused = [&](const fs::path& link, const fs::path& target, const std::string& what) {
+        fs::create_symlink(target, link);
+        RequireRefusal(FileJournal::OpenExisting(dir, JournalRole::COMMIT, 5), ErrorCode::STORAGE_FATAL, JOURNAL_SEGMENT_READ, what);
+        BOOST_REQUIRE(fs::remove(link));
+    };
+    const fs::path first{dir / fs::u8path(FIRST_SEGMENT_NAME)};
+    const fs::path moved{root.Sub("kept") / fs::u8path(FIRST_SEGMENT_NAME)};
+    fs::rename(first, moved);
+    refused(first, missing, "a dangling first segment");
+    refused(first, small, "a first segment pointing at a wrong-sized file");
+    fs::rename(moved, first);
+    const fs::path later{dir / fs::u8path(SegmentFileName(1))};
+    if (std::filesystem::exists(std::filesystem::symlink_status(later))) BOOST_REQUIRE(fs::remove(later)); // the spare, if any
+    refused(later, missing, "a dangling later segment");
+    refused(later, small, "a later segment pointing at a wrong-sized file");
+    Result<std::unique_ptr<FileJournal>> reopened{FileJournal::OpenExisting(dir, JournalRole::COMMIT, 5)};
+    RequireStorageOk(reopened, "reopen without the symlinks");
+    BOOST_CHECK_EQUAL((*reopened)->Status().durable_seq, 1U);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

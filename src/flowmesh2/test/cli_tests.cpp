@@ -232,6 +232,39 @@ BOOST_AUTO_TEST_CASE(the_outbox_keeps_exact_bytes_and_results_across_a_reopen)
     fs::remove_all(dir);
 }
 
+BOOST_AUTO_TEST_CASE(a_failed_result_in_the_outbox_gives_way_to_a_certified_one)
+{
+    // Review workflow of 2026-11-18 (08a): 4da8c4d2 stopped fm2-cli recording an uncertified FAILED, but an outbox an
+    // earlier build wrote may hold one. `resend --wait` then printed the stale FAILED without polling, and had it polled,
+    // recording the certified result would have been OUTBOX_RESULT_TWICE. A FAILED is never final: a certified result
+    // (INCLUDED or EXPIRED) may follow it, and survives a reopen; after a certified result nothing more is taken.
+    Rig rig;
+    const fs::path dir{CliDir("outbox_failed")};
+    const ProfileParams& profile{rig.node->Profile()};
+    const MarketDescriptor market{rig.node->Markets().front()};
+    const OutboxResult failed{OutboxOutcome::FAILED, 4, 0, "NONCE_USED"};
+    const OutboxResult included{OutboxOutcome::INCLUDED, 6, 1, {}};
+    {
+        Result<std::unique_ptr<Outbox>> opened{Outbox::Open(dir, profile)};
+        RequireOk(opened, "Open new");
+        RequireOk((*opened)->Add("bid", rig.alice->Place("bid", 1, market, Side::BUY, TimeInForce::GTC, 100, 5, 1).value()), "Add bid");
+        RequireOk((*opened)->Record("bid", failed), "Record failed (as an earlier build did)");
+    }
+    {
+        Result<std::unique_ptr<Outbox>> opened{Outbox::Open(dir, profile)};
+        RequireOk(opened, "Reopen");
+        BOOST_REQUIRE((*opened)->Find("bid").value().result == std::optional<OutboxResult>{failed});
+        RequireOk((*opened)->Record("bid", included), "a certified result after a FAILED");
+        RequireRefusal((*opened)->Record("bid", OutboxResult{OutboxOutcome::EXPIRED, 7, 0, {}}), ErrorCode::ORDER_VIOLATION, OUTBOX_RESULT_TWICE,
+                       "a result after a certified one");
+    }
+    Result<std::unique_ptr<Outbox>> reopened{Outbox::Open(dir, profile)};
+    RequireOk(reopened, "Reopen after the certified result");
+    BOOST_CHECK((*reopened)->Find("bid").value().result == std::optional<OutboxResult>{included});
+    reopened->reset();
+    fs::remove_all(dir);
+}
+
 BOOST_AUTO_TEST_CASE(the_chunk_decoder_is_incremental_and_refuses_malformed_sizes)
 {
     // Chunks split anywhere across reads decode to the same body; the terminal chunk ends it.

@@ -123,8 +123,8 @@
  *     own node has not finalized and seen deep enough.
  *   - ProveAnchor(candidate, from): VerifyAnchor(candidate, from) first, then
  *     the AnchorProof (core/anchor_proof.h) of the header path from `from`
- *     to `candidate` under the current finality pin; it passes
- *     CheckAnchorProof.
+ *     through `candidate` to the current finality pin (pin.height -
+ *     from.height links); it passes CheckAnchorProof.
  *   - SeatSetAt(epoch): the seat set of every epoch since creation; NEED_DATA
  *     (SEAT_SET_UNKNOWN_EPOCH) for any other.
  *
@@ -199,7 +199,7 @@ public:
     Result<void> OnDisconnected(const Anchor& block) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
     Result<void> OnFinalized(const Anchor& block) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
 
-    //! The header path from `from` to `candidate` under the current pin; the answers of VerifyAnchor(candidate, from) first.
+    //! The header path from `from` through `candidate` to the current pin; the answers of VerifyAnchor(candidate, from) first.
     Result<AnchorProof> ProveAnchor(const Anchor& candidate, const Anchor& from) const EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
 
     // Inspection.
