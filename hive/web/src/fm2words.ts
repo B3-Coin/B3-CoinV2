@@ -188,7 +188,7 @@ export function tell(row: Row, standing: (label: string, m: Market) => string = 
       return {
         title: `Placed an order to ${i.side} ${size(asked, m)}`,
         meta: `at ${priceText(BigInt(i.price_ticks), m)}`,
-        detail: [`It went into the order book at ${priceText(BigInt(i.price_ticks), m)}, to trade when someone ${buy ? "sells" : "buys"} at that price.`, standing(row.label, m)].filter(Boolean).join(" "),
+        detail: [`It went into the order book at ${priceText(BigInt(i.price_ticks), m)}, to wait for a ${buy ? "seller" : "buyer"} who accepts that price.`, standing(row.label, m)].filter(Boolean).join(" "),
         tone: "mine",
         icon: "book",
         result: "success",
@@ -215,8 +215,8 @@ export function tell(row: Row, standing: (label: string, m: Market) => string = 
       // an order that had traded in part, less than it first set aside.
       const freed = row.deltas.filter((d) => BigInt(d.available) > 0n).map((d) => amountText(BigInt(d.available), d.asset));
       const back = freed.length
-        ? `The ${freed.join(" and ")} ${all ? "they" : "it"} still held ${freed.length > 1 ? "are" : "is"} available again.`
-        : `What ${all ? "they" : "it"} held is available again.`;
+        ? `The ${freed.join(" and ")} ${all ? "they" : "it"} still set aside ${freed.length > 1 ? "are" : "is"} available again.`
+        : `What ${all ? "they" : "it"} set aside is available again.`;
       return {
         title: all ? "All orders cancelled" : "Order cancelled",
         meta: what,
@@ -303,7 +303,7 @@ export type Asking = {
  *  plain amount when every piece trades at one price, where the order's own
  *  limit guarantees it, and "about" with the estimate when it reaches
  *  further into the book. */
-function money(p: Plan, buy: boolean, m: Market): string {
+export function money(p: Plan, buy: boolean, m: Market): string {
   const sure = p.limit === p.best;
   const atoms = buy ? (sure ? p.ceiling : p.gross) : p.gross - p.fee;
   return `${sure ? "" : "about "}${amountText(atoms, m.quote)}`;
@@ -479,7 +479,12 @@ export function outlook(side: "buy" | "sell", tif: string, ticks: bigint, lots: 
   const say = (text: string, refused = false): Outlook => ({ text: `Right now: ${text}.`, refused });
   if (now === 0n) return say(tif === "ioc" ? `nothing would trade, because nobody ${buy ? "sells at this price or lower" : "buys at this price or higher"}` : "all of it waits in the order book");
   if (tif === "post_only") {
-    return say(`it would be refused, because it could trade at once. Post only needs a price ${buy ? "below" : "above"} ${price(BigInt(levels[0].price_ticks), m)} ${per}`, true);
+    // The nearest price that cannot trade at once is one step past the
+    // best one on the other side.
+    const edge = BigInt(levels[0].price_ticks);
+    const need = buy ? edge - 1n : edge + 1n;
+    const where = need >= 1n ? `${price(need, m)} ${per} or ${buy ? "lower" : "higher"}` : `a price below ${price(edge, m)} ${per}`;
+    return say(`it would be refused, because it could trade at once. Post only needs ${where}`, true);
   }
   const at = first === last ? `at ${price(first, m)} ${per}` : `at about ${averagePrice(gross, now, m)} ${per}`;
   // What that part comes to: the estimate an order with a price of its
@@ -560,8 +565,8 @@ export function question(a: Drafted): Question {
     const others = buy ? "sellers" : "buyers";
     const exact: Fact[] = [
       { key: "Market", value: m.name, full: m.id },
-      { key: "Exactly", value: `${whole(BigInt(i.lots))} lots at ${whole(ticks)} ticks`, hint: `As it is signed. One lot is ${lotText(m)}. One tick moves the price by ${tickText(m)}.` },
-      { key: "Kind of order", value: tifText(i.tif) },
+      { key: "In lots and ticks", value: `${whole(BigInt(i.lots))} lots at ${whole(ticks)} ticks`, hint: `As it is signed. One lot is ${lotText(m)}. One tick moves the price by ${tickText(m)}.` },
+      { key: "Time in force", value: tifText(i.tif) },
     ];
     const bound: Fact = { key: "Price limit", value: limit, hint: buy ? "It never pays a higher price than this." : "It never sells at a lower price than this." };
     if (i.tif === "ioc") {
@@ -589,13 +594,13 @@ export function question(a: Drafted): Question {
     return {
       title: `${ordered(i)}?`,
       explain: waits
-        ? `Whatever can trade at once at this price or ${buy ? "lower" : "higher"}, trades. The rest waits in the order book until someone ${buy ? "sells" : "buys"} at your price or you cancel it. While it waits, ${held} is set aside from your balance. What has traded cannot be undone.`
-        : `It only waits in the order book, until someone ${buy ? "sells" : "buys"} at your price or you cancel it. If it could trade at once, the network refuses it and nothing happens. While it waits, ${held} is set aside from your balance.`,
+        ? `Whatever can trade at once at this price or ${buy ? "lower" : "higher"}, trades. The rest waits in the order book for a ${buy ? "seller" : "buyer"} who accepts your price, until you cancel it. While it waits, ${held} is set aside from your balance. What has traded cannot be undone.`
+        : `It only waits in the order book, for a ${buy ? "seller" : "buyer"} who accepts your price, until you cancel it. If it could trade at once, the network refuses it and nothing happens. While it waits, ${held} is set aside from your balance.`,
       facts: [
         { key: buy ? "You buy up to" : "You sell up to", value: what, hint: `Whenever ${others} accept your price. That can be all of it, part of it, or none.` },
         ...sold,
         bound,
-        waits ? { key: "What cannot trade at once", value: "Waits in the order book until you cancel it" } : { key: "If it could trade at once", value: "The network refuses all of it" },
+        waits ? { key: "What cannot trade at once", value: "Waits in the order book until it trades or you cancel it" } : { key: "If it could trade at once", value: "The network refuses all of it" },
       ],
       more: [...exact, ...more],
       // An order that waits promises no trade: the button places it.

@@ -59,7 +59,7 @@ import {
   type Plan,
   type Want,
 } from "./fm2fmt";
-import { OWN_ORDER, WAITING, advise, numberProblem, outlook, size, tell, type Advice, type Fill, type Offer, type Row, type Told } from "./fm2words";
+import { OWN_ORDER, WAITING, advise, money, numberProblem, outlook, size, tell, type Advice, type Fill, type Offer, type Row, type Told } from "./fm2words";
 
 // ---- what the core sends (src-tauri/src/fm2/view.rs, src/trade.rs) ---------
 
@@ -318,6 +318,9 @@ const ready = (): boolean => !!info?.account && !!account?.proved;
 
 /** Something waits in the approval window: one at a time. */
 const pending = (): boolean => [...flows.values()].some((f) => f.stage === "review");
+/** Why a button is off while a request waits in the approval window. */
+const ONE_AT_A_TIME = "Finish the request in the small window first. One request waits at a time.";
+
 /** Whether the request that waits there was made from the trading form. */
 const ownWaits = (): boolean => flows.get("trade")?.stage === "review";
 
@@ -1206,7 +1209,10 @@ function renderFlow(origin: Origin): void {
     box.replaceChildren();
     return;
   }
-  const key = [flow.stage, flow.draft, flow.sent?.accepted ?? "", flow.slow, flow.row?.state ?? "", flow.error, full].join("|");
+  // A result is told as things stand now: an order it says is waiting
+  // may have traded or been cancelled since, and then it says so.
+  const told = flow.stage === "done" && flow.row ? tell(flow.row, standing).detail : "";
+  const key = [flow.stage, flow.draft, flow.sent?.accepted ?? "", flow.slow, flow.row?.state ?? "", flow.error, full, told].join("|");
   keyed(box, key, () => buildFlow(flow, full));
 }
 
@@ -1329,7 +1335,7 @@ function renderStrip(): void {
   el("tr-lot").textContent = lotText(m);
   el("tr-tick").textContent = tickText(m);
   // A sale that brings anything pays at least the smallest unit.
-  el("tr-fee-stat").textContent = `${feeRate(info.fee_ppm)}, at least ${amountText(1n, m.quote)}`;
+  el("tr-fee-stat").textContent = `${feeRate(info.fee_ppm)}, at least ${amountText(1n, m.quote)} per order`;
 }
 
 /** How many prices of a side the book shows: ten where it has a column
@@ -1663,7 +1669,7 @@ function renderAccount(): void {
       free.title = "What you can trade or send right now.";
       amounts.append(free);
       if (BigInt(b.reserved) > 0n) {
-        const set = h("span", "tr-bal-held", `plus ${masked(amount(BigInt(b.reserved), b.asset, places))} in open orders`);
+        const set = h("span", "tr-bal-held", `plus ${masked(amount(BigInt(b.reserved), b.asset, places))} set aside for open orders`);
         set.title = "Set aside for your orders that are waiting. It comes back when an order is cancelled.";
         amounts.append(set);
       }
@@ -1687,7 +1693,7 @@ function renderAccount(): void {
   el("tr-account-actions").hidden = !ready();
   const send = el<HTMLButtonElement>("tr-send-open");
   send.disabled = pending() || !a?.balances.some((b) => BigInt(b.available) > 0n);
-  send.title = pending() ? "Finish the request in the small window first." : "";
+  send.title = pending() ? ONE_AT_A_TIME : "";
 }
 
 function renderOrders(): void {
@@ -1699,7 +1705,9 @@ function renderOrders(): void {
   count.textContent = String(orders.length);
   el("tr-lists").toggleAttribute("data-has-orders", orders.length > 0 || !!a?.orders_mismatch || flows.has("orders"));
   el("tr-orders-actions").hidden = orders.length < 2;
-  el<HTMLButtonElement>("tr-cancel-all").disabled = pending();
+  const all = el<HTMLButtonElement>("tr-cancel-all");
+  all.disabled = pending();
+  all.title = pending() ? ONE_AT_A_TIME : "Every order this account has waiting, in every market of this network, with one approval.";
   const mismatch = el("tr-orders-mismatch");
   mismatch.hidden = !a?.orders_mismatch;
   mismatch.textContent = a?.orders_mismatch ? "This list may be out of date: an order may have traded while B3 Hive was not watching. Your balances are confirmed and correct." : "";
@@ -1757,6 +1765,7 @@ function renderOrders(): void {
       const cancel = action(o.cancelling ? "Cancelling" : "Cancel", "btn btn-secondary btn-sm", () => void cancelOrder(o, m));
       cancel.disabled = o.cancelling || pending();
       if (o.cancelling) cancel.title = "The cancellation is signed and waits for the network. Until it is confirmed, the order can still trade.";
+      else if (pending()) cancel.title = ONE_AT_A_TIME;
       trail.append(cancel);
       main.append(lead, text, trail);
       item.append(main);
@@ -1801,6 +1810,7 @@ function ordersTable(orders: Order[]): HTMLElement {
     const cancel = action(o.cancelling ? "Cancelling" : "Cancel", "btn btn-secondary btn-sm", () => void cancelOrder(o, m));
     cancel.disabled = o.cancelling || pending();
     if (o.cancelling) cancel.title = "The cancellation is signed and waits for the network. Until it is confirmed, the order can still trade.";
+    else if (pending()) cancel.title = ONE_AT_A_TIME;
     if (m) cancel.setAttribute("aria-label", `Cancel: ${buy ? "buy" : "sell"} ${size(placed, m)} at ${priceText(ticks, m)}`);
     act.append(cancel);
     row.append(
@@ -1873,17 +1883,17 @@ function renderActivity(): void {
       else if (r.state === "expired") fact("Proved expired at", `slot ${whole(BigInt(r.height))}`, false, "The validators proved that no slot can include it any more.");
       else fact("Valid until", `slot ${whole(BigInt(r.ref_slot) + BigInt(r.window_slots))}`, false, "After that the validators can prove it expired, and it can never happen.");
       if (r.intent.action === "place") {
-        fact("Kind of order", tifText(r.intent.tif));
+        fact("Time in force", tifText(r.intent.tif));
         fact("Price limit", priceText(BigInt(r.intent.price_ticks), r.intent.market));
         fact(
-          "Exactly",
+          "In lots and ticks",
           `${whole(BigInt(r.intent.lots))} lots at ${whole(BigInt(r.intent.price_ticks))} ticks`,
           false,
           `One lot is ${lotText(r.intent.market)}. One tick moves the price by ${tickText(r.intent.market)}.`,
         );
       }
-      fact("Number", r.nonce, false, "This account's counter in the action, so that it can only ever happen once.");
-      fact("Action", r.action_id, true);
+      fact("Nonce", r.nonce, false, "This account's counter in the action, so that it can only ever happen once.");
+      fact("Action id", r.action_id, true);
       // The trades behind the sentence, one row each, as the network
       // confirmed them.
       if (r.state === "included" && r.intent.action === "place" && r.fills.length) more.append(fillsTable(r.fills, r.intent.market, r.intent.side === "sell"));
@@ -1936,6 +1946,9 @@ function fillsTable(fills: Fill[], m: Market, sold: boolean): HTMLElement {
   table.append(thead, body);
   const wrap = h("div", "table-wrap");
   wrap.append(table);
+  // One order pays one fee, rounded up once. Per trade it shows where the
+  // rounding fell, which can look like a higher rate on one of them.
+  if (sold && info) wrap.append(h("p", "t-xs muted tr-fills-note", `The seller's fee is ${feeRate(info.fee_ppm)} of what the whole order brings, rounded up once for the order, not for each trade.`));
   return wrap;
 }
 
@@ -2008,7 +2021,14 @@ function ticket(): Ticket | null {
         t.ticks = p.limit;
         if (meetsOwn(m, buy, p.limit)) t.warnings.push(OWN_ORDER);
         const far = reach(p);
-        if (far >= FAR_BPS) t.warnings.push(`Its last part trades at a price ${percent(far)} ${buy ? "above" : "below"} the best one.`);
+        if (far >= FAR_BPS) {
+          const beyond = p.lots - BigInt(offers[0].lots);
+          t.warnings.push(
+            buy
+              ? `${size(beyond, m)} of it costs more than the best price, up to ${priceText(p.limit, m)}: ${percent(far)} above it.`
+              : `${size(beyond, m)} of it sells below the best price, down to ${priceText(p.limit, m)}: ${percent(far)} below it.`,
+          );
+        }
       }
     }
     t.ok = !t.error && !!t.p && t.p.lots > 0n && t.p.short === null && !!links.get("book")?.live;
@@ -2078,7 +2098,13 @@ function renderTicket(): void {
   grouped("tr-price", !atOnce && t.ticks !== null ? price(t.ticks, m) : null);
   grouped("tr-amount", t.lots !== null ? amount(baseAtoms(t.lots, m), m.base) : null);
 
-  const rounded = `${feeRate(info.fee_ppm)}, rounded up`;
+  // The rule behind the fee's amount stands with it, a pointer away.
+  const feeRule = `${feeRate(info.fee_ppm)} of what the whole order brings, rounded up once to the smallest unit of ${unit(m.quote)}.`;
+  const feeLine = (value: string): HTMLDivElement => {
+    const line = pair("Seller's fee", value);
+    line.title = feeRule;
+    return line;
+  };
   // A sale's floor holds for the whole amount: less sold brings less.
   const LEAST = "For all of it you receive at least";
   let lines: HTMLElement[] = [];
@@ -2104,7 +2130,7 @@ function renderTicket(): void {
       lines.push(
         pair(sure ? "You receive" : "You receive about", amountText(t.p.gross - t.p.fee, m.quote)),
         pair(LEAST, amountText(worst - sellerFee(worst, info.fee_ppm), m.quote)),
-        pair("Seller's fee", `${amountText(t.p.fee, m.quote)} (${rounded})`),
+        feeLine(`${amountText(t.p.fee, m.quote)}, already subtracted above`),
       );
     }
   } else if (!atOnce && t.ticks !== null && t.lots !== null) {
@@ -2127,7 +2153,7 @@ function renderTicket(): void {
       if (stay !== "ioc") most.title = "Set aside from your balance while the order waits.";
       lines.push(most, pair("Fee", "None for buying"));
     } else {
-      lines.push(pair(LEAST, amountText(quote - fee, m.quote)), pair("Seller's fee", `${amountText(fee, m.quote)} at this price (${rounded})`));
+      lines.push(pair(LEAST, amountText(quote - fee, m.quote)), feeLine(`${amountText(fee, m.quote)} at this price, already subtracted above`));
     }
   }
   // While a request from this form is under way, its steps stand where the
@@ -2163,8 +2189,10 @@ function renderTicket(): void {
         : refused
           ? "Would be refused right now"
           : t.ok && lots
-          ? atOnce
-            ? `${verb} ${size(lots, m)} now`
+          ? atOnce && t.p
+            ? // The same words as the simple card's button: what it costs
+              // or brings, "about" when it reaches past the best price.
+              `${verb} ${size(lots, m)} for ${money(t.p, buy, m)}`
             : `${verb} ${size(lots, m)} at ${price(t.ticks ?? 0n, m)} ${unit(m.quote)}`
           : t.error
             ? // The line above the button says what is wrong.
@@ -2178,7 +2206,12 @@ function renderTicket(): void {
   el("tr-slider").title = atOnce
     ? "A share of the most that can trade at once: what you have available, or everything on offer if that is less."
     : "A share of what you have available.";
-  const most = mostLots(t);
+  const { lots: most, byBook } = mostNow(t);
+  // When the book and not the balance sets the most, 100% is less than
+  // "Available" says, and the form says what it is.
+  const note = el("tr-slider-note");
+  note.hidden = !(atOnce && byBook);
+  note.textContent = note.hidden ? "" : `100% is ${size(most, m)}: all that ${buy ? "is for sale" : "buyers want"} right now.`;
   const slider = el<HTMLInputElement>("tr-pct");
   slider.disabled = most === 0n;
   const pct = most > 0n && lots ? Math.min(100, Number((lots * 100n) / most)) : 0;
@@ -2189,20 +2222,22 @@ function renderTicket(): void {
   for (const mark of document.querySelectorAll<HTMLElement>("#tr-slider [data-pct]")) mark.classList.toggle("on", Number(mark.dataset.pct) <= pct && pct > 0);
 }
 
-/** The most the ticket can order with what is available. */
-function mostLots(t: Ticket): bigint {
-  if (!info) return 0n;
-  if (kind === "limit") return t.buy ? (t.ticks !== null ? maxLots("buy", t.have, t.ticks, t.m) : 0n) : maxLots("sell", t.have, 0n, t.m);
-  if (!book) return 0n;
+/** The most the ticket can order with what is available, and whether what
+ *  is on offer, not the balance, sets it. */
+function mostNow(t: Ticket): { lots: bigint; byBook: boolean } {
+  if (!info) return { lots: 0n, byBook: false };
+  if (kind === "limit") return { lots: t.buy ? (t.ticks !== null ? maxLots("buy", t.have, t.ticks, t.m) : 0n) : maxLots("sell", t.have, 0n, t.m), byBook: false };
+  if (!book) return { lots: 0n, byBook: false };
   const offers = t.buy ? book.asks : book.bids;
-  return plan(side, t.buy ? { of: "quote", atoms: t.have } : { of: "base", atoms: t.have }, offers, t.have, t.m, info.fee_ppm).lots;
+  const p = plan(side, t.buy ? { of: "quote", atoms: t.have } : { of: "base", atoms: t.have }, offers, t.have, t.m, info.fee_ppm);
+  return { lots: p.lots, byBook: p.lots > 0n && p.short === "book" };
 }
 
 function setPart(pct: number): void {
   const t = ticket();
   if (!t) return;
   totalLed = false;
-  const lots = (mostLots(t) * BigInt(Math.round(pct))) / 100n;
+  const lots = (mostNow(t).lots * BigInt(Math.round(pct))) / 100n;
   el<HTMLInputElement>("tr-amount").value = lots > 0n ? plain(baseAtoms(lots, t.m), t.m.base) : "";
   renderTicket();
 }

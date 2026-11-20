@@ -187,14 +187,14 @@ test("an order that went into the book is told in the past tense", () => {
   assert.deepEqual(tell(row), {
     title: "Placed an order to buy 0.005 B3",
     meta: `at 99${G}000 rUSD per B3`,
-    detail: `It went into the order book at 99${G}000 rUSD per B3, to trade when someone sells at that price.`,
+    detail: `It went into the order book at 99${G}000 rUSD per B3, to wait for a seller who accepts that price.`,
     tone: "mine",
     icon: "book",
     result: "success",
   });
   const sell = tell(included(place("sell", "post_only", 105, 5), "RESTING", true), () => "It is still waiting.");
   assert.equal(sell.title, "Placed an order to sell 0.005 B3");
-  assert.equal(sell.detail, `It went into the order book at 105${G}000 rUSD per B3, to trade when someone buys at that price. It is still waiting.`);
+  assert.equal(sell.detail, `It went into the order book at 105${G}000 rUSD per B3, to wait for a buyer who accepts that price. It is still waiting.`);
 });
 
 test("an order that did nothing says that nothing moved", () => {
@@ -226,7 +226,7 @@ test("cancelling says what was cancelled and that its funds are back", () => {
   assert.deepEqual(tell(included({ action: "cancel", order: "ef".repeat(32), placed }, "CANCELLED", true)), {
     title: "Order cancelled",
     meta: `Buy 0.005 B3 at 99${G}000 rUSD per B3`,
-    detail: `Buy 0.005 B3 at 99${G}000 rUSD per B3. What it held is available again.`,
+    detail: `Buy 0.005 B3 at 99${G}000 rUSD per B3. What it set aside is available again.`,
     tone: "ok",
     icon: "check",
     result: "success",
@@ -234,14 +234,14 @@ test("cancelling says what was cancelled and that its funds are back", () => {
   // An order this copy of B3 Hive did not place itself.
   const unknown = tell(included({ action: "cancel", order: "ef".repeat(32), placed: null }, "CANCELLED", true));
   assert.equal(unknown.meta, "");
-  assert.equal(unknown.detail, "What it held is available again.");
+  assert.equal(unknown.detail, "What it set aside is available again.");
   const all = tell(included({ action: "cancel_all" }, "CANCELLED", true));
   assert.equal(all.title, "All orders cancelled");
-  assert.equal(all.detail, "What they held is available again.");
+  assert.equal(all.detail, "What they set aside is available again.");
   // What it gave back is named from the confirmed change of the balances:
   // for an order that had traded in part, less than it first set aside.
   const back = { ...included({ action: "cancel", order: "ef".repeat(32), placed }, "CANCELLED", true), deltas: [{ asset: RUSD, available: "297", reserved: "-297" }] } as Row;
-  assert.equal(tell(back).detail, `Buy 0.005 B3 at 99${G}000 rUSD per B3. The 297 rUSD it still held is available again.`);
+  assert.equal(tell(back).detail, `Buy 0.005 B3 at 99${G}000 rUSD per B3. The 297 rUSD it still set aside is available again.`);
   const both = {
     ...included({ action: "cancel_all" }, "CANCELLED", true),
     deltas: [
@@ -249,7 +249,7 @@ test("cancelling says what was cancelled and that its funds are back", () => {
       { asset: B3, available: "5000000", reserved: "-5000000" },
     ],
   } as Row;
-  assert.equal(tell(both).detail, "The 297 rUSD and 0.005 B3 they still held are available again.");
+  assert.equal(tell(both).detail, "The 297 rUSD and 0.005 B3 they still set aside are available again.");
 
   // It had already traded or was already cancelled: not an error.
   for (const code of ["REJ_ORDER_CLOSED", "REJ_UNKNOWN_ORDER"]) {
@@ -596,11 +596,11 @@ test("a limit order's outlook says whether it waits, trades, or some of each", (
   for (const tif of ["gtc", "ioc"]) assert.equal(outlook("buy", tif, 101n, 40n, ASKS, M).refused, false);
   // A post-only order that could trade is refused by the network.
   assert.deepEqual(outlook("buy", "post_only", 101n, 10n, ASKS, M), {
-    text: `Right now: it would be refused, because it could trade at once. Post only needs a price below 101${G}000 rUSD.`,
+    text: `Right now: it would be refused, because it could trade at once. Post only needs 100${G}000 rUSD or lower.`,
     refused: true,
   });
   assert.deepEqual(outlook("sell", "post_only", 97n, 10n, BIDS, M), {
-    text: `Right now: it would be refused, because it could trade at once. Post only needs a price above 98${G}000 rUSD.`,
+    text: `Right now: it would be refused, because it could trade at once. Post only needs 99${G}000 rUSD or higher.`,
     refused: true,
   });
 });
@@ -630,7 +630,7 @@ test("the approval window asks about an immediate order with the bound its limit
   assert.equal(buy.approve, "Buy 0.004 B3");
   assert.equal(buy.reject, "Don't buy");
   // What is signed, to the integer, is under Details.
-  assert.deepEqual(keys(buy.more), ["Market", "Exactly", "Kind of order", ...DETAILS]);
+  assert.deepEqual(keys(buy.more), ["Market", "In lots and ticks", "Time in force", ...DETAILS]);
   assert.equal(buy.more[1].value, "4 lots at 101 ticks");
   assert.equal(buy.more[0].full, M.id);
   assert.equal(buy.more[3].full, "ab".repeat(32));
@@ -658,14 +658,14 @@ test("the approval window says what an order that waits sets aside", () => {
   assert.equal(buy.title, `Buy 0.005 B3 at 99${G}000 rUSD per B3?`);
   assert.equal(
     buy.explain,
-    "Whatever can trade at once at this price or lower, trades. The rest waits in the order book until someone sells at your price or you cancel it. While it waits, 495 rUSD is set aside from your balance. What has traded cannot be undone.",
+    "Whatever can trade at once at this price or lower, trades. The rest waits in the order book for a seller who accepts your price, until you cancel it. While it waits, 495 rUSD is set aside from your balance. What has traded cannot be undone.",
   );
   // The form's own words for it, and no amount promised: an order that
   // waits may buy all, part or none, and its button places it.
   assert.deepEqual(keys(buy.facts), ["You buy up to", "You pay at most", "Price limit", "What cannot trade at once"]);
   assert.equal(buy.facts[0].hint, "Whenever sellers accept your price. That can be all of it, part of it, or none.");
   assert.equal(buy.facts[1].hint, "Set aside while the order waits. Buyers pay no fee.");
-  assert.equal(buy.facts[3].value, "Waits in the order book until you cancel it");
+  assert.equal(buy.facts[3].value, "Waits in the order book until it trades or you cancel it");
   assert.equal(buy.approve, "Place the order");
   assert.equal(buy.reject, "Don't place it");
 
@@ -673,7 +673,7 @@ test("the approval window says what an order that waits sets aside", () => {
   assert.equal(post.title, `Sell 0.005 B3 at 105${G}000 rUSD per B3?`);
   assert.equal(
     post.explain,
-    "It only waits in the order book, until someone buys at your price or you cancel it. If it could trade at once, the network refuses it and nothing happens. While it waits, 0.005 B3 is set aside from your balance.",
+    "It only waits in the order book, for a buyer who accepts your price, until you cancel it. If it could trade at once, the network refuses it and nothing happens. While it waits, 0.005 B3 is set aside from your balance.",
   );
   assert.deepEqual(keys(post.facts), ["You sell up to", "For all of it you receive at least", "Seller's fee", "Price limit", "If it could trade at once"]);
   assert.equal(post.facts[0].hint, "Whenever buyers accept your price. That can be all of it, part of it, or none.");

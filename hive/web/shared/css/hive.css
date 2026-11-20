@@ -555,6 +555,7 @@ button.tr-book-row { width: 100%; text-align: left; }
 }
 .tr-marks button.on { border-color: var(--c); background: var(--c); }
 .tr-pct-out { position: absolute; right: 0; top: 50%; translate: 0 -50%; color: var(--text-muted); }
+.tr-slider-note { margin: 0; }
 .tr-sum { margin: 0; display: grid; gap: 4px; font-size: var(--text-xs); }
 .tr-sum:empty { display: none; }
 .tr-sum > div { display: flex; justify-content: space-between; gap: var(--space-2); }
@@ -627,6 +628,7 @@ details.tr-row[open] .tr-row-trail .caret { rotate: 90deg; }
 .tr-row-more { display: grid; gap: var(--space-2); padding: 0 var(--space-4) var(--space-3) calc(var(--space-4) + 32px + var(--space-3)); font-size: var(--text-sm); }
 .tr-row-more p { margin: 0; }
 .tr-row-more .details .drow { padding-block: 4px; }
+.tr-row-more .details .dkey { flex: none; white-space: nowrap; }
 .tr-row-more .mono { font-family: var(--font-mono); font-size: var(--text-xs); overflow-wrap: anywhere; }
 
 /* Dialogs */
@@ -693,6 +695,7 @@ details.tr-row[open] .tr-row-trail .caret { rotate: 90deg; }
 .tr-fills th:first-child, .tr-fills td:first-child { padding-left: 0; }
 .tr-fills th:last-child, .tr-fills td:last-child { padding-right: 0; }
 .tr-fills tbody tr:hover td { background: none; }
+.tr-fills-note { margin: var(--space-1) 0 0; }
 
 /* In the simple view a sale is not a warning: its mark is plain. */
 .tr-page[data-mode="simple"] .tr-row-lead[data-tone="buy"],
