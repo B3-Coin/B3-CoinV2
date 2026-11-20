@@ -6,6 +6,7 @@ pub mod bytes;
 pub mod crypto;
 pub mod genesis;
 pub mod hash;
+pub mod http;
 pub mod reply;
 pub mod types;
 pub mod verify;
