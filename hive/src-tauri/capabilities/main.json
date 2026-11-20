@@ -56,6 +56,7 @@
     "allow-ui-trade-pro",
     "allow-set-ui-trade-pro",
     "allow-approval-show",
+    "allow-fm2-withdraw",
     "allow-update-status",
     "allow-update-check",
     "allow-update-download",

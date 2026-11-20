@@ -64,6 +64,7 @@ fn main() {
             "ui_trade_pro",
             "set_ui_trade_pro",
             "approval_show",
+            "fm2_withdraw",
             "update_status",
             "update_check",
             "update_download",

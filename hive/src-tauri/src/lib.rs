@@ -1381,6 +1381,40 @@ async fn approval_show(
     Ok(true)
 }
 
+/// Withdraws a FlowMesh request that waits in the approval window, for a
+/// user who changed their mind on the Trade page. It can only reject, and
+/// only a FlowMesh request: nothing is signed either way, and a payment is
+/// decided in the approval window alone. The page hears "rejected" as it
+/// would from the window, which then shows the next waiting draft or
+/// closes.
+#[tauri::command]
+async fn fm2_withdraw(
+    app: AppHandle,
+    window: Window,
+    core: State<'_, Arc<Core>>,
+    id: String,
+) -> Result<(), String> {
+    require_window(&window, MAIN)?;
+    let more = {
+        let mut drafts = core.drafts.lock().unwrap();
+        drafts
+            .take_fm2(&id)
+            .ok_or("This request was already decided.")?;
+        drafts.oldest().is_some()
+    };
+    let _ = app.emit_to(MAIN, "draft-result", DraftResult::Rejected { id });
+    if let Some(approval) = app.get_webview_window(APPROVAL) {
+        // The window read the waiting draft when it loaded; loading it
+        // again is how it learns that this one is gone.
+        let _ = if more {
+            approval.reload()
+        } else {
+            approval.close()
+        };
+    }
+    Ok(())
+}
+
 // ---- node settings (main window) --------------------------------------------
 
 #[derive(Serialize)]
@@ -2548,6 +2582,7 @@ pub fn run() {
             ui_trade_pro,
             set_ui_trade_pro,
             approval_show,
+            fm2_withdraw,
             update_status,
             update_check,
             update_download,

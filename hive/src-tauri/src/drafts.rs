@@ -200,6 +200,16 @@ impl DraftStore {
         self.drafts.remove(id)
     }
 
+    /// Removes and returns a waiting FlowMesh request, and nothing else: a
+    /// payment or a staking request stays where it is. This is what the
+    /// Trade page may withdraw without the approval window.
+    pub fn take_fm2(&mut self, id: &str) -> Option<Draft> {
+        match self.drafts.get(id)?.request {
+            Request::Fm2 { .. } => self.drafts.remove(id),
+            _ => None,
+        }
+    }
+
     /// Removes every waiting draft (the approval window was closed).
     pub fn take_all(&mut self) -> Vec<Draft> {
         std::mem::take(&mut self.drafts).into_values().collect()
@@ -276,6 +286,37 @@ mod tests {
         assert_eq!(psbt(store.take(&id).unwrap()), "beef");
         assert!(store.take(&id).is_none());
         assert!(store.oldest().is_none());
+    }
+
+    #[test]
+    fn only_a_flowmesh_request_can_be_withdrawn() {
+        use crate::fm2::types::Payload;
+        use crate::fm2::view::{ActionDraft, Intent};
+        let mut store = DraftStore::default();
+        let payment = store.insert(pay("t1", "beef")).unwrap();
+        let action = store
+            .insert(Request::Fm2 {
+                action: Box::new(ActionDraft {
+                    chain: "regtest",
+                    domain: String::new(),
+                    account: String::new(),
+                    intent: Intent::CancelAll,
+                    window_slots: 64,
+                    seats: 4,
+                    fee_ppm: 100,
+                    payload: Payload::CancelAll,
+                    bound: ([0; 32], [0; 32]),
+                }),
+            })
+            .unwrap();
+        // A payment waits for the approval window, whoever asks.
+        assert!(store.take_fm2(&payment).is_none());
+        assert_eq!(psbt(store.get(&payment).unwrap()), "beef");
+        assert!(store.take_fm2("00000000-0000000000000000").is_none());
+        // The FlowMesh request goes, once.
+        assert_eq!(store.take_fm2(&action).unwrap().id, action);
+        assert!(store.take_fm2(&action).is_none());
+        assert_eq!(store.oldest().unwrap().id, payment);
     }
 
     #[test]
