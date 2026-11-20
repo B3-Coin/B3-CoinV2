@@ -6,6 +6,10 @@
 .approval .modal-head { padding-top: var(--space-5); }
 .approval .modal-body { overflow-y: auto; }
 .approval .empty { margin-block: auto; }
+/* Buying is green on the Trade page, and so is the button that approves a
+   buy: the one pressed there and the one here are plainly the same. */
+.approval .btn-buy { background: var(--success); color: var(--success-on); border-color: var(--success); }
+.approval .btn-buy:hover:not(:disabled) { filter: brightness(1.08); }
 
 /* Output lines: the amount on the right, the address under its label. A
    long address or id wraps under its label; the value keeps its width. */

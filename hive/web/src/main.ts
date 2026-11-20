@@ -148,7 +148,7 @@ const VIEWS = {
   activity: { title: "Activity", sub: "Your wallet's transactions" },
   book: { title: "Address book", sub: "Addresses you pay, with their labels" },
   stake: { title: "Stake", sub: "Secure B3 with this wallet's validator" },
-  trade: { title: "Trade", sub: "FlowMesh V2 markets on a regtest test network" },
+  trade: { title: "Trade", sub: "Buy and sell on a FlowMesh test network" },
   wallets: { title: "Wallets", sub: "Open, create, switch and back up wallets" },
   network: { title: "Network", sub: "Your node and its peers" },
   settings: { title: "Settings", sub: "How your node runs and connects" },

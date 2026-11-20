@@ -2,7 +2,7 @@
 // holds, and its only powers are reading that draft and deciding on it.
 import { invoke } from "@tauri-apps/api/core";
 import { count, el, formatAmount, initTheme, sumAmounts } from "../shared/ui";
-import { amountText, feeRate, lotText, price, sellerFee, shortId, tifText, unit, whole, type Asset, type Market } from "../src/fm2fmt";
+import { amountText, feeRate, lotText, priceText, sellerFee, shortId, tickText, tifText, unit, whole, type Asset, type Market } from "../src/fm2fmt";
 import { LONG_WAIT_SECONDS, shareText, stakeOutlook, waitText } from "../src/outlook";
 
 type OutputLine = { address: string; amount: string; change: boolean; mine: boolean };
@@ -240,80 +240,103 @@ function showAction(r: Extract<Request, { kind: "stake" | "bind_finality" | "rev
     "The wallet is locked. It unlocks only for this request and locks again straight after.";
 }
 
-// A FlowMesh V2 action: exactly what is signed, in the terms of the
-// network's genesis document. No wallet signs it and no B3 moves on the
-// chain: the network's own account key signs, and the seats decide.
-function placeLine(i: Extract<Fm2Intent, { action: "place" }>): string {
-  const lots = BigInt(i.lots);
-  return `${i.side === "buy" ? "Buy" : "Sell"} ${whole(lots)} lot${lots === 1n ? "" : "s"} of ${i.market.name} at ${price(BigInt(i.price_ticks), i.market)} ${unit(i.market.quote)}`;
+// A FlowMesh V2 action, in the words and units of the Trade page: the same
+// functions format both, so a price reads the same on the page, here and
+// in the result. No wallet signs it and no B3 moves on the chain: the
+// network's own account key signs, and the validators decide. What a first
+// look needs comes first; the exact integers that are signed, and where it
+// goes, are under Details.
+type Fm2Place = Extract<Fm2Intent, { action: "place" }>;
+
+const fm2Size = (i: Fm2Place): string => amountText(BigInt(i.base.atoms), i.base.asset);
+
+function placeLine(i: Fm2Place): string {
+  return `${i.side === "buy" ? "Buy" : "Sell"} ${fm2Size(i)} at ${priceText(BigInt(i.price_ticks), i.market)}`;
 }
 
 function showFm2(a: ActionDraft): void {
   const i = a.intent;
-  el("from").textContent = `FlowMesh V2 on ${a.chain} · a test network, not mainnet`;
-  const common = [
-    row("Account", shortId(a.account, 10, 6), a.account, false),
-    explained("Valid for", `${a.window_slots} slots`, "About a second each. After that the seats can prove it expired, and it can never happen."),
-    explained("Sent to", `${a.seats} seats`, "The same signed action goes to every seat of the network."),
-    row("Network", shortId(a.domain, 10, 6), a.domain, false),
+  el("from").textContent = "On a FlowMesh test network, with test funds";
+  const more: HTMLElement[] = [
+    row("Trading account", shortId(a.account, 10, 6), a.account, false),
+    explained("Valid for", `about ${a.window_slots} seconds`, `${a.window_slots} slots of the network. If it is not confirmed by then, it never can be.`),
+    explained("Sent to", `${a.seats} validators`, "The same signed action goes to every validator of the network."),
+    row("Network", a.chain, a.domain, false),
   ];
-  const posted = "It is signed with this network's account key in B3 Hive and posted to every seat. A seat taking it is not a result: it takes effect only in a certified slot, which the Trade page then shows.";
+  const signed = "Approving signs it with your trading account's key and sends it to the network. The Trade page shows the result once the network confirms it.";
+  let rows: HTMLElement[] = [];
   if (i.action === "place") {
     const buy = i.side === "buy";
     const m = i.market;
+    const ticks = BigInt(i.price_ticks);
     const quote = BigInt(i.quote.atoms);
     const fee = sellerFee(quote, a.fee_ppm);
-    el("title").textContent = `${placeLine(i)}?`;
-    const how =
-      i.tif === "gtc"
-        ? "It fills what it can at this price or better; the rest waits in the book until it fills or you cancel it."
-        : i.tif === "ioc"
-          ? "It fills what it can at this price or better at once; the rest is dropped."
-          : "It only ever waits in the book, and is rejected if it could fill at once.";
-    el("action-text").textContent =
-      `This places one order. ${how} ` +
-      (buy
-        ? `The amount it can pay is held from your available balance while the order is open. Buyers pay no fee. `
-        : `What it sells is held from your available balance while the order is open. The seller pays a fee of ${feeRate(a.fee_ppm)} of what the sale brings, taken from it. `) +
-      posted;
-    el("action-rows").replaceChildren(
-      row(buy ? "Buy" : "Sell", amountText(BigInt(i.base.atoms), i.base.asset)),
-      explained("Price", `${price(BigInt(i.price_ticks), m)} ${unit(m.quote)}`, `For one lot. One lot is ${lotText(m)}.`),
-      row("Amount", `${whole(BigInt(i.lots))} lots`),
-      buy ? row("Pays at most", amountText(quote, i.quote.asset)) : row("Receives at least", amountText(quote - fee, i.quote.asset)),
-      ...(buy ? [] : [explained("Fee", `${amountText(fee, i.quote.asset)} at this price`, "More if it sells at a better price, in the same proportion.")]),
-      row("Order type", tifText(i.tif), undefined, false),
+    const limit = priceText(ticks, m);
+    const base = unit(m.base);
+    const atOnce = i.tif === "ioc";
+    el("title").textContent = atOnce ? `${buy ? "Buy" : "Sell"} ${fm2Size(i)}?` : `${placeLine(i)}?`;
+    const how = atOnce
+      ? buy
+        ? `It trades at once with the sellers waiting in the order book, at their prices, the best first, and never above ${limit}. Whatever cannot trade at once is dropped, and what it would have cost stays yours.`
+        : `It trades at once with the buyers waiting in the order book, at their prices, the best first, and never below ${limit}. Whatever cannot trade at once is dropped and stays yours.`
+      : i.tif === "gtc"
+        ? buy
+          ? "It trades at once with anyone selling at this price or lower. The rest waits in the order book until someone sells at your price, or you cancel it. While it waits, the most it can cost is set aside from your balance."
+          : `It trades at once with anyone buying at this price or higher. The rest waits in the order book until someone buys at your price, or you cancel it. While it waits, the ${base} it sells is set aside from your balance.`
+        : `It only ever waits in the order book, until someone ${buy ? "sells" : "buys"} at your price or you cancel it. If it could trade at once, the network refuses it and nothing happens. While it waits, ${buy ? "the most it can cost" : `the ${base} it sells`} is set aside from your balance.`;
+    const fees = buy ? "Buyers pay no fee." : `The seller pays a fee of ${feeRate(a.fee_ppm)} of what the sale brings, taken from it.`;
+    el("action-text").textContent = `${how} ${fees} ${signed}`;
+    rows = [
+      atOnce
+        ? explained(buy ? "You buy" : "You sell", fm2Size(i), `Less if the ${buy ? "offers" : "buyers"} are gone by the time it arrives.`)
+        : row(buy ? "You buy" : "You sell", fm2Size(i), undefined, false),
+      explained("Price limit", limit, buy ? "It never pays a higher price than this." : "It never sells at a lower price than this."),
+      buy
+        ? row("You pay at most", amountText(quote, i.quote.asset), undefined, false)
+        : explained("You receive at least", amountText(quote - fee, i.quote.asset), "For all of it, after the seller's fee."),
+      ...(buy ? [] : [explained("Seller's fee", `${amountText(fee, i.quote.asset)} at this price`, "More if it sells at a better price, in the same proportion.")]),
+      row("What does not trade at once", atOnce ? "Is dropped" : i.tif === "gtc" ? "Waits in the order book" : "All of it must wait", undefined, false),
+    ];
+    more.unshift(
       row("Market", m.name, m.id, false),
-      ...common,
+      explained("Exactly", `${whole(BigInt(i.lots))} lots at ${whole(ticks)} ticks`, `As it is signed. One lot is ${lotText(m)}. One tick moves the price by ${tickText(m)}.`),
+      row("Kind of order", tifText(i.tif), undefined, false),
     );
-    el("approve").textContent = buy ? "Place buy order" : "Place sell order";
+    el("approve").textContent = `${buy ? "Buy" : "Sell"} ${fm2Size(i)}`;
   } else if (i.action === "cancel") {
     el("title").textContent = "Cancel this order?";
-    el("action-text").textContent = `This cancels one open order. Until a certified slot holds the cancellation, the order can still fill. What the order holds returns to your available balance then. ${posted}`;
-    el("action-rows").replaceChildren(
-      i.placed && i.placed.action === "place" ? row("Order", placeLine(i.placed), undefined, false) : row("Order", shortId(i.order, 10, 6), undefined, false),
-      row("Order id", shortId(i.order, 10, 6), i.order, false),
-      ...common,
-    );
-    el("approve").textContent = "Send cancellation";
+    el("action-text").textContent = `The order stops waiting in the order book, and what it set aside becomes available again. Until the network confirms the cancellation, the order can still trade. ${signed}`;
+    rows = [i.placed && i.placed.action === "place" ? row("Order", placeLine(i.placed), undefined, false) : row("Order", shortId(i.order, 10, 6), undefined, false)];
+    more.unshift(row("Order number", shortId(i.order, 10, 6), i.order, false));
+    el("approve").textContent = "Cancel the order";
   } else if (i.action === "cancel_all") {
-    el("title").textContent = "Cancel all your open orders?";
-    el("action-text").textContent = `This cancels every order this account has open, in every market of the network. Until a certified slot holds the cancellation, the orders can still fill. What they hold returns to your available balance then. ${posted}`;
-    el("action-rows").replaceChildren(...common);
+    el("title").textContent = "Cancel all your orders?";
+    el("action-text").textContent = `Every order this account has waiting stops, in every market of this network, and what they set aside becomes available again. Until the network confirms it, the orders can still trade. ${signed}`;
     el("approve").textContent = "Cancel all orders";
   } else if (i.action === "transfer") {
     const text = amountText(BigInt(i.amount.atoms), i.amount.asset);
-    el("title").textContent = `Transfer ${text}?`;
-    el("action-text").textContent = `This moves the amount to another FlowMesh account of this test network. It stays inside FlowMesh: no B3 moves on the chain, and there is no fee. Once a certified slot holds it, it cannot be taken back, so check the account it goes to. ${posted}`;
-    el("action-rows").replaceChildren(row("Transfer", text), row("To account", shortId(i.to, 10, 6), i.to, false), ...common);
-    el("approve").textContent = "Transfer";
+    el("title").textContent = `Send ${text}?`;
+    el("action-text").textContent = `It goes to another account on this test network, with no fee. It stays inside FlowMesh: nothing moves on the B3 chain. Once the network confirms it, it cannot be taken back, so check the account number. ${signed}`;
+    rows = [row("You send", text, undefined, false), row("To account", shortId(i.to, 10, 6), i.to, false)];
+    el("approve").textContent = `Send ${text}`;
   } else {
     // The core drafts only what this window can show; never approve blind.
     el("title").textContent = "This request cannot be shown";
     el("action-text").textContent = "This version of B3 Hive does not know this kind of action. Reject it.";
-    el("action-rows").replaceChildren();
     el("approve").hidden = true;
+    more.length = 0;
   }
+  el("action-rows").replaceChildren(...rows);
+  el("action-more-rows").replaceChildren(...more);
+}
+
+/** How an approval's button looks. Red marks a request that moves value
+ *  out of this wallet or its trading balance. A FlowMesh buy is the
+ *  exception: it wears the green that buying has on the Trade page, so the
+ *  button pressed there and the one here are plainly the same. */
+function approveClass(r: Request): string {
+  if (r.kind === "fm2" && r.action.intent.action === "place" && r.action.intent.side === "buy") return "btn btn-buy";
+  return `btn ${movesValue(r) ? "btn-danger" : "btn-primary"}`;
 }
 
 /** Whether approving moves value out of this wallet or its trading
@@ -361,7 +384,12 @@ function show(draft: DraftView | null): void {
   else if (r.kind === "sign_psbt" || r.kind === "send_psbt") showPsbt(r.kind, r.summary);
   else if (r.kind === "fm2") showFm2(r.action);
   else showAction(r);
-  el("approve").className = `btn ${movesValue(r) ? "btn-danger" : "btn-primary"}`;
+  el("approve").className = approveClass(r);
+  // An action's rows and its details show only when the request filled
+  // them in.
+  el("action-rows").hidden = pay || el("action-rows").childElementCount === 0;
+  el("action-more").hidden = r.kind !== "fm2" || el("action-more-rows").childElementCount === 0;
+  el<HTMLDetailsElement>("action-more").open = false;
   arm();
   el("pass-field").hidden = !draft.locked;
   el<HTMLInputElement>("pass").value = "";
