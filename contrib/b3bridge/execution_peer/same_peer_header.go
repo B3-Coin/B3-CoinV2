@@ -14,7 +14,7 @@ import (
 // Fetch availability bytes while preserving the connection for subsequent
 // SNAP queries. The exact supplied hash is checked; consensus authority still
 // comes only from native Gloas verification and its same-process capability.
-func witnessExecutionHeader(ctx context.Context, rw p2p.MsgReadWriter, want common.Hash) ([]byte, error) {
+func witnessExecutionHeader(ctx context.Context, rw p2p.MsgReadWriter, want common.Hash, version uint) ([]byte, error) {
 	id, err := witnessRequestID()
 	if err != nil {
 		return nil, err
@@ -56,6 +56,10 @@ func witnessExecutionHeader(ctx context.Context, rw p2p.MsgReadWriter, want comm
 			}
 		case eth.NewPooledTransactionHashesMsg, eth.TransactionsMsg, eth.BlockRangeUpdateMsg:
 			if err = m.Discard(); err != nil {
+				return nil, err
+			}
+		case eth.GetReceiptsMsg, eth.GetBlockAccessListsMsg, eth.GetCellsMsg:
+			if _, err = replyUnavailableETHData(m, rw, version); err != nil {
 				return nil, err
 			}
 		default:

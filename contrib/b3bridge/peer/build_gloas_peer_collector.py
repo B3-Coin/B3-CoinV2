@@ -17,7 +17,7 @@ import subprocess
 import time
 
 NIMBUS_COMMIT = "963756c91c19b7824cea57e7aab5857ce2c776c7"
-FORMAT = "b3-nimbus-sepolia-gloas-collector/1"
+FORMAT = "b3-nimbus-sepolia-gloas-collector/2"
 RUNTIME_ENV = ("PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "TZ", "TMPDIR",
                "SYSTEMROOT", "WINDIR", "TEMP", "TMP")
 

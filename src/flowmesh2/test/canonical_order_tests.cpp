@@ -233,7 +233,8 @@ BOOST_AUTO_TEST_CASE(phase_of_every_kind)
     // A PLACE whose payload does not decode returns the decoder's error.
     RequireError(PhaseOf(WithKind(ActionKind::PLACE, {0x01})), ErrorCode::DECODE, "truncated PLACE payload");
     // The stub branches (the validity predicate refuses these kinds first).
-    RequireStub(PhaseOf(WithKind(ActionKind::CANCEL_ALL, {})), "M3-ENG-09");
+    BOOST_CHECK(PhaseOf(WithKind(ActionKind::CANCEL_ALL, {})).value() == SlotPhase::CANCELS);
+    RequireError(PhaseOf(WithKind(ActionKind::CANCEL_ALL, {0x00})), ErrorCode::OVERSIZE, "CANCEL_ALL payload with a byte");
     RequireStub(PhaseOf(WithKind(ActionKind::WITHDRAW, {})), "M2-LED-05");
     RequireStub(PhaseOf(WithKind(ActionKind::SPOT_TO_FUTURES, {})), "M2-LED-06");
     RequireStub(PhaseOf(WithKind(ActionKind::FUTURES_TO_SPOT, {})), "M2-LED-06");

@@ -377,8 +377,8 @@ BOOST_AUTO_TEST_CASE(preconditions_messages_and_timeouts)
     const std::vector<unsigned char> bytes{1, 2, 3};
     const Result<void> message{certifier->OnMessage(0, bytes)};
     BOOST_REQUIRE(!message.has_value());
-    BOOST_CHECK(message.error().code == ErrorCode::UNSUPPORTED);
-    BOOST_CHECK_EQUAL(message.error().detail, "M4-AGR-02");
+    BOOST_CHECK(message.error().code == ErrorCode::INVALID_INPUT);
+    BOOST_CHECK_EQUAL(message.error().detail, dev::DEV_NO_MESSAGES);
     BOOST_CHECK(certifier->OnTimeout(123).has_value());
     BOOST_CHECK(!certifier->TakeDecision().has_value());
 

@@ -79,7 +79,7 @@ def policy_input(path: Path) -> tuple[Path, dict]:
     return actual, policy
 
 
-def backend_arguments(binary: Path, policy: dict, directory: str, port: int, bootstrap_file: Path | None = None) -> list[str]:
+def backend_arguments(binary: Path, policy: dict, directory: str, port: int, bootstrap_file: Path | None = None, history_file: Path | None = None) -> list[str]:
     if type(port) is not int or not 1024 <= port <= 65533:
         raise ValueError("Peer base port must leave three unprivileged ports")
     arguments = [str(binary), "--network=sepolia", "--no-el", "--nat=none",
@@ -89,6 +89,8 @@ def backend_arguments(binary: Path, policy: dict, directory: str, port: int, boo
             "--quic-port=" + str(port + 1)]
     if bootstrap_file is not None:
         arguments.extend(["--bootstrap-file", str(bootstrap_file)])
+    if history_file is not None:
+        arguments.extend(["--history-file", str(history_file)])
     return arguments
 
 
@@ -145,7 +147,7 @@ def _drain_log(pipe, result: dict, name: str, private_directory: Path | None = N
 
 
 def run_session(backend: Path, verifier: Path, policy_path: Path, policy: dict,
-                journal: Path, seconds: int, port: int, bootstrap_file: Path | None = None, private_log_directory: Path | None = None) -> dict:
+                journal: Path, seconds: int, port: int, bootstrap_file: Path | None = None, private_log_directory: Path | None = None, history_file: Path | None = None) -> dict:
     if type(seconds) is not int or not 1 <= seconds <= 86400:
         raise ValueError("Session duration must be between one second and one day")
     env = clean_environment()
@@ -161,7 +163,7 @@ def run_session(backend: Path, verifier: Path, policy_path: Path, policy: dict,
     started = time.monotonic()
     with tempfile.TemporaryDirectory(prefix="b3-eth-peer-") as directory:
         try:
-            collector = subprocess.Popen(backend_arguments(backend, policy, directory, port, bootstrap_file),
+            collector = subprocess.Popen(backend_arguments(backend, policy, directory, port, bootstrap_file, history_file),
                                          stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                          stderr=subprocess.PIPE, env=env)
             native = subprocess.Popen([str(verifier), "--policy", str(policy_path),
@@ -197,6 +199,9 @@ def run_session(backend: Path, verifier: Path, policy_path: Path, policy: dict,
             def retain(value: dict) -> None:
                 nonlocal total, dropped, live_updates, last_result, first_anchor_slot
                 consistent_result(last_result, value)
+                if last_result is None and history_file is not None and (
+                        value.get("result") != "READY" or value["sequence"] < 2):
+                    raise ValueError("Nimbus history warm seed requires a pre-existing authenticated native history journal")
                 slot = value.get("beacon_slot")
                 if first_anchor_slot is None and type(slot) is int and slot >= 0:
                     first_anchor_slot = slot
@@ -253,7 +258,8 @@ def run_session(backend: Path, verifier: Path, policy_path: Path, policy: dict,
             final_slot = last_result.get("beacon_slot")
             head_advanced = (type(final_slot) is int and first_anchor_slot is not None and
                              final_slot > first_anchor_slot)
-            result = ("SEPOLIA_GLOAS_LIVE_UPDATE_VERIFIED" if bls_verified and live_updates else
+            result = ("SEPOLIA_GLOAS_LIVE_UPDATE_VERIFIED" if bls_verified and live_updates and head_advanced else
+                      "SEPOLIA_GLOAS_PEER_UPDATE_NO_FINALITY_ADVANCE" if bls_verified and live_updates else
                       "SEPOLIA_GLOAS_VERIFIED_REPLAY_ONLY" if bls_verified else
                       "TRUSTED_BOOTSTRAP_ONLY" if fresh else "NO_FRESH_ANCHOR")
             return {"format": "b3-sepolia-gloas-peer-session/1", "mainnet_enabled": False,
@@ -261,7 +267,7 @@ def run_session(backend: Path, verifier: Path, policy_path: Path, policy: dict,
                     "chain_id": 11155111, "execution_roots_verified": False,
                     "execution_header_required": True,
                     "result": result, "native_bls_update_verified": bls_verified,
-                    "live_bls_update_verified": bool(fresh and live_updates),
+                    "live_bls_update_verified": bool(fresh and live_updates and head_advanced),
                     "accepted_live_updates": live_updates,
                     "finalized_head_advanced_this_run": bool(fresh and head_advanced),
                     "stop_reason": reason, "duration_seconds": round(time.monotonic() - started, 3),
@@ -306,6 +312,7 @@ def main() -> int:
     parser.add_argument("--seconds", type=int, default=300)
     parser.add_argument("--peer-base-port", type=int, default=19000)
     parser.add_argument("--private-log-dir", type=Path, help="Fresh private bounded collector diagnostic directory")
+    parser.add_argument("--history-file", type=Path, help="Retained checked-update cache seeded before peer emission; never live proof acquisition")
     parser.add_argument("--bootstrap-file", type=Path, help="Untrusted raw bootstrap proof frame at the unchanged policy root")
     args = parser.parse_args()
     if os.name != "posix":
@@ -334,10 +341,28 @@ def main() -> int:
         if private_log_directory.exists() or private_log_directory.is_symlink():
             raise ValueError("Private diagnostic directory must be a fresh path")
         private_log_directory.mkdir(mode=0o700)
+    history_file, history_sha256 = None, None
+    if args.history_file is not None:
+        if bootstrap_file is None or args.history_file.is_symlink():
+            raise ValueError("Retained history requires a regular unchanged-root bootstrap cache")
+        native_journal = args.journal.absolute()
+        if native_journal.is_symlink() or not native_journal.is_file() or native_journal.stat().st_size == 0:
+            raise ValueError("History warm seeding requires an existing native authenticated journal")
+        history_file = args.history_file.resolve(strict=True)
+        if not history_file.is_file() or not 1 <= history_file.stat().st_size <= 2097152:
+            raise ValueError("Retained history exceeds its bounded regular-file input")
+        history_sha256 = sha256(history_file)
     result = run_session(backend, verifier, policy_path, policy, args.journal.absolute(),
-                         args.seconds, args.peer_base_port, bootstrap_file, private_log_directory)
+                         args.seconds, args.peer_base_port, bootstrap_file, private_log_directory, history_file)
     if bootstrap_file is not None and sha256(bootstrap_file) != bootstrap_sha256:
         raise ValueError("Bootstrap cache changed during the session")
+    if history_file is not None and sha256(history_file) != history_sha256:
+        raise ValueError("Retained history cache changed during the session")
+    result.update(history_file_sha256=history_sha256,
+                  history_availability="untrusted-retained-local-cache" if history_file else None,
+                  history_seed_before_peer_emit_observers=True,
+                  cached_history_counts_as_live=False,
+                  history_seed_scope="Nimbus availability only; cached records must already be authenticated in native journal")
     result.update(bootstrap_file_sha256=bootstrap_sha256,
                   bootstrap_availability="untrusted-local-cache" if bootstrap_file else "peer-to-peer")
     if sha256(backend) != args.backend_sha256 or sha256(verifier) != args.verifier_sha256:

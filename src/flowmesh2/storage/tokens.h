@@ -6,7 +6,6 @@
 #define B3_FLOWMESH2_STORAGE_TOKENS_H
 
 #include <crypto/bls.h>
-#include <flowmesh2/storage/control_types.h>
 #include <flowmesh2/storage/record.h>
 #include <uint256.h>
 
@@ -54,16 +53,24 @@
 namespace flowmesh2::storage {
 
 class SignerLog;
-class ControlLog;
 class CommitLog;
 
 //! Vote phases. APPEND-ONLY.
 enum class VotePhase : uint8_t {
-    PREPARE = 1, //!< PBFT prepare (M4-AGR-02); its digest is not defined in the outline
-    COMMIT = 2,  //!< signs SlotHeaderV2::CommitDigest()
+    PREPARE = 1,     //!< PBFT prepare: signs agreement::PrepareDigest(domain, epoch, slot, view, header hash) (M4-AGR-02)
+    COMMIT = 2,      //!< signs SlotHeaderV2::CommitDigest()
+    VIEW_CHANGE = 3, //!< a statement, not a vote: signs agreement::ViewChangeDigest (M4-AGR-02)
+    NEW_VIEW = 4,    //!< a statement: signs agreement::NewViewDigest (M4-AGR-02)
+    HIGH_WATER = 5,  //!< a statement: signs agreement::HighWaterDigest (M4-AGR-06)
 };
 
-constexpr bool IsKnown(VotePhase phase) { return phase == VotePhase::PREPARE || phase == VotePhase::COMMIT; }
+constexpr bool IsKnown(VotePhase phase)
+{
+    return phase == VotePhase::PREPARE || phase == VotePhase::COMMIT || phase == VotePhase::VIEW_CHANGE || phase == VotePhase::NEW_VIEW ||
+           phase == VotePhase::HIGH_WATER;
+}
+//! PREPARE and COMMIT vote for a proposal; the other phases sign statements that have none.
+constexpr bool IsVotePhase(VotePhase phase) { return phase == VotePhase::PREPARE || phase == VotePhase::COMMIT; }
 
 //! The 96-byte compressed BLS signature of a vote.
 using VoteSignature = std::array<unsigned char, bls::SIGNATURE_SIZE>;
@@ -121,18 +128,6 @@ struct VoteKey {
 
 inline constexpr size_t VOTE_KEY_BYTES{57};
 
-struct ControlRef {
-    ControlKey key;
-    uint256 digest;
-    friend bool operator==(const ControlRef&, const ControlRef&) = default;
-};
-struct SignedControlRef {
-    ControlKey key;
-    uint256 digest;
-    VoteSignature signature{};
-    friend bool operator==(const SignedControlRef&, const SignedControlRef&) = default;
-};
-
 struct ProposalRef {
     ProposalKey key;
     uint256 header_hash;
@@ -162,10 +157,6 @@ struct AppliedRef {
     friend bool operator==(const AppliedRef&, const AppliedRef&) = default;
 };
 
-constexpr uint64_t SlotOf(const ControlRef& r) { return r.key.slot; }
-constexpr uint64_t SlotOf(const SignedControlRef& r) { return r.key.slot; }
-constexpr const uint256& DigestOf(const ControlRef& r) { return r.digest; }
-constexpr const uint256& DigestOf(const SignedControlRef& r) { return r.digest; }
 constexpr uint64_t SlotOf(const ProposalRef& r) { return r.key.slot; }
 constexpr uint64_t SlotOf(const VoteRef& r) { return r.key.slot; }
 constexpr uint64_t SlotOf(const SignedVoteRef& r) { return r.key.slot; }
@@ -201,11 +192,6 @@ struct RecordRefOf<RecordType::APPLIED> {
     using type = AppliedRef;
 };
 
-template <>
-struct RecordRefOf<RecordType::CONTROL_INTENT> { using type = ControlRef; };
-template <>
-struct RecordRefOf<RecordType::SIGNED_CONTROL> { using type = SignedControlRef; };
-
 //! A record appended to a journal but not yet known to be durable.
 template <RecordType T>
 class Pending
@@ -224,7 +210,6 @@ public:
 
 private:
     friend class SignerLog;
-    friend class ControlLog;
     friend class CommitLog;
     Pending(uint64_t journal_instance, uint64_t seq, const Ref& key) : m_journal_instance{journal_instance}, m_seq{seq}, m_key{key} {}
 
@@ -233,8 +218,6 @@ private:
     Ref m_key;
 };
 
-using PendingControlIntent = Pending<RecordType::CONTROL_INTENT>;
-using PendingSignedControl = Pending<RecordType::SIGNED_CONTROL>;
 using PendingProposal = Pending<RecordType::ACCEPTED_PROPOSAL>;
 using PendingIntent = Pending<RecordType::INTENT>;
 using PendingSignedVote = Pending<RecordType::SIGNED_VOTE>;

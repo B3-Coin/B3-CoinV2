@@ -12,6 +12,8 @@
 #include <flowmesh2/admission/admission.h>
 #include <flowmesh2/admission/pool.h>
 #include <flowmesh2/agreement/agreement.h>
+#include <flowmesh2/agreement/evidence.h>
+#include <flowmesh2/agreement/pbft.h>
 #include <flowmesh2/core/authority.h>
 #include <flowmesh2/core/body.h>
 #include <flowmesh2/core/certificate.h>
@@ -27,18 +29,18 @@
 #include <flowmesh2/dev/fake_chain.h>
 #include <flowmesh2/net/in_process_api.h>
 #include <flowmesh2/net/lanes.h>
+#include <flowmesh2/net/seat_mesh.h>
 #include <flowmesh2/read/read_service.h>
 #include <flowmesh2/read/views.h>
+#include <flowmesh2/seat/seat_node.h>
 #include <flowmesh2/sim/faults.h>
 #include <flowmesh2/sim/trace.h>
 #include <flowmesh2/state/candidate.h>
-#include <flowmesh2/state/replay.h>
 #include <flowmesh2/state/state_owner.h>
 #include <flowmesh2/storage/commit_log.h>
 #include <flowmesh2/storage/memory_journal.h>
 #include <flowmesh2/storage/seat_signer.h>
 #include <flowmesh2/storage/signer_log.h>
-#include <flowmesh2/storage/snapshot_mark.h>
 #include <uint256.h>
 
 #include <cstddef>
@@ -51,114 +53,45 @@
 #include <vector>
 
 /** One simulated FlowMesh node (slice R14; ARCHITECTURE.md sections 3 and
- * 14). REGTEST and TEST values only: the synthetic network SimNetwork()
- * (a TEST magic and ModernChainDomain = SHA256("fm2/sim/domain")), label
- * block hashes, the one seat's BLS IKM SHA256("fm2/sim/seat0"). It never
- * touches a real network, datadir or key.
+ * 14): a dev wrapper over seat::SeatNode (seat/seat_node.h, the component
+ * assembly and sealing steps shared with the daemon since stage 2). REGTEST
+ * and TEST values only: the synthetic network SimNetwork() (a TEST magic and
+ * ModernChainDomain = SHA256("fm2/sim/domain")), label block hashes, the
+ * seats' BLS IKMs SHA256("fm2/sim/seat<i>"). It never touches a real
+ * network, datadir or key.
  *
- * Composition (every component real; references stay valid because each
- * lives behind a unique_ptr the node owns):
- *   FakeChainAdapter over base SimAnchor(129), seen through a
- *   TracingChainAdapter; a SIGNER and a COMMIT MemoryJournal observed by the
- *   TraceRecorder, their SignerLog and CommitLog; the SeatSigner (observed
- *   too) and its PoP-verified one-seat SeatSet; the genesis head (markets
- *   M1 = B3/rUSD and M2 = TOK/rUSD, anchor SimAnchor(129), facts from
- *   (130, 0)) and its StateOwner; a ReadService; an ActionPool; the
- *   UnlimitedDevBudget; Admission; a LaneSet (ProvisionalLaneLimits) and
- *   the InProcessApi; the DevSingleSeatCertifier (k = 1, REGTEST only).
- *
- * SealSlot() seals the next slot, in this order (the trace records each
- * step; ARCHITECTURE.md 14.4 P3):
- *  0. FENCED (SIM_FENCED) while admission is fenced: a fenced node seals
- *     nothing, so after a refusal it never polls, signs or writes again
- *     (O-89); the slot window holds only slot.begin and slot.end;
- *  1. Poll(head.facts_to, MAX_SLOT_FACTS): BUSY and NEED_DATA are returned
- *     as such (no slot); AUTHORITY_CHANGED fences admission and is returned;
- *     FACTS gives the batch;
- *  2. ActionPool::TakeForSlot(head + 1, max_actions_per_slot, the plan's
- *     withhold filter);
- *  3. state::PreviewExcludingRefused(committed head, {batch authority,
- *     anchor, range, fact bytes, taken originals}); every original it leaves
- *     out becomes terminal EXCLUDED in the pool (ActionPool::Exclude, traced
- *     as pool.exclude) and leaves the slot (M4-ADM-03);
- *  4. the plan's authority bump, if this is its slot;
- *  5. DevSingleSeatCertifier::Propose(candidate, batch authority) and
- *     TakeDecision (B-INTENT, sign, B-VOTE, B-DECISION); then the plan's
- *     bump_authority_before_apply_at bump, if this is its slot;
- *  6. StateOwner::Apply(candidate, decision, CurrentAuthority()) (check 3);
- *  7. CommitLog::AppendApplied(Apply's ApplyReceipt), Barrier, Confirm (B-APPLIED);
- *  8. SlotView::Build and ReadService::Publish;
- *  9. ActionPool::OnCommitted(DurableApplied, head, outcomes, certified body).
- * Any failure returns its error and nothing after it runs. Before Apply
- * moved the head, STORAGE_FATAL, FENCED, AUTHORITY_CHANGED,
- * EQUIVOCATION_REFUSED, INVARIANT and ORDER_VIOLATION also fence the node
- * (Admission::Fence); BUSY, NEED_DATA and a refusal of the facts or the
- * slot alone (an O-34 error no action causes) do not, and the slot is tried
- * again. An engine error that one action causes no longer reaches here:
- * step 3 excludes that action. After Apply moved the head, EVERY error of steps 7
- * to 9 fences the node, because the commit log, the read service or the
- * pool would disagree with the head on every later call (O-90). A fenced
- * node's new submissions get HALTED, reads stay live on the last
- * publication.
- * Nothing is retried: a later SealSlot answers FENCED at step 0. A
- * DECISION that check 3 refused stays durable and final for its height:
- * the node halts at the last applied slot, which is also the head a replay
- * of its commit journal gives (O-89).
- *
- * Snapshots and restart (M4-STO-03, O-71, O-89, O-95). Snapshot(store)
- * writes the committed head's state (state::EncodeSnapshot) to a
- * storage::SnapshotStore, synchronously, then appends its SNAPSHOT_MARK and
- * makes it durable (B-MARK): only then is that slot a restart point. Crash
- * gives what a crash leaves: the durable images of both journals and the
- * base chain, which outlives the node. Restart(crash, config, trace,
- * store) builds a node over those journals (MemoryJournal::Reopen; the logs
- * rebuild their indexes) and recovers, in this order:
- *  1. the base: the newest durable mark whose slot is at least R slots
- *     below the last applied slot L, where R is the larger of the pool's
- *     retention and the read service's outcome index (both kept by
- *     re-execution); its bytes must load and reproduce the certified
- *     header of that slot (state::SnapshotHead); any mark that does not is
- *     skipped (traced restart.snapshot_refused) and the next older one
- *     tried; with none, the configured genesis;
- *  2. StateOwner::Restore(base, the whole commit journal, seats): every
- *     record verified, the slots above the base re-executed once, the head
- *     of L installed. Its observer hands every re-executed slot to the read
- *     service (Publish) and to the action pool, created at the base height
- *     (OnCommitted), with the tokens of the slots' durable APPLIED records
- *     (CommitLog::AppliedAt): so the pool again holds the INCLUDED records
- *     of the last R slots and an exact resend of an included action is
- *     DUPLICATE (O-71). Any error here fails Restart: no node;
- *  3. the decided tail (DECISION durable, APPLIED not): each slot is
- *     re-executed on the head and applied under the authority read now
- *     (check 3), then steps 7 to 9 of SealSlot run for it. A refusal fences
- *     the node and leaves the head at L: Restart returns the fenced node,
- *     which seals nothing, so that height is never decided again (O-89).
- *     An error after Apply moved the head fences it too (O-90).
- * The trace records restart.base, restart.replayed and, per tail slot,
- * restart.check3. A restart's fault plan may not use fail_commit_barrier_at
- * (barriers are counted per journal object; INVALID_INPUT, SIM_RESTART_FAULT).
+ * What the wrapper adds to the seat: a FakeChainAdapter over base
+ * SimAnchor(129), seen through a TracingChainAdapter; a SIGNER and a COMMIT
+ * MemoryJournal observed by the TraceRecorder; the genesis head (markets
+ * M1 = B3/rUSD and M2 = TOK/rUSD, anchor SimAnchor(129), facts from
+ * (130, 0)); the UnlimitedDevBudget; the DevSingleSeatCertifier for k = 1
+ * (REGTEST only); the fault plan (withhold, the authority bumps, the
+ * commit-barrier mapping check) and the trace events, through
+ * seat::NodeHooks at exactly the points the seat's file comment names; and
+ * every sealed slot kept for the checks (Sealed, ReapplySealed). The sealing
+ * order, the fencing rules and the k > 1 drive are the seat's (see
+ * seat/seat_node.h; the traces are byte-identical to R14's).
  *
  * The node is driven by one simulation thread (the scheduler's); the
  * components keep their own locking rules.
  */
-namespace flowmesh2::storage {
-class SnapshotStore;
-} // namespace flowmesh2::storage
-
 namespace flowmesh2::sim {
 
-// Static details (ErrorCode in parentheses).
-inline constexpr std::string_view SIM_POLL_BUSY{"the chain adapter answered BUSY"};                         //!< (BUSY)
-inline constexpr std::string_view SIM_POLL_NEED_DATA{"the chain adapter has no data at the cursor"};        //!< (NEED_DATA)
-inline constexpr std::string_view SIM_POLL_AUTHORITY{"the chain adapter reported an authority change"};     //!< (AUTHORITY_CHANGED)
-inline constexpr std::string_view SIM_NO_DECISION{"Propose succeeded without a decision"};                  //!< (INVARIANT)
+// Static details (ErrorCode in parentheses); the sealing ones are the seat's.
+inline constexpr std::string_view SIM_POLL_BUSY{seat::SEAT_POLL_BUSY};           //!< (BUSY)
+inline constexpr std::string_view SIM_POLL_NEED_DATA{seat::SEAT_POLL_NEED_DATA}; //!< (NEED_DATA)
+inline constexpr std::string_view SIM_POLL_AUTHORITY{seat::SEAT_POLL_AUTHORITY}; //!< (AUTHORITY_CHANGED)
+inline constexpr std::string_view SIM_NO_DECISION{seat::SEAT_NO_DECISION};       //!< (INVARIANT)
 inline constexpr std::string_view SIM_FAULT_MAPPING{"commit barriers so far do not match the fault plan"};  //!< (INVARIANT)
 inline constexpr std::string_view SIM_FAULT_SLOT{"fault plan slot must be at least 1"};                     //!< (INVALID_INPUT)
+inline constexpr std::string_view SIM_CRASH_AFTER_DECISION{"the plan's crash after the decision"};             //!< (STORAGE_FATAL)
 inline constexpr std::string_view SIM_NOT_SEALED{"no sealed slot at that height"};                          //!< (INVALID_INPUT)
 inline constexpr std::string_view SIM_BAD_KEY{"a simulator key label gives no key"};                        //!< (INVALID_INPUT)
-inline constexpr std::string_view SIM_FENCED{"the node is fenced and seals nothing"};                       //!< (FENCED)
-inline constexpr std::string_view SIM_RESTART_FAULT{"a restart cannot map a commit barrier fault"};         //!< (INVALID_INPUT)
-inline constexpr std::string_view SIM_RESTART_CHAIN{"a restart needs the base chain of the crash"};         //!< (INVALID_INPUT)
+inline constexpr std::string_view SIM_FENCED{seat::SEAT_FENCED};                                            //!< (FENCED)
+inline constexpr std::string_view SIM_MULTI_SEAT{seat::SEAT_MULTI_SEAT};                                    //!< (INVALID_INPUT)
+inline constexpr std::string_view SIM_NOT_LEADER{seat::SEAT_NOT_LEADER};                                    //!< (INVALID_INPUT)
+inline constexpr std::string_view SIM_MESH_MISSING{seat::SEAT_MESH_MISSING};                                //!< (INVALID_INPUT)
+inline constexpr std::string_view SIM_SEAT_RANGE{seat::SEAT_RANGE};                                         //!< (INVALID_INPUT)
 
 //! The synthetic TEST network of the simulator: chain REGTEST, magic f2 51 4d 01, ModernChainDomain SHA256("fm2/sim/domain").
 NetworkId SimNetwork();
@@ -182,49 +115,20 @@ struct SimNodeConfig {
     size_t max_replies{64};
     uint64_t signer_journal_instance{1};
     uint64_t commit_journal_instance{2};
-    /** TEST only: max_delay_slots and outcome_index_slots of the node's
-     * profile (so its profile hash) set to this, so a test of the retained
-     * window (restart, O-71) needs tens of slots, not thousands. The sim
-     * clients' actions use max_delay 16. Nullopt keeps DevRegtestProfile's.
-     */
-    std::optional<uint16_t> action_window_slots;
+    // Multi-seat (M4-SIM-01): with seat_count > 1 the node signs as seat
+    // self_seat of the k simulator seats (IKM SHA256("fm2/sim/seat<i>")) and
+    // runs PbftAgreement over `mesh`, its end of the in-process mesh, which
+    // the cluster owns and which must outlive the node. seat_count 1 is the
+    // k = 1 dev certifier of the walking skeleton, byte for byte.
+    uint32_t seat_count{1};
+    uint32_t self_seat{0};
+    net::SeatMesh* mesh{nullptr};
+    agreement::PbftConfig pbft; //!< self_seat is taken from above
+    net::StreamHubLimits streams; //!< the stream hub's limits (tests make the queue small to force a gap)
 };
 
-//! What a crash of a node leaves (SimNode::Crash): its journals' durable bytes and the base chain.
-struct SimCrash {
-    std::vector<unsigned char> signer_image;
-    std::vector<unsigned char> commit_image;
-    std::unique_ptr<dev::FakeChainAdapter> chain;
-};
-
-//! What Restart recovered (also in the trace).
-struct RestartReport {
-    uint64_t base_height{0};    //!< the snapshot slot restored, or 0 for genesis
-    uint64_t applied_height{0}; //!< the head Restore installed (L)
-    uint64_t replayed{0};       //!< slots re-executed by Restore (above the base)
-    uint64_t tail{0};           //!< decided slots without APPLIED when recovery started
-    uint64_t skipped_marks{0};  //!< marks tried and refused before the base
-};
-
-//! One slot this node sealed: everything a later check or N13 needs.
-struct SealedSlot {
-    uint64_t height{0};
-    std::shared_ptr<const state::HeadView> head; //!< the committed head after the slot
-    state::Candidate candidate;                  //!< a copy of the applied candidate (N13 re-applies it)
-    agreement::Decision decision;                //!< the durable decision, its certificate and canonical body
-    std::vector<OutcomeV2> outcomes;             //!< emission order
-    std::shared_ptr<const read::SlotView> view;
-    admission::CommitReport pool_report;
-    std::vector<ActionId> taken;                 //!< what TakeForSlot handed to the proposal, less the excluded (M4-ADM-03)
-};
-
-//! What one successful SealSlot did.
-struct SealReport {
-    uint64_t height{0};
-    uint256 header_hash;
-    uint32_t originals{0};
-    uint32_t outcomes{0};
-};
+using SealedSlot = seat::SealedSlot;
+using SealReport = seat::SealReport;
 
 class SimNode
 {
@@ -235,27 +139,26 @@ public:
     SimNode& operator=(const SimNode&) = delete;
     ~SimNode();
 
-    /** What a crash of `node` leaves: both journals' DurableImage() and its
-     * base chain. Everything else (unflushed records, the pool, the read
-     * service, the sealed list) is lost.
-     */
-    static SimCrash Crash(std::unique_ptr<SimNode> node);
-    //! A node over `crash`, recovered as the file comment says; `snapshots` may be null (restart from genesis).
-    static Result<std::unique_ptr<SimNode>> Restart(SimCrash crash, const SimNodeConfig& config, TraceRecorder& trace,
-                                                    const storage::SnapshotStore* snapshots);
+    //! Seal the next slot (k = 1 only; INVALID_INPUT SIM_MULTI_SEAT otherwise); seat::SeatNode::SealSlot.
+    Result<SealReport> SealSlot() { return m_node->SealSlot(); }
 
-    //! Seal the next slot; see the file comment.
-    Result<SealReport> SealSlot();
-    /** Store the committed head's snapshot in `store` and make its
-     * SNAPSHOT_MARK durable (file comment). A store error is returned
-     * without a mark; a commit-log error fences as before Apply (O-90).
-     * FENCED (SIM_FENCED) on a fenced node.
+    // ---- Multi-seat (k > 1, M4-SIM-01): the cluster drives these (seat::SeatNode) ----
+
+    bool IsLeader() { return m_node->IsLeader(); }
+    Result<uint64_t> ProposeSlot() { return m_node->ProposeSlot(); }
+    Result<void> OnFrame(const net::InboundFrame& frame) { return m_node->OnFrame(frame); }
+    Result<void> Tick(uint64_t now_ms) { return m_node->Tick(now_ms); }
+    Result<std::optional<SealReport>> Complete() { return m_node->Complete(); }
+    std::optional<agreement::PbftStatus> AgreementStatus() { return m_node->AgreementStatus(); }
+    /** A crash and restart (M4-SIM-02): the journals and the chain stay; the
+     * seat rebuilds everything else (seat::SeatNode::Restart). The trace
+     * records node.restart.
      */
-    Result<storage::SnapshotMark> Snapshot(storage::SnapshotStore& store);
-    //! What the last Restart recovered; nullopt for a node from Create.
-    const std::optional<RestartReport>& Restarted() const { return m_restarted; }
+    Result<void> Restart();
+    uint32_t SeatCount() const { return m_node->SeatCount(); }
+    uint32_t SelfSeat() const { return m_node->SelfSeat(); }
     //! Answer at most `max` queued API requests (InProcessApi::Pump).
-    Result<net::PumpReport> Pump(size_t max);
+    Result<net::PumpReport> Pump(size_t max) { return m_node->Pump(max); }
     /** Apply sealed slot `height`'s candidate copy and durable decision again,
      * under the current authority (N13). INVALID_INPUT (SIM_NOT_SEALED) if
      * this node sealed no such slot; otherwise StateOwner::Apply's answer
@@ -264,78 +167,66 @@ public:
     Result<std::shared_ptr<const state::HeadView>> ReapplySealed(uint64_t height);
 
     // Components (the node owns them; references stay valid for its life).
-    const ProfileParams& Profile() const { return m_profile; }
+    const ProfileParams& Profile() const { return m_node->Profile(); }
     const NetworkId& Network() const { return m_network; }
     const uint256& Domain() const { return m_domain; }
-    const SeatSet& Seats() const { return m_seats; }
+    const SeatSet& Seats() const { return m_node->Seats(); }
     const AuthorityVersion& GenesisAuthority() const { return m_genesis_authority; }
-    const state::HeadView& Genesis() const { return m_genesis; }
+    const state::HeadView& Genesis() const { return m_node->Genesis(); }
     std::span<const MarketDescriptor> Markets() const { return m_markets; }
     const FaultPlan& Faults() const { return m_faults; }
     dev::FakeChainAdapter& Chain() { return *m_fake; }
     chain::ChainAdapter& TracedChain() { return *m_traced; }
-    state::StateOwner& Owner() { return *m_owner; }
-    read::ReadService& Read() { return *m_read; }
-    admission::ActionPool& Pool() { return *m_pool; }
-    admission::Admission& Admitter() { return *m_admission; }
-    net::InProcessApi& Api() { return *m_api; }
+    state::StateOwner& Owner() { return m_node->Owner(); }
+    read::ReadService& Read() { return m_node->Read(); }
+    admission::ActionPool& Pool() { return m_node->Pool(); }
+    admission::Admission& Admitter() { return m_node->Admitter(); }
+    net::InProcessApi& Api() { return m_node->Api(); }
     storage::MemoryJournal& SignerJournal() { return *m_signer_journal; }
     storage::MemoryJournal& CommitJournal() { return *m_commit_journal; }
+    storage::CommitLog& CommitLog() { return m_node->CommitLog(); }
+    agreement::EvidenceStore& Evidence() { return m_node->Evidence(); }
+    storage::SignerLog& SignerLog() { return m_node->SignerLog(); }
+    seat::SeatNode& Seat() { return *m_node; }
     TraceRecorder& Trace() { return m_trace; }
     const std::vector<SealedSlot>& Sealed() const { return m_sealed; }
     //! True once STORAGE_FATAL, FENCED or AUTHORITY_CHANGED fenced admission.
-    bool Fenced() const { return m_admission->Fenced(); }
+    bool Fenced() const { return m_node->Fenced(); }
 
 private:
     struct Parts;
-    explicit SimNode(Parts&& parts);
-    //! Create and Restart: `crash` null for a fresh node.
-    static Result<std::unique_ptr<SimNode>> Build(const SimNodeConfig& config, TraceRecorder& trace, SimCrash* crash,
-                                                  const storage::SnapshotStore* snapshots, std::optional<state::ReplayResult>* replayed);
-    //! Restart steps 1 and 2 over the parts (fills parts.pool); see the file comment.
-    static Result<RestartReport> Recover(Parts& parts, const read::ReadLimits& limits, const storage::SnapshotStore* snapshots,
-                                         std::optional<state::ReplayResult>& replayed);
-    //! Restart step 3 for one decided slot without APPLIED; see the file comment.
-    Result<void> CompleteDecided(const storage::DecisionRecord& decision);
+    //! The seat's hooks: the trace and the fault plan.
+    class Hooks final : public seat::NodeHooks
+    {
+    public:
+        explicit Hooks(SimNode& node) : m_node{node} {}
+        void Record(std::string_view kind, std::string detail) override;
+        void BeginSlot(uint64_t height) override;
+        void EndSlot(uint64_t height, std::string_view result) override;
+        bool Withhold(const ActionV2& action) override;
+        Result<void> AfterPreview(uint64_t height) override;
+        Result<void> AfterDecision(uint64_t height) override;
+        void OnSealed(SealedSlot&& sealed) override;
 
-    //! The steps of SealSlot after slot.begin.
-    Result<SealReport> SealNext(const std::shared_ptr<const state::HeadView>& head, uint64_t height);
-    //! Fence admission (once; the trace records node.fence with the code).
-    void Fence(const Error& error);
-    /** Before the head moves: fence after `error` if it is STORAGE_FATAL,
-     * FENCED, AUTHORITY_CHANGED, EQUIVOCATION_REFUSED, INVARIANT or
-     * ORDER_VIOLATION; returns `error` (O-90).
-     */
-    Error FenceOn(const Error& error);
-    //! After Apply moved the head: always fence; returns `error` (O-90).
-    Error FenceAfterApply(const Error& error);
+    private:
+        SimNode& m_node;
+    };
+    explicit SimNode(Parts&& parts);
 
     TraceRecorder& m_trace;
-    const ProfileParams m_profile;
     const NetworkId m_network;
     const uint256 m_domain;
     const FaultPlan m_faults;
     const std::vector<MarketDescriptor> m_markets;
     std::unique_ptr<storage::MemoryJournal> m_signer_journal;
     std::unique_ptr<storage::MemoryJournal> m_commit_journal;
-    std::unique_ptr<storage::SignerLog> m_signer_log;
-    std::unique_ptr<storage::CommitLog> m_commit_log;
-    std::unique_ptr<storage::SeatSigner> m_signer;
-    const SeatSet m_seats;
     const AuthorityVersion m_genesis_authority;
     std::unique_ptr<dev::FakeChainAdapter> m_fake;
     std::unique_ptr<TracingChainAdapter> m_traced;
-    const state::HeadView m_genesis;
-    std::unique_ptr<state::StateOwner> m_owner;
-    std::unique_ptr<read::ReadService> m_read;
-    std::unique_ptr<admission::ActionPool> m_pool;
     std::unique_ptr<dev::UnlimitedDevBudget> m_budget;
-    std::unique_ptr<admission::Admission> m_admission;
-    std::unique_ptr<net::LaneSet> m_lanes;
-    std::unique_ptr<net::InProcessApi> m_api;
-    std::unique_ptr<dev::DevSingleSeatCertifier> m_certifier;
+    Hooks m_hooks;
+    std::unique_ptr<seat::SeatNode> m_node;
     std::vector<SealedSlot> m_sealed;
-    std::optional<RestartReport> m_restarted;
 };
 
 } // namespace flowmesh2::sim

@@ -62,6 +62,12 @@ Candidate::Candidate(SlotHeaderV2 header, std::vector<OutcomeV2> outcomes, std::
 
 Result<Candidate> BuildCandidate(const engine::Engine& engine, const HeadView& parent, const SlotInputs& inputs)
 {
+    return BuildCandidateBinding(engine, parent, inputs, parent.CertHash());
+}
+
+Result<Candidate> BuildCandidateBinding(const engine::Engine& engine, const HeadView& parent, const SlotInputs& inputs,
+                                        const uint256& parent_cert_hash)
+{
     const SlotHeaderV2& head{parent.Header()};
 
     // 1. The authority the slot is certified under.
@@ -80,9 +86,8 @@ Result<Candidate> BuildCandidate(const engine::Engine& engine, const HeadView& p
     const Result<engine::ValidatedSlot> slot{engine::ValidateSlotInputs(engine_parent, engine_inputs, engine.Profile())};
     if (!slot.has_value()) return slot.error();
 
-    // 3. Execution. The candidate shares the parent's ledger trees and stored
-    // commitment levels (M2-LED-10): copy, phase 9 and the roots cost
-    // O(changed) in the ledger; the books are still copied whole.
+    // 3. Execution. The engine copies the whole parent state into the result.
+    // TODO(rebirth:M2-LED-10) copy-on-write candidate state: same roots, work O(changed leaves).
     Result<engine::SlotResult> executed{engine.ApplySlot(engine_parent, *slot)};
     if (!executed.has_value()) return executed.error();
     engine::SlotResult result{std::move(executed).value()};
@@ -110,10 +115,7 @@ Result<Candidate> BuildCandidate(const engine::Engine& engine, const HeadView& p
     header.authority_epoch = inputs.authority.epoch;
     header.height = slot->Height();
     header.parent_hash = parent.HeaderHash();
-    // Version 2 commits to the certified value, independent of which valid
-    // quorum subset supplied the proof. Legacy version 0 keeps its exact bytes.
-    header.parent_cert_hash = (head.commitment_version == COMMITMENT_VERSION_WITHDRAWALS || head.commitment_version == COMMITMENT_VERSION_VIEW_BOUND) && !parent.CertHash().IsNull()
-                                  ? parent.HeaderHash() : parent.CertHash();
+    header.parent_cert_hash = parent_cert_hash;
     header.anchor = inputs.anchor;
     header.facts_from = inputs.facts_from;
     header.facts_to = inputs.facts_to;
@@ -144,7 +146,9 @@ Result<Candidate> ReexecuteOn(const engine::Engine& engine, const HeadView& pare
     inputs.facts_from = header.facts_from;
     inputs.facts_to = header.facts_to;
     inputs.body = body;
-    Result<Candidate> candidate{BuildCandidate(engine, parent, inputs)};
+    // The proposer's parent certificate hash is kept: certificates are not unique (O-4b), the
+    // caller verified the carried certificate against the parent header (O-98).
+    Result<Candidate> candidate{BuildCandidateBinding(engine, parent, inputs, header.parent_cert_hash)};
     if (!candidate.has_value()) return candidate.error();
     if (!(candidate->Header() == header)) return Error{ErrorCode::VERIFY_FAILED, REEXECUTE_HEADER_MISMATCH};
     if (!(candidate->Body() == body)) return Error{ErrorCode::VERIFY_FAILED, REEXECUTE_BODY_MISMATCH};

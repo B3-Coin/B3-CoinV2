@@ -18,7 +18,6 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
-#include <utility>
 #include <vector>
 
 using namespace flowmesh2;
@@ -52,170 +51,56 @@ BOOST_AUTO_TEST_CASE(create_checks_role_fence_and_history)
     RequireRefusal(CommitLog::Create(*fatal), ErrorCode::FENCED, JOURNAL_FENCED, "fatal journal");
     auto used{NewMemoryJournal(JournalRole::COMMIT, 3)};
     RequireStorageOk(used->Append(RecordType::DECISION, Bytes("history")), "append");
-    RequireRefusal(CommitLog::Create(*used), ErrorCode::ORDER_VIOLATION, LOG_PENDING_RECORDS, "pending history");
-    RequireRefusal(CommitLog::Create(*used, Profile()), ErrorCode::ORDER_VIOLATION, LOG_PENDING_RECORDS, "pending replay");
-    RequireStorageOk(used->Barrier(), "make malformed history durable");
-    RequireRefusal(CommitLog::Create(*used), ErrorCode::INVALID_INPUT, LOG_REPLAY_PROFILE_REQUIRED, "history needs decoding profile");
-    RequireCode(CommitLog::Create(*used, Profile()), ErrorCode::DECODE, "malformed durable history");
+    RequireRefusal(CommitLog::Create(*used), ErrorCode::ORDER_VIOLATION, LOG_HAS_HISTORY, "journal with history: Recover");
 }
 
-BOOST_AUTO_TEST_CASE(recovery_restores_decisions_applied_order_and_original_tokens)
+BOOST_AUTO_TEST_CASE(recover_rebuilds_the_decision_index)
 {
-    OwnerFixture f{30};
-    state::Candidate candidate{f.Preview(f.Inputs(FundingFacts(f.actions), {}))};
-    const SlotHeaderV2 header{candidate.Header()};
-    const SlotCertificate cert{TestCertificate(header, 1)};
-    const SlotBody body{candidate.Body()};
-    const PendingDecision pending{f.log.AppendDecision(header, cert, body).value()};
-    RequireStorageOk(f.log.Barrier(), "durable first decision");
-    const DurableDecision decision{f.log.Confirm(pending).value()};
-    const state::AppliedSlot applied{f.owner->Apply(std::move(candidate), decision, f.authority).value()};
-    const PendingApplied applied_pending{f.log.AppendApplied(applied.receipt).value()};
-    RequireStorageOk(f.log.Barrier(), "durable first applied");
+    // M4-STO-01: the decisions and applications in the journal's history are
+    // the recovered log's index: DecisionAt answers, conflicts are refused,
+    // re-appends are idempotent and the next application follows the last.
+    OwnerFixture f{11};
+    const state::Candidate c1{f.Preview(f.Inputs(FundingFacts(f.actions), {}))};
+    const SlotCertificate cert1{TestCertificate(c1.Header())};
+    const PendingDecision p1{f.log.AppendDecision(c1.Header(), cert1, c1.Body()).value()};
+    BOOST_CHECK_EQUAL(f.log.Barrier().value(), 1U);
+    const DurableDecision d1{f.log.Confirm(p1).value()};
+    state::Candidate copy1{c1};
+    const state::AppliedSlot a1{f.owner->Apply(std::move(copy1), d1, f.authority).value()};
+    const PendingApplied pa1{f.log.AppendApplied(a1.receipt).value()};
+    BOOST_CHECK_EQUAL(f.log.Barrier().value(), 2U);
     f.Sync();
-    state::Candidate next{f.Preview(f.Inputs({}, {}))};
-    const SlotHeaderV2 next_header{next.Header()};
-    const SlotBody next_body{next.Body()};
-    const DurableDecision next_decision{f.Decide(next)};
-    const state::AppliedSlot next_applied{f.owner->Apply(std::move(next), next_decision, f.authority).value()};
-    const auto before{f.journal->DurableImage()};
-    const JournalStatus before_status{f.journal->Status()};
+    // Slot 2 decided but not applied: a crash between B-DECISION and B-APPLIED.
+    const state::Candidate c2{f.Preview(f.Inputs({}, {}))};
+    const SlotCertificate cert2{TestCertificate(c2.Header())};
+    const PendingDecision p2{f.log.AppendDecision(c2.Header(), cert2, c2.Body()).value()};
+    BOOST_CHECK_EQUAL(f.log.Barrier().value(), 3U);
 
-    Result<CommitLog> created{CommitLog::Create(*f.journal, Profile())};
-    RequireStorageOk(created, "rebuild commit indexes");
-    CommitLog restored{std::move(created).value()};
-    SlotCertificate other_cert{cert};
-    other_cert.aggregate.fill(2);
-    BOOST_CHECK(restored.AppendDecision(header, other_cert, body).value() == pending);
-    BOOST_CHECK(restored.Confirm(pending).value().Binding() == decision.Binding());
-    BOOST_CHECK(restored.AppendApplied(applied.receipt).value() == applied_pending);
-    BOOST_CHECK(restored.DecisionAt(next_header.height) == std::optional<DecisionRef>{next_decision.Binding()});
-    BOOST_CHECK(f.journal->DurableImage() == before);
-    BOOST_CHECK(f.journal->Status() == before_status);
-    SlotHeaderV2 conflicting{next_header};
-    conflicting.state_root = LabelHash("other-decided-root");
-    RequireRefusal(restored.AppendDecision(conflicting, TestCertificate(conflicting), next_body),
-                   ErrorCode::EQUIVOCATION_REFUSED, DECISION_CONFLICT, "decision without APPLIED still reserves slot");
-    const PendingApplied recovered_next{restored.AppendApplied(next_applied.receipt).value()};
-    BOOST_CHECK_EQUAL(recovered_next.Seq(), before_status.appended_seq + 1);
-    RequireStorageOk(restored.Barrier(), "finish next APPLIED");
-    RequireStorageOk(restored.Confirm(recovered_next), "confirm recovered append");
-    CommitLog restored_again{CommitLog::Create(*f.journal, Profile()).value()};
-    BOOST_CHECK(restored_again.AppendApplied(next_applied.receipt).value() == recovered_next);
-}
+    Result<CommitLog> recovered{CommitLog::Recover(*f.journal, Profile())};
+    RequireStorageOk(recovered, "Recover");
+    CommitLog& log{*recovered};
+    BOOST_CHECK(log.DecisionAt(1) == (DecisionRef{1, c1.Header().Hash(), cert1.Hash()}));
+    BOOST_CHECK(log.DecisionAt(2) == (DecisionRef{2, c2.Header().Hash(), cert2.Hash()}));
+    BOOST_CHECK(!log.DecisionAt(3).has_value());
+    BOOST_CHECK(log.AppendDecision(c1.Header(), cert1, c1.Body()).value() == p1);
+    BOOST_CHECK(log.AppendApplied(a1.receipt).value() == pa1);
+    const StorageSlot other{MakeStorageSlot(2, c2.Header().authority_epoch, "other")};
+    RequireRefusal(log.AppendDecision(other.header, other.certificate, other.body), ErrorCode::EQUIVOCATION_REFUSED, DECISION_CONFLICT,
+                   "another header for slot 2");
+    const DurableDecision d2{log.Confirm(p2).value()};
+    state::Candidate copy2{c2};
+    const state::AppliedSlot a2{f.owner->Apply(std::move(copy2), d2, f.authority).value()};
+    BOOST_CHECK_EQUAL(log.AppendApplied(a2.receipt).value().Seq(), 4U);
+    BOOST_CHECK_EQUAL(log.Barrier().value(), 4U);
+    BOOST_CHECK(f.journal->Status() == (JournalStatus{4, 4, false}));
 
-BOOST_AUTO_TEST_CASE(recovery_refuses_corrupt_decisions_and_application_history)
-{
-    const StorageSlot slot{MakeStorageSlot(1, 0, "recovery-corrupt")};
-    const auto decision{DecisionRecord{slot.header, slot.certificate, slot.body}.Encode()};
-    const AppliedRecord applied{1, slot.header.Hash(), slot.header.state_root};
-    uint64_t instance{40};
-    const auto refuses = [&](const std::vector<std::pair<RecordType, std::vector<unsigned char>>>& records,
-                             ErrorCode code, std::string_view detail) {
-        auto journal{NewMemoryJournal(JournalRole::COMMIT, instance++)};
-        for (const auto& [type, payload] : records) RequireStorageOk(journal->Append(type, payload), "raw corruption fixture");
-        RequireStorageOk(journal->Barrier(), "durable corruption fixture");
-        const auto before{journal->DurableImage()};
-        RequireRefusal(CommitLog::Create(*journal, Profile()), code, detail, "corrupt commit history");
-        BOOST_CHECK(journal->DurableImage() == before);
-    };
-    refuses({{RecordType::APPLIED, applied.Encode()}}, ErrorCode::VERIFY_FAILED, APPLIED_DECISION_UNKNOWN);
-    refuses({{RecordType::APPLIED, applied.Encode()}, {RecordType::DECISION, decision}},
-            ErrorCode::VERIFY_FAILED, APPLIED_DECISION_UNKNOWN);
-    AppliedRecord bad_root{applied};
-    bad_root.state_root = LabelHash("wrong-state-root");
-    refuses({{RecordType::DECISION, decision}, {RecordType::APPLIED, bad_root.Encode()}},
-            ErrorCode::VERIFY_FAILED, APPLIED_ROOT_MISMATCH);
-    AppliedRecord bad_hash{applied};
-    bad_hash.header_hash = LabelHash("wrong-header");
-    refuses({{RecordType::DECISION, decision}, {RecordType::APPLIED, bad_hash.Encode()}},
-            ErrorCode::VERIFY_FAILED, APPLIED_DECISION_UNKNOWN);
-    SlotCertificate bad_cert{slot.certificate};
-    bad_cert.header_hash = LabelHash("wrong-certified-header");
-    refuses({{RecordType::DECISION, DecisionRecord{slot.header, bad_cert, slot.body}.Encode()}},
-            ErrorCode::VERIFY_FAILED, DECISION_CERT_HEADER);
-    SlotBody bad_body{slot.body};
-    bad_body.originals.push_back(Bytes("extra"));
-    refuses({{RecordType::DECISION, DecisionRecord{slot.header, slot.certificate, bad_body}.Encode()}},
-            ErrorCode::VERIFY_FAILED, BODY_HEADER_MISMATCH);
-    const StorageSlot conflict{MakeStorageSlot(1, 0, "conflicting-decision")};
-    refuses({{RecordType::DECISION, decision},
-             {RecordType::DECISION, DecisionRecord{conflict.header, conflict.certificate, conflict.body}.Encode()}},
-            ErrorCode::EQUIVOCATION_REFUSED, DECISION_CONFLICT);
-    const StorageSlot second{MakeStorageSlot(2, 0, "second-slot")};
-    refuses({{RecordType::DECISION, DecisionRecord{second.header, second.certificate, second.body}.Encode()},
-             {RecordType::APPLIED, AppliedRecord{2, second.header.Hash(), second.header.state_root}.Encode()}},
-            ErrorCode::ORDER_VIOLATION, APPLIED_OUT_OF_ORDER);
-    const StorageSlot zero{MakeStorageSlot(0, 0, "zero-slot")};
-    refuses({{RecordType::DECISION, DecisionRecord{zero.header, zero.certificate, zero.body}.Encode()},
-             {RecordType::APPLIED, AppliedRecord{0, zero.header.Hash(), zero.header.state_root}.Encode()}},
-            ErrorCode::ORDER_VIOLATION, APPLIED_OUT_OF_ORDER);
-}
-
-BOOST_AUTO_TEST_CASE(recovery_keeps_first_certificate_and_refuses_unsupported_records)
-{
-    CommitFixture f{60};
-    const StorageSlot slot{MakeStorageSlot(1, 0, "duplicate-recovery")};
-    const PendingDecision first{f.log.AppendDecision(slot.header, slot.certificate, slot.body).value()};
-    RequireStorageOk(f.log.Barrier(), "durable first decision");
-    SlotCertificate other_cert{slot.certificate};
-    other_cert.aggregate.fill(3);
-    RequireStorageOk(f.journal->Append(RecordType::DECISION,
-        DecisionRecord{slot.header, other_cert, slot.body}.Encode()), "duplicate decision with other certificate");
-    const auto applied{AppliedRecord{1, slot.header.Hash(), slot.header.state_root}.Encode()};
-    RequireStorageOk(f.journal->Append(RecordType::APPLIED, applied), "first applied");
-    RequireStorageOk(f.journal->Append(RecordType::APPLIED, applied), "duplicate applied");
-    RequireStorageOk(f.journal->Barrier(), "durable duplicate history");
-    CommitLog restored{CommitLog::Create(*f.journal, Profile()).value()};
-    BOOST_CHECK(restored.AppendDecision(slot.header, other_cert, slot.body).value() == first);
-    BOOST_CHECK(restored.DecisionAt(1) == std::optional<DecisionRef>{first.Key()});
-    BOOST_CHECK_EQUAL(f.journal->Status().appended_seq, 4U);
-    for (const RecordType type : {RecordType::SNAPSHOT_MARK, RecordType::PREPARED_QC}) {
-        auto journal{NewMemoryJournal(JournalRole::COMMIT, 61 + static_cast<uint8_t>(type))};
-        RequireStorageOk(journal->Append(type, {}), "unsupported record");
-        RequireStorageOk(journal->Barrier(), "unsupported record durable");
-        RequireCode(CommitLog::Create(*journal, Profile()), ErrorCode::DECODE, "malformed record");
-    }
-}
-
-BOOST_AUTO_TEST_CASE(snapshot_marks_name_applied_slots_and_survive_recovery)
-{
-    OwnerFixture f{71};
-    const SkeletonRun run{RunWalkingSkeleton(f)};
-    const auto mark_of{[&](uint64_t slot) {
-        const SlotHeaderV2& header{run.heads[slot - 1]->Header()};
-        return SnapshotMark{slot, header.Hash(), header.state_root};
-    }};
-    const uint64_t before{f.journal->Status().appended_seq};
-    const Result<uint64_t> seq{f.log.AppendSnapshotMark(mark_of(3))};
-    RequireOk(seq, "AppendSnapshotMark");
-    BOOST_CHECK_EQUAL(*seq, before + 1);
-    // The same mark again is idempotent and writes nothing.
-    BOOST_CHECK(f.log.AppendSnapshotMark(mark_of(3)).value() == *seq);
-    BOOST_CHECK_EQUAL(f.journal->Status().appended_seq, before + 1);
-    // Only an applied slot with its own header and root; a refusal writes nothing.
-    SnapshotMark other_root{mark_of(4)};
-    other_root.state_root = LabelHash("fm2/test/other-root");
-    RequireRefusal(f.log.AppendSnapshotMark(other_root), ErrorCode::VERIFY_FAILED, SNAPSHOT_MARK_UNAPPLIED, "another root");
-    SnapshotMark undecided{mark_of(5)};
-    undecided.slot = 6;
-    RequireRefusal(f.log.AppendSnapshotMark(undecided), ErrorCode::VERIFY_FAILED, SNAPSHOT_MARK_UNAPPLIED, "an undecided slot");
-    SnapshotMark moved{mark_of(3)};
-    moved.header_hash = mark_of(2).header_hash;
-    RequireRefusal(f.log.AppendSnapshotMark(moved), ErrorCode::VERIFY_FAILED, SNAPSHOT_MARK_UNAPPLIED, "another mark for a marked slot");
-    BOOST_CHECK_EQUAL(f.journal->Status().appended_seq, before + 1);
-    RequireOk(f.log.AppendSnapshotMark(mark_of(5)), "mark slot 5");
-    RequireStorageOk(f.log.Barrier(), "durable marks");
-    BOOST_CHECK((f.log.SnapshotMarks() == std::vector<SnapshotMark>{mark_of(3), mark_of(5)}));
-    // Recovery rebuilds the marks, and keeps refusing what the live log refused.
-    CommitLog restored{CommitLog::Create(*f.journal, Profile()).value()};
-    BOOST_CHECK((restored.SnapshotMarks() == std::vector<SnapshotMark>{mark_of(3), mark_of(5)}));
-    BOOST_CHECK(restored.AppendSnapshotMark(mark_of(3)).value() == *seq);
-    // A journal holding a mark of a slot it never applied does not recover.
-    auto journal{NewMemoryJournal(JournalRole::COMMIT, 72)};
-    RequireStorageOk(journal->Append(RecordType::SNAPSHOT_MARK, mark_of(1).Encode()), "a mark without its slot");
-    RequireStorageOk(journal->Barrier(), "durable mark");
-    RequireRefusal(CommitLog::Create(*journal, Profile()), ErrorCode::VERIFY_FAILED, SNAPSHOT_MARK_UNAPPLIED, "mark of an unknown slot");
+    // A history that contradicts the rules is refused.
+    auto planted{NewMemoryJournal(JournalRole::COMMIT, 12)};
+    RequireStorageOk(planted->Append(RecordType::APPLIED, AppliedRecord{1, uint256::ONE, uint256::ONE}.Encode()), "applied without its decision");
+    RequireStorageOk(planted->Barrier(), "barrier");
+    RequireRefusal(CommitLog::Recover(*planted, Profile()), ErrorCode::VERIFY_FAILED, RECOVER_INCONSISTENT, "applied without its decision");
+    auto signer{NewMemoryJournal(JournalRole::SIGNER, 13)};
+    RequireRefusal(CommitLog::Recover(*signer, Profile()), ErrorCode::ORDER_VIOLATION, LOG_ROLE, "signer journal");
 }
 
 BOOST_AUTO_TEST_CASE(decision_then_applied)
@@ -361,8 +246,51 @@ BOOST_AUTO_TEST_CASE(decision_rules)
     BOOST_CHECK(f.log.DecisionAt(3) == std::optional<DecisionRef>{first.Key()});
     BOOST_CHECK(!f.log.DecisionAt(2).has_value());
     BOOST_CHECK(!f.log.DecisionAt(4).has_value());
-    RequireStub(f.log.AppendPreparedQc(PreparedQcRecord{0, 3, 0, slot.header.Hash(), Bytes("qc"), {}, {}}), "M4-STO-07");
     BOOST_CHECK_EQUAL(f.journal->Status().appended_seq, 1U);
+}
+
+BOOST_AUTO_TEST_CASE(prepared_qc_keeps_the_highest_view)
+{
+    // M4-STO-07. Every PreparedQC is a durable fact; the index keeps the
+    // highest view per slot and never downgrades; two headers prepared in one
+    // view are a conflict (PROTOCOL.md: "conflicting equal-view complete proofs halt").
+    CommitFixture f{14};
+    const StorageSlot slot{MakeStorageSlot(3, 0, "pqc")};
+    const StorageSlot other{MakeStorageSlot(3, 0, "pqc-other")};
+    const std::vector<unsigned char> qc{slot.certificate.Encode()};
+    const std::vector<unsigned char> other_qc{other.certificate.Encode()};
+    BOOST_CHECK(!f.log.HighestPrepared(3).has_value());
+    BOOST_CHECK_EQUAL(f.log.AppendPreparedQc(PreparedQcRecord{0, 3, 1, slot.header.Hash(), qc}).value(), 1U);
+    BOOST_CHECK_EQUAL(f.log.AppendPreparedQc(PreparedQcRecord{0, 3, 1, slot.header.Hash(), qc}).value(), 1U); // idempotent
+    RequireRefusal(f.log.AppendPreparedQc(PreparedQcRecord{0, 3, 1, other.header.Hash(), other_qc}), ErrorCode::EQUIVOCATION_REFUSED,
+                   PREPARED_CONFLICT, "two headers prepared in one view");
+    RequireRefusal(f.log.AppendPreparedQc(PreparedQcRecord{0, 3, 2, slot.header.Hash(), other_qc}), ErrorCode::VERIFY_FAILED,
+                   PREPARED_CERT_HEADER, "certificate names another header");
+    RequireCode(f.log.AppendPreparedQc(PreparedQcRecord{0, 4, 0, slot.header.Hash(), Bytes("qc")}), ErrorCode::DECODE, "qc bytes are not a certificate");
+    // A lower view's proof is recorded but the highest stays; a higher one replaces it.
+    BOOST_CHECK_EQUAL(f.log.AppendPreparedQc(PreparedQcRecord{0, 3, 0, other.header.Hash(), other_qc}).value(), 2U);
+    const PreparedQcRecord first_view{0, 3, 1, slot.header.Hash(), qc};
+    BOOST_CHECK(f.log.HighestPrepared(3) == std::optional<PreparedQcRecord>{first_view});
+    BOOST_CHECK_EQUAL(f.log.AppendPreparedQc(PreparedQcRecord{0, 3, 2, other.header.Hash(), other_qc}).value(), 3U);
+    BOOST_CHECK_EQUAL(f.log.HighestPrepared(3)->view, 2U);
+    BOOST_CHECK(!f.log.HighestPrepared(4).has_value());
+    BOOST_CHECK_EQUAL(f.log.Barrier().value(), 3U);
+
+    const PreparedQcRecord r{0, 3, 2, other.header.Hash(), other_qc};
+    BOOST_CHECK(PreparedQcRecord::Decode(r.Encode()).value() == r);
+    std::vector<unsigned char> truncated{r.Encode()};
+    truncated.pop_back();
+    BOOST_CHECK(PreparedQcRecord::Decode(truncated).error().code == ErrorCode::DECODE);
+    const std::vector<JournalRecord> records{f.journal->ReadAll().value()};
+    BOOST_REQUIRE_EQUAL(records.size(), 3U);
+    BOOST_CHECK(records[2].type == RecordType::PREPARED_QC && PreparedQcRecord::Decode(records[2].payload).value() == r);
+    // Recover rebuilds the index (M4-STO-01); decisions are untouched by prepared proofs.
+    Result<CommitLog> recovered{CommitLog::Recover(*f.journal, Profile())};
+    RequireStorageOk(recovered, "Recover");
+    BOOST_CHECK(recovered->HighestPrepared(3) == f.log.HighestPrepared(3));
+    BOOST_CHECK(!recovered->DecisionAt(3).has_value());
+    RequireRefusal(recovered->AppendPreparedQc(PreparedQcRecord{0, 3, 2, slot.header.Hash(), qc}), ErrorCode::EQUIVOCATION_REFUSED,
+                   PREPARED_CONFLICT, "conflict after recovery");
 }
 
 BOOST_AUTO_TEST_CASE(decision_token_binds_the_kept_certificate)
@@ -437,6 +365,35 @@ BOOST_AUTO_TEST_CASE(record_codecs_golden_and_exact)
     RequireCode(DecisionRecord::Decode(huge, Profile()), ErrorCode::OVERSIZE, "above the maximum");
     // The largest decision of the regtest profile fits in one record.
     BOOST_CHECK(DecisionRecord::MaxEncodedSize(Profile()) <= MAX_RECORD_PAYLOAD_BYTES);
+}
+
+BOOST_AUTO_TEST_CASE(every_decision_record_is_served_from_memory_also_after_a_recovery)
+{
+    // Review of 2026-11-16, confirmed defect 2: the catch-up replies of O-101 come from the log's memory, which
+    // used to hold only the last sixteen decisions. Every DECISION this log appended or recovered is served.
+    CommitFixture f{21};
+    constexpr uint64_t SLOTS{40};
+    for (uint64_t height{1}; height <= SLOTS; ++height) {
+        const StorageSlot slot{MakeStorageSlot(height, 0, "slot-" + std::to_string(height))};
+        RequireStorageOk(f.log.AppendDecision(slot.header, slot.certificate, slot.body), "AppendDecision");
+    }
+    RequireStorageOk(f.log.Barrier(), "barrier");
+    BOOST_CHECK(!f.log.DecisionRecordAt(0).has_value());
+    BOOST_CHECK(!f.log.DecisionRecordAt(SLOTS + 1).has_value());
+    for (const uint64_t height : {uint64_t{1}, uint64_t{17}, SLOTS}) {
+        const std::optional<std::vector<unsigned char>> record{f.log.DecisionRecordAt(height)};
+        BOOST_REQUIRE_MESSAGE(record.has_value(), "slot " << height);
+        const DecisionRecord decoded{DecisionRecord::Decode(*record, Profile()).value()};
+        BOOST_CHECK_EQUAL(decoded.header.height, height);
+        BOOST_CHECK(decoded.header.Hash() == f.log.DecisionAt(height)->header_hash);
+    }
+    // A recovered log serves the same bytes for every slot.
+    Result<CommitLog> recovered{CommitLog::Recover(*f.journal, Profile())};
+    RequireStorageOk(recovered, "Recover");
+    for (uint64_t height{1}; height <= SLOTS; ++height) {
+        BOOST_CHECK_MESSAGE(recovered->DecisionRecordAt(height) == f.log.DecisionRecordAt(height), "slot " << height);
+    }
+    BOOST_CHECK(!recovered->DecisionRecordAt(SLOTS + 1).has_value());
 }
 
 BOOST_AUTO_TEST_SUITE_END()

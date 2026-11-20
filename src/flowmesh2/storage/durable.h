@@ -64,8 +64,6 @@ enum class DurableKind : uint8_t {
     SIGNED_VOTE = 2,
     DECISION = 3,
     APPLIED = 4,
-    CONTROL_INTENT = 10,
-    SIGNED_CONTROL = 11,
 };
 
 constexpr storage::RecordType RecordTypeOf(DurableKind kind) { return static_cast<storage::RecordType>(kind); }
@@ -74,8 +72,7 @@ constexpr DurableKind DurableKindOf(storage::RecordType type) { return static_ca
 constexpr bool HasDurableKind(storage::RecordType type)
 {
     return type == storage::RecordType::INTENT || type == storage::RecordType::SIGNED_VOTE ||
-           type == storage::RecordType::DECISION || type == storage::RecordType::APPLIED ||
-           type == storage::RecordType::CONTROL_INTENT || type == storage::RecordType::SIGNED_CONTROL;
+           type == storage::RecordType::DECISION || type == storage::RecordType::APPLIED;
 }
 static_assert(RecordTypeOf(DurableKind::INTENT) == storage::RecordType::INTENT);
 static_assert(RecordTypeOf(DurableKind::SIGNED_VOTE) == storage::RecordType::SIGNED_VOTE);
@@ -109,7 +106,7 @@ public:
     const uint256& Digest() const { return storage::DigestOf(m_ref); }
     //! The view of a vote.
     uint64_t View() const
-        requires(K == DurableKind::INTENT || K == DurableKind::SIGNED_VOTE || K == DurableKind::CONTROL_INTENT || K == DurableKind::SIGNED_CONTROL)
+        requires(K == DurableKind::INTENT || K == DurableKind::SIGNED_VOTE)
     {
         return m_ref.key.view;
     }
@@ -123,8 +120,6 @@ private:
     Ref m_ref;
 };
 
-using DurableControlIntent = Durable<DurableKind::CONTROL_INTENT>;
-using DurableSignedControl = Durable<DurableKind::SIGNED_CONTROL>;
 using DurableIntent = Durable<DurableKind::INTENT>;
 using DurableSignedVote = Durable<DurableKind::SIGNED_VOTE>;
 using DurableDecision = Durable<DurableKind::DECISION>;

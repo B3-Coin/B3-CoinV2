@@ -51,9 +51,8 @@
  *  A2  domain is not this instance's (the head's domain)           WRONG_DOMAIN
  *      kind unknown (the frame is judged with a known kind byte
  *      first, so A1 and the domain still come first)               UNKNOWN_KIND
- *      kind not executable yet: CANCEL_ALL (M3-ENG-09), WITHDRAW
- *      (M2-LED-05), SPOT_TO_FUTURES and FUTURES_TO_SPOT
- *      (M2-LED-06); the reason is the task ID                      UNSUPPORTED_KIND
+ *      kind not executable yet: WITHDRAW (M2-LED-05), SPOT_TO_FUTURES
+ *      and FUTURES_TO_SPOT (M2-LED-06); the reason is the task ID  UNSUPPORTED_KIND
  *      the payload of a supported kind does not decode exactly as
  *      the validity predicate decodes it (PayloadAdmissible)        MALFORMED
  *  A3  the same ActionId AND signature as an original this node
@@ -146,18 +145,18 @@ struct Refusal {
     friend bool operator==(const Refusal&, const Refusal&) = default;
 };
 
-/** A2 kind rule: Ok for PLACE, CANCEL and TRANSFER (exactly KindSupported);
- * Unsupported with the task ID for CANCEL_ALL (M3-ENG-09), WITHDRAW
- * (M2-LED-05), SPOT_TO_FUTURES and FUTURES_TO_SPOT (M2-LED-06);
- * INVALID_INPUT for an unregistered kind.
+/** A2 kind rule: Ok for PLACE, CANCEL, CANCEL_ALL and TRANSFER (exactly
+ * KindSupported); Unsupported with the task ID for WITHDRAW (M2-LED-05),
+ * SPOT_TO_FUTURES and FUTURES_TO_SPOT (M2-LED-06); INVALID_INPUT for an
+ * unregistered kind.
  */
 Result<void> KindAdmissible(ActionKind kind);
 Result<void> KindAdmissible(ActionKind kind, const ProfileParams& profile);
 
 /** A2 payload rule, the validity predicate's (engine ValidateSlotInputs step
- * 8): a supported kind's payload decodes exactly (ActionV2::Place, Cancel
- * or Transfer) and engine::PhaseOf accepts the action. False for every
- * other kind.
+ * 8): a supported kind's payload decodes exactly (ActionV2::Place, Cancel,
+ * CancelAll or Transfer) and engine::PhaseOf accepts the action. False for
+ * every other kind.
  */
 bool PayloadAdmissible(const ActionV2& action);
 bool PayloadAdmissible(const ActionV2& action, const ProfileParams& profile);

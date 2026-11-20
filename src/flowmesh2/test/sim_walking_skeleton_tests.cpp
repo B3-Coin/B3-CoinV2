@@ -252,7 +252,7 @@ BOOST_AUTO_TEST_CASE(a_client_refuses_doctored_replies)
 
 BOOST_AUTO_TEST_CASE(manifests_cover_every_check)
 {
-    BOOST_CHECK_EQUAL(AllChecks().size(), 21U);
+    BOOST_CHECK_EQUAL(AllChecks().size(), 27U);
     std::multiset<std::string_view> covered;
     for (const Variant variant : AllVariants()) {
         for (const std::string_view id : ManifestOf(variant)) covered.insert(id);
@@ -260,7 +260,7 @@ BOOST_AUTO_TEST_CASE(manifests_cover_every_check)
     }
     for (const std::string_view id : SuiteChecks()) covered.insert(id);
     const std::set<std::string_view> all{AllChecks().begin(), AllChecks().end()};
-    BOOST_CHECK_EQUAL(all.size(), 21U);
+    BOOST_CHECK_EQUAL(all.size(), 27U);
     // Every check is covered; the variant-specific ones exactly once, the shared ones by each variant.
     for (const std::string_view id : all) BOOST_CHECK_MESSAGE(covered.contains(id), std::string{id} + " is in no manifest");
     for (const std::string_view id : covered) BOOST_CHECK_MESSAGE(all.contains(id), std::string{id} + " is not a check");
@@ -369,8 +369,8 @@ BOOST_AUTO_TEST_CASE(suite_json_is_deterministic_sorted_and_complete)
     const SuiteReport a{RunSuite(AllVariants(), 1, 2)};
     const SuiteReport b{RunSuite(AllVariants(), 1, 2)};
     BOOST_CHECK(a.ok);
-    BOOST_CHECK_EQUAL(a.runs.size(), 6U);
-    BOOST_CHECK_EQUAL(a.manifest.size(), 21U);
+    BOOST_CHECK_EQUAL(a.runs.size(), 8U);
+    BOOST_CHECK_EQUAL(a.manifest.size(), 27U);
     for (const auto& [id, verdict] : a.manifest) BOOST_CHECK_MESSAGE(verdict == "pass", id + " is " + verdict);
     const std::string json{SuiteJson(a)};
     BOOST_CHECK_EQUAL(json, SuiteJson(b));
@@ -401,16 +401,18 @@ BOOST_AUTO_TEST_CASE(cluster_and_node_refusals)
 {
     TraceRecorder trace;
     RequireError(SimCluster::Create(0, SimNodeConfig{}, trace), ErrorCode::INVALID_INPUT, "an empty cluster");
-    RequireStub(SimCluster::Create(4, SimNodeConfig{}, trace), "M4-SIM-01");
     RequireStub(SimCluster::CreateTwins(4, 1, SimNodeConfig{}, trace), "M4-SIM-03");
-    BOOST_CHECK_EQUAL(trace.Size(), 0U); // the stubs build nothing
+    BOOST_CHECK_EQUAL(trace.Size(), 0U); // the stub builds nothing
     Result<std::unique_ptr<SimCluster>> one{SimCluster::Create(1, SimNodeConfig{}, trace)};
     RequireOk(one, "a one-node cluster");
     BOOST_CHECK_EQUAL((*one)->Size(), 1U);
+    Result<std::unique_ptr<SimCluster>> four{SimCluster::Create(4, SimNodeConfig{}, trace)};
+    RequireOk(four, "a four-node cluster (M4-SIM-01)");
+    BOOST_CHECK_EQUAL((*four)->Size(), 4U);
 
     SimNodeConfig crash;
     crash.faults.crash_before_slot = 2;
-    RequireStub(SimNode::Create(crash, trace), "M4-SIM-02");
+    RequireOk(SimNode::Create(crash, trace), "a crash plan is a cluster fault (M4-SIM-02); a lone node ignores it");
     SimNodeConfig zero;
     zero.faults.fail_commit_barrier_at = 0;
     RequireError(SimNode::Create(zero, trace), ErrorCode::INVALID_INPUT, "fault at slot 0");

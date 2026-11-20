@@ -11,14 +11,9 @@
 #include <flowmesh2/test/util/storage_fixtures.h>
 #include <util/strencodings.h>
 
-#include <algorithm>
-#include <chrono>
 #include <cstdint>
-#include <map>
 #include <memory>
-#include <optional>
 #include <string>
-#include <utility>
 #include <vector>
 
 using namespace flowmesh2;
@@ -81,131 +76,59 @@ BOOST_AUTO_TEST_CASE(create_checks_role_fence_and_history)
     RequireRefusal(SignerLog::Create(*fatal), ErrorCode::FENCED, JOURNAL_FENCED, "fatal journal");
     auto used{NewMemoryJournal(JournalRole::SIGNER, 3)};
     RequireStorageOk(used->Append(RecordType::INTENT, Bytes("history")), "append");
-    RequireRefusal(SignerLog::Create(*used), ErrorCode::ORDER_VIOLATION, LOG_PENDING_RECORDS, "pending history");
-    RequireRefusal(SignerLog::Create(*used, Profile()), ErrorCode::ORDER_VIOLATION, LOG_PENDING_RECORDS, "pending replay");
-    RequireStorageOk(used->Barrier(), "make malformed history durable");
-    RequireRefusal(SignerLog::Create(*used), ErrorCode::INVALID_INPUT, LOG_REPLAY_PROFILE_REQUIRED, "history needs decoding profile");
-    RequireCode(SignerLog::Create(*used, Profile()), ErrorCode::DECODE, "malformed durable history");
+    RequireRefusal(SignerLog::Create(*used), ErrorCode::ORDER_VIOLATION, LOG_HAS_HISTORY, "journal with history: Recover");
 }
 
-BOOST_AUTO_TEST_CASE(recovery_preserves_signed_and_unsigned_obligations)
+BOOST_AUTO_TEST_CASE(recover_rebuilds_the_equivocation_index)
 {
-    SignerFixture f{30};
-    const StorageSlot slot{MakeStorageSlot(4, 2, "recovered")};
+    // M4-STO-01: a log over a journal with history refuses exactly what the
+    // original log refused and hands out the original pending records.
+    SignerFixture f{13};
+    const StorageSlot slot{MakeStorageSlot(6, 2, "recover")};
+    const StorageSlot other{MakeStorageSlot(6, 2, "recover-other")};
     const PendingProposal proposal{f.Accept(slot, 0)};
     const PendingIntent pending{f.Intend(slot, 0, proposal)};
     const DurableIntent intent{f.DurableIntentFor(pending)};
-    const VoteSignature sig{FakeSignature(0x41)};
+    const VoteSignature sig{FakeSignature(0x6b)};
     const PendingSignedVote signed_pending{f.log.AppendSignedVote(intent, sig).value()};
-    RequireStorageOk(f.log.Barrier(), "make signature durable");
-    const VoteKey prepare{slot.header.domain, 2, 4, 0, VotePhase::PREPARE};
-    const uint256 prepare_digest{LabelHash("fm2/test/storage/unsigned-prepare")};
-    const PendingIntent unsigned_pending{f.log.AppendIntent(prepare, prepare_digest, proposal).value()};
-    RequireStorageOk(f.log.Barrier(), "make unsigned obligation durable");
-    const auto before{f.journal->DurableImage()};
-    const JournalStatus before_status{f.journal->Status()};
+    BOOST_CHECK_EQUAL(f.log.Barrier().value(), 3U);
+    // A second view: proposal and intent, no signature yet.
+    const PendingProposal second{f.Accept(slot, 1)};
+    const PendingIntent second_intent{f.Intend(slot, 1, second)};
+    BOOST_CHECK_EQUAL(f.log.Barrier().value(), 5U);
 
-    Result<SignerLog> created{SignerLog::Create(*f.journal, Profile())};
-    RequireStorageOk(created, "rebuild signer indexes");
-    SignerLog restored{std::move(created).value()};
-    BOOST_CHECK(restored.AppendAcceptedProposal(ProposalKey{2, 4, 0}, slot.header, slot.body).value() == proposal);
-    BOOST_CHECK(restored.AppendIntent(CommitVoteKey(slot.header, 0), slot.header.CommitDigest(), proposal).value() == pending);
-    BOOST_CHECK(restored.Knows(intent));
-    BOOST_CHECK(restored.AppendSignedVote(intent, sig).value() == signed_pending);
-    BOOST_CHECK(restored.Confirm(signed_pending).value().Binding() == (SignedVoteRef{CommitVoteKey(slot.header, 0), slot.header.CommitDigest(), sig}));
-    BOOST_CHECK(restored.AppendIntent(prepare, prepare_digest, proposal).value() == unsigned_pending);
-    RequireRefusal(restored.AppendIntent(prepare, LabelHash("other"), proposal), ErrorCode::EQUIVOCATION_REFUSED,
-                   VOTE_EQUIVOCATION, "unsigned reservation survives");
-    RequireRefusal(restored.AppendSignedVote(intent, FakeSignature(0x42)), ErrorCode::EQUIVOCATION_REFUSED,
-                   SIGNED_VOTE_CONFLICT, "exact signature survives");
-    const StorageSlot conflict{MakeStorageSlot(4, 2, "recovered-conflict")};
-    RequireRefusal(restored.AppendAcceptedProposal(ProposalKey{2, 4, 0}, conflict.header, conflict.body),
-                   ErrorCode::EQUIVOCATION_REFUSED, PROPOSAL_CONFLICT, "accepted proposal survives");
-    BOOST_CHECK(f.journal->DurableImage() == before);
-    BOOST_CHECK(f.journal->Status() == before_status);
-}
+    Result<SignerLog> recovered{SignerLog::Recover(*f.journal, Profile())};
+    RequireStorageOk(recovered, "Recover");
+    SignerLog& log{*recovered};
+    // Idempotent re-appends return the original records (same sequence numbers); nothing new is written.
+    BOOST_CHECK(log.AppendAcceptedProposal(ProposalKey{2, 6, 0}, slot.header, slot.body).value() == proposal);
+    BOOST_CHECK(log.AppendIntent(CommitVoteKey(slot.header, 0), slot.header.CommitDigest(), proposal).value() == pending);
+    BOOST_CHECK(log.Knows(intent));
+    BOOST_CHECK(log.AppendSignedVote(intent, sig).value() == signed_pending);
+    BOOST_CHECK(log.AppendIntent(CommitVoteKey(slot.header, 1), slot.header.CommitDigest(), second).value() == second_intent);
+    BOOST_CHECK(f.journal->Status() == (JournalStatus{5, 5, false}));
+    // The equivocation rules hold against the history.
+    RequireRefusal(log.AppendAcceptedProposal(ProposalKey{2, 6, 0}, other.header, other.body), ErrorCode::EQUIVOCATION_REFUSED,
+                   PROPOSAL_CONFLICT, "another header for the key");
+    RequireRefusal(log.AppendSignedVote(intent, FakeSignature(0x6c)), ErrorCode::EQUIVOCATION_REFUSED, SIGNED_VOTE_CONFLICT, "another signature");
+    // The second intent can still be signed: its vote is new.
+    const DurableIntent second_durable{f.journal->Confirm(second_intent).value()};
+    BOOST_CHECK(log.Knows(second_durable));
+    BOOST_CHECK_EQUAL(log.AppendSignedVote(second_durable, FakeSignature(0x6d)).value().Seq(), 6U);
 
-BOOST_AUTO_TEST_CASE(recovery_refuses_corrupt_bindings_and_conflicts)
-{
-    const StorageSlot slot{MakeStorageSlot(1, 0, "recovery-corrupt")};
-    const ProposalKey proposal_key{0, 1, 0};
-    const VoteKey vote_key{CommitVoteKey(slot.header, 0)};
-    const auto accepted{AcceptedProposalRecord{proposal_key, slot.header, slot.body}.Encode()};
-    const auto intent{IntentRecord{vote_key, slot.header.CommitDigest(), 1}.Encode()};
-    uint64_t instance{40};
-    const auto refuses = [&](const std::vector<std::pair<RecordType, std::vector<unsigned char>>>& records,
-                             ErrorCode code, std::string_view detail) {
-        auto journal{NewMemoryJournal(JournalRole::SIGNER, instance++)};
-        for (const auto& [type, payload] : records) RequireStorageOk(journal->Append(type, payload), "raw corruption fixture");
-        RequireStorageOk(journal->Barrier(), "durable corruption fixture");
-        const auto before{journal->DurableImage()};
-        RequireRefusal(SignerLog::Create(*journal, Profile()), code, detail, "corrupt signer history");
-        BOOST_CHECK(journal->DurableImage() == before);
-    };
-    refuses({{RecordType::INTENT, intent}}, ErrorCode::INVALID_INPUT, INTENT_PROPOSAL_MISMATCH);
-    refuses({{RecordType::ACCEPTED_PROPOSAL, accepted},
-             {RecordType::INTENT, IntentRecord{vote_key, slot.header.CommitDigest(), 2}.Encode()}},
-            ErrorCode::INVALID_INPUT, INTENT_PROPOSAL_MISMATCH);
-    VoteKey wrong_domain{vote_key};
-    wrong_domain.domain = LabelHash("other-domain");
-    refuses({{RecordType::ACCEPTED_PROPOSAL, accepted},
-             {RecordType::INTENT, IntentRecord{wrong_domain, slot.header.CommitDigest(), 1}.Encode()}},
-            ErrorCode::INVALID_INPUT, INTENT_PROPOSAL_MISMATCH);
-    refuses({{RecordType::ACCEPTED_PROPOSAL, accepted},
-             {RecordType::INTENT, IntentRecord{vote_key, LabelHash("wrong-commit"), 1}.Encode()}},
-            ErrorCode::INVALID_INPUT, INTENT_DIGEST_MISMATCH);
-    refuses({{RecordType::ACCEPTED_PROPOSAL, accepted}, {RecordType::INTENT, intent},
-             {RecordType::SIGNED_VOTE, SignedVoteRecord{vote_key, slot.header.CommitDigest(), FakeSignature(1), 1}.Encode()}},
-            ErrorCode::VERIFY_FAILED, INTENT_UNKNOWN);
-    refuses({{RecordType::SIGNED_VOTE, SignedVoteRecord{vote_key, slot.header.CommitDigest(), FakeSignature(1), 2}.Encode()}},
-            ErrorCode::VERIFY_FAILED, INTENT_UNKNOWN);
-    const auto signed_vote{SignedVoteRecord{vote_key, slot.header.CommitDigest(), FakeSignature(1), 2}.Encode()};
-    refuses({{RecordType::ACCEPTED_PROPOSAL, accepted}, {RecordType::INTENT, intent}, {RecordType::SIGNED_VOTE, signed_vote},
-             {RecordType::SIGNED_VOTE, SignedVoteRecord{vote_key, slot.header.CommitDigest(), FakeSignature(2), 2}.Encode()}},
-            ErrorCode::EQUIVOCATION_REFUSED, SIGNED_VOTE_CONFLICT);
-    const StorageSlot conflict{MakeStorageSlot(1, 0, "conflicting-proposal")};
-    refuses({{RecordType::ACCEPTED_PROPOSAL, accepted},
-             {RecordType::ACCEPTED_PROPOSAL, AcceptedProposalRecord{proposal_key, conflict.header, conflict.body}.Encode()}},
-            ErrorCode::EQUIVOCATION_REFUSED, PROPOSAL_CONFLICT);
-    VoteKey prepare{vote_key};
-    prepare.phase = VotePhase::PREPARE;
-    refuses({{RecordType::ACCEPTED_PROPOSAL, accepted},
-             {RecordType::INTENT, IntentRecord{prepare, LabelHash("a"), 1}.Encode()},
-             {RecordType::INTENT, IntentRecord{prepare, LabelHash("b"), 1}.Encode()}},
-            ErrorCode::EQUIVOCATION_REFUSED, VOTE_EQUIVOCATION);
-    SlotBody wrong_body{slot.body};
-    wrong_body.originals.push_back(Bytes("extra"));
-    refuses({{RecordType::ACCEPTED_PROPOSAL, AcceptedProposalRecord{proposal_key, slot.header, wrong_body}.Encode()}},
-            ErrorCode::VERIFY_FAILED, BODY_HEADER_MISMATCH);
-}
-
-BOOST_AUTO_TEST_CASE(recovery_keeps_first_references_and_refuses_unsupported_records)
-{
-    SignerFixture f{60};
-    const StorageSlot slot{MakeStorageSlot(1, 0, "duplicate-recovery")};
-    const PendingProposal proposal{f.Accept(slot, 0)};
-    const PendingIntent pending{f.Intend(slot, 0, proposal)};
-    const DurableIntent intent{f.DurableIntentFor(pending)};
-    const VoteSignature signature{FakeSignature(7)};
-    const PendingSignedVote vote{f.log.AppendSignedVote(intent, signature).value()};
-    RequireStorageOk(f.log.Barrier(), "durable original vote");
-    RequireStorageOk(f.journal->Append(RecordType::ACCEPTED_PROPOSAL,
-        AcceptedProposalRecord{ProposalKey{0, 1, 0}, slot.header, slot.body}.Encode()), "duplicate proposal");
-    RequireStorageOk(f.journal->Append(RecordType::INTENT,
-        IntentRecord{CommitVoteKey(slot.header, 0), slot.header.CommitDigest(), proposal.Seq()}.Encode()), "duplicate intent");
-    RequireStorageOk(f.journal->Append(RecordType::SIGNED_VOTE,
-        SignedVoteRecord{CommitVoteKey(slot.header, 0), slot.header.CommitDigest(), signature, pending.Seq()}.Encode()), "duplicate vote");
-    RequireStorageOk(f.journal->Barrier(), "durable duplicate records");
-    SignerLog restored{SignerLog::Create(*f.journal, Profile()).value()};
-    BOOST_CHECK(restored.AppendAcceptedProposal(ProposalKey{0, 1, 0}, slot.header, slot.body).value() == proposal);
-    BOOST_CHECK(restored.AppendIntent(CommitVoteKey(slot.header, 0), slot.header.CommitDigest(), proposal).value() == pending);
-    BOOST_CHECK(restored.AppendSignedVote(intent, signature).value() == vote);
-    for (const RecordType type : {RecordType::VIEW_STATE, RecordType::NEW_VIEW_ACCEPTED}) {
-        auto journal{NewMemoryJournal(JournalRole::SIGNER, 61 + static_cast<uint8_t>(type))};
-        RequireStorageOk(journal->Append(type, {}), "unsupported record");
-        RequireStorageOk(journal->Barrier(), "unsupported record durable");
-        RequireStub(SignerLog::Create(*journal, Profile()), "M4-STO-07");
-    }
+    // Recover refuses a history that contradicts the rules, the wrong role and a fatal journal.
+    auto planted{NewMemoryJournal(JournalRole::SIGNER, 14)};
+    RequireStorageOk(planted->Append(RecordType::INTENT, IntentRecord{CommitVoteKey(slot.header, 0), slot.header.CommitDigest(), 1}.Encode()),
+                     "intent without its proposal");
+    // Only durable records are history: before the barrier Recover sees an empty journal.
+    RequireStorageOk(SignerLog::Recover(*planted, Profile()), "planted record not yet durable");
+    RequireStorageOk(planted->Barrier(), "barrier");
+    RequireRefusal(SignerLog::Recover(*planted, Profile()), ErrorCode::VERIFY_FAILED, RECOVER_INCONSISTENT, "intent without its proposal");
+    auto commit{NewMemoryJournal(JournalRole::COMMIT, 15)};
+    RequireRefusal(SignerLog::Recover(*commit, Profile()), ErrorCode::ORDER_VIOLATION, LOG_ROLE, "commit journal");
+    auto fatal{NewMemoryJournal(JournalRole::SIGNER, 16, MemoryJournalFaults{.fail_barrier = 1})};
+    RequireCode(fatal->Barrier(), ErrorCode::STORAGE_FATAL, "make the journal fatal");
+    RequireRefusal(SignerLog::Recover(*fatal, Profile()), ErrorCode::FENCED, JOURNAL_FENCED, "fatal journal");
 }
 
 BOOST_AUTO_TEST_CASE(strict_order_writes_the_expected_records)
@@ -397,7 +320,7 @@ BOOST_AUTO_TEST_CASE(record_codecs_golden_and_exact)
     bytes.resize(INTENT_RECORD_BYTES - 1);
     RequireCode(IntentRecord::Decode(bytes), ErrorCode::DECODE, "intent - 1 byte");
     bytes = intent.Encode();
-    bytes[VOTE_KEY_BYTES - 1] = 3; // phase byte
+    bytes[VOTE_KEY_BYTES - 1] = 9; // phase byte (3 to 5 are the statement phases since M4-AGR-02)
     RequireCode(IntentRecord::Decode(bytes), ErrorCode::DECODE, "unknown phase");
     std::vector<unsigned char> vote_bytes{vote.Encode()};
     vote_bytes.pop_back();
@@ -423,154 +346,58 @@ BOOST_AUTO_TEST_CASE(stubs_return_their_task_ids)
     const StorageSlot slot{MakeStorageSlot(1, 0, "stub")};
     const PendingProposal proposal{f.Accept(slot, 0)};
     RequireStub(f.log.AppendSignedFolded(CommitVoteKey(slot.header, 0), slot.header.CommitDigest(), proposal, FakeSignature(3)), "M4-STO-05");
-    RequireStub(f.log.AppendViewState(ViewStateRecord{0, 1}), "M4-STO-07");
-    RequireStub(f.log.AppendNewViewAccepted(NewViewAcceptedRecord{0, 1, Bytes("nv")}), "M4-STO-07");
-    // The stubs wrote nothing.
+    // The stub wrote nothing.
     BOOST_CHECK_EQUAL(f.journal->Status().appended_seq, 1U);
 }
 
-BOOST_AUTO_TEST_SUITE_END()
-
-namespace {
-
-/** The answers AcceptedAt gave before it was indexed, from one scan of the
- * durable journal: the first ACCEPTED_PROPOSAL record of each key.
- */
-std::map<ProposalKey, AcceptedProposalRecord> ScanAccepted(const Journal& journal, const ProfileParams& profile)
+BOOST_AUTO_TEST_CASE(view_state_and_new_view_are_durable_and_monotonic)
 {
-    std::map<ProposalKey, AcceptedProposalRecord> first;
-    const auto records{journal.ReadAll()};
-    RequireStorageOk(records, "scan the durable journal");
-    for (const auto& record : *records) {
-        if (record.type != RecordType::ACCEPTED_PROPOSAL) continue;
-        auto proposal{AcceptedProposalRecord::Decode(record.payload, profile)};
-        RequireStorageOk(proposal, "decode a durable proposal");
-        first.emplace(proposal->key, std::move(*proposal));
-    }
-    return first;
-}
+    // M4-STO-07. VIEW_STATE moves (slot, view) forward only; the same state
+    // again is idempotent. NEW_VIEW_ACCEPTED is exact per (epoch, slot, view).
+    SignerFixture f{17};
+    BOOST_CHECK(!f.log.ViewState().has_value());
+    BOOST_CHECK_EQUAL(f.log.AppendViewState(ViewStateRecord{0, 3, 1}).value(), 1U);
+    BOOST_CHECK_EQUAL(f.log.AppendViewState(ViewStateRecord{0, 3, 1}).value(), 1U); // idempotent: nothing new
+    BOOST_CHECK_EQUAL(f.log.AppendViewState(ViewStateRecord{0, 3, 2}).value(), 2U);
+    RequireRefusal(f.log.AppendViewState(ViewStateRecord{0, 3, 1}), ErrorCode::ORDER_VIOLATION, VIEW_STATE_BACKWARDS, "lower view");
+    RequireRefusal(f.log.AppendViewState(ViewStateRecord{0, 2, 5}), ErrorCode::ORDER_VIOLATION, VIEW_STATE_BACKWARDS, "lower slot");
+    RequireRefusal(f.log.AppendViewState(ViewStateRecord{1, 3, 2}), ErrorCode::ORDER_VIOLATION, VIEW_STATE_BACKWARDS, "same (slot, view), another epoch");
+    const ViewStateRecord vs{1, 4, 0};
+    BOOST_CHECK_EQUAL(f.log.AppendViewState(vs).value(), 3U); // the next slot starts at view 0
+    BOOST_CHECK(f.log.ViewState() == std::optional<ViewStateRecord>{vs});
+    BOOST_CHECK_EQUAL(f.log.AppendNewViewAccepted(NewViewAcceptedRecord{1, 4, 1, Bytes("nv")}).value(), 4U);
+    BOOST_CHECK_EQUAL(f.log.AppendNewViewAccepted(NewViewAcceptedRecord{1, 4, 1, Bytes("nv")}).value(), 4U);
+    RequireRefusal(f.log.AppendNewViewAccepted(NewViewAcceptedRecord{1, 4, 1, Bytes("other")}), ErrorCode::EQUIVOCATION_REFUSED,
+                   NEW_VIEW_CONFLICT, "another bundle for one view");
+    RequireCode(f.log.AppendNewViewAccepted(NewViewAcceptedRecord{1, 4, 2, {}}), ErrorCode::INVALID_INPUT, "an empty new-view message");
+    BOOST_CHECK(f.log.NewViewAccepted(1, 4, 1) == std::optional<std::vector<unsigned char>>{Bytes("nv")});
+    BOOST_CHECK(!f.log.NewViewAccepted(1, 4, 2).has_value());
+    BOOST_CHECK_EQUAL(f.log.Barrier().value(), 4U);
 
-//! "" when the log answers `key` as the scan does, byte for byte.
-std::string SameAnswer(const SignerLog& log, const std::map<ProposalKey, AcceptedProposalRecord>& scan, const ProposalKey& key,
-                       const ProfileParams& profile)
-{
-    const auto got{log.AcceptedAt(key, profile)};
-    if (!got.has_value()) return "lookup failed: " + std::string{got.error().detail};
-    const auto want{scan.find(key)};
-    if (got->has_value() != (want != scan.end())) return got->has_value() ? "an answer the scan does not have" : "a missing answer";
-    if (got->has_value() && (*got)->Encode() != want->second.Encode()) return "other bytes";
-    return "";
-}
+    // Codecs are exact.
+    BOOST_CHECK_EQUAL(vs.Encode().size(), VIEW_STATE_RECORD_BYTES);
+    BOOST_CHECK(ViewStateRecord::Decode(vs.Encode()).value() == vs);
+    std::vector<unsigned char> truncated{vs.Encode()};
+    truncated.pop_back();
+    BOOST_CHECK(ViewStateRecord::Decode(truncated).error().code == ErrorCode::DECODE);
+    const NewViewAcceptedRecord nv{1, 4, 1, Bytes("nv")};
+    BOOST_CHECK(NewViewAcceptedRecord::Decode(nv.Encode()).value() == nv);
+    std::vector<unsigned char> longer{nv.Encode()};
+    longer.push_back(0);
+    BOOST_CHECK(NewViewAcceptedRecord::Decode(longer).error().code == ErrorCode::DECODE);
+    const std::vector<JournalRecord> records{f.journal->ReadAll().value()};
+    BOOST_REQUIRE_EQUAL(records.size(), 4U);
+    BOOST_CHECK(records[0].type == RecordType::VIEW_STATE && records[3].type == RecordType::NEW_VIEW_ACCEPTED);
+    BOOST_CHECK(ViewStateRecord::Decode(records[2].payload).value() == vs);
 
-using AcceptedClock = std::chrono::steady_clock;
-
-//! Fastest of `reps` mean AcceptedAt times, in microseconds, of the newest of `slots` durable proposals.
-double TimeAcceptedAt(uint64_t slots, int reps)
-{
-    SignerFixture f{70};
-    for (uint64_t height{1}; height <= slots; ++height) f.Accept(MakeStorageSlot(height, 0, "cost/" + std::to_string(height)), 0);
-    RequireStorageOk(f.log.Barrier(), "make the proposals durable");
-    const ProposalKey newest{0, slots, 0};
-    const ProfileParams profile{Profile()};
-    BOOST_REQUIRE(f.log.AcceptedAt(newest, profile).value().has_value());
-    double best{1e300};
-    for (int rep{0}; rep < reps; ++rep) {
-        constexpr int CALLS{50};
-        const auto start{AcceptedClock::now()};
-        for (int call{0}; call < CALLS; ++call) {
-            const auto found{f.log.AcceptedAt(newest, profile)};
-            if (!found.has_value() || !found->has_value()) BOOST_FAIL("AcceptedAt lost the newest proposal");
-        }
-        const std::chrono::duration<double, std::micro> took{AcceptedClock::now() - start};
-        best = std::min(best, took.count() / CALLS);
-    }
-    return best;
-}
-
-} // namespace
-
-BOOST_AUTO_TEST_SUITE(signer_log_accepted_tests)
-
-BOOST_AUTO_TEST_CASE(accepted_at_costs_the_same_with_two_thousand_slots_as_with_a_hundred)
-{
-    // Every agreement step of the regtest PBFT looks up the proposal it
-    // accepted (agreement/regtest_pbft, dev/regtest_operator); a scan of the
-    // journal made each step slower with every slot signed (latency report).
-    const double small{TimeAcceptedAt(100, 5)};
-    const double large{TimeAcceptedAt(2'000, 5)};
-    BOOST_TEST_MESSAGE("AcceptedAt of the newest proposal: " << small << " us at 100 slots, " << large << " us at 2000 slots, ratio "
-                                                             << large / small);
-    BOOST_CHECK_LT(large / small, 5.0);
-}
-
-BOOST_AUTO_TEST_CASE(accepted_at_answers_like_a_scan_of_the_durable_journal)
-{
-    // 400 slots, a few in two or three views; barriers now and then, so that
-    // some records are durable and some only appended; a repeated accept;
-    // and keys that were never accepted. Every answer must be the scan's,
-    // byte for byte, before and after a rebuild from the journal.
-    // Thinned to a checkpoint every 50 slots to keep the sanitizer time low.
-    SignerFixture f{71};
-    const ProfileParams profile{Profile()};
-    std::vector<ProposalKey> keys;
-    uint64_t state{0x4acc};
-    const auto next{[&state] {
-        state = state * 6'364'136'223'846'793'005ULL + 1'442'695'040'888'963'407ULL;
-        return state >> 33;
-    }};
-    size_t durable_answers{0}, pending_answers{0};
-    for (uint64_t height{1}; height <= 400; ++height) {
-        const uint64_t views{next() % 8 == 0 ? 1 + next() % 3 : 1};
-        for (uint64_t view{0}; view < views; ++view) {
-            const StorageSlot slot{MakeStorageSlot(height, 0, "scan/" + std::to_string(height) + "/" + std::to_string(view))};
-            const PendingProposal first{f.Accept(slot, view)};
-            if (next() % 16 == 0) BOOST_REQUIRE(f.Accept(slot, view) == first); // the repeat keeps the first record
-            keys.push_back(ProposalKey{0, height, view});
-        }
-        if (next() % 5 == 0) RequireStorageOk(f.log.Barrier(), "barrier");
-        if (height % 50 == 0) {
-            const auto scan{ScanAccepted(*f.journal, profile)};
-            for (const ProposalKey& key : keys) {
-                const std::string difference{SameAnswer(f.log, scan, key, profile)};
-                if (!difference.empty()) BOOST_FAIL("height " << height << " key " << key.slot << "/" << key.view << ": " << difference);
-                if (scan.contains(key)) {
-                    ++durable_answers;
-                } else {
-                    ++pending_answers;
-                }
-            }
-        }
-    }
-    const std::vector<ProposalKey> absent{{0, 401, 0}, {0, 1, 7}, {1, 1, 0}, {0, 0, 0}};
-    for (const ProposalKey& key : absent) BOOST_CHECK(!f.log.AcceptedAt(key, profile).value().has_value());
-    BOOST_TEST_MESSAGE("answers compared: " << durable_answers << " durable, " << pending_answers << " not yet durable");
-    BOOST_CHECK_GT(durable_answers, 1'000U);
-    BOOST_CHECK_GT(pending_answers, 10U);
-
-    // A log rebuilt from the journal answers the same.
-    RequireStorageOk(f.log.Barrier(), "last barrier");
-    Result<SignerLog> created{SignerLog::Create(*f.journal, profile)};
-    RequireStorageOk(created, "rebuild");
-    const SignerLog restored{std::move(created).value()};
-    const auto scan{ScanAccepted(*f.journal, profile)};
-    BOOST_CHECK_EQUAL(scan.size(), keys.size());
-    for (const ProposalKey& key : keys) {
-        BOOST_REQUIRE_EQUAL(SameAnswer(f.log, scan, key, profile), "");
-        BOOST_REQUIRE_EQUAL(SameAnswer(restored, scan, key, profile), "");
-    }
-}
-
-BOOST_AUTO_TEST_CASE(accepted_at_after_a_fatal_barrier_is_fenced)
-{
-    SignerFixture f{72, MemoryJournalFaults{.fail_barrier = 2}};
-    const StorageSlot slot{MakeStorageSlot(1, 0, "fenced")};
-    f.Accept(slot, 0);
-    RequireStorageOk(f.log.Barrier(), "first barrier");
-    const ProfileParams profile{Profile()};
-    BOOST_REQUIRE(f.log.AcceptedAt(ProposalKey{0, 1, 0}, profile).value().has_value());
-    f.Accept(MakeStorageSlot(2, 0, "fenced/2"), 0);
-    RequireRefusal(f.log.Barrier(), ErrorCode::STORAGE_FATAL, MEMORY_JOURNAL_BARRIER_FAULT, "second barrier");
-    RequireRefusal(f.log.AcceptedAt(ProposalKey{0, 1, 0}, profile), ErrorCode::FENCED, JOURNAL_FENCED, "lookup after fatal");
+    // Recover rebuilds the view state and the accepted new views (M4-STO-01).
+    Result<SignerLog> recovered{SignerLog::Recover(*f.journal, Profile())};
+    RequireStorageOk(recovered, "Recover");
+    BOOST_CHECK(recovered->ViewState() == std::optional<ViewStateRecord>{vs});
+    BOOST_CHECK(recovered->NewViewAccepted(1, 4, 1) == std::optional<std::vector<unsigned char>>{Bytes("nv")});
+    RequireRefusal(recovered->AppendNewViewAccepted(NewViewAcceptedRecord{1, 4, 1, Bytes("other")}), ErrorCode::EQUIVOCATION_REFUSED,
+                   NEW_VIEW_CONFLICT, "conflict after recovery");
+    RequireRefusal(recovered->AppendViewState(ViewStateRecord{1, 3, 9}), ErrorCode::ORDER_VIOLATION, VIEW_STATE_BACKWARDS, "backwards after recovery");
 }
 
 BOOST_AUTO_TEST_SUITE_END()

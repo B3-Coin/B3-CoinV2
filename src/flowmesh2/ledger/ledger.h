@@ -14,15 +14,11 @@
 #include <flowmesh2/core/params.h>
 #include <flowmesh2/core/result.h>
 #include <flowmesh2/core/state_root.h>
-#include <flowmesh2/ledger/merkle_levels.h>
 #include <flowmesh2/ledger/nonce_window.h>
-#include <flowmesh2/ledger/persistent_tree.h>
 
 #include <cstdint>
 #include <map>
-#include <memory>
 #include <set>
-#include <span>
 #include <string_view>
 #include <utility>
 
@@ -37,16 +33,8 @@
  * Ownership, locks, determinism. LedgerState is a plain value type with no
  * lock: the single writer (state/StateOwner, R9) copies it into a candidate,
  * mutates the copy and publishes it immutably. Every container is ordered
- * and keyed by ids that compare as bytes; there is no clock, I/O, randomness
- * or floating point.
- *
- * Copies (M2-LED-10). The accounts and the nullifier set are persistent
- * trees (ledger/persistent_tree.h): a copy shares them, and a change clones
- * only its path, so the engine's candidate copy costs O(totals + withdrawals),
- * not O(accounts + nullifiers). Seal stores the commitment v0 levels of both
- * (ledger/merkle_levels.h), and the roots of a later copy start from them
- * and the changes since. ForEachChangedAccount and CheckConservationSince let
- * phase 9 check a slot in O(changed) instead of O(accounts).
+ * (std::map/std::set keyed by ids that compare as bytes); there is no clock,
+ * I/O, randomness or floating point.
  *
  * Amounts. Every amount argument must be in [0, MAX_ATOMS]; anything else is
  * INVALID_INPUT. Arithmetic is checked (core/amount.h); a result above
@@ -83,9 +71,6 @@
  */
 namespace flowmesh2::ledger {
 
-//! (INVALID_INPUT) FromLeaves: leaves out of order, repeated or not canonical.
-inline constexpr std::string_view LEDGER_LEAVES_ORDER{"ledger leaves out of order or not canonical"};
-
 //! One account's spot balance of one asset.
 struct Balance {
     Atoms available{0};
@@ -108,10 +93,7 @@ struct AccountState {
     friend bool operator==(const AccountState&, const AccountState&) = default;
 };
 
-//! Every account, ascending AccountId; copies share structure.
-using AccountMap = PersistentMap<AccountId, AccountState>;
-//! Every credited deposit outpoint, ascending; copies share structure.
-using NullifierSet = PersistentSet<Outpoint>;
+using AccountMap = std::map<AccountId, AccountState>;
 using TotalsMap = std::map<AssetId, AssetTotals>;
 using WithdrawalMap = std::map<ActionId, WithdrawalRecord>;
 //! Regtest live-obligation bound. Paid records/nullifiers are never pruned.
@@ -149,21 +131,6 @@ public:
      */
     static Result<LedgerState> Create(const ProfileParams& profile);
 
-    /** The ledger whose commitment leaves these are (M4-STO-03 snapshots,
-     * state/snapshot.h): every account's canonical leaf, ascending
-     * AccountId; the nullifier set, ascending; every asset's totals,
-     * ascending AssetId, none all-zero; every withdrawal record, ascending
-     * ActionId. Create(profile)'s errors first. INVALID_INPUT
-     * (LEDGER_LEAVES_ORDER) for leaves out of order or repeated, a leaf that
-     * is not canonical, or a nonce list the profile's window does not hold.
-     * Then CheckConservation (INVARIANT), so a ledger no operation sequence
-     * could reach is refused, as far as the conservation rules can tell.
-     */
-    static Result<LedgerState> FromLeaves(const ProfileParams& profile, std::span<const AccountLeafV0> accounts,
-                                          std::span<const Outpoint> nullifiers,
-                                          std::span<const std::pair<AssetId, AssetTotals>> totals,
-                                          std::span<const WithdrawalRecord> withdrawals);
-
     // ---- Reads --------------------------------------------------------------
 
     const ProfileParams& Profile() const { return m_profile; }
@@ -179,7 +146,7 @@ public:
     Balance BalanceOf(const AccountId& account, const AssetId& asset) const;
 
     //! Every credited deposit outpoint (the nullifier set), ascending.
-    const NullifierSet& Nullifiers() const { return m_nullifiers; }
+    const std::set<Outpoint>& Nullifiers() const { return m_nullifiers; }
     bool Credited(const Outpoint& outpoint) const { return m_nullifiers.contains(outpoint); }
 
     //! Totals of every asset the ledger has seen, ascending; never all-zero.
@@ -195,54 +162,6 @@ public:
 
     //! CheckConservation over this ledger (see the free function).
     Result<void> CheckConservation() const;
-
-    /** CheckConservation of a ledger derived from `parent`, which must pass
-     * CheckConservation itself (induction: the engine runs this in phase 9,
-     * and every restored head and snapshot runs the full check). The account
-     * rules are checked on each changed account only, and each asset's
-     * equation from the parent's totals and the changed accounts' balances:
-     * O(changed + assets + withdrawals) instead of O(accounts). INVARIANT
-     * where CheckConservation would fail, and for a parent under another
-     * profile, a parent whose totals are not conserved or a removed account.
-     */
-    Result<void> CheckConservationSince(const LedgerState& parent) const;
-
-    /** visit(account, before, after) for every account whose state differs
-     * from its state in `before`, ascending AccountId; `before` is nullptr
-     * for an account `before` lacks (the ledger removes none, so `after` is
-     * never nullptr for a ledger derived from `before`). Subtrees the two
-     * ledgers share are skipped (AccountMap::Diff).
-     */
-    template <class Visit>
-    void ForEachChangedAccount(const LedgerState& before, Visit&& visit) const
-    {
-        AccountMap::Diff(before.m_accounts, m_accounts, [&visit](const AccountMap::value_type* was, const AccountMap::value_type* now) {
-            visit(now != nullptr ? now->first : was->first, was != nullptr ? &was->second : nullptr,
-                  now != nullptr ? &now->second : nullptr);
-            return true;
-        });
-    }
-
-    // ---- Commitment v0 components (ledger/state_commitment.h) -----------------
-
-    /** MerkleRoot of AccountLeafV0::LeafValue() of every account, ascending
-     * AccountId: the accounts component. From the levels the last Seal stored
-     * and the accounts changed since, or from every leaf when none are
-     * stored. INVARIANT for an account that is not canonical.
-     */
-    Result<uint256> AccountsRootV0() const;
-    //! MerkleRoot of NullifierLeafValue of every nullifier, ascending: the nullifiers component.
-    uint256 NullifiersRootV0() const;
-    //! The accounts component's inclusion proof of `account`; INVALID_INPUT if it has no account.
-    Result<MerkleProof> ProveAccountLeafV0(const AccountId& account) const;
-
-    /** Store the levels of both components for the current state, so the
-     * roots of this ledger and of its later copies start from them. Changes
-     * no value: operator== and every read answer the same afterwards.
-     * FromLeaves seals, and the engine seals every slot's state before it
-     * commits it. Errors as AccountsRootV0, with nothing stored.
-     */
-    Result<void> Seal();
 
     // ---- Facts --------------------------------------------------------------
 
@@ -328,38 +247,22 @@ public:
     Result<void> TransferToFutures(const AccountId& account, const AssetId& asset, Atoms amount);
     Result<void> TransferFromFutures(const AccountId& account, const AssetId& asset, Atoms amount);
 
-    //! Every value member; never the stored levels, which Seal adds without changing the state.
-    friend bool operator==(const LedgerState& a, const LedgerState& b)
-    {
-        return a.m_profile == b.m_profile && a.m_seat_pool == b.m_seat_pool && a.m_treasury == b.m_treasury &&
-               a.m_empty_window == b.m_empty_window && a.m_accounts == b.m_accounts && a.m_nullifiers == b.m_nullifiers &&
-               a.m_totals == b.m_totals && a.m_withdrawals == b.m_withdrawals;
-    }
+    friend bool operator==(const LedgerState&, const LedgerState&) = default;
 
 private:
-    //! The commitment v0 levels of `accounts` and `nullifiers` (Seal).
-    struct CommitmentLevels;
-
     LedgerState(ProfileParams profile, AccountId seat_pool, AccountId treasury, NonceWindow empty_window);
 
     AccountState* FindMutable(const AccountId& account);
     void PutTotals(const AssetId& asset, const AssetTotals& totals);
-    Result<AccountLeafV0> LeafOf(const AccountId& account, const AccountState& state) const;
-    //! The withdrawal half of CheckConservation (obligations against totals).
-    Result<void> CheckWithdrawalObligations() const;
-    Result<MerkleLevels> AccountLevels() const;
-    MerkleLevels NullifierLevels() const;
 
     ProfileParams m_profile;
     AccountId m_seat_pool;
     AccountId m_treasury;
     NonceWindow m_empty_window; //!< the window every new account starts with
-    // A new value member joins operator== above.
     AccountMap m_accounts;
-    NullifierSet m_nullifiers;
+    std::set<Outpoint> m_nullifiers;
     TotalsMap m_totals;
     WithdrawalMap m_withdrawals;
-    std::shared_ptr<const CommitmentLevels> m_levels; //!< from Seal; shared by copies, never written
 };
 
 } // namespace flowmesh2::ledger

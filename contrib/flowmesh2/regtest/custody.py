@@ -5,8 +5,6 @@ Only Python's standard library and the pinned local Foundry tools are used.
 RPC is restricted to literal loopback addresses, unforked Anvil and chain31337.
 The fixture mnemonic is public test data. Never supply an actual wallet/key.
 """
-# TODO(rebirth:M8-CUS-01) 3-of-4 EVM custody fixture; it contradicts the planned
-# keyless VaultV2 (D2, SEC-1) and waits for the owner's custody ruling.
 
 import argparse
 import ipaddress
@@ -24,9 +22,6 @@ import urllib.parse
 import urllib.request
 import uuid
 
-from keepalive import KeepAliveOpener
-import tool_paths
-
 CHAIN_ID = 31337
 Q_ASSET = "0x6439dd037ac1af8e258b4177319230f77f127c3fcf5ec6436aba005bb25bd7ed"
 SYNTHETIC_ASSETS = {"Q": Q_ASSET,
@@ -34,6 +29,8 @@ SYNTHETIC_ASSETS = {"Q": Q_ASSET,
                     "TOKENB": "0xfc416025aa6b00dd141d6dd9911cbfa7f0978707da4bfc3f0a4c7ca0c1c19283"}
 TEST_MNEMONIC = "test test test test test test test test test test test junk"
 MAX_ATOMS = 1 << 62
+TOOLS_DEFAULT = "/home/josh/B3-tools/foundry-v1.8.5"
+SOLC_DEFAULT = "/home/josh/B3-tools/solc-0.8.35"
 WITHDRAWAL_ABI = "(bytes32,bytes32,bytes32,uint256,address,uint64,bytes32,uint64)"
 
 
@@ -43,6 +40,11 @@ class CustodyError(RuntimeError):
 
 class RpcError(CustodyError):
     pass
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, request, file_pointer, code, message, headers, new_url):
+        raise RpcError("RPC HTTP redirects are forbidden")
 
 
 def expect(condition, message):
@@ -153,8 +155,7 @@ class LocalRpc:
         self.counter = 0
         self.counter_lock = threading.Lock()
         # Environment proxies must never forward local custody data elsewhere.
-        # One loopback URL, no proxy, no redirects, one kept-alive connection per thread.
-        self.opener = KeepAliveOpener(self.url)
+        self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
 
     @staticmethod
     def _unique_fields(pairs):
@@ -897,7 +898,8 @@ def main():
     stand = commands.add_parser("standalone-test")
     stand.add_argument("--source-root", required=True)
     stand.add_argument("--evidence-dir", required=True)
-    tool_paths.add(stand, "tools", "solc")
+    stand.add_argument("--tools", default=TOOLS_DEFAULT)
+    stand.add_argument("--solc", default=SOLC_DEFAULT)
     units = commands.add_parser("q-units")
     units.add_argument("amount")
     receipt = commands.add_parser("receipt")
@@ -910,7 +912,6 @@ def main():
     args = parser.parse_args()
     try:
         if args.command == "standalone-test":
-            tool_paths.resolve(stand, args, "tools", "solc")
             fixture(args)
         elif args.command == "q-units":
             print(q_units(args.amount))

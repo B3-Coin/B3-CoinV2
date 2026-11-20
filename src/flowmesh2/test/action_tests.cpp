@@ -143,13 +143,13 @@ BOOST_AUTO_TEST_CASE(kind_registries_pinned)
     BOOST_CHECK(!IsKnown(static_cast<TimeInForce>(4)));
 }
 
-BOOST_AUTO_TEST_CASE(kind_supported_only_place_cancel_transfer)
+BOOST_AUTO_TEST_CASE(kind_supported_registry)
 {
     std::set<int> supported;
     for (int v{0}; v <= 255; ++v) {
         if (KindSupported(static_cast<ActionKind>(v))) supported.insert(v);
     }
-    BOOST_CHECK(supported == (std::set<int>{1, 2, 5}));
+    BOOST_CHECK(supported == (std::set<int>{1, 2, 3, 5})); // PLACE, CANCEL, CANCEL_ALL, TRANSFER
 }
 
 BOOST_AUTO_TEST_CASE(bip340_sign_verify_round_trip)
@@ -360,6 +360,7 @@ BOOST_AUTO_TEST_CASE(payload_codecs_round_trip_and_refusals)
     BOOST_CHECK_EQUAL(a.payload.size(), PlacePayload::ENCODED_BYTES);
     BOOST_CHECK(a.Place().value() == place);
     CheckError(a.Cancel(), ErrorCode::INVALID_INPUT);
+    CheckError(a.CancelAll(), ErrorCode::INVALID_INPUT);
     CheckError(a.Transfer(), ErrorCode::INVALID_INPUT);
     CheckError(a.Withdraw(), ErrorCode::INVALID_INPUT);
 
@@ -368,6 +369,17 @@ BOOST_AUTO_TEST_CASE(payload_codecs_round_trip_and_refusals)
     BOOST_CHECK_EQUAL(a.payload.size(), CancelPayload::ENCODED_BYTES);
     BOOST_CHECK(a.Cancel().value() == cancel);
     CheckError(a.Place(), ErrorCode::INVALID_INPUT);
+
+    // CANCEL_ALL carries no fields (M3-ENG-09): the exact encoding is empty,
+    // so any payload byte is above its size.
+    a.kind = ActionKind::CANCEL_ALL;
+    a.payload = EncodePayload(CancelAllPayload{}).value();
+    BOOST_CHECK_EQUAL(a.payload.size(), CancelAllPayload::ENCODED_BYTES);
+    BOOST_CHECK(a.payload.empty());
+    BOOST_CHECK(a.CancelAll().value() == CancelAllPayload{});
+    CheckError(a.Cancel(), ErrorCode::INVALID_INPUT);
+    a.payload = {0x00};
+    CheckError(a.CancelAll(), ErrorCode::OVERSIZE);
 
     a.kind = ActionKind::TRANSFER;
     a.payload = EncodePayload(transfer).value();

@@ -34,19 +34,20 @@
  * v1 (M2-LED-02), the liability sum root (M2-LED-03) and exit_value
  * (M2-LED-04). Slice R6 adds the residual-cross call (M3-ENG-02) and
  * extends M3-ENG-03 to probe the engine's PriceBandCheck as well. Slice R7
- * adds the engine's CANCEL_ALL branch (M3-ENG-09) and futures phase 7
- * (M9-FUT-04), and extends M2-LED-05 and M2-LED-06 to probe the engine
+ * adds the engine's CANCEL_ALL branch (M3-ENG-09, done since: its case is
+ * gone) and futures phase 7 (M9-FUT-04), and extends M2-LED-05 and M2-LED-06 to probe the engine
  * branches of WITHDRAW and the spot/futures transfers (engine PhaseOf) as
- * well. Slice R8 adds the file journal's reopen and read-back and the logs'
- * recovery over a journal with history (M4-STO-01), segment rollover
- * (M4-STO-06, since finished), the group-commit writer (M4-STO-02), snapshots (M4-STO-03, since finished) and the view
+ * well. Slice R8 added the file journal's reopen and the logs' recovery over
+ * a journal with history (M4-STO-01, done since: its case is gone; segment
+ * rollover and ReadAll landed with M4-STO-06, also done),
+ * the group-commit writer (M4-STO-02), snapshots (M4-STO-03) and the view
  * state records (M4-STO-07), and extends M4-STO-05 to probe the signer
  * log's folded signing as well. Slice R9 adds the state owner's pipelined
  * Preview over an uncommitted candidate (M4-AGR-10), and extends M4-STO-03
- * (since finished) to probe StateOwner::Restore and the replay of a SNAPSHOT_MARK record and
+ * to probe StateOwner::Restore and the replay of a SNAPSHOT_MARK record and
  * M4-STO-07 to probe the replay of a PREPARED_QC record as well. Slice
- * R10 adds the b3d chain adapters: trusted facts on REGTEST (MB1-ADP-06)
- * and the finalized adapter (M7-ADP-01); PBFT safety (M4-AGR-01; the probe
+ * R10 adds the b3d chain adapters: trusted facts on REGTEST (MB1-ADP-06;
+ * the finalized adapter M7-ADP-01 was a stub here until it landed); PBFT safety (M4-AGR-01; the probe
  * checks MayPrepare, MayCommit and OnViewChange), the PBFT agreement
  * (M4-AGR-02; the probe also checks the dev certifier's OnMessage, which
  * returns Unsupported), the leader schedule (M4-AGR-03), inclusion lists (M4-AGR-04;
@@ -55,12 +56,12 @@
  * liability paths (M5-VFY-03), checkpoints (M8-CKP-01) and anchor proofs
  * (M7-ADP-02). Slice R12 adds the credit budget (M4-ADM-02), and extends
  * M4-ADM-01 to probe admission's batch path (Admission::AdmitBatch) and
- * M2-LED-05, M2-LED-06 and M3-ENG-09 to probe admission's kind rule
+ * M2-LED-05 and M2-LED-06 (and M3-ENG-09 until it landed) to probe admission's kind rule
  * (KindAdmissible, whose Unsupported refusals become UNSUPPORTED_KIND).
  * Slice R13 adds the client API's HTTPS + SSE transport (M5-API-01) and
- * streams (M5-API-02, InProcessApi::Subscribe); the in-process (M4-SIM-01)
- * and TCP (M4-NET-01) seat meshes, short IDs (M4-NET-02, since finished)
- * and sentry fan-out (M4-NET-03); the bridge's mint (M8-BRG-01)
+ * streams (M5-API-02, InProcessApi::Subscribe); the in-process (M4-SIM-01,
+ * until the mesh landed) and TCP (M4-NET-01) seat meshes, short IDs
+ * (M4-NET-02, until the codec landed) and sentry fan-out (M4-NET-03); the bridge's mint (M8-BRG-01)
  * and release limits (M8-BRG-03); the futures oracle (M9-FUT-02) and
  * margin (M9-FUT-03); removals (M7-GOV-02) and versioned parameters
  * (M7-GOV-03). It extends M8-BRG-02 to probe BuildWithdrawalPacket,
@@ -101,6 +102,7 @@
 #include <flowmesh2/net/in_process_api.h>
 #include <flowmesh2/net/in_process_mesh.h>
 #include <flowmesh2/net/sentry.h>
+#include <flowmesh2/net/short_id.h>
 #include <flowmesh2/net/tcp_mesh.h>
 #include <flowmesh2/sim/cluster.h>
 #include <flowmesh2/sim/faults.h>
@@ -109,6 +111,7 @@
 #include <flowmesh2/state/replay.h>
 #include <flowmesh2/state/state_owner.h>
 #include <flowmesh2/storage/commit_log.h>
+#include <flowmesh2/storage/file_journal.h>
 #include <flowmesh2/storage/log_writer.h>
 #include <flowmesh2/storage/memory_journal.h>
 #include <flowmesh2/storage/signer_log.h>
@@ -236,7 +239,7 @@ void CheckOneStub(std::string_view case_name)
 //! body that follows the macro is the probe. See the file comment.
 #define FM2_STUB_CASE(case_ident, task_literal)                                                       \
     static flowmesh2::test::StubObservation case_ident##_probe();                                     \
-    static const flowmesh2::test::StubRegistrar case_ident##_registrar{flowmesh2::TaskId{task_literal}, #case_ident,     \
+    static const flowmesh2::test::StubRegistrar case_ident##_registrar{task_literal, #case_ident,     \
                                                                        &case_ident##_probe};          \
     BOOST_AUTO_TEST_CASE(case_ident) { flowmesh2::test::CheckOneStub(#case_ident); }                  \
     static flowmesh2::test::StubObservation case_ident##_probe()
@@ -422,7 +425,7 @@ FM2_STUB_CASE(M8_BRG_02, "M8-BRG-02")
 {
     // The payout fact's codec (R4) and the bridge's withdrawal packet (R13).
     bridge::BridgeManagerV2 manager;
-    // The payout fact codec is real; production packet export is still gated.
+    // The payout fact codec is real since the origin/rebirth merge; the production packet export is still gated.
     return Observe(manager.BuildWithdrawalPacket(bridge::WithdrawalRequest{}));
 }
 
@@ -461,9 +464,7 @@ FM2_STUB_CASE(M2_LED_06, "M2-LED-06")
 
 FM2_STUB_CASE(M2_LED_02, "M2-LED-02")
 {
-    // Since M2-LED-02 built commitment v1 in the ledger, the stub is the engine's header switch.
-    const engine::EngineState state{engine::EngineState::Genesis(EmptyRegtestLedger().Profile(), {}).value()};
-    return Observe(state.CommitV1());
+    return Observe(ledger::CommitV1(EmptyRegtestLedger()));
 }
 
 FM2_STUB_CASE(M2_LED_03, "M2-LED-03")
@@ -487,13 +488,6 @@ FM2_STUB_CASE(M3_ENG_02, "M3-ENG-02")
 
 // ---- Slice R7: engine/engine ----
 
-FM2_STUB_CASE(M3_ENG_09, "M3-ENG-09")
-{
-    // The engine branch (R7) and admission's kind rule (R12).
-    return FirstDeviation("M3-ENG-09", {Observe(engine::PhaseOf(ActionOfKind(ActionKind::CANCEL_ALL))),
-                                        Observe(admission::KindAdmissible(ActionKind::CANCEL_ALL))});
-}
-
 FM2_STUB_CASE(M9_FUT_04, "M9-FUT-04")
 {
     // Phase 7 with futures enabled. Validate() refuses that profile first
@@ -506,6 +500,8 @@ FM2_STUB_CASE(M9_FUT_04, "M9-FUT-04")
     return FirstDeviation("M9-FUT-04", {Observe(engine::RunFuturesPhase(state, profile)), Observe(domain.Sweep(1))});
 }
 
+// ---- Slice R8: storage/file_journal ----
+
 // ---- Slice R8: storage logs, writer and snapshots ----
 
 FM2_STUB_CASE(M4_STO_02, "M4-STO-02")
@@ -514,18 +510,17 @@ FM2_STUB_CASE(M4_STO_02, "M4-STO-02")
     return Observe(storage::LogWriter::Start(*journal, storage::LogWriterOptions{}));
 }
 
-FM2_STUB_CASE(M4_STO_07, "M4-STO-07")
+FM2_STUB_CASE(M4_STO_03, "M4-STO-03")
 {
-    // VIEW_STATE and NEW_VIEW_ACCEPTED in the signer log, PREPARED_QC in the
-    // legacy commit-log entry point. Certified prepared replay is implemented.
-    auto signer_journal{NewMemoryJournal(storage::JournalRole::SIGNER, 1)};
-    auto commit_journal{NewMemoryJournal(storage::JournalRole::COMMIT, 2)};
-    storage::SignerLog signer{storage::SignerLog::Create(*signer_journal).value()};
-    storage::CommitLog commit{storage::CommitLog::Create(*commit_journal).value()};
+    // Write and Load; the store touches no file in the outline. StateOwner::Restore from the genesis landed with
+    // M4-SIM-02 (a restarted simulated node); a snapshot base and the decided-but-unapplied tail stay M4-STO-03's.
+    storage::SnapshotStore store{fs::PathFromString(FM2_TEST_TMP_DIR) / fs::u8path("stub_m4_sto_03_never_created")};
+    const storage::SnapshotMark mark{1, uint256::ONE, uint256::ONE};
     HeartbeatOwner heartbeat{MakeHeartbeatOwner()};
-    return FirstDeviation("M4-STO-07", {Observe(signer.AppendViewState(storage::ViewStateRecord{0, 1})),
-                                        Observe(signer.AppendNewViewAccepted(storage::NewViewAcceptedRecord{0, 1, Bytes("nv")})),
-                                        Observe(commit.AppendPreparedQc(storage::PreparedQcRecord{0, 1, 1, uint256::ONE, Bytes("qc"), {}, {}}))});
+    const std::shared_ptr<const state::HeadView> head{heartbeat.owner->Head()};
+    const std::vector<storage::JournalRecord> marked{{1, storage::RecordType::SNAPSHOT_MARK, {}, uint256{}}};
+    return FirstDeviation("M4-STO-03", {Observe(store.Write(mark, Bytes("state"))), Observe(store.Load(mark)),
+                                        Observe(state::ReplayDecisions(*head, marked))});
 }
 
 // ---- Slice R9: the state owner ----
@@ -556,48 +551,8 @@ FM2_STUB_CASE(MB1_ADP_06, "MB1-ADP-06")
     return Observe(chain::B3dTrustedFactsAdapter::Create(StubRegtestNetwork(), chain::B3dAdapterConfig{}));
 }
 
-FM2_STUB_CASE(M7_ADP_01, "M7-ADP-01")
-{
-    return Observe(chain::B3dFinalizedAdapter::Create(StubRegtestNetwork(), chain::B3dAdapterConfig{30}));
-}
-
 // ---- Slice R10: agreement ----
 
-//! A sink that refuses everything (the stubs never send).
-class StubSink final : public agreement::MessageSink
-{
-public:
-    Result<void> Send(uint32_t, std::span<const unsigned char>) override { return Error{ErrorCode::BUSY, "stub sink"}; }
-};
-
-FM2_STUB_CASE(M4_AGR_01, "M4-AGR-01")
-{
-    agreement::PbftSafetyRules rules;
-    const agreement::Proposal proposal{};
-    return FirstDeviation("M4-AGR-01", {Observe(rules.MayPrepare(proposal)), Observe(rules.MayCommit(proposal, agreement::PreparedCert{})),
-                                        Observe(rules.OnViewChange(agreement::ViewChange{}))});
-}
-
-FM2_STUB_CASE(M4_AGR_02, "M4-AGR-02")
-{
-    AgreementRig rig;
-    agreement::PbftSafetyRules rules;
-    StubSink sink;
-    const agreement::PbftContext context{*rig.adapter, *rig.owner, rig.signer, rig.signer_log, rig.commit_log, rules, sink};
-    // The k = 1 dev certifier receives no messages: its OnMessage is PBFT's to replace.
-    const auto certifier{dev::DevSingleSeatCertifier::Create(rig.profile, *rig.adapter, rig.seats, rig.signer, rig.signer_log,
-                                                             rig.commit_log)
-                             .value()};
-    const std::vector<unsigned char> message{1};
-    return FirstDeviation("M4-AGR-02", {Observe(agreement::PbftAgreement::Create(rig.profile, agreement::PbftConfig{}, context)),
-                                        Observe(certifier->OnMessage(0, message))});
-}
-
-FM2_STUB_CASE(M4_AGR_03, "M4-AGR-03")
-{
-    const agreement::LeaderSchedule schedule{4};
-    return Observe(schedule.LeaderFor(AuthorityVersion{}, 0, agreement::SlowSet{}));
-}
 
 FM2_STUB_CASE(M4_AGR_04, "M4-AGR-04")
 {
@@ -607,12 +562,6 @@ FM2_STUB_CASE(M4_AGR_04, "M4-AGR-04")
 FM2_STUB_CASE(M4_AGR_06, "M4-AGR-06")
 {
     return Observe(agreement::RestartFence::Collect({}, TestSeats({"s0"}), 0));
-}
-
-FM2_STUB_CASE(M4_AGR_07, "M4-AGR-07")
-{
-    agreement::EvidenceStore store;
-    return FirstDeviation("M4-AGR-07", {Observe(store.Record(agreement::Evidence{agreement::DoubleVote{}})), Observe(store.Load())});
 }
 
 // ---- Slice R11: b3verify ----
@@ -649,39 +598,7 @@ FM2_STUB_CASE(M7_ADP_02, "M7-ADP-02")
 
 // ---- Slice R13: net/ client API ----
 
-FM2_STUB_CASE(M5_API_01, "M5-API-01")
-{
-    ApiRig rig;
-    return Observe(net::HttpsSseApi::Create(net::HttpsSseConfig{}, *rig.api));
-}
-
-FM2_STUB_CASE(M5_API_02, "M5-API-02")
-{
-    ApiRig rig;
-    return Observe(rig.api->Subscribe(net::StreamRequest{}));
-}
-
 // ---- Slice R13: net/ seat mesh ----
-
-FM2_STUB_CASE(M4_SIM_01, "M4-SIM-01")
-{
-    // R13: the in-process seat mesh; R14: a simulated cluster of more than one node.
-    sim::TraceRecorder trace;
-    return FirstDeviation("M4-SIM-01", {Observe(net::InProcessSeatMesh::Create(TestMeshConfig(0, 4), 4)),
-                                        Observe(sim::SimCluster::Create(4, sim::SimNodeConfig{}, trace))});
-}
-
-// Retain the inventoried case name as a real boundary regression. Socket,
-// session authentication and lane isolation live in tcp_mesh_tests.
-BOOST_AUTO_TEST_CASE(M4_NET_01)
-{
-    net::TcpMeshConfig config;
-    config.mesh = TestMeshConfig(0, 4);
-    config.network_magic = {0xfa, 0xbf, 0xb5, 0xda};
-    const auto mesh{net::TcpSeatMesh::Create(config)};
-    BOOST_REQUIRE(!mesh.has_value());
-    BOOST_CHECK(mesh.error().code == ErrorCode::INVALID_INPUT);
-}
 
 FM2_STUB_CASE(M4_NET_03, "M4-NET-03")
 {
@@ -737,20 +654,6 @@ FM2_STUB_CASE(M7_GOV_03, "M7-GOV-03")
 }
 
 // ---- Slice R14: sim/ ----
-
-FM2_STUB_CASE(M4_SIM_02, "M4-SIM-02")
-{
-    // Each target-shape fault on its own is the stub; the three real faults are not.
-    std::vector<sim::FaultPlan> plans(5);
-    plans[0].crash_before_slot = 2;
-    plans[1].drop.push_back(sim::DropRule{0, 1, 1'000});
-    plans[2].delay.push_back(sim::DelayRule{0, 1, 5});
-    plans[3].partition.push_back({0});
-    plans[4].skew.push_back(sim::SkewRule{0, 3});
-    std::vector<StubObservation> observed;
-    for (const sim::FaultPlan& plan : plans) observed.push_back(Observe(sim::CheckFaultPlan(plan)));
-    return FirstDeviation("M4-SIM-02", observed);
-}
 
 FM2_STUB_CASE(M4_SIM_03, "M4-SIM-03")
 {

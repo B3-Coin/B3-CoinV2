@@ -42,8 +42,8 @@ static_assert(std::is_trivially_copyable_v<Error>, "an Error owns no memory");
 // The task ID is the literal at the stub site, also at compile time.
 static_assert(NotImplemented("R1").code == ErrorCode::NOT_IMPLEMENTED);
 static_assert(NotImplemented("M2-LED-05").detail == "M2-LED-05");
-static_assert(Unsupported("M3-ENG-09").code == ErrorCode::UNSUPPORTED);
-static_assert(Unsupported("M3-ENG-09").detail == "M3-ENG-09");
+static_assert(Unsupported("M2-LED-06").code == ErrorCode::UNSUPPORTED);
+static_assert(Unsupported("M2-LED-06").detail == "M2-LED-06");
 
 // The TaskId format accepted at compile time equals the TODO.md ID pattern.
 static_assert(IsWellFormedTaskId("R1"));

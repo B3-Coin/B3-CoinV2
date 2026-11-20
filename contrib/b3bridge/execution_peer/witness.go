@@ -497,7 +497,7 @@ func collectWitness(ctx context.Context, req witnessRequest, maxPeers int, fixtu
 			g.stateRoot = req.StateRoot
 			if req.ExecutionHash != "" {
 				want, _ := parseHash(req.ExecutionHash)
-				raw, err := witnessExecutionHeader(ctx, bounded, want)
+				raw, err := witnessExecutionHeader(ctx, bounded, want, v)
 				if err != nil {
 					count, _ := stats.Stages.LoadOrStore("exact_header_"+peerDropClass(err.Error()), new(atomic.Uint64))
 					count.(*atomic.Uint64).Add(1)
@@ -538,6 +538,10 @@ func collectWitness(ctx context.Context, req witnessRequest, maxPeers int, fixtu
 					}
 				case eth.NewPooledTransactionHashesMsg, eth.TransactionsMsg, eth.BlockRangeUpdateMsg:
 					if err = m.Discard(); err != nil {
+						return err
+					}
+				case eth.GetReceiptsMsg, eth.GetBlockAccessListsMsg, eth.GetCellsMsg:
+					if _, err = replyUnavailableETHData(m, bounded, v); err != nil {
 						return err
 					}
 				default:
@@ -601,7 +605,7 @@ func collectWitness(ctx context.Context, req witnessRequest, maxPeers int, fixtu
 			return nil
 		}})
 	}
-	server := p2p.Server{Config: p2p.Config{PrivateKey: key, MaxPeers: maxPeers, MaxPendingPeers: 4, DialRatio: 1, Name: "b3-execution-witness/1", ListenAddr: "127.0.0.1:0", DiscAddr: "0.0.0.0:0", NoDiscovery: fixture != "", DiscoveryV4: fixture == "", BootstrapNodes: nodes, StaticNodes: nodes, Protocols: protocols, Dialer: publicDialer{fixture: fixture != "", dialer: net.Dialer{Timeout: 5 * time.Second}}, Logger: logger}}
+	server := p2p.Server{Config: p2p.Config{PrivateKey: key, MaxPeers: maxPeers, MaxPendingPeers: 4, DialRatio: 1, Name: "b3-execution-witness/1", ListenAddr: "127.0.0.1:0", DiscAddr: "0.0.0.0:0", NoDiscovery: fixture != "", DiscoveryV4: fixture == "", BootstrapNodes: nodes, StaticNodes: fixtureStaticNodes(fixture, nodes), Protocols: protocols, Dialer: publicDialer{fixture: fixture != "", dialer: net.Dialer{Timeout: 5 * time.Second}}, Logger: logger}}
 	if err = server.Start(); err != nil {
 		return baseWitness(req), err
 	}
@@ -671,7 +675,14 @@ func runWitness(requestPath string, seconds, maxPeers int, fixture string) int {
 		}
 	}
 	value.Seconds = time.Since(started).Seconds()
-	if json.NewEncoder(os.Stdout).Encode(value) != nil {
+	raw, encodeErr := encodeAvailabilityJSON(value)
+	if encodeErr != nil {
+		value = baseWitness(witnessRequest{})
+		value.Failure = "final witness output byte bound exceeded"
+		raw, _ = encodeAvailabilityJSON(value)
+		status = 1
+	}
+	if _, writeErr := os.Stdout.Write(raw); writeErr != nil {
 		return 1
 	}
 	return status

@@ -11,6 +11,7 @@
 #include <flowmesh2/core/ids.h>
 #include <flowmesh2/core/result.h>
 #include <flowmesh2/net/lanes.h>
+#include <flowmesh2/net/stream_types.h>
 #include <flowmesh2/read/read_service.h>
 #include <uint256.h>
 
@@ -44,7 +45,10 @@
  *  3. INCLUSION AND EXECUTION: only certified data, through GetAction and
  *     GetState (one read lease per answer, read/read_service.h), which the
  *     client verifies with b3verify against its own trusted seat set.
- *  4. STREAMS: Subscribe (the stub M5-API-02).
+ *  4. STREAMS: Subscribe, TakeEvents, Unsubscribe (M5-API-02, O-103): events
+ *     with (stream_epoch, seq, head_slot) cursors, a SNAPSHOT then DELTAs,
+ *     a gap reported once and answered by a resubscription from the last
+ *     head_slot.
  *
  * GetAction(original) answers, from ONE read lease and then the pool:
  *  - INCLUDED: the lease's read service holds the including slot's
@@ -102,7 +106,6 @@ std::string_view ToString(ApiActionStatus status);
 inline constexpr std::string_view API_UNKNOWN_NOTHING_PUBLISHED{"nothing published yet and not in this node's pool"};
 inline constexpr std::string_view API_UNKNOWN_INCLUDED_AFTER_LEASE{"included in a slot after the lease's head; ask again"};
 inline constexpr std::string_view API_UNKNOWN_TERMINAL_UNPROVEN{"this node's pool dropped it, but the lease proves nothing"};
-inline constexpr std::string_view API_UNKNOWN_EXCLUDED{"this node's proposals excluded it: the engine refused every candidate holding it"};
 
 //! The answer of GetAction (see the file comment).
 struct ActionStatusReply {
@@ -139,13 +142,18 @@ enum class StreamChannel : uint8_t {
     SLOTS = 4,
 };
 
-//! A position in a stream: (stream_epoch, seq). Target shape for M5-API-02.
+/** A position in a stream (M5-API-02, O-103): stream_epoch names the
+ * publisher instance, seq is per subscription (ordering only), head_slot is
+ * the slot the event describes and the value a resubscription names.
+ */
 struct StreamCursor {
     uint64_t stream_epoch{0};
     uint64_t seq{0};
+    uint64_t head_slot{0};
+    friend bool operator==(const StreamCursor&, const StreamCursor&) = default;
 };
 
-//! A subscription request: a snapshot, then deltas from `from` (or now). Target shape for M5-API-02.
+//! A subscription request: a snapshot, then deltas; with `from`, the slots after from.head_slot are replayed when the hub still holds them (net/stream_hub.h).
 struct StreamRequest {
     StreamChannel channel{StreamChannel::SLOTS};
     std::optional<AccountId> account; //!< ACCOUNT
@@ -156,6 +164,13 @@ struct StreamRequest {
 struct StreamId {
     uint64_t value{0};
     friend bool operator==(const StreamId&, const StreamId&) = default;
+};
+
+//! One stream event (net/stream_types.h for the bodies).
+struct StreamEvent {
+    StreamCursor cursor;
+    StreamEventKind kind{StreamEventKind::DELTA};
+    StreamBody body;
 };
 
 class ClientApi
@@ -178,6 +193,9 @@ public:
     virtual Result<read::AccountReply> GetState(const AccountId& account) const = 0;
     //! A snapshot-then-delta stream (UX-10). Stub M5-API-02 in the outline.
     virtual Result<StreamId> Subscribe(const StreamRequest& request) = 0;
+    //! At most `max` queued events of `id`, oldest first; NEED_DATA STREAM_GAP once when the subscription fell behind (then it is gone).
+    virtual Result<std::vector<StreamEvent>> TakeEvents(StreamId id, size_t max) = 0;
+    virtual Result<void> Unsubscribe(StreamId id) = 0;
 };
 
 } // namespace flowmesh2::net

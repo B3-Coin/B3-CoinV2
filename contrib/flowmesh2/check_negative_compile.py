@@ -25,7 +25,9 @@ tsa_missing_lock (missing LOCK), ignored_result (ignored Result),
 forge_token (forged Durable token), since slice R8 sign_without_intent
 (SeatSigner::Sign without a DurableIntent), and since the review fix O-92
 forge_receipt (forged ApplyReceipt) and apply_without_receipt
-(CommitLog::AppendApplied without the receipt of a successful Apply). Any
+(CommitLog::AppendApplied without the receipt of a successful Apply), and since
+the review fix 17.3 item 10 malformed_task_id (a TaskId literal outside the
+TODO.md format, converted implicitly in a namespace-scope initialiser). Any
 other *.cpp in the directory must follow the same pattern and is run as well.
 
 Stale objects cannot hide a result: before every build the runner deletes the
@@ -43,7 +45,8 @@ import re
 import subprocess
 import sys
 
-REQUIRED = ("tsa_missing_lock", "ignored_result", "forge_token", "sign_without_intent", "forge_receipt", "apply_without_receipt")
+REQUIRED = ("tsa_missing_lock", "ignored_result", "forge_token", "sign_without_intent", "forge_receipt", "apply_without_receipt",
+            "malformed_task_id")
 POSITIVE = "positive_control"
 EXPECT = re.compile(r"^//\s*FM2_EXPECT_ERROR:\s*(.+?)\s*$", re.M)
 BUILD_TIMEOUT_S = 600

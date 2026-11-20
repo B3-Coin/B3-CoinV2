@@ -3,8 +3,6 @@
 
 This program has no mainnet mode. Synthetic assets and owned local chains only.
 """
-# TODO(rebirth:M0-QUAL-01) the gates are qualified on one host only; they must
-# pass on a second machine from the tools setup_tools.sh documents.
 import argparse
 import json
 import os
@@ -13,7 +11,6 @@ import subprocess
 import sys
 import time
 
-import tool_paths
 from qualify_regtest import sha256, source_manifest
 
 
@@ -22,9 +19,12 @@ def main():
     parser.add_argument('--source-root', required=True)
     parser.add_argument('--build-dir', required=True)
     parser.add_argument('--evidence-dir', required=True)
-    tool_paths.add(parser, 'b3_node_build', 'tools', 'solc', 'asan_build', 'tsan_build')
+    parser.add_argument('--b3-node-build', default='/home/josh/B3-builds/regtest-b3-node')
+    parser.add_argument('--tools', default='/home/josh/B3-tools/foundry-v1.8.5')
+    parser.add_argument('--solc', default='/home/josh/B3-tools/solc-0.8.35')
+    parser.add_argument('--asan-build', default='/home/josh/B3-builds/audit-asan-20261018T071928Z-dy81br')
+    parser.add_argument('--tsan-build', default='/home/josh/B3-builds/audit-tsan-20261018T072648Z-XWPNXT')
     args = parser.parse_args()
-    tool_paths.resolve(parser, args, 'b3_node_build', 'tools', 'solc', 'asan_build', 'tsan_build')
     source, build = Path(args.source_root).resolve(strict=True), Path(args.build_dir).resolve(strict=True)
     evidence = Path(args.evidence_dir).resolve()
     if evidence == source or source in evidence.parents or evidence.exists():
@@ -70,7 +70,6 @@ def main():
             '--offline', '--use', args.solc, '--out', evidence / 'contracts-out',
             '--cache-path', evidence / 'contracts-cache', '-vv'])
         for label, name in (('tls-boundary', 'test_https_api.py'), ('rpc-batch-boundary', 'test_custody_batch.py'),
-                            ('tls-keepalive-boundary', 'test_https_keepalive.py'),
                             ('private-identity-update', 'test_private_atomic_json.py'),
                             ('automatic-custody-protocol', 'test_automatic_custody.py'),
                             ('automatic-batching-protocol', 'test_automatic_batches.py'),
@@ -79,7 +78,6 @@ def main():
                             ('runtime-guard-order', 'test_runtime_guards.py'),
                             ('custody-grouped-snapshot', 'test_custody_group.py'),
                             ('b3-rpc-batch-boundary', 'test_b3_rpc_batch.py'),
-                            ('rpc-keepalive-boundary', 'test_keepalive.py'),
                             ('finality-and-relayer-codec', 'test_source_finality.py')):
             run(label, [sys.executable, '-B', driver / name])
         run('custody-proxy-upgrade', [sys.executable, '-B', driver / 'test_custody_proxy.py',

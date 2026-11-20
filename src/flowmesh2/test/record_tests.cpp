@@ -47,7 +47,8 @@ BOOST_AUTO_TEST_CASE(registry_pinned)
     // APPEND-ONLY registry (ARCHITECTURE.md 7.1): integers and names pinned.
     const std::vector<std::pair<int, std::string>> expected{
         {1, "INTENT"}, {2, "SIGNED_VOTE"}, {3, "DECISION"}, {4, "APPLIED"}, {5, "SNAPSHOT_MARK"},
-        {6, "ACCEPTED_PROPOSAL"}, {7, "VIEW_STATE"}, {8, "NEW_VIEW_ACCEPTED"}, {9, "PREPARED_QC"}, {10, "CONTROL_INTENT"}, {11, "SIGNED_CONTROL"}};
+        {6, "ACCEPTED_PROPOSAL"}, {7, "VIEW_STATE"}, {8, "NEW_VIEW_ACCEPTED"}, {9, "PREPARED_QC"}, {10, "EVIDENCE"},
+        {11, "OUTBOX_ACTION"}, {12, "OUTBOX_RESULT"}};
     BOOST_REQUIRE_EQUAL(RecordTypeRegistry().size(), expected.size());
     for (size_t i{0}; i < expected.size(); ++i) {
         BOOST_CHECK_EQUAL(static_cast<int>(RecordTypeRegistry()[i].type), expected[i].first);
@@ -56,26 +57,30 @@ BOOST_AUTO_TEST_CASE(registry_pinned)
         BOOST_CHECK_EQUAL(std::string{ToString(RecordTypeRegistry()[i].type)}, expected[i].second);
     }
     BOOST_CHECK(!IsKnown(RecordType{0}));
-    BOOST_CHECK(!IsKnown(RecordType{12}));
-    BOOST_CHECK_EQUAL(std::string{ToString(RecordType{12})}, "UNKNOWN");
+    BOOST_CHECK(!IsKnown(RecordType{13}));
+    BOOST_CHECK_EQUAL(std::string{ToString(RecordType{13})}, "UNKNOWN");
     BOOST_CHECK_EQUAL(static_cast<int>(JournalRole::SIGNER), 1);
     BOOST_CHECK_EQUAL(static_cast<int>(JournalRole::COMMIT), 2);
+    BOOST_CHECK_EQUAL(static_cast<int>(JournalRole::OUTBOX), 3);
+    BOOST_CHECK_EQUAL(std::string{ToString(JournalRole::OUTBOX)}, "OUTBOX");
     BOOST_CHECK(!IsKnown(JournalRole{0}));
-    BOOST_CHECK(!IsKnown(JournalRole{3}));
-    BOOST_CHECK_EQUAL(std::string{ToString(JournalRole{3})}, "UNKNOWN");
+    BOOST_CHECK(!IsKnown(JournalRole{4}));
+    BOOST_CHECK_EQUAL(std::string{ToString(JournalRole{4})}, "UNKNOWN");
 }
 
 BOOST_AUTO_TEST_CASE(role_acceptance_table)
 {
-    // SIGNER holds {1, 2, 6, 7, 8, 10, 11}; COMMIT holds {3, 4, 5, 9}; nothing else.
+    // SIGNER holds {1, 2, 6, 7, 8}; COMMIT holds {3, 4, 5, 9, 10}; OUTBOX holds {11, 12}; nothing else.
     for (int t{0}; t <= 255; ++t) {
         const RecordType type{static_cast<RecordType>(t)};
-        const bool signer{t == 1 || t == 2 || t == 6 || t == 7 || t == 8 || t == 10 || t == 11};
-        const bool commit{t == 3 || t == 4 || t == 5 || t == 9};
+        const bool signer{t == 1 || t == 2 || t == 6 || t == 7 || t == 8};
+        const bool commit{t == 3 || t == 4 || t == 5 || t == 9 || t == 10};
+        const bool outbox{t == 11 || t == 12};
         BOOST_CHECK_EQUAL(RoleAccepts(JournalRole::SIGNER, type), signer);
         BOOST_CHECK_EQUAL(RoleAccepts(JournalRole::COMMIT, type), commit);
+        BOOST_CHECK_EQUAL(RoleAccepts(JournalRole::OUTBOX, type), outbox);
         BOOST_CHECK(!RoleAccepts(JournalRole{0}, type));
-        BOOST_CHECK(!RoleAccepts(JournalRole{3}, type));
+        BOOST_CHECK(!RoleAccepts(JournalRole{4}, type));
     }
 }
 
@@ -123,7 +128,7 @@ BOOST_AUTO_TEST_CASE(encode_refusals)
 {
     const uint256 genesis{JournalGenesisChain(JournalRole::SIGNER, 1)};
     RequireRefusal(EncodeRecord(genesis, RecordType{0}, {}), ErrorCode::INVALID_INPUT, RECORD_TYPE, "type 0");
-    RequireRefusal(EncodeRecord(genesis, RecordType{12}, {}), ErrorCode::INVALID_INPUT, RECORD_TYPE, "type 12");
+    RequireRefusal(EncodeRecord(genesis, RecordType{13}, {}), ErrorCode::INVALID_INPUT, RECORD_TYPE, "type 13");
     const std::vector<unsigned char> at_cap(MAX_RECORD_PAYLOAD_BYTES);
     const Result<EncodedRecord> ok{EncodeRecord(genesis, RecordType::INTENT, at_cap)};
     RequireStorageOk(ok, "payload at the cap");
@@ -277,6 +282,36 @@ BOOST_AUTO_TEST_CASE(scan_detects_length_type_and_tail_errors)
         short_tail.insert(short_tail.end(), {0, 0, 0, 1});
         RequireRefusal(ScanRecords(short_tail, role, 2), ErrorCode::DECODE, RECORD_LENGTH, "non-zero bytes shorter than a header");
     }
+}
+
+BOOST_AUTO_TEST_CASE(scan_from_a_chain_continues_a_previous_segment)
+{
+    // ScanRecordsFrom (M4-STO-06): the chain and the sequence numbers continue
+    // from a previous segment's last record; from the genesis chain and 0 it is ScanRecords.
+    std::vector<unsigned char> first;
+    std::vector<unsigned char> second;
+    uint256 prev{JournalGenesisChain(JournalRole::SIGNER, 3)};
+    const std::vector<unsigned char> payload_a{0x01};
+    const std::vector<unsigned char> payload_b{0x02};
+    const EncodedRecord a{EncodeRecord(prev, RecordType::INTENT, payload_a).value()};
+    first.insert(first.end(), a.bytes.begin(), a.bytes.end());
+    const EncodedRecord b{EncodeRecord(a.chain, RecordType::SIGNED_VOTE, payload_b).value()};
+    second.insert(second.end(), b.bytes.begin(), b.bytes.end());
+    second.resize(second.size() + 7, 0); // a zero tail
+    const Result<ScanResult> one{ScanRecordsFrom(first, JournalRole::SIGNER, prev, 0)};
+    BOOST_REQUIRE(one.has_value());
+    const ScanResult from_genesis{ScanRecords(first, JournalRole::SIGNER, 3).value()};
+    BOOST_CHECK(one->records == from_genesis.records && one->last_chain == from_genesis.last_chain && one->end_offset == from_genesis.end_offset);
+    const Result<ScanResult> two{ScanRecordsFrom(second, JournalRole::SIGNER, one->last_chain, one->records.size())};
+    BOOST_REQUIRE(two.has_value());
+    BOOST_REQUIRE_EQUAL(two->records.size(), 1U);
+    BOOST_CHECK_EQUAL(two->records[0].seq, 2U);
+    BOOST_CHECK(two->records[0].type == RecordType::SIGNED_VOTE);
+    BOOST_CHECK(two->last_chain == b.chain);
+    BOOST_CHECK_EQUAL(two->end_offset, b.bytes.size());
+    // The wrong starting chain is a chain break; an unknown role is refused.
+    BOOST_CHECK(ScanRecordsFrom(second, JournalRole::SIGNER, prev, 1).error().detail == RECORD_CHAIN);
+    BOOST_CHECK(ScanRecordsFrom(second, JournalRole{0}, prev, 1).error().code == ErrorCode::INVALID_INPUT);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

@@ -10,6 +10,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <string_view>
 #include <vector>
@@ -39,9 +40,11 @@
  *
  * RecordType (APPEND-ONLY, owner-protected registry; pinned by record_tests):
  *   INTENT=1, SIGNED_VOTE=2, DECISION=3, APPLIED=4, SNAPSHOT_MARK=5,
- *   ACCEPTED_PROPOSAL=6, VIEW_STATE=7, NEW_VIEW_ACCEPTED=8, PREPARED_QC=9.
+ *   ACCEPTED_PROPOSAL=6, VIEW_STATE=7, NEW_VIEW_ACCEPTED=8, PREPARED_QC=9,
+ *   EVIDENCE=10, OUTBOX_ACTION=11, OUTBOX_RESULT=12.
  * JournalRole (append-only): SIGNER=1 accepts {1, 2, 6, 7, 8}; COMMIT=2
- * accepts {3, 4, 5, 9}. The signer journal is never deleted (DUR-2).
+ * accepts {3, 4, 5, 9, 10}; OUTBOX=3 (the client's outbox, cli/outbox.h,
+ * M5-CLI-01) accepts {11, 12}. The signer journal is never deleted (DUR-2).
  *
  * Everything here is deterministic: no I/O, clock, lock or allocation beyond
  * the returned vectors.
@@ -59,8 +62,9 @@ enum class RecordType : uint8_t {
     VIEW_STATE = 7,        //!< signer: durable PBFT view state (M4-STO-07)
     NEW_VIEW_ACCEPTED = 8, //!< signer: an accepted new-view message (M4-STO-07)
     PREPARED_QC = 9,       //!< commit: a prepared quorum certificate (M4-STO-07)
-    CONTROL_INTENT = 10,   //!< control: immutable view/report intent, durable before signing
-    SIGNED_CONTROL = 11,   //!< control: exact signature, durable before publication
+    EVIDENCE = 10,         //!< commit: recorded evidence of a safety violation, the encoded agreement message (M4-AGR-07)
+    OUTBOX_ACTION = 11,    //!< outbox: a client's signed action, exact bytes under a label (M5-CLI-01, DUR-4)
+    OUTBOX_RESULT = 12,    //!< outbox: what became of an outbox action (M5-CLI-01)
 };
 
 struct RecordTypeInfo {
@@ -78,11 +82,12 @@ std::string_view ToString(RecordType type);
 //! Which journal a record belongs to. APPEND-ONLY.
 enum class JournalRole : uint8_t {
     SIGNER = 1, //!< ACCEPTED_PROPOSAL, INTENT, SIGNED_VOTE, VIEW_STATE, NEW_VIEW_ACCEPTED
-    COMMIT = 2, //!< DECISION, APPLIED, SNAPSHOT_MARK, PREPARED_QC
+    COMMIT = 2, //!< DECISION, APPLIED, SNAPSHOT_MARK, PREPARED_QC, EVIDENCE
+    OUTBOX = 3, //!< OUTBOX_ACTION, OUTBOX_RESULT (the client's journal, cli/outbox.h)
 };
 
 bool IsKnown(JournalRole role);
-//! Total: "SIGNER", "COMMIT" or "UNKNOWN".
+//! Total: "SIGNER", "COMMIT", "OUTBOX" or "UNKNOWN".
 std::string_view ToString(JournalRole role);
 //! True iff `role` is known, `type` is known and the role's journal holds that type.
 bool RoleAccepts(JournalRole role, RecordType type);
@@ -161,15 +166,25 @@ struct ScanResult {
  */
 Result<ScanResult> ScanRecords(std::span<const unsigned char> bytes, JournalRole role, uint64_t instance_id);
 
-/** ScanRecords of a segment after the first (M4-STO-06): the image's first
- * record must continue `prev` (the chain after the previous segment's last
- * record, which also binds the instance) and is numbered `first_seq`.
- * `end_offset` is relative to `bytes`; `last_chain` is `prev` when the image
- * holds no record. ScanRecords is ScanRecordsFrom(bytes, role,
- * JournalGenesisChain(role, instance_id), 1). INVALID_INPUT for an unknown
- * role or a zero first_seq.
+/** ScanRecords for a later segment of a journal (M4-STO-06): the chain
+ * continues from `prev_chain` (the previous segment's `last_chain`) and the
+ * records are numbered from `first_seq` + 1. With the genesis chain and 0 it
+ * is ScanRecords. Same refusals; `RECORD_CHAIN` also when `prev_chain` is
+ * not the chain the segment continues.
  */
-Result<ScanResult> ScanRecordsFrom(std::span<const unsigned char> bytes, JournalRole role, const uint256& prev, uint64_t first_seq);
+Result<ScanResult> ScanRecordsFrom(std::span<const unsigned char> bytes, JournalRole role, const uint256& prev_chain, uint64_t first_seq);
+
+/** ScanRecordsFrom that keeps what scanned clean before the first refusal:
+ * recovery (M4-STO-01) decides from `refused_at` and the bytes after it
+ * whether the refusal is a torn tail or corruption. With no refusal
+ * `accepted` is the whole image and `refusal` is empty.
+ */
+struct PartialScan {
+    ScanResult accepted;          //!< the records before the first refusal (all of them if none)
+    std::optional<Error> refusal; //!< the first problem, if any (the same errors as ScanRecords)
+    size_t refused_at{0};         //!< byte offset of the record that was refused (unused without a refusal)
+};
+PartialScan ScanRecordsPartial(std::span<const unsigned char> bytes, JournalRole role, const uint256& prev_chain, uint64_t first_seq);
 
 } // namespace flowmesh2::storage
 

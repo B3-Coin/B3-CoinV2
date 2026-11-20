@@ -5,13 +5,12 @@
 #ifndef B3_FLOWMESH2_AGREEMENT_AGREEMENT_H
 #define B3_FLOWMESH2_AGREEMENT_AGREEMENT_H
 
-#include <flowmesh2/core/authority.h>
 #include <flowmesh2/agreement/outbound.h>
-#include <flowmesh2/agreement/control_outbound.h>
-#include <flowmesh2/agreement/messages.h>
+#include <flowmesh2/core/authority.h>
 #include <flowmesh2/core/body.h>
 #include <flowmesh2/core/certificate.h>
 #include <flowmesh2/core/result.h>
+#include <flowmesh2/core/slot.h>
 #include <flowmesh2/state/candidate.h>
 #include <flowmesh2/storage/durable.h>
 
@@ -59,12 +58,12 @@
  */
 namespace flowmesh2::agreement {
 
-//! A decided slot: the durable DECISION and what its record holds besides the header.
+//! A decided slot: the durable DECISION and what its record holds.
 struct Decision {
     DurableDecision decision; //!< names the slot, the header hash and the certificate hash
     SlotCertificate certificate;
     SlotBody body;
-    std::optional<SlotHeaderV2> header; //!< exact durable header; legacy three-field construction remains valid
+    SlotHeaderV2 header; //!< the decided header (a follower re-executes header and body to apply; M4-AGR-02)
 };
 
 class MessageSink
@@ -73,12 +72,20 @@ public:
     virtual ~MessageSink() = default;
     //! Queue one encoded message to `seat`; BUSY when its lane is full (nothing queued).
     virtual Result<void> Send(uint32_t seat, std::span<const unsigned char> message) = 0;
-    //! A typed durability witness accompanies every emitted vote. Simple
-    //! sinks use the already encoded frame; SeatMesh routes its typed port.
-    virtual Result<void> SendDurableVote(uint32_t seat, const OutboundVote&, const uint256&,
-                                         std::span<const unsigned char> message) { return Send(seat, message); }
-    virtual Result<void> SendDurableControl(uint32_t seat, const OutboundControl&,
-                                            std::span<const unsigned char> message) { return Send(seat, message); }
+};
+
+/** Where an agreement sends what only a durable record may let out
+ * (M4-AGR-02; ARCHITECTURE.md 7.3): a vote, as an OutboundVote, which exists
+ * only for a durable SIGNED_VOTE; and a VIEW_CHANGE or NEW_VIEW statement,
+ * whose signature must be the OutboundVote's of the matching statement
+ * intent. The seat mesh implements it (net/seat_mesh.h).
+ */
+class VoteSink
+{
+public:
+    virtual ~VoteSink() = default;
+    virtual Result<void> SendVote(uint32_t seat, const OutboundVote& vote, const uint256& header_hash) = 0;
+    virtual Result<void> SendStatement(uint32_t seat, const OutboundVote& statement, std::span<const unsigned char> message) = 0;
 };
 
 class Agreement
@@ -90,16 +97,6 @@ public:
     virtual Result<void> OnMessage(uint32_t from_seat, std::span<const unsigned char> bytes) = 0;
     virtual Result<void> OnTimeout(uint64_t now_ms) = 0;
     virtual std::optional<Decision> TakeDecision() = 0;
-    virtual uint64_t CurrentView() const { return 0; }
-    virtual bool ChangingView() const { return false; }
-    //! Pure availability/evidence port. Only a real CHANGING leader may
-    //! expose its quorum-selected unsigned bundle for independent source RPC.
-    virtual Result<std::optional<ControlNewView>> PendingObservationNewView(const std::optional<Proposal>& = std::nullopt) const
-    { return Ok(std::optional<ControlNewView>{}); }
-    //! Resume that exact quorum bundle through normal intent/sign/barriers,
-    //! only after the independent source adapter authorizes the selected body.
-    virtual Result<void> ResumeObservationNewView(const ControlNewView&)
-    { return Error{ErrorCode::INVALID_INPUT, "agreement has no observation handover port"}; }
 };
 
 } // namespace flowmesh2::agreement

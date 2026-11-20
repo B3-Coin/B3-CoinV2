@@ -32,10 +32,12 @@ if(BUILD_FLOWMESH2)
   endif()
 
   # Linked PRIVATE by every fm2 target: lock annotations are errors on Clang,
-  # and an ignored [[nodiscard]] Result is an error on every compiler.
+  # and an ignored [[nodiscard]] Result is an error on every compiler. Clang
+  # up to 20 reports a discarded [[nodiscard]] type under -Wunused-result;
+  # Apple clang 21 reports it under -Wunused-value, so both are errors.
   add_library(fm2_warnings INTERFACE)
   target_compile_options(fm2_warnings INTERFACE
-    $<$<COMPILE_LANG_AND_ID:CXX,Clang,AppleClang>:-Wthread-safety;-Werror=thread-safety>
+    $<$<COMPILE_LANG_AND_ID:CXX,Clang,AppleClang>:-Wthread-safety;-Werror=thread-safety;-Werror=unused-value>
     $<$<COMPILE_LANG_AND_ID:CXX,Clang,AppleClang,GNU>:-Werror=unused-result>
     $<$<COMPILE_LANG_AND_ID:CXX,MSVC>:/we4834>
   )
@@ -51,6 +53,7 @@ if(BUILD_FLOWMESH2)
     core/account_leaf.cpp
     core/action.cpp
     core/amount.cpp
+    core/anchor_proof.cpp
     core/body.cpp
     core/certificate.cpp
     core/codes.cpp
@@ -66,9 +69,7 @@ if(BUILD_FLOWMESH2)
     core/result.cpp
     core/seat_set.cpp
     core/slot.cpp
-    core/smt.cpp
     core/state_root.cpp
-    core/state_root_v1.cpp
   )
   target_link_libraries(fm2_types
     PRIVATE
@@ -111,20 +112,18 @@ if(BUILD_FLOWMESH2)
     admission/admission.cpp
     admission/budget.cpp
     admission/pool.cpp
-    agreement/control_messages.cpp
+    agreement/digests.cpp
     agreement/evidence.cpp
     agreement/inclusion.cpp
     agreement/leader.cpp
     agreement/messages.cpp
     agreement/pbft.cpp
-    agreement/regtest_pbft.cpp
     agreement/restart_fence.cpp
     bridge/bridge_manager.cpp
     bridge/checkpoint.cpp
     bridge/forced_exit.cpp
     chain/b3d_adapter.cpp
     chain/chain_adapter.cpp
-    engine/band_book.cpp
     engine/book.cpp
     engine/engine.cpp
     engine/matcher.cpp
@@ -132,27 +131,24 @@ if(BUILD_FLOWMESH2)
     futures/futures.cpp
     governance/governance.cpp
     ledger/ledger.cpp
-    ledger/merkle_levels.cpp
     ledger/nonce_window.cpp
-    ledger/smt_tree.cpp
     ledger/state_commitment.cpp
-    ledger/state_commitment_v1.cpp
     net/client_api.cpp
-    net/https_sse_api.cpp
     net/in_process_api.cpp
     net/in_process_mesh.cpp
     net/lanes.cpp
     net/seat_mesh.cpp
     net/sentry.cpp
     net/short_id.cpp
+    net/stream_hub.cpp
+    net/sync.cpp
     read/read_service.cpp
     read/views.cpp
+    seat/seat_node.cpp
     state/candidate.cpp
     state/replay.cpp
-    state/snapshot.cpp
     state/state_owner.cpp
     storage/commit_log.cpp
-    storage/control_log.cpp
     storage/file_journal.cpp
     storage/journal.cpp
     storage/journal_commit.cpp
@@ -161,25 +157,17 @@ if(BUILD_FLOWMESH2)
     storage/record.cpp
     storage/seat_signer.cpp
     storage/signer_log.cpp
-    storage/snapshot_mark.cpp
     storage/snapshot_store.cpp
   )
   target_link_libraries(fm2_core
     PRIVATE
       core_interface
       crc32c
-      leveldb
       fm2_warnings
     PUBLIC
       flowmesh2_foundations
       fm2_types
   )
-
-  # Authenticated socket/crypto boundary. The deterministic core and pure
-  # verifier retain their existing link isolation from bitcoin_common.
-  add_library(fm2_transport STATIC net/tcp_mesh.cpp net/tcp_mesh_wire.cpp ${PROJECT_SOURCE_DIR}/src/bip324.cpp)
-  target_link_libraries(fm2_transport PRIVATE core_interface fm2_warnings
-    PUBLIC fm2_core bitcoin_common)
 
   # verify/ (slice R11): b3verify, the engine-off client verifier
   # (certificates, outcomes, account leaves, fills, balance transitions and
@@ -198,6 +186,40 @@ if(BUILD_FLOWMESH2)
       bitcoin_crypto
   )
 
+  # netio/ (stage 2, M4-NET-01): the TCP seat mesh, in namespaces
+  # flowmesh2::netio (channel, handshake) and flowmesh2::net (the
+  # TcpSeatMesh declared in net/tcp_mesh.h). It links bitcoin_common for the
+  # ElligatorSwift ECDH, the BIP340 transport signatures and the socket
+  # helpers, which fm2_core may not link (guard rule 4); only executables
+  # and the tests link fm2_netio, never fm2_core, fm2_verify or fm2_types.
+  # Since M5-API-01 it also holds the HTTPS + SSE API (libevent's evhttp over
+  # bufferevent_openssl; OpenSSL and libevent are REQUIRED by the top-level
+  # build whenever BUILD_TESTS is on, so they are not new dependencies).
+  add_library(fm2_netio STATIC
+    netio/api_json.cpp
+    netio/bip324_session.cpp
+    netio/genesis_doc.cpp
+    netio/https_sse_api.cpp
+    netio/mesh_handshake.cpp
+    netio/tcp_mesh.cpp
+  )
+  target_link_libraries(fm2_netio
+    PRIVATE
+      core_interface
+      fm2_warnings
+    PUBLIC
+      fm2_core
+      bitcoin_common
+      bitcoin_crypto
+      univalue
+      OpenSSL::SSL
+      OpenSSL::Crypto
+      libevent::core
+      libevent::extra
+      libevent::openssl
+      $<TARGET_NAME_IF_EXISTS:libevent::pthreads>
+  )
+
   # dev/ (slice R10): REGTEST-only dev components, in namespace
   # flowmesh2::dev: the scripted fake chain adapter and the k = 1 dev
   # certifier (O-10); since slice R12 also the unlimited dev budget. Every dev header has
@@ -208,16 +230,67 @@ if(BUILD_FLOWMESH2)
   add_library(fm2_dev STATIC
     dev/dev_budget.cpp
     dev/dev_certifier.cpp
+    dev/dev_chain_file.cpp
     dev/fake_chain.cpp
   )
   target_compile_definitions(fm2_dev PUBLIC FM2_DEV_COMPONENTS)
   target_link_libraries(fm2_dev
     PRIVATE
       core_interface
+      crc32c
       fm2_warnings
     PUBLIC
       fm2_core
   )
+
+  # Regtest tools (stage 2 step 5, M5-NODE-01; DEV ONLY): fm2-keygen writes a
+  # cluster's genesis.json and seat keys, fm2-devchain is the faucet over the
+  # shared dev chain file. Both link fm2_dev and fm2_netio; no executable
+  # here links bitcoin_node (guard rule 3: no V1 flowmesh:: symbol).
+  add_executable(fm2_keygen dev/fm2_keygen_main.cpp)
+  set_target_properties(fm2_keygen PROPERTIES OUTPUT_NAME fm2-keygen)
+  target_link_libraries(fm2_keygen PRIVATE core_interface fm2_warnings fm2_dev fm2_netio)
+  add_executable(fm2_devchain dev/fm2_devchain_main.cpp)
+  set_target_properties(fm2_devchain PROPERTIES OUTPUT_NAME fm2-devchain)
+  target_link_libraries(fm2_devchain PRIVATE core_interface fm2_warnings fm2_dev fm2_netio)
+
+  # daemon/ (stage 2 step 5, M5-NODE-01): fm2d, one seat as a process over
+  # file journals, the TCP mesh and the HTTPS + SSE API. REGTEST only in this
+  # stage: it links fm2_dev for the shared dev chain file and the dev budget
+  # (the b3d adapter is stage 3). Never bitcoin_node (guard rule 3).
+  add_executable(fm2_daemon daemon/fm2d_main.cpp)
+  set_target_properties(fm2_daemon PROPERTIES OUTPUT_NAME fm2d)
+  target_link_libraries(fm2_daemon PRIVATE core_interface fm2_warnings fm2_dev fm2_netio)
+
+  # cli/ (stage 2 step 6, M5-CLI-01): the client's parts (the durable outbox
+  # over storage::FileJournal, the pinned TLS client, the reply JSON parser,
+  # the trust inputs and b3verify checks, the BIP340 key) and the fm2-cli
+  # binary. Never fm2_dev: a client has no dev components. Not a
+  # deterministic directory; signs with CKey::SignSchnorr (the stage 2
+  # report flags that guard rule 7 does not name it).
+  add_library(fm2_clilib STATIC
+    cli/https_client.cpp
+    cli/outbox.cpp
+    cli/reply_json.cpp
+    cli/signer.cpp
+    cli/trust.cpp
+  )
+  target_link_libraries(fm2_clilib
+    PRIVATE
+      core_interface
+      fm2_warnings
+    PUBLIC
+      fm2_core
+      fm2_verify
+      fm2_netio
+      bitcoin_common
+      univalue
+      OpenSSL::SSL
+      OpenSSL::Crypto
+  )
+  add_executable(fm2_cli cli/fm2_cli_main.cpp)
+  set_target_properties(fm2_cli PROPERTIES OUTPUT_NAME fm2-cli)
+  target_link_libraries(fm2_cli PRIVATE core_interface fm2_warnings fm2_clilib)
 
   # sim/ (slice R14): the deterministic simulator and the walking skeleton,
   # in namespace flowmesh2::sim. FakeClock and the seeded Scheduler are the
@@ -232,6 +305,7 @@ if(BUILD_FLOWMESH2)
   # the tests and the fm2-sim CLI links it.
   add_library(fm2_simlib STATIC
     sim/cluster.cpp
+    sim/cluster_scenario.cpp
     sim/scenario.cpp
     sim/scheduler.cpp
     sim/sim_client.cpp
@@ -257,32 +331,17 @@ if(BUILD_FLOWMESH2)
   set_target_properties(fm2_sim_cli PROPERTIES OUTPUT_NAME fm2-sim)
   target_link_libraries(fm2_sim_cli PRIVATE core_interface fm2_warnings fm2_simlib)
 
-  # fm2-trace (M3-ENG-05): runs the engine on a batch of slots for the
-  # independent checker in contrib/flowmesh2/checker.
-  add_executable(fm2_trace_cli sim/fm2_trace_main.cpp)
-  set_target_properties(fm2_trace_cli PROPERTIES OUTPUT_NAME fm2-trace)
-  target_link_libraries(fm2_trace_cli PRIVATE core_interface fm2_warnings fm2_simlib univalue)
-
-  # Explicit local-only four-seat operator worker. Never linked into b3coind.
-  if(UNIX)
-    add_executable(fm2_regtest_node dev/regtest_operator.cpp dev/regtest_node_main.cpp)
-    set_target_properties(fm2_regtest_node PROPERTIES OUTPUT_NAME fm2-regtest-node)
-    target_link_libraries(fm2_regtest_node PRIVATE core_interface fm2_warnings
-      fm2_dev fm2_core fm2_verify fm2_transport bitcoin_common bitcoin_clientversion univalue secp256k1)
-  endif()
-
   # Boost.Test suite of the outline. Every case is listed in test/INVENTORY.txt.
   add_executable(test_flowmesh2
     test/main.cpp
     test/account_leaf_tests.cpp
-    test/bip324_overlay_context_tests.cpp
     test/admission_precedence_tests.cpp
     test/admission_tests.cpp
     test/action_tests.cpp
     test/agreement_tests.cpp
     test/amount_tests.cpp
     test/authority_tests.cpp
-    test/band_book_tests.cpp
+    test/b3d_adapter_tests.cpp
     test/body_tests.cpp
     test/book_tests.cpp
     test/budget_tests.cpp
@@ -290,69 +349,61 @@ if(BUILD_FLOWMESH2)
     test/canonical_order_tests.cpp
     test/certificate_tests.cpp
     test/chain_adapter_tests.cpp
+    test/cli_tests.cpp
     test/codec_tests.cpp
     test/codes_tests.cpp
     test/commit_log_tests.cpp
-    test/control_log_tests.cpp
-    test/control_messages_tests.cpp
     test/commitment_tests.cpp
     test/dev_certifier_tests.cpp
     test/durable_tests.cpp
     test/engine_property_tests.cpp
     test/engine_tests.cpp
+    test/evidence_tests.cpp
     test/facts_tests.cpp
     test/fake_chain_tests.cpp
     test/fee_math_tests.cpp
     test/file_journal_tests.cpp
+    test/genesis_doc_tests.cpp
     test/hashes_tests.cpp
+    test/https_sse_tests.cpp
     test/ids_tests.cpp
     test/in_process_api_tests.cpp
-    test/int128_vector_tests.cpp
     test/journal_tests.cpp
     test/lanes_tests.cpp
     test/ledger_property_tests.cpp
-    test/ledger_cow_tests.cpp
     test/ledger_tests.cpp
-    test/ledger_v1_tests.cpp
     test/market_tests.cpp
     test/matcher_reference_tests.cpp
     test/matcher_tests.cpp
-    test/merkle_levels_tests.cpp
     test/merkle_tests.cpp
     test/messages_tests.cpp
     test/nonce_rule_tests.cpp
     test/nonce_window_tests.cpp
     test/outcome_tests.cpp
+    test/pbft_tests.cpp
     test/params_tests.cpp
-    test/pbft_view_change_tests.cpp
-    test/pbft_seat_count_tests.cpp
-    test/persistent_tree_tests.cpp
     test/pool_tests.cpp
     test/read_tests.cpp
     test/record_tests.cpp
     test/replay_tests.cpp
     test/result_tests.cpp
     test/seat_mesh_tests.cpp
+    test/short_id_tests.cpp
     test/seat_set_tests.cpp
     test/seat_signer_tests.cpp
-    test/short_id_tests.cpp
     test/signer_log_tests.cpp
+    test/sim_cluster_tests.cpp
     test/sim_node_tests.cpp
-    test/sim_restart_tests.cpp
     test/sim_scheduler_tests.cpp
     test/sim_trace_tests.cpp
     test/sim_walking_skeleton_tests.cpp
-    test/slot_cost_tests.cpp
     test/slot_tests.cpp
-    test/smt_tests.cpp
-    test/smt_tree_tests.cpp
-    test/snapshot_store_tests.cpp
-    test/snapshot_tests.cpp
     test/state_owner_tests.cpp
     test/state_root_tests.cpp
-    test/tcp_mesh_tests.cpp
-    test/tcp_mesh_wire_tests.cpp
+    test/stream_hub_tests.cpp
     test/stub_inventory_tests.cpp
+    test/sync_tests.cpp
+    test/tcp_mesh_tests.cpp
     test/validate_slot_tests.cpp
     test/verify_tests.cpp
   )
@@ -361,8 +412,9 @@ if(BUILD_FLOWMESH2)
   target_link_libraries(test_flowmesh2 PRIVATE
     core_interface
     fm2_warnings
+    fm2_clilib
+    fm2_netio
     fm2_simlib
-    fm2_transport
     fm2_dev
     fm2_core
     fm2_verify
@@ -385,10 +437,36 @@ if(BUILD_FLOWMESH2)
 
   set(FM2_CONTRIB ${PROJECT_SOURCE_DIR}/contrib/flowmesh2)
 
+  # Every CTest TIMEOUT below is a plain-build figure times FM2_TEST_TIMEOUT_SCALE.
+  # A sanitizer build runs the same tests several times slower (TSan 5 to 15
+  # times), and the CI runner is slower than a developer machine: the first
+  # sanitizer jobs on the branch (runs 44057193801 and 44089611835) failed
+  # `ctest -L flowmesh2` with no sanitizer report, test_flowmesh2 alone taking
+  # 95 s under TSan on an Apple M-series against the 120 s limit (review of
+  # 2026-11-16, item 11). The CI job's own 30-minute step stays the outer bound.
+  # Not a cache entry of its own: a cached default would survive a later -DSANITIZERS on the same build directory
+  # (review workflow of 2026-11-17 on 17.3 item 14). -DFM2_TEST_TIMEOUT_SCALE=<n> on the command line overrides it.
+  if(NOT DEFINED FM2_TEST_TIMEOUT_SCALE)
+    if(SANITIZERS)
+      set(FM2_TEST_TIMEOUT_SCALE 6)
+    else()
+      set(FM2_TEST_TIMEOUT_SCALE 1)
+    endif()
+  endif()
+  if(NOT FM2_TEST_TIMEOUT_SCALE MATCHES "^[1-9][0-9]*$")
+    message(FATAL_ERROR "FM2_TEST_TIMEOUT_SCALE must be a positive integer (got '${FM2_TEST_TIMEOUT_SCALE}')")
+  endif()
+  function(fm2_test_timeout test_name plain_seconds)
+    math(EXPR fm2_scaled "${plain_seconds} * ${FM2_TEST_TIMEOUT_SCALE}")
+    set_tests_properties(${test_name} PROPERTIES TIMEOUT ${fm2_scaled})
+  endfunction()
+  message(STATUS "flowmesh2 CTest timeouts scaled by ${FM2_TEST_TIMEOUT_SCALE}")
+
   # The simulator (slice R14): every variant for seeds 1..32 must pass its
   # manifest, and two CLI runs must print the same bytes.
   add_test(NAME flowmesh2_sim COMMAND fm2_sim_cli --scenario all --seeds 1-32)
-  set_tests_properties(flowmesh2_sim PROPERTIES TIMEOUT 600 LABELS "flowmesh2;isolated;outline;sim")
+  set_tests_properties(flowmesh2_sim PROPERTIES LABELS "flowmesh2;isolated;outline;sim")
+  fm2_test_timeout(flowmesh2_sim 600)
   add_test(NAME flowmesh2_sim_cli_determinism
     COMMAND ${CMAKE_COMMAND}
       -DSIM=$<TARGET_FILE:fm2_sim_cli>
@@ -396,34 +474,12 @@ if(BUILD_FLOWMESH2)
       "-DSIM_ARGS=--scenario;all;--seeds;1-8"
       -P ${FM2_CONTRIB}/sim_determinism.cmake
   )
-  set_tests_properties(flowmesh2_sim_cli_determinism PROPERTIES TIMEOUT 600 LABELS "flowmesh2;isolated;outline;sim")
-
-  # M3-ENG-05: the independent checker (contrib/flowmesh2/checker) must agree
-  # with the engine, through fm2-trace, on every slot of seeded random,
-  # adversarial, dust, caps and slotcap batches, and must recompute the walking
-  # skeleton's goldens that are pinned from the C++ output (O-87).
-  add_test(NAME flowmesh2_checker_selftest
-    COMMAND ${Python3_EXECUTABLE} -I -B ${FM2_CONTRIB}/checker/test_fm2check.py
-  )
-  set_tests_properties(flowmesh2_checker_selftest PROPERTIES TIMEOUT 60 LABELS "flowmesh2;isolated;checker")
-  add_test(NAME flowmesh2_checker_agreement
-    COMMAND ${Python3_EXECUTABLE} -I -B ${FM2_CONTRIB}/checker/fm2_check.py --trace $<TARGET_FILE:fm2_trace_cli>
-      --seeds 6 --slots 12 --kinds random,adversarial,dust --skeleton
-  )
-  set_tests_properties(flowmesh2_checker_agreement PROPERTIES TIMEOUT 600 LABELS "flowmesh2;isolated;checker")
-  add_test(NAME flowmesh2_checker_caps
-    COMMAND ${Python3_EXECUTABLE} -I -B ${FM2_CONTRIB}/checker/fm2_check.py --trace $<TARGET_FILE:fm2_trace_cli>
-      --seeds 1 --kinds caps
-  )
-  set_tests_properties(flowmesh2_checker_caps PROPERTIES TIMEOUT 600 LABELS "flowmesh2;isolated;checker")
-  add_test(NAME flowmesh2_checker_slotcap
-    COMMAND ${Python3_EXECUTABLE} -I -B ${FM2_CONTRIB}/checker/fm2_check.py --trace $<TARGET_FILE:fm2_trace_cli>
-      --seeds 1 --kinds slotcap
-  )
-  set_tests_properties(flowmesh2_checker_slotcap PROPERTIES TIMEOUT 900 LABELS "flowmesh2;isolated;checker")
+  set_tests_properties(flowmesh2_sim_cli_determinism PROPERTIES LABELS "flowmesh2;isolated;outline;sim")
+  fm2_test_timeout(flowmesh2_sim_cli_determinism 600)
 
   add_test(NAME flowmesh2_unit COMMAND test_flowmesh2 --log_level=test_suite)
-  set_tests_properties(flowmesh2_unit PROPERTIES TIMEOUT 120 LABELS "flowmesh2;isolated;outline")
+  set_tests_properties(flowmesh2_unit PROPERTIES LABELS "flowmesh2;isolated;outline")
+  fm2_test_timeout(flowmesh2_unit 120)
 
   add_test(NAME flowmesh2_inventory
     COMMAND ${Python3_EXECUTABLE} -I -B ${FM2_CONTRIB}/check_inventory.py
@@ -432,7 +488,22 @@ if(BUILD_FLOWMESH2)
       --workdir ${FM2_TEST_TMP}/inventory
       --selftest
   )
-  set_tests_properties(flowmesh2_inventory PROPERTIES TIMEOUT 300 LABELS "flowmesh2;isolated;outline;lint")
+  set_tests_properties(flowmesh2_inventory PROPERTIES LABELS "flowmesh2;isolated;outline;lint")
+  fm2_test_timeout(flowmesh2_inventory 300)
+
+  # Four fm2d on regtest (M5-NODE-01): keygen, the dev chain faucet, four seats
+  # that heartbeat and agree, a deposit seen on every seat, a seat killed and
+  # restarted that catches up. The driver names no CMake target (guard rule 4).
+  add_test(NAME flowmesh2_e2e_regtest
+    COMMAND ${Python3_EXECUTABLE} -I -B ${FM2_CONTRIB}/e2e_regtest.py
+      --keygen $<TARGET_FILE:fm2_keygen>
+      --devchain $<TARGET_FILE:fm2_devchain>
+      --fm2d $<TARGET_FILE:fm2_daemon>
+      --cli $<TARGET_FILE:fm2_cli>
+      --workdir ${FM2_TEST_TMP}/e2e
+  )
+  set_tests_properties(flowmesh2_e2e_regtest PROPERTIES LABELS "flowmesh2;isolated;outline;e2e")
+  fm2_test_timeout(flowmesh2_e2e_regtest 300)
 
   add_test(NAME flowmesh2_todo_lint
     COMMAND ${Python3_EXECUTABLE} -I -B ${FM2_CONTRIB}/check_todo.py
@@ -440,14 +511,8 @@ if(BUILD_FLOWMESH2)
       --workdir ${FM2_TEST_TMP}/todo_lint
       --selftest
   )
-  set_tests_properties(flowmesh2_todo_lint PROPERTIES TIMEOUT 60 LABELS "flowmesh2;isolated;outline;lint")
-
-  # M2-LED-09: the shared 128-bit vectors must be what the generator writes.
-  add_test(NAME flowmesh2_int128_vectors
-    COMMAND ${Python3_EXECUTABLE} -I -B ${FM2_CONTRIB}/int128_vectors.py
-      --check ${CMAKE_CURRENT_SOURCE_DIR}/test/util/int128_vectors.h
-  )
-  set_tests_properties(flowmesh2_int128_vectors PROPERTIES TIMEOUT 120 LABELS "flowmesh2;isolated;lint")
+  set_tests_properties(flowmesh2_todo_lint PROPERTIES LABELS "flowmesh2;isolated;outline;lint")
+  fm2_test_timeout(flowmesh2_todo_lint 60)
 
   # -------------------------------------------------------------------------
   # Guards (slice R2): contrib/flowmesh2/check_guards.py, seven rules.
@@ -461,7 +526,8 @@ if(BUILD_FLOWMESH2)
       --source
       --nm ${CMAKE_BINARY_DIR} --config $<CONFIG> --nm-tool ${CMAKE_NM}
   )
-  set_tests_properties(flowmesh2_guards PROPERTIES TIMEOUT 300 LABELS "flowmesh2;isolated;outline;lint;guards")
+  set_tests_properties(flowmesh2_guards PROPERTIES LABELS "flowmesh2;isolated;outline;lint;guards")
+  fm2_test_timeout(flowmesh2_guards 300)
 
   add_test(NAME flowmesh2_guards_selftest
     COMMAND ${Python3_EXECUTABLE} -I -B ${FM2_CONTRIB}/test_check_guards.py
@@ -469,14 +535,16 @@ if(BUILD_FLOWMESH2)
       --workdir ${FM2_TEST_TMP}/guards_selftest
       --cxx ${CMAKE_CXX_COMPILER} --ar ${CMAKE_AR} --nm-tool ${CMAKE_NM}
   )
-  set_tests_properties(flowmesh2_guards_selftest PROPERTIES TIMEOUT 300 LABELS "flowmesh2;isolated;outline;lint;guards")
+  set_tests_properties(flowmesh2_guards_selftest PROPERTIES LABELS "flowmesh2;isolated;outline;lint;guards")
+  fm2_test_timeout(flowmesh2_guards_selftest 300)
 
   # Evidence tool (slice R2): contrib/flowmesh2/evidence.py run/verify.
   add_test(NAME flowmesh2_evidence_selftest
     COMMAND ${Python3_EXECUTABLE} -I -B ${FM2_CONTRIB}/test_evidence.py
       --workdir ${FM2_TEST_TMP}/evidence_selftest
   )
-  set_tests_properties(flowmesh2_evidence_selftest PROPERTIES TIMEOUT 300 LABELS "flowmesh2;isolated;outline;lint;evidence")
+  set_tests_properties(flowmesh2_evidence_selftest PROPERTIES LABELS "flowmesh2;isolated;outline;lint;evidence")
+  fm2_test_timeout(flowmesh2_evidence_selftest 300)
 
   # Compile-fail controls (slice R2), Clang only: the lock control needs
   # Clang's thread-safety analysis. Each negative control is built twice, as
@@ -488,7 +556,7 @@ if(BUILD_FLOWMESH2)
   if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
     set(fm2_compile_fail_targets fm2_cf_positive_control)
     add_library(fm2_cf_positive_control OBJECT EXCLUDE_FROM_ALL test/compile_fail/positive_control.cpp)
-    foreach(fm2_case IN ITEMS tsa_missing_lock ignored_result forge_token sign_without_intent forge_receipt apply_without_receipt)
+    foreach(fm2_case IN ITEMS tsa_missing_lock ignored_result forge_token sign_without_intent forge_receipt apply_without_receipt malformed_task_id)
       add_library(fm2_cf_${fm2_case} OBJECT EXCLUDE_FROM_ALL test/compile_fail/${fm2_case}.cpp)
       add_library(fm2_cf_${fm2_case}_fixed OBJECT EXCLUDE_FROM_ALL test/compile_fail/${fm2_case}.cpp)
       target_compile_definitions(fm2_cf_${fm2_case}_fixed PRIVATE FM2_COMPILE_FAIL_FIXED)
@@ -511,8 +579,9 @@ if(BUILD_FLOWMESH2)
     )
     # RUN_SERIAL: the test drives the build system of this build directory.
     set_tests_properties(flowmesh2_negative_compile PROPERTIES
-      TIMEOUT 900 RUN_SERIAL TRUE LABELS "flowmesh2;isolated;outline;negative_compile"
+      RUN_SERIAL TRUE LABELS "flowmesh2;isolated;outline;negative_compile"
     )
+    fm2_test_timeout(flowmesh2_negative_compile 900)
   endif()
 
   # Sanitizer canaries (slice R2), default OFF. One deliberately defective
@@ -541,30 +610,7 @@ if(BUILD_FLOWMESH2)
       add_executable(fm2_canary_${fm2_canary} ${PROJECT_SOURCE_DIR}/contrib/flowmesh2/canaries/${fm2_canary}_canary.cpp)
       target_link_libraries(fm2_canary_${fm2_canary} PRIVATE core_interface)
     endforeach()
-    # GCC's UBSan object-size check sees the canary's read past the end
-    # first and halts before AddressSanitizer can report it, so the ASan
-    # canary would fire with the wrong diagnostic. Turn that one UBSan check
-    # off for this one program under GCC; Clang and every other target and
-    # check are unchanged. A source-file option is placed after the
-    # -fsanitize flags that core_interface brings in, so it takes effect.
-    if(TARGET fm2_canary_asan AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
-      set_source_files_properties(${PROJECT_SOURCE_DIR}/contrib/flowmesh2/canaries/asan_canary.cpp
-        PROPERTIES COMPILE_OPTIONS -fno-sanitize=object-size)
-    endif()
     message(STATUS "flowmesh2 sanitizer canaries: ${fm2_canaries}")
-  endif()
-
-  # Fuzz targets of every fm2 decoder (M0-FUZ-01) and the stateful ledger
-  # target (M2-LED-08): FUZZ=<target> bin/fm2_fuzz.
-  # libFuzzer when SANITIZERS includes fuzzer (Clang); otherwise a corpus
-  # replay driver (GCC). Its own driver, fuzz/fuzz_main.cpp, keeps the node's
-  # test_fuzz library and the V1 code out of this executable.
-  if(BUILD_FUZZ_BINARY)
-    add_executable(fm2_fuzz fuzz/fuzz_main.cpp fuzz/decoders.cpp fuzz/ledger_ops.cpp)
-    target_link_libraries(fm2_fuzz PRIVATE core_interface fm2_warnings fuzzer_interface fm2_core fm2_transport)
-    if(NOT FUZZ_BINARY_LINKS_WITHOUT_MAIN_FUNCTION)
-      target_compile_definitions(fm2_fuzz PRIVATE FM2_FUZZ_PROVIDE_MAIN)
-    endif()
   endif()
 
   # -------------------------------------------------------------------------

@@ -16,15 +16,12 @@
 #include <flowmesh2/core/result.h>
 #include <flowmesh2/core/slot.h>
 #include <flowmesh2/core/state_root.h>
-#include <flowmesh2/core/state_root_v1.h>
 #include <flowmesh2/engine/book.h>
 #include <flowmesh2/ledger/ledger.h>
 #include <uint256.h>
 
 #include <cstddef>
 #include <cstdint>
-#include <memory>
-#include <set>
 #include <span>
 #include <string_view>
 #include <utility>
@@ -92,7 +89,7 @@ Result<std::vector<size_t>> CanonicalOrder(std::span<const VerifiedAction> origi
 enum class SlotPhase : uint8_t {
     DEPOSITS = 1,     //!< chain facts: deposits credit accounts
     ACCOUNT = 2,      //!< TRANSFER (later WITHDRAW, M2-LED-05)
-    CANCELS = 3,      //!< CANCEL by OrderId (later CANCEL_ALL, M3-ENG-09)
+    CANCELS = 3,      //!< CANCEL by OrderId and CANCEL_ALL
     POST_ONLY = 4,    //!< PLACE POST_ONLY: rest, or REJ_WOULD_CROSS
     TAKERS = 5,       //!< PLACE GTC/IOC: reserve all, then one A2 sweep per market
     REST = 6,         //!< GTC remainders rest; IOC and refused remainders are released
@@ -104,13 +101,12 @@ bool IsKnown(SlotPhase phase);
 //! Registry name; "UNKNOWN" for an unregistered value.
 std::string_view ToString(SlotPhase phase);
 
-/** The phase in which `action` executes: TRANSFER in ACCOUNT, CANCEL in
- * CANCELS, a POST_ONLY PLACE in POST_ONLY, a GTC or IOC PLACE in TAKERS. A
- * PLACE whose payload does not decode returns the decoder's error. The
- * other kinds are the engine branches the outline leaves as stubs; the
- * validity predicate refuses them first (KindSupported), so a validated
- * slot never reaches them:
- * - CANCEL_ALL: NotImplemented(M3-ENG-09) (phase CANCELS once done);
+/** The phase in which `action` executes: TRANSFER in ACCOUNT, CANCEL and
+ * CANCEL_ALL in CANCELS, a POST_ONLY PLACE in POST_ONLY, a GTC or IOC PLACE
+ * in TAKERS. A PLACE or CANCEL_ALL whose payload does not decode returns the
+ * decoder's error. The other kinds are the engine branches the outline
+ * leaves as stubs; the validity predicate refuses them first
+ * (KindSupported), so a validated slot never reaches them:
  * - WITHDRAW: NotImplemented(M2-LED-05) (phase ACCOUNT once done);
  * - SPOT_TO_FUTURES, FUTURES_TO_SPOT: NotImplemented(M2-LED-06).
  * INVALID_INPUT for an unregistered kind.
@@ -140,35 +136,9 @@ Result<uint64_t> ArrivalRank(uint64_t height, SlotPhase phase, uint64_t rank, ui
  * candidate, Engine::ApplySlot mutates the copy, and the result is published
  * immutably. Markets are fixed at genesis (D6; listings are M7-GOV-01).
  */
-/** A state that passed the slot-boundary invariants (EngineState::Verify,
- * M2-LED-10): its ledger and the owners of its resting orders, all phase 9
- * needs to check a later state by its changes. Only Verify makes one, right
- * after the check, so every basis satisfies the invariants; the ledger copy
- * shares the checked state's trees.
- */
-class VerifiedBasis
-{
-public:
-    const ledger::LedgerState& Ledger() const { return m_ledger; }
-    //! Every owner of a resting order of the checked state.
-    const std::set<AccountId>& Owners() const { return m_owners; }
-
-private:
-    friend struct EngineState;
-    VerifiedBasis(ledger::LedgerState ledger, std::set<AccountId> owners) : m_ledger{std::move(ledger)}, m_owners{std::move(owners)} {}
-
-    ledger::LedgerState m_ledger;
-    std::set<AccountId> m_owners;
-};
-
 struct EngineState {
     ledger::LedgerState ledger;
     BookSet books;
-    /** The last state Verify checked: this one, or an ancestor that copies
-     * and changes led from. Shared by copies, never part of the value
-     * (operator== ignores it). Null when nothing was verified.
-     */
-    std::shared_ptr<const VerifiedBasis> verified;
 
     /** The state at genesis: LedgerState::Create(profile) and one empty book
      * per market (BookSet::Create); their errors propagate.
@@ -181,12 +151,6 @@ struct EngineState {
     std::vector<RestingOrderLeafV0> OrderLeaves() const;
     //! State commitment v0: ledger::CommitTradingStateV0(ledger, Markets(), OrderLeaves()).
     Result<StateRootsV0> Commit() const;
-    /** State commitment v1, the roots a v1 header would commit
-     * (ledger/state_commitment_v1.h). Not live: which profiles switch, the
-     * version byte and the certificate format are BLOCKED-ON-RULING.
-     */
-    // TODO(rebirth:M2-LED-02) commit v1 roots in the header once the switch is ruled.
-    Result<StateRootsV1> CommitV1() const;
 
     /** The invariants that hold at every slot boundary; INVARIANT if one
      * fails (engine phase 9 checks them before any candidate exists):
@@ -201,26 +165,7 @@ struct EngineState {
      */
     Result<void> CheckInvariants() const;
 
-    /** CheckInvariants, given that `basis` satisfies them (M2-LED-10):
-     * conservation by LedgerState::CheckConservationSince(basis ledger), the
-     * books and invariant 3 in full, and invariants 4 and 5 for every account
-     * that changed since the basis or owns a resting order here or in the
-     * basis. Any other account is the basis's own and ordered nothing, so its
-     * basis check still holds. The same verdict as CheckInvariants, in
-     * O(changed + orders + assets + withdrawals) instead of O(accounts +
-     * orders); "changed" counts every change since the basis, however made.
-     */
-    Result<void> CheckInvariantsSince(const VerifiedBasis& basis) const;
-
-    /** Engine phase 9: CheckInvariantsSince(*verified), or CheckInvariants
-     * when nothing was verified; on success `verified` becomes this state.
-     * Genesis and snapshot loads verify too, so a slot on any head the
-     * engine or a restore produced checks only its own changes.
-     */
-    Result<void> Verify();
-
-    //! The ledger and the books; never `verified`.
-    friend bool operator==(const EngineState& a, const EngineState& b) { return a.ledger == b.ledger && a.books == b.books; }
+    friend bool operator==(const EngineState&, const EngineState&) = default;
 };
 
 /** A committed head as the engine reads it: the parent header and the state
@@ -265,8 +210,8 @@ struct SlotInputs {
     friend bool operator==(const SlotInputs&, const SlotInputs&) = default;
 };
 
-//! The decoded payload of an action kind the outline executes.
-using ActionPayload = std::variant<PlacePayload, CancelPayload, TransferPayload, WithdrawPayload>;
+//! The decoded payload of an action kind the engine executes.
+using ActionPayload = std::variant<PlacePayload, CancelPayload, CancelAllPayload, TransferPayload, WithdrawPayload>;
 
 //! One validated original: the verified action, its decoded payload and its phase.
 struct SlotAction {
@@ -435,7 +380,12 @@ Result<void> RunFuturesPhase(EngineState& state, const ProfileParams& profile);
  *    REJ_UNKNOWN_ORDER (not resting: never placed, already closed, or
  *    placed in this slot, whose PLACE runs later) or REJ_NOT_OWN_ORDER.
  *    REJ_ORDER_CLOSED needs an index of closed orders; the outline does
- *    not keep one and answers REJ_UNKNOWN_ORDER.
+ *    not keep one and answers REJ_UNKNOWN_ORDER. CANCEL_ALL (M3-ENG-09)
+ *    removes every resting order of the signer's account in every market
+ *    (books in ascending MarketId, each book in its Orders() order) the
+ *    same way and is always CANCELLED, with one delta per reserved asset
+ *    (none when nothing rested), never a fill; it cannot reach a PLACE of
+ *    its own slot either.
  * 4. POST_ONLY: RESTING at its own price with
  *    ArrivalRank(height, POST_ONLY, rank), or REJ_WOULD_CROSS if it would
  *    execute against the book as it stands after the earlier post-only

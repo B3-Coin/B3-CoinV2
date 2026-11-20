@@ -19,10 +19,9 @@ Result<void> KindAdmissible(ActionKind kind)
     switch (kind) {
     case ActionKind::PLACE:
     case ActionKind::CANCEL:
+    case ActionKind::CANCEL_ALL:
     case ActionKind::TRANSFER:
         return Ok();
-    case ActionKind::CANCEL_ALL:
-        return Unsupported("M3-ENG-09"); // TODO(rebirth:M3-ENG-09) admit CANCEL_ALL once the engine executes it
     case ActionKind::WITHDRAW:
         return Unsupported("M2-LED-05"); // TODO(rebirth:M2-LED-05) admit WITHDRAW once the ledger reserves withdrawals
     case ActionKind::SPOT_TO_FUTURES:
@@ -52,8 +51,8 @@ bool PayloadAdmissible(const ActionV2& action)
     switch (action.kind) {
     case ActionKind::PLACE: decodes = action.Place().has_value(); break;
     case ActionKind::CANCEL: decodes = action.Cancel().has_value(); break;
+    case ActionKind::CANCEL_ALL: decodes = action.CancelAll().has_value(); break;
     case ActionKind::TRANSFER: decodes = action.Transfer().has_value(); break;
-    case ActionKind::CANCEL_ALL:
     case ActionKind::WITHDRAW:
     case ActionKind::SPOT_TO_FUTURES:
     case ActionKind::FUTURES_TO_SPOT:
@@ -222,7 +221,7 @@ Result<AdmissionReply> Admission::Evaluate(std::span<const unsigned char> frame,
     }
     if (action.domain != m_domain) return Ok(Reply(AdmissionCode::WRONG_DOMAIN, REASON_WRONG_DOMAIN));
     if (const Result<void> kind{KindAdmissible(action.kind, m_profile)}; !kind.has_value()) {
-        // TODO(rebirth:M2-LED-05) TODO(rebirth:M3-ENG-09) TODO(rebirth:M2-LED-06) each task makes its kind admissible.
+        // TODO(rebirth:M2-LED-05) TODO(rebirth:M2-LED-06) each task makes its kind admissible.
         return Ok(Reply(AdmissionCode::UNSUPPORTED_KIND, kind.error().detail));
     }
     if (!PayloadAdmissible(action, m_profile)) return Ok(Reply(AdmissionCode::MALFORMED, REASON_PAYLOAD_MALFORMED));

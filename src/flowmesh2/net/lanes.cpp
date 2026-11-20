@@ -4,6 +4,8 @@
 
 #include <flowmesh2/net/lanes.h>
 
+#include <flowmesh2/net/sync.h>
+
 #include <flowmesh2/agreement/messages.h>
 #include <flowmesh2/core/action.h>
 #include <util/check.h>
@@ -126,7 +128,7 @@ LaneSetLimits ProvisionalLaneLimits(const ProfileParams& profile)
     limits.Of(Lane::CRITICAL) = LaneOf(4'096, agreement_bytes);
     limits.Of(Lane::PROPOSAL) = LaneOf(16, agreement_bytes);
     limits.Of(Lane::ACTION) = LaneOf(std::max<size_t>(profile.pool_capacity, 20), ActionV2::MaxEncodedSize(profile) + 1);
-    limits.Of(Lane::BULK) = LaneOf(64, agreement_bytes);
+    limits.Of(Lane::BULK) = LaneOf(64, MaxBulkFrameBytes(profile)); // sync frames (O-101) are the longest
     return limits;
 }
 

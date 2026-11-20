@@ -199,13 +199,20 @@ BOOST_AUTO_TEST_CASE(fault_plan_real_faults_pass_and_stub_faults_are_typed)
     plan.bump_authority_at = 3;
     RequireOk(CheckFaultPlan(plan), "the three real faults");
 
-    std::vector<FaultPlan> stubs(5, plan);
-    stubs[0].crash_before_slot = 2;
-    stubs[1].drop.push_back(DropRule{0, 1, 500});
-    stubs[2].delay.push_back(DelayRule{0, 1, 20});
-    stubs[3].partition.push_back({0, 1});
-    stubs[4].skew.push_back(SkewRule{1, -5});
-    for (const FaultPlan& stub : stubs) RequireStub(CheckFaultPlan(stub), "M4-SIM-02");
+    // The cluster faults (M4-SIM-02) pass too, each on its own; an inconsistent plan is typed INVALID_INPUT.
+    std::vector<FaultPlan> cluster(5, plan);
+    cluster[0].crash_before_slot = 2;
+    cluster[1].drop.push_back(DropRule{0, 1, 500});
+    cluster[2].delay.push_back(DelayRule{0, 1, 20});
+    cluster[3].partition.push_back({0, 1});
+    cluster[4].skew.push_back(SkewRule{1, -5});
+    for (const FaultPlan& fault : cluster) RequireOk(CheckFaultPlan(fault), "a cluster fault");
+    FaultPlan bad{plan};
+    bad.drop.push_back(DropRule{0, 1, 1'001});
+    const Result<void> refused{CheckFaultPlan(bad)};
+    BOOST_REQUIRE(!refused.has_value());
+    BOOST_CHECK(refused.error().code == ErrorCode::INVALID_INPUT);
+    BOOST_CHECK(refused.error().detail == FAULT_PLAN_INVALID);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

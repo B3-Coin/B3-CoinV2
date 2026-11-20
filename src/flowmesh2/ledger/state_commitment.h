@@ -36,14 +36,9 @@
  * never on the order of the operations that produced it or of the inputs.
  * The state root is StateRootsV0::Root().
  *
- * Cost (M2-LED-10): the accounts and nullifiers roots come from the levels
- * the ledger stored at its last Seal (LedgerState::AccountsRootV0), so a
- * changed account costs O(log n) hashes and a key inserted at position p
- * about n - p (v0's sorted leaves shift); orders, markets, totals and
- * withdrawals are still hashed whole, O(orders + markets + assets +
- * withdrawals). Commitment v1 (ledger/state_commitment_v1.h, M2-LED-02)
- * puts each component in a sparse Merkle tree with absence proofs and
- * O(changed) updates; it is built but not live. v0 has no absence proof.
+ * Cost: O(state) hashing per call, with no caching. The planned sparse Merkle
+ * trees (M2-LED-02, with non-membership proofs and O(changed) updates)
+ * replace v0; v0 has no absence proof.
  *
  * Deterministic, no locks, no I/O. Errors: INVALID_INPUT for an invalid or
  * repeated market, a repeated OrderId, or (ProveAccountV0) an absent account;
@@ -98,6 +93,10 @@ struct WithdrawalWitness {
 Result<WithdrawalWitness> ProveWithdrawal(const LedgerState& ledger, const ActionId& id);
 
 // ---- Stubs -------------------------------------------------------------------
+
+//! Commitment v1: per-component sparse Merkle trees (commitment_version = 1).
+// TODO(rebirth:M2-LED-02) SMT commitment v1 with non-membership proofs and O(changed) updates.
+Result<uint256> CommitV1(const LedgerState& ledger);
 
 //! Merkle-sum root of the liabilities of one asset (sums in [0, 2^62]).
 // TODO(rebirth:M2-LED-03) Merkle-sum liability tree per asset.

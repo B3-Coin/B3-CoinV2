@@ -196,7 +196,8 @@ public:
     const std::shared_ptr<const CoreState>& Next() const { return m_next; }
 
 private:
-    friend Result<Candidate> BuildCandidate(const engine::Engine& engine, const HeadView& parent, const SlotInputs& inputs);
+    friend Result<Candidate> BuildCandidateBinding(const engine::Engine& engine, const HeadView& parent, const SlotInputs& inputs,
+                                                   const uint256& parent_cert_hash);
     Candidate(SlotHeaderV2 header, std::vector<OutcomeV2> outcomes, std::vector<uint256> outcome_leaves,
               std::vector<uint256> action_leaves, SlotBody body, std::shared_ptr<const CoreState> next);
 
@@ -232,11 +233,13 @@ private:
  *    commitment v0 root), action_count, outcome_count, commitment_version 0.
  * The next state keeps the parent's seat set.
  *
- * REAL-REPLACE M2-LED-10: the candidate shares the parent's ledger trees and
- * commitment levels, so the ledger's part of the work is O(changed); the
- * books are still copied, hashed and checked whole, O(orders).
+ * REAL-REPLACE M2-LED-10: the engine copies the whole parent state for every
+ * candidate; copy-on-write makes the work O(changed).
  */
 Result<Candidate> BuildCandidate(const engine::Engine& engine, const HeadView& parent, const SlotInputs& inputs);
+//! BuildCandidate whose header binds `parent_cert_hash` instead of parent.CertHash() (ReexecuteOn; O-98).
+Result<Candidate> BuildCandidateBinding(const engine::Engine& engine, const HeadView& parent, const SlotInputs& inputs,
+                                        const uint256& parent_cert_hash);
 
 /** Re-execute a proposed or decided slot (`header`, `body`) on `parent`:
  * INVALID_INPUT (REEXECUTE_GENESIS) for height 0; STALE_PARENT
@@ -246,6 +249,14 @@ Result<Candidate> BuildCandidate(const engine::Engine& engine, const HeadView& p
  * (REEXECUTE_HEADER_MISMATCH) unless the candidate's header equals `header`
  * exactly, and VERIFY_FAILED (REEXECUTE_BODY_MISMATCH) unless `body` is the
  * candidate's canonical body. Pure.
+ *
+ * The parent certificate hash is the one `header` carries, not `parent`'s
+ * (O-98, M4-AGR-02): a BLS certificate is not unique (O-4b), so seats that
+ * decided one slot from different vote subsets hold different certificate
+ * hashes for the same header; the proposer binds its own, every follower
+ * verifies the certificate the proposal carries against the parent header
+ * (agreement/pbft.h) before it re-executes, and replay trusts the decided
+ * header. Everything else of the header is recomputed and compared.
  */
 Result<Candidate> ReexecuteOn(const engine::Engine& engine, const HeadView& parent, const SlotHeaderV2& header,
                               const SlotBody& body);

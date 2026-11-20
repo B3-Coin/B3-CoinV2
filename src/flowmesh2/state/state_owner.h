@@ -9,21 +9,17 @@
 #include <flowmesh2/core/body.h>
 #include <flowmesh2/core/params.h>
 #include <flowmesh2/core/result.h>
-#include <flowmesh2/core/seat_set.h>
 #include <flowmesh2/core/slot.h>
 #include <flowmesh2/engine/engine.h>
 #include <flowmesh2/state/candidate.h>
-#include <flowmesh2/state/replay.h>
 #include <flowmesh2/storage/durable.h>
 #include <flowmesh2/storage/record.h>
 #include <sync.h>
 
-#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <span>
 #include <string_view>
-#include <vector>
 
 /** The single-writer state owner (slice R9; ARCHITECTURE.md sections 3, 4
  * and 8; [CC] ownership boundary 2).
@@ -41,8 +37,8 @@
  *   PARENT_KIND_UNKNOWN); copies the head pointer under the lock; STALE_PARENT
  *   (PARENT_NOT_HEAD) unless `parent` names that head (height and header
  *   hash); then BuildCandidate (state/candidate.h) WITHOUT the lock. The
- *   head is never changed. REAL-REPLACE M2-LED-10: every Preview shares
- *   the head's ledger but still copies its books.
+ *   head is never changed. REAL-REPLACE M2-LED-10: every Preview copies
+ *   the whole state (copy-on-write replaces it).
  * - Reexecute(header, body) const: a follower's check of a proposal or a
  *   decided slot: ReexecuteOn on the head, i.e. Preview with the inputs the
  *   header names plus exact header and canonical-body equality (VERIFY_FAILED
@@ -66,26 +62,15 @@
  *   only input CommitLog::AppendApplied takes: APPLIED, and so publication,
  *   can only follow an Apply that passed check 3 (O-92).
  * - Head(): the current head; never null.
- * - Restore(base, records, seats) (M4-STO-03, O-95): install the head a
- *   snapshot base (state::SnapshotHead) and the whole commit journal give.
- *   A genesis base is RestoreVerifiedGenesis. Otherwise: STALE_PARENT
- *   unless the owner still holds its configured genesis; VERIFY_FAILED
- *   (RESTORE_AUTHORITY) unless `seats` is the base's seat set; the base's
- *   domain, profile, static epoch 0, seat set, commitment version, state
- *   root and slot-boundary invariants (O-54; RESTORE_AUTHORITY,
- *   OWNER_COMMITMENT_VERSION, OWNER_STATE_ROOT_MISMATCH, the invariant's
- *   error); every record verified as RestoreVerifiedGenesis verifies it
- *   (chain, exact bodies, quorum certificates); ReplayDecisions from the
- *   base (state/replay.h: the decisions below it chain into it); VERIFY_FAILED
- *   (RESTORE_BASE_UNMARKED) unless the records hold the base's SNAPSHOT_MARK;
- *   both replayed heads checked again; then a compare-and-swap installs
- *   ReplayResult::head (the last APPLIED slot). On refusal the head is
- *   unchanged. `observer` sees every slot above the base as the replay
- *   commits it (state/replay.h), before the install: that is how a restart
- *   rebuilds the read service and the action pool (O-71) without
- *   executing a slot twice. The decided tail is returned UNAPPLIED: the caller runs
- *   check 3 on it under the current authority before it writes APPLIED,
- *   and a refusal keeps the head there and the node fenced (O-89).
+ * - Restore(base, records): install the head ReplayDecisions rebuilds from
+ *   the genesis `base` and the whole commit journal (M4-STO-01's restart,
+ *   landed 2026-11-14): the owner must still be at its genesis
+ *   (ORDER_VIOLATION, RESTORE_NOT_FRESH) and `base` must be it
+ *   (INVALID_INPUT, OWNER_NOT_GENESIS). The head installed is the last
+ *   APPLIED slot; a decided slot after it is the seat node's to re-execute
+ *   and apply after check 3 passes again under the current authority
+ *   (O-89; SeatNode::ApplyUnappliedTail, review of 2026-11-16, defect 8).
+ *   A snapshot base is NotImplemented until M4-STO-03 lands it.
  *
  * Create(profile, genesis, commit_journal_instance) takes a GENESIS head
  * only (height 0, zero parent hash, parent certificate hash and certificate
@@ -112,13 +97,9 @@ inline constexpr std::string_view OWNER_SEAT_SET_MISMATCH{"initial header names 
 inline constexpr std::string_view OWNER_STATE_ROOT_MISMATCH{"initial header does not commit to its state"};    //!< (VERIFY_FAILED)
 inline constexpr std::string_view DECISION_OTHER_HEADER{"decision token for another header"};                 //!< (VERIFY_FAILED)
 inline constexpr std::string_view AUTHORITY_SUPERSEDED{"candidate authority is not the current authority"};   //!< (AUTHORITY_CHANGED)
+inline constexpr std::string_view RESTORE_NOT_FRESH{"restore onto an owner whose head already moved"};         //!< (ORDER_VIOLATION)
 
 inline constexpr std::string_view OWNER_COMMITMENT_VERSION{"head commitment version differs from its profile"}; //!< (VERIFY_FAILED)
-inline constexpr std::string_view RESTORE_BASE_MISMATCH{"restore base differs from configured genesis"}; //!< (VERIFY_FAILED)
-inline constexpr std::string_view RESTORE_AUTHORITY{"restore requires the configured static epoch-zero authority"}; //!< (VERIFY_FAILED)
-inline constexpr std::string_view RESTORE_CERTIFICATE{"restore decision certificate does not verify"}; //!< (VERIFY_FAILED)
-inline constexpr std::string_view RESTORE_BASE_UNMARKED{"restore base has no durable snapshot mark"}; //!< (VERIFY_FAILED)
-inline constexpr std::string_view RESTORE_RECORD_CHAIN{"restore commit-journal chain does not match this instance"}; //!< (VERIFY_FAILED)
 
 //! What a successful Apply gives: the new head, and the receipt CommitLog::AppendApplied requires (O-92).
 struct AppliedSlot {
@@ -152,82 +133,18 @@ public:
     Result<AppliedSlot> Apply(Candidate&& candidate, const DurableDecision& decision, const AuthorityVersion& current)
         EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
 
-    //! Snapshot (or genesis) `base` plus the whole commit journal `records`. See the file comment.
-    Result<ReplayResult> Restore(const HeadView& base, std::span<const storage::JournalRecord> records, const SeatSet& seats,
-                                 const ReplayObserver& observer = {}) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+    //! Install the committed head ReplayDecisions rebuilds from the genesis `base` and the whole commit journal (file comment).
+    Result<void> Restore(const HeadView& base, std::span<const storage::JournalRecord> records) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
 
-    /** Certified genesis-only restart for the static REGTEST authority.
-     * `base` must equal this owner's configured genesis and the owner must
-     * still be there. `records` must be the whole durable Journal::ReadAll()
-     * result from this owner's COMMIT journal instance; the caller owns that
-     * durability precondition. A span/hash chain is not proof of a disk barrier
-     * and cannot detect a coherently rewritten/rolled-back store.
-     *
-     * Verifies the instance-bound chain and every DECISION's exact body,
-     * domain/profile/epoch/commitment version and real quorum BLS certificate,
-     * including duplicates, then executes ReplayDecisions outside the lock.
-     * CAS installs only its last APPLIED head. On refusal the head is unchanged.
-     * The returned decided tail is verified but UNAPPLIED: keep admission,
-     * publication and sealing fenced until the caller completes it through
-     * recovered CommitLog, Reexecute, Apply and APPLIED+Barrier. No log writes,
-     * signing, receipts or durable tokens are fabricated by restoration.
-     * This does not implement changing rosters, view-change or rollback
-     * detection; a snapshot base is Restore.
-     */
-    Result<ReplayResult> RestoreVerifiedGenesis(const HeadView& base, std::span<const storage::JournalRecord> records,
-                                               const SeatSet& seats) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
 
 private:
     StateOwner(engine::Engine engine, std::shared_ptr<const HeadView> genesis, uint64_t commit_journal_instance);
 
-    //! RestoreVerifiedGenesis with an observer (Restore of a genesis base).
-    Result<ReplayResult> RestoreGenesis(const HeadView& base, std::span<const storage::JournalRecord> records, const SeatSet& seats,
-                                        const ReplayObserver& observer) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
-    //! The verified part both restores share: replay from `base`, the mark of a snapshot base, both heads checked, CAS from `before`.
-    Result<ReplayResult> Install(const std::shared_ptr<const HeadView>& before, const HeadView& base,
-                                 std::span<const storage::JournalRecord> records, const ReplayObserver& observer)
-        EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
-
     const engine::Engine m_engine;
     const uint64_t m_commit_journal_instance;
-    const std::shared_ptr<const HeadView> m_configured_genesis;
     mutable Mutex m_mutex;
     std::shared_ptr<const HeadView> m_head GUARDED_BY(m_mutex);
 };
-
-/** True for the errors a Preview can give because of the slot's inputs
- * (DECODE, OVERSIZE, ARITHMETIC_OVERFLOW, VERIFY_FAILED, INVALID_INPUT,
- * NOT_IMPLEMENTED, UNSUPPORTED). False for every error about the node, the
- * call or the head (STALE_PARENT, ORDER_VIOLATION, INVARIANT, BUSY, ...).
- */
-bool IsInputRefusal(ErrorCode code);
-
-//! A candidate and the originals PreviewExcludingRefused left out.
-struct PreviewSelection {
-    Candidate candidate;
-    std::vector<size_t> excluded; //!< ascending indexes into inputs.body.originals
-};
-
-/** M4-ADM-03: Preview that leaves out the originals the engine refuses, so
- * one action (an O-34 error, for example a 257th asset in one account) does
- * not stall sealing. Pure, like Preview.
- *
- * 1. Preview(parent, inputs); success gives the candidate, nothing excluded.
- * 2. Any error that is not IsInputRefusal is returned. So is the error when
- *    there are no originals, or when the same inputs without originals fail
- *    too: then the facts or the slot are refused, and no action is blamed.
- * 3. Else, while Preview of the kept originals fails with an input refusal:
- *    bisect over the kept originals in their given order for a prefix that
- *    previews and the same prefix plus one original that does not (prefix 0
- *    previews, the whole list does not), and leave that one original out.
- *    The first kept list that previews gives the candidate.
- * Every original left out made a valid prefix of the others invalid on this
- * parent; it is never one that was valid with every kept original before it.
- * A non-refusal error in between is returned. Cost: at most
- * 2 + excluded * (ceil(log2 n) + 1) Previews for n originals, and only one
- * when nothing is refused.
- */
-Result<PreviewSelection> PreviewExcludingRefused(const StateOwner& owner, const ParentRef& parent, const SlotInputs& inputs);
 
 } // namespace flowmesh2::state
 

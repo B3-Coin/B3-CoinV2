@@ -199,18 +199,23 @@ BOOST_AUTO_TEST_CASE(message_sink_routes_by_type)
     auto mesh{RecordingMesh::Make(TestMeshConfig(1, 3))};
     agreement::MessageSink& sink{*mesh};
     RequireOk(sink.Send(0, ProposalFrame()), "proposal");
-    RequireOk(sink.Send(2, ViewChangeFrame()), "view change");
-    RequireOk(sink.Send(2, NewViewFrame()), "new view");
+    // Since M4-AGR-02 a view change or new view leaves only through SendStatement, with its durable statement.
+    RequireRefused(sink.Send(2, ViewChangeFrame()), ErrorCode::INVALID_INPUT, net::MESH_STATEMENT_NOT_TYPED, "view change through the sink");
+    RequireRefused(sink.Send(2, NewViewFrame()), ErrorCode::INVALID_INPUT, net::MESH_STATEMENT_NOT_TYPED, "new view through the sink");
     RequireOk(sink.Send(0, EvidenceFrame()), "evidence");
     RequireRefused(sink.Send(0, VoteFrame()), ErrorCode::INVALID_INPUT, net::MESH_VOTE_NOT_TYPED, "vote through the sink");
     RequireRefused(sink.Send(0, Frame{0x05}), ErrorCode::INVALID_INPUT, net::MESH_LANE_CONTENT, "no envelope");
     RequireRefused(sink.Send(1, ProposalFrame()), ErrorCode::INVALID_INPUT, net::MESH_SELF, "to itself through the sink");
-    BOOST_REQUIRE_EQUAL(mesh->sent.size(), 4U);
+    BOOST_REQUIRE_EQUAL(mesh->sent.size(), 2U);
     BOOST_CHECK(mesh->sent[0].lane == Lane::PROPOSAL);
     BOOST_CHECK(mesh->sent[1].lane == Lane::CRITICAL);
-    BOOST_CHECK(mesh->sent[2].lane == Lane::CRITICAL);
-    BOOST_CHECK(mesh->sent[3].lane == Lane::CRITICAL);
-    BOOST_CHECK_EQUAL(mesh->sent[1].seat, 2U);
+    // SendStatement needs the message to be the durable statement's: a vote's token is not one.
+    DurableVoteFixture durable;
+    const agreement::OutboundVote vote_token{durable.Vote()};
+    RequireRefused(mesh->SendStatement(2, vote_token, ViewChangeFrame()), ErrorCode::INVALID_INPUT, net::MESH_STATEMENT_MISMATCH,
+                   "a view change under a vote's token");
+    RequireRefused(mesh->SendStatement(2, vote_token, ProposalFrame()), ErrorCode::INVALID_INPUT, net::MESH_LANE_CONTENT,
+                   "a proposal as a statement");
 }
 
 BOOST_AUTO_TEST_CASE(poll_hands_out_received_frames)

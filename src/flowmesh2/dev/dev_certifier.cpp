@@ -112,8 +112,8 @@ Result<void> DevSingleSeatCertifier::Propose(const state::Candidate& candidate, 
 
 Result<void> DevSingleSeatCertifier::OnMessage(uint32_t /*from_seat*/, std::span<const unsigned char> /*bytes*/)
 {
-    // One seat receives nothing; the multi-seat message path is PBFT's.
-    return Unsupported("M4-AGR-02"); // TODO(rebirth:M4-AGR-02)
+    // One seat receives nothing; the multi-seat message path is PbftAgreement's (agreement/pbft.h).
+    return Error{ErrorCode::INVALID_INPUT, DEV_NO_MESSAGES};
 }
 
 Result<void> DevSingleSeatCertifier::OnTimeout(uint64_t /*now_ms*/)

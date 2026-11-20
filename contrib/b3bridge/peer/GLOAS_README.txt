@@ -55,6 +55,41 @@ In particular, retained mainnet journals and finality checkpoints are separate
 and must never be used by this path. Journal/policy files require private POSIX
 ownership and durability; run under Linux/WSL.
 
+Retained history across a committee-period restart
+--------------------------------------------------
+The optional --history-file warm-seeds ONLY the Nimbus availability client.
+It does not initialize or repair native authority by itself. The corresponding
+records must already have passed normal native Submit and be durably present
+in the same authenticated native journal. Do not import a copied journal.
+Missing/empty and bootstrap-only native histories are refused by the launcher.
+
+The file contains raw untrusted NDJSON update/finality_update frames, at most
+32 records / 2 MiB, with each frame bounded to 262144 bytes. It requires the
+unchanged-root bootstrap cache. Every record must have at least 342 participants
+and pass pinned Nimbus LightClientProcessor.addObject, including BLS, domain,
+period, finality and committee branches. A full update must leave a checked
+next committee known. Errors and Duplicate are refused, including a malformed
+duplicate that might otherwise be ignored before signature verification.
+
+The completed checked-update future fences synchronous callbacks before P2P
+emission observers are attached. The adapter never directly assigns a private
+committee/store: scoped pinned API access reads the processor reference and
+checks its postcondition. Cached updates emit no proof frames and cannot count
+as live peer progress. Cache-only replay and committee-only progress without
+finalized-head advancement cannot obtain the live-P2P result.
+
+This fixes the restart case where the native journal has authenticated the next
+committee but a freshly started availability client only restored its bootstrap.
+Historical committee proofs may fill an unknown committee without rolling back
+finalized state under existing native rules. The 8192-slot current-authority
+freshness/recovery guard, fork horizon, policy digest and journal lineage remain
+unchanged. A stale native authority is still refused; never reset/rebase it to
+evade that guard. Previous collector binaries and mainnet v1 data are preserved.
+
+Collector protocol version2 identifies this checked history support. Use its
+explicit fresh build/executable pin; an older version1 backend is refused by
+the updated owning launcher.
+
 Build and run
 -------------
 Build b3-bridge-gloascheck with the normal CMake build. Separately run:
@@ -70,10 +105,12 @@ Run the native consumer through its bounded owning launcher:
     --policy /absolute/private/sepolia-policy.json \
     --journal /absolute/private/gloas.journal --seconds 300 \
     --bootstrap-file /absolute/private/untrusted-bootstrap.json \
+    --history-file /absolute/private/already-native-checked-history.jsonl \
     --report /absolute/fresh-session-report.json \
     --private-log-dir /absolute/fresh-private-log-directory
 
-The bootstrap-file and private-log-dir options are optional. The latter stores
+The bootstrap-file, history-file and private-log-dir options are optional.
+History-file requires the already authenticated native history described above. The latter stores
 at most 1 MiB per child in private files; public reports contain hashes/counts.
 An execution_header input frame to b3-bridge-gloascheck carries only untrusted
 raw header bytes; native matching is still mandatory. Its format is:
@@ -124,7 +161,7 @@ domain separation, RLP preimage binding, owner/current/freshness capability
 checks, strict JSON and journal tamper/storage fences. Original v1 tests remain.
 Python boundary tests:
 
-  python3 -m unittest test_gloas_adapter.py test_peer_adapter.py
+  python3 -m unittest test_gloas_adapter.py test_gloas_history_adapter.py test_peer_adapter.py
 
 Go tests exercise trie inclusion/absence/tamper, strict request bounds, ordered
 proof trimming, actual ETH/SNAP loopback negotiation and wrong-network gating:

@@ -108,9 +108,10 @@ durability tokens that only `Journal::Confirm` mints after a barrier, the
 signer log (accepted proposals, intents and signed votes with the
 equivocation rule), the seat signer whose `Sign` takes only a
 `DurableIntent`, the commit log (decisions with their bodies, and
-applications) and `agreement/outbound.h`; reopening a file journal,
-rollover, group commit, snapshots, folded signing and the PBFT view-state
-records are typed stubs; and **R9**, the state owner in `state/`: the core
+applications) and `agreement/outbound.h`; group commit, snapshots,
+folded signing and the PBFT view-state records are typed stubs (segment
+rollover, `ReadAll` and reopen with recovery landed with M4-STO-06 and
+M4-STO-01); and **R9**, the state owner in `state/`: the core
 state and its genesis, owned committed heads, slot candidates that only
 the engine can produce (with the originals in canonical order, so a
 permuted proposal gives the same header), the single-writer `StateOwner`
@@ -125,9 +126,10 @@ batch must pass `CheckBatch`), the capped agreement messages and the
 `Agreement` and `SafetyRules` interfaces in `agreement/`, and the new
 REGTEST-only `fm2_dev` library with a scripted fake chain and the k = 1
 dev certifier, which writes `ACCEPTED_PROPOSAL`, `INTENT`, `SIGNED_VOTE`
-and `DECISION` in barrier order with both authority checks; PBFT, the
-leader schedule, inclusion lists, the restart fence, the evidence store
-and the b3d adapters are typed stubs; and **R11**, certified reads in
+and `DECISION` in barrier order with both authority checks; inclusion lists, the restart fence and
+the trusted-facts b3d adapter are typed stubs (PBFT over k seats, the
+leader schedule and the evidence store landed with M4-AGR-01/02/03/07; the
+finalized b3d adapter landed with M7-ADP-01, stage 3); and **R11**, certified reads in
 `read/`: an immutable `SlotView` per committed slot (header, certificate,
 outcomes, v0 account leaves with their tree levels, action and order-fill
 indexes), and the `ReadService`, which publishes only after B-APPLIED
@@ -153,9 +155,9 @@ BUSY that always means "not queued"), the client API contract and the
 in-process API (exactly one reply per request, admission through the
 lane, and `GetAction` from one read lease that answers EXPIRED only with
 a proof), and the seat mesh interface whose only vote path takes a
-durable vote; HTTPS + SSE, streams, the real meshes, short IDs, sentry
+durable vote; HTTPS + SSE, streams, the real meshes, sentry
 fan-out and the `bridge/`, `futures/` and `governance/` boundaries are
-typed stubs; and **R14**, the deterministic simulator in `sim/` (library
+typed stubs (the short-ID codec landed with M4-NET-02); and **R14**, the deterministic simulator in `sim/` (library
 `fm2_simlib`, CLI `fm2-sim`): a fake clock and a scheduler seeded from
 the run's seed, a fault plan (withhold an action, fail the commit barrier
 after a slot's DECISION, bump the authority between Preview and Propose),
@@ -163,12 +165,13 @@ a trace recorder over the journals, the seat signer and the chain
 authority, a simulated node built from the real components and a client
 that signs each action once and verifies everything with b3verify, and
 the walking skeleton of ARCHITECTURE.md §14 with all its checks for every
-seed; multi-node clusters, crash, drop, partition and skew faults, and
-Twins are typed stubs. Every outline slice has landed; Codex's first task
+seed; since M4-SIM-01/02 (§14.7) a four-seat PBFT cluster over the
+in-process mesh under drop, delay, skew, partition and crash faults
+(`pbft_cluster`, checks Q1..Q6); Twins are a typed stub. Every outline slice has landed; Codex's first task
 is the audit M0-AUD-01. Nothing is linked into the node, wallet or Qt.
 
 ```sh
-git -C /Users/josh/development/ON/B3-FlowMesh-hl branch --show-current   # must print: rebirth
+git -C /Users/joshesteve/development/on/B3-FlowMesh-hl branch --show-current   # must print: rebirth
 cmake -S . -B build-rebirth -DCMAKE_BUILD_TYPE=RelWithDebInfo \
   -DBUILD_TESTS=ON -DBUILD_FLOWMESH2_FOUNDATION_TESTS=ON -DBUILD_FLOWMESH2=ON \
   -DBUILD_GUI=OFF -DBUILD_DAEMON=OFF -DBUILD_CLI=OFF -DBUILD_TX=OFF -DBUILD_UTIL=OFF \
@@ -178,16 +181,50 @@ ctest --test-dir build-rebirth -L flowmesh2 --no-tests=error --output-on-failure
 build-rebirth/bin/fm2-sim --scenario all --seeds 1-32   # JSON on stdout; exit 0 only if every check passed
 ```
 
-Expected after R14 and the review fixes (O-89 to O-92): 10 CTests pass
+Expected after stage 2 step 6 (M5-CLI-01, 2026-11-14): 11 CTests pass
 (`flowmesh2_foundations` with its 19 C1 cases, `flowmesh2_sim`,
-`flowmesh2_sim_cli_determinism`, `flowmesh2_unit` with 510 cases,
+`flowmesh2_sim_cli_determinism`, `flowmesh2_unit` with 567 cases (551 after
+stage 2 step 6; the review fixes of 2026-11-17, ARCHITECTURE 17.3, added 16),
 `flowmesh2_inventory`, `flowmesh2_todo_lint`, `flowmesh2_guards`,
-`flowmesh2_guards_selftest`, `flowmesh2_evidence_selftest` and, with Clang,
-`flowmesh2_negative_compile` with six negative controls and a positive one).
+`flowmesh2_guards_selftest`, `flowmesh2_evidence_selftest`, with Clang
+`flowmesh2_negative_compile` with seven negative controls and a positive one, and
+`flowmesh2_e2e_regtest`, four `fm2d` processes on loopback and a trade through
+`fm2-cli`). After R14 and the review fixes (O-89 to O-92) there were 10 CTests and
+526 cases.
+
+To run a regtest cluster by hand (stage 2; REGTEST only, DEV parts until
+stage 3, ARCHITECTURE.md O-105):
+
+```sh
+build-rebirth/bin/fm2-keygen --out /tmp/fm2 --seats 4            # genesis.json, seat<index>/seat.key, seat<index>/transport.key
+for i in 0 1 2 3; do
+  build-rebirth/bin/fm2d --datadir /tmp/fm2/data$i --genesis /tmp/fm2/genesis.json \
+    --seat $i --keys /tmp/fm2/seat$i --devchain /tmp/fm2/devchain.log --log file &
+done
+cat /tmp/fm2/data0/fm2d.ready                                      # api port, mesh port, SPKI fingerprint
+build-rebirth/bin/fm2-devchain --file /tmp/fm2/devchain.log --genesis /tmp/fm2/genesis.json \
+  deposit <account-hex> rUSD 1000000000                           # the faucet: one block at the next height
+curl -k https://127.0.0.1:18800/v2/health                        # -k: the self-signed regtest certificate
+```
+
+Every seat tails the same dev chain file. The client (`fm2-cli`, M5-CLI-01,
+ARCHITECTURE.md O-106) signs once, keeps the exact bytes in a durable outbox,
+posts them to every seat and verifies every answer with b3verify against
+genesis.json; it pins each seat's SPKI fingerprint (from `fm2d.ready` or
+`api.fingerprint`) instead of `-k`:
+
+```sh
+python3 -c 'import json; print(json.dumps({str(i): json.load(open(f"/tmp/fm2/data{i}/fm2d.ready"))["fingerprint"] for i in range(4)}))' > /tmp/fm2/pins.json
+CLI="build-rebirth/bin/fm2-cli --genesis /tmp/fm2/genesis.json --pins /tmp/fm2/pins.json --key /tmp/fm2/alice.key --outbox /tmp/fm2/alice.outbox"
+$CLI keygen                                                        # alice's key and account id
+build-rebirth/bin/fm2-devchain --file /tmp/fm2/devchain.log --genesis /tmp/fm2/genesis.json deposit <alice-account> rUSD 1000000000
+$CLI state                                                         # the verified leaf
+$CLI place --market B3/rUSD --side buy --price 100 --lots 5 --wait # signed once, durable, posted to every seat, verified
+$CLI outbox                                                        # what was signed and what became of it
+$CLI stream --channel slots --count 3                              # verified slot envelopes
+```
 R14 itself had 505 cases and four negative controls. The file journal tests write only under
 `build-rebirth/fm2-test-tmp/`.
-Sanitizer builds and their canaries are described in ARCHITECTURE.md §13.2,
-and so is the fuzz binary `fm2_fuzz` (M0-FUZ-01), which has one target per
-fm2 decoder and is built only with `BUILD_FUZZ_BINARY=ON`. Open gates (workspace lock reconciliation, decision
+Sanitizer builds and their canaries are described in ARCHITECTURE.md §13.2. Open gates (workspace lock reconciliation, decision
 D3) are listed in ARCHITECTURE.md §0. All outline values are provisional and
 REGTEST-only.

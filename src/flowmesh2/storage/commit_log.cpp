@@ -72,6 +72,25 @@ std::vector<unsigned char> AppliedRecord::Encode() const
     return out;
 }
 
+std::vector<unsigned char> PreparedQcRecord::Encode() const
+{
+    std::vector<unsigned char> out;
+    VectorWriter writer{out, 0, epoch, slot, view, header_hash};
+    WriteCompactSize(writer, qc.size());
+    writer.write(MakeByteSpan(qc));
+    return out;
+}
+
+Result<PreparedQcRecord> PreparedQcRecord::Decode(std::span<const unsigned char> bytes)
+{
+    return DecodeExactWith(bytes, MAX_ENCODED_BYTES, [](SpanReader& reader) {
+        PreparedQcRecord record;
+        reader >> record.epoch >> record.slot >> record.view >> record.header_hash;
+        ReadCappedVector(reader, record.qc, SlotCertificate::MAX_ENCODED_BYTES);
+        return record;
+    });
+}
+
 Result<AppliedRecord> AppliedRecord::Decode(std::span<const unsigned char> bytes)
 {
     return DecodeExactWith(bytes, APPLIED_RECORD_BYTES, [](SpanReader& reader) {
@@ -81,146 +100,94 @@ Result<AppliedRecord> AppliedRecord::Decode(std::span<const unsigned char> bytes
     });
 }
 
-std::vector<unsigned char> PreparedQcRecord::Encode() const
-{
-    std::vector<unsigned char> out;
-    VectorWriter writer{out, 0};
-    writer << epoch << slot << view << header_hash;
-    const auto header_bytes{header.Encode()};
-    out.insert(out.end(), header_bytes.begin(), header_bytes.end());
-    VectorWriter qc_writer{out, out.size()};
-    WriteCappedVector(qc_writer, qc, SlotCertificate::MAX_ENCODED_BYTES);
-    const auto body_bytes{body.Encode()};
-    out.insert(out.end(), body_bytes.begin(), body_bytes.end());
-    return out;
-}
-
-size_t PreparedQcRecord::MaxEncodedSize(const ProfileParams& profile)
-{
-    return 56 + DecisionRecord::MaxEncodedSize(profile);
-}
-
-Result<PreparedQcRecord> PreparedQcRecord::Decode(std::span<const unsigned char> bytes, const ProfileParams& profile)
-{
-    if (bytes.size() > MaxEncodedSize(profile)) return Error{ErrorCode::OVERSIZE, "PBFT_PREPARED_SIZE"};
-    if (bytes.size() < 56) return Error{ErrorCode::DECODE, "PBFT_PREPARED_PREFIX"};
-    PreparedQcRecord record;
-    SpanReader reader{bytes.first(56)};
-    reader >> record.epoch >> record.slot >> record.view >> record.header_hash;
-    auto decision{DecisionRecord::Decode(bytes.subspan(56), profile)};
-    if (!decision.has_value()) return decision.error();
-    record.qc = decision->certificate.Encode();
-    record.header = std::move(decision->header);
-    record.body = std::move(decision->body);
-    return Ok(std::move(record));
-}
-
-namespace {
-Result<void> CheckPreparedRecord(const PreparedQcRecord& record)
-{
-    if (record.slot == 0 || record.header_hash.IsNull()) return Error{ErrorCode::INVALID_INPUT, "PBFT_PREPARED_KEY"};
-    if (record.header.authority_epoch != record.epoch || record.header.height != record.slot || record.header.Hash() != record.header_hash) {
-        return Error{ErrorCode::VERIFY_FAILED, "PBFT_PREPARED_KEY_BINDING"};
-    }
-    if (!BodyMatchesHeader(record.header, record.body)) return Error{ErrorCode::VERIFY_FAILED, BODY_HEADER_MISMATCH};
-    const auto certificate{SlotCertificate::Decode(record.qc)};
-    if (!certificate.has_value()) return certificate.error();
-    if (certificate->header_hash != record.header_hash) return Error{ErrorCode::VERIFY_FAILED, "PBFT_PREPARED_HEADER"};
-    if (const auto format{CertificateDigest(record.header, *certificate)}; !format.has_value()) return format.error();
-    if (record.header.commitment_version == COMMITMENT_VERSION_VIEW_BOUND && certificate->view != record.view) {
-        return Error{ErrorCode::VERIFY_FAILED, "PBFT_PREPARED_VIEW"};
-    }
-    if (certificate->Encode() != record.qc) return Error{ErrorCode::DECODE, "PBFT_PREPARED_CANONICAL"};
-    return Ok();
-}
-} // namespace
-
 Result<CommitLog> CommitLog::Create(Journal& journal)
-{
-    return CreateImpl(journal, nullptr);
-}
-
-Result<CommitLog> CommitLog::Create(Journal& journal, const ProfileParams& profile)
-{
-    return CreateImpl(journal, &profile);
-}
-
-Result<CommitLog> CommitLog::CreateImpl(Journal& journal, const ProfileParams* profile)
 {
     if (journal.Role() != JournalRole::COMMIT) return Error{ErrorCode::ORDER_VIOLATION, LOG_ROLE};
     const JournalStatus status{journal.Status()};
     if (status.fatal) return Error{ErrorCode::FENCED, JOURNAL_FENCED};
-    if (status.appended_seq != status.durable_seq) return Error{ErrorCode::ORDER_VIOLATION, LOG_PENDING_RECORDS};
-    if (profile) {
-        if (Result<void> valid{Validate(*profile)}; !valid.has_value()) return valid.error();
-    }
-    if (status.durable_seq == 0) return Ok(CommitLog{journal});
-    if (!profile) return Error{ErrorCode::INVALID_INPUT, LOG_REPLAY_PROFILE_REQUIRED};
+    if (status.appended_seq != 0) return Error{ErrorCode::ORDER_VIOLATION, LOG_HAS_HISTORY};
+    return Ok(CommitLog{journal});
+}
+
+Result<CommitLog> CommitLog::Recover(Journal& journal, const ProfileParams& profile)
+{
+    if (journal.Role() != JournalRole::COMMIT) return Error{ErrorCode::ORDER_VIOLATION, LOG_ROLE};
+    if (journal.IsFatal()) return Error{ErrorCode::FENCED, JOURNAL_FENCED};
     Result<std::vector<JournalRecord>> records{journal.ReadAll()};
     if (!records.has_value()) return records.error();
-    if (records->size() != status.durable_seq) return Error{ErrorCode::ORDER_VIOLATION, LOG_REPLAY_SEQUENCE};
-
     CommitLog log{journal};
-    uint64_t expected_seq{0};
+    const Error inconsistent{ErrorCode::VERIFY_FAILED, RECOVER_INCONSISTENT};
     for (const JournalRecord& record : *records) {
-        if (record.seq != ++expected_seq) return Error{ErrorCode::ORDER_VIOLATION, LOG_REPLAY_SEQUENCE};
         switch (record.type) {
         case RecordType::DECISION: {
-            Result<DecisionRecord> decision{DecisionRecord::Decode(record.payload, *profile)};
-            if (!decision.has_value()) return decision.error();
-            const SlotHeaderV2& header{decision->header};
-            const uint256 header_hash{header.Hash()};
-            if (decision->certificate.header_hash != header_hash) return Error{ErrorCode::VERIFY_FAILED, DECISION_CERT_HEADER};
-            if (!BodyMatchesHeader(header, decision->body)) return Error{ErrorCode::VERIFY_FAILED, BODY_HEADER_MISMATCH};
+            Result<DecisionRecord> decoded{DecisionRecord::Decode(record.payload, profile)};
+            if (!decoded.has_value()) return decoded.error();
+            const uint256 header_hash{decoded->header.Hash()};
+            if (decoded->certificate.header_hash != header_hash || !BodyMatchesHeader(decoded->header, decoded->body)) return inconsistent;
             const auto [it, inserted]{log.m_decisions.emplace(
-                header.height, DecisionEntry{header_hash, decision->certificate.Hash(), header.state_root, record.seq, std::nullopt})};
-            if (!inserted && it->second.header_hash != header_hash) return Error{ErrorCode::EQUIVOCATION_REFUSED, DECISION_CONFLICT};
+                decoded->header.height,
+                DecisionEntry{header_hash, decoded->certificate.Hash(), decoded->certificate, decoded->header.state_root, record.seq, std::nullopt,
+                              record.payload})};
+            if (!inserted) return inconsistent; // one DECISION record per slot
             break;
         }
         case RecordType::APPLIED: {
-            Result<AppliedRecord> applied{AppliedRecord::Decode(record.payload)};
-            if (!applied.has_value()) return applied.error();
-            const auto it{log.m_decisions.find(applied->slot)};
-            if (it == log.m_decisions.end() || it->second.header_hash != applied->header_hash) {
-                return Error{ErrorCode::VERIFY_FAILED, APPLIED_DECISION_UNKNOWN};
+            Result<AppliedRecord> decoded{AppliedRecord::Decode(record.payload)};
+            if (!decoded.has_value()) return decoded.error();
+            const auto it{log.m_decisions.find(decoded->slot)};
+            if (it == log.m_decisions.end() || it->second.header_hash != decoded->header_hash ||
+                it->second.state_root != decoded->state_root || it->second.applied_seq.has_value() ||
+                log.m_last_applied_slot == UINT64_MAX || decoded->slot != log.m_last_applied_slot + 1) {
+                return inconsistent;
             }
-            DecisionEntry& entry{it->second};
-            if (applied->state_root != entry.state_root) return Error{ErrorCode::VERIFY_FAILED, APPLIED_ROOT_MISMATCH};
-            if (!entry.applied_seq) {
-                if (log.m_last_applied_slot == UINT64_MAX || applied->slot != log.m_last_applied_slot + 1) {
-                    return Error{ErrorCode::ORDER_VIOLATION, APPLIED_OUT_OF_ORDER};
-                }
-                entry.applied_seq = record.seq;
-                log.m_last_applied_slot = applied->slot;
-            }
+            it->second.applied_seq = record.seq;
+            log.m_last_applied_slot = decoded->slot;
             break;
         }
-        case RecordType::SNAPSHOT_MARK: {
-            const Result<SnapshotMark> mark{SnapshotMark::Decode(record.payload)};
-            if (!mark.has_value()) return mark.error();
-            if (const Result<void> marked{log.Mark(*mark, record.seq)}; !marked.has_value()) return marked.error();
-            break;
-        }
+        case RecordType::SNAPSHOT_MARK:
+            return NotImplemented("M4-STO-03"); // TODO(rebirth:M4-STO-03) recover from the last snapshot
         case RecordType::PREPARED_QC: {
-            auto prepared{PreparedQcRecord::Decode(record.payload, *profile)};
-            if (!prepared.has_value()) return prepared.error();
-            if (auto valid{CheckPreparedRecord(*prepared)}; !valid.has_value()) return valid.error();
-            const auto key{std::tuple{prepared->epoch, prepared->slot, prepared->view}};
-            const auto [it, inserted]{log.m_prepared.emplace(key, std::pair{*prepared, record.seq})};
-            if (!inserted && it->second.first.header_hash != prepared->header_hash) {
-                return Error{ErrorCode::EQUIVOCATION_REFUSED, "PBFT_PREPARED_CONFLICT"};
-            }
+            Result<PreparedQcRecord> decoded{PreparedQcRecord::Decode(record.payload)};
+            if (!decoded.has_value()) return decoded.error();
+            const Result<SlotCertificate> cert{SlotCertificate::Decode(decoded->qc)};
+            if (!cert.has_value() || cert->header_hash != decoded->header_hash) return inconsistent;
+            const ProposalKey key{decoded->epoch, decoded->slot, decoded->view};
+            const auto [it, inserted]{log.m_prepared.emplace(key, PreparedEntry{*decoded, record.seq})};
+            if (!inserted) return inconsistent; // one proof per (epoch, slot, view)
             break;
         }
-        default:
-            if (!IsKnown(record.type)) return Error{ErrorCode::DECODE, RECORD_TYPE};
+        case RecordType::EVIDENCE:
+            if (record.payload.empty()) return inconsistent;
+            log.m_evidence.push_back(record.payload); // decoded and checked by the evidence store (agreement/evidence)
+            break;
+        case RecordType::INTENT:
+        case RecordType::SIGNED_VOTE:
+        case RecordType::ACCEPTED_PROPOSAL:
+        case RecordType::VIEW_STATE:
+        case RecordType::NEW_VIEW_ACCEPTED:
+        case RecordType::OUTBOX_ACTION:
+        case RecordType::OUTBOX_RESULT:
             return Error{ErrorCode::ORDER_VIOLATION, RECORD_ROLE};
         }
     }
-    const JournalStatus after{journal.Status()};
-    if (after.fatal) return Error{ErrorCode::FENCED, JOURNAL_FENCED};
-    if (!(after == status)) return Error{ErrorCode::ORDER_VIOLATION, LOG_REPLAY_CHANGED};
     return Ok(std::move(log));
+}
+
+std::optional<std::vector<unsigned char>> CommitLog::DecisionRecordAt(uint64_t slot) const
+{
+    const auto it{m_decisions.find(slot)};
+    if (it == m_decisions.end()) return std::nullopt;
+    return it->second.record;
+}
+
+Result<uint64_t> CommitLog::AppendEvidence(std::span<const unsigned char> payload)
+{
+    if (m_journal->IsFatal()) return Error{ErrorCode::FENCED, JOURNAL_FENCED};
+    if (payload.empty()) return Error{ErrorCode::INVALID_INPUT, EVIDENCE_EMPTY};
+    Result<uint64_t> seq{m_journal->Append(RecordType::EVIDENCE, payload)};
+    if (!seq.has_value()) return seq.error();
+    m_evidence.emplace_back(payload.begin(), payload.end());
+    return seq;
 }
 
 Result<PendingDecision> CommitLog::AppendDecision(const SlotHeaderV2& header, const SlotCertificate& certificate, const SlotBody& body)
@@ -239,45 +206,8 @@ Result<PendingDecision> CommitLog::AppendDecision(const SlotHeaderV2& header, co
     const std::vector<unsigned char> payload{DecisionRecord{header, certificate, body}.Encode()};
     Result<uint64_t> seq{m_journal->Append(RecordType::DECISION, payload)};
     if (!seq.has_value()) return seq.error();
-    m_decisions.emplace(header.height, DecisionEntry{header_hash, cert_hash, header.state_root, *seq, std::nullopt});
+    m_decisions.emplace(header.height, DecisionEntry{header_hash, cert_hash, certificate, header.state_root, *seq, std::nullopt, payload});
     return Ok(PendingDecision{m_journal->InstanceId(), *seq, DecisionRef{header.height, header_hash, cert_hash}});
-}
-
-bool CommitLog::IsApplied(const SnapshotMark& mark) const
-{
-    const auto it{m_decisions.find(mark.slot)};
-    return it != m_decisions.end() && it->second.applied_seq && it->second.header_hash == mark.header_hash &&
-           it->second.state_root == mark.state_root;
-}
-
-Result<void> CommitLog::Mark(const SnapshotMark& mark, uint64_t seq)
-{
-    if (!IsApplied(mark)) return Error{ErrorCode::VERIFY_FAILED, SNAPSHOT_MARK_UNAPPLIED};
-    m_marks.try_emplace(mark.slot, mark, seq); // a repeat keeps the first record
-    return Ok();
-}
-
-Result<uint64_t> CommitLog::AppendSnapshotMark(const SnapshotMark& mark)
-{
-    if (m_journal->IsFatal()) return Error{ErrorCode::FENCED, JOURNAL_FENCED};
-    if (const auto it{m_marks.find(mark.slot)}; it != m_marks.end()) {
-        if (it->second.first == mark) return Ok(it->second.second);
-        return Error{ErrorCode::VERIFY_FAILED, SNAPSHOT_MARK_UNAPPLIED};
-    }
-    // Checked before the append, so a refused mark writes nothing.
-    if (!IsApplied(mark)) return Error{ErrorCode::VERIFY_FAILED, SNAPSHOT_MARK_UNAPPLIED};
-    Result<uint64_t> seq{m_journal->Append(RecordType::SNAPSHOT_MARK, mark.Encode())};
-    if (!seq.has_value()) return seq.error();
-    if (const Result<void> marked{Mark(mark, *seq)}; !marked.has_value()) return marked.error();
-    return seq;
-}
-
-std::vector<SnapshotMark> CommitLog::SnapshotMarks() const
-{
-    std::vector<SnapshotMark> marks;
-    marks.reserve(m_marks.size());
-    for (const auto& [slot, entry] : m_marks) marks.push_back(entry.first);
-    return marks;
 }
 
 Result<PendingApplied> CommitLog::AppendApplied(const ApplyReceipt& receipt)
@@ -303,11 +233,11 @@ Result<PendingApplied> CommitLog::AppendApplied(const ApplyReceipt& receipt)
     return Ok(PendingApplied{m_journal->InstanceId(), *seq, ref});
 }
 
-std::optional<PendingApplied> CommitLog::AppliedAt(uint64_t slot) const
+std::optional<SlotCertificate> CommitLog::CertificateAt(uint64_t slot) const
 {
     const auto it{m_decisions.find(slot)};
-    if (it == m_decisions.end() || !it->second.applied_seq.has_value()) return std::nullopt;
-    return PendingApplied{m_journal->InstanceId(), *it->second.applied_seq, AppliedRef{slot, it->second.header_hash, it->second.state_root}};
+    if (it == m_decisions.end()) return std::nullopt;
+    return it->second.certificate;
 }
 
 std::optional<DecisionRef> CommitLog::DecisionAt(uint64_t slot) const
@@ -317,51 +247,40 @@ std::optional<DecisionRef> CommitLog::DecisionAt(uint64_t slot) const
     return DecisionRef{slot, it->second.header_hash, it->second.cert_hash};
 }
 
-Result<uint64_t> CommitLog::AppendPreparedQc(const PreparedQcRecord& /*record*/)
-{
-    return NotImplemented("M4-STO-07"); // TODO(rebirth:M4-STO-07)
-}
-
-Result<uint64_t> CommitLog::RecordVerifiedPreparedQc(const PreparedQcRecord& record)
+Result<uint64_t> CommitLog::AppendPreparedQc(const PreparedQcRecord& record)
 {
     if (m_journal->IsFatal()) return Error{ErrorCode::FENCED, JOURNAL_FENCED};
-    if (auto valid{CheckPreparedRecord(record)}; !valid.has_value()) return valid.error();
-    const auto key{std::tuple{record.epoch, record.slot, record.view}};
+    const Result<SlotCertificate> cert{SlotCertificate::Decode(record.qc)};
+    if (!cert.has_value()) return cert.error();
+    if (cert->header_hash != record.header_hash) return Error{ErrorCode::VERIFY_FAILED, PREPARED_CERT_HEADER};
+    const ProposalKey key{record.epoch, record.slot, record.view};
     if (const auto it{m_prepared.find(key)}; it != m_prepared.end()) {
-        if (it->second.first.header_hash != record.header_hash) return Error{ErrorCode::EQUIVOCATION_REFUSED, "PBFT_PREPARED_CONFLICT"};
-        return Ok(it->second.second);
+        if (it->second.record.header_hash != record.header_hash) return Error{ErrorCode::EQUIVOCATION_REFUSED, PREPARED_CONFLICT};
+        return Ok(it->second.seq);
     }
-    auto seq{m_journal->Append(RecordType::PREPARED_QC, record.Encode())};
+    Result<uint64_t> seq{m_journal->Append(RecordType::PREPARED_QC, record.Encode())};
     if (!seq.has_value()) return seq.error();
-    m_prepared.emplace(key, std::pair{record, *seq});
+    m_prepared.emplace(key, PreparedEntry{record, *seq});
     return seq;
 }
 
-std::optional<PreparedQcRecord> CommitLog::PreparedAt(uint64_t epoch, uint64_t slot, uint64_t view) const
-{
-    const auto it{m_prepared.find(std::tuple{epoch, slot, view})};
-    return it == m_prepared.end() ? std::nullopt : std::optional{it->second.first};
-}
-
-std::optional<uint64_t> CommitLog::HighestDurablePreparedViewAt(uint64_t epoch, uint64_t slot) const
-{
-    std::optional<uint64_t> highest;
-    const auto durable{m_journal->DurableSeq()};
-    for (const auto& [key, entry] : m_prepared) {
-        if (std::get<0>(key) == epoch && std::get<1>(key) == slot && entry.second <= durable &&
-            (!highest || *highest < std::get<2>(key))) highest = std::get<2>(key);
-    }
-    return highest;
-}
-
-std::optional<PreparedQcRecord> CommitLog::HighestPreparedAt(uint64_t epoch, uint64_t slot, uint64_t before_view, uint64_t watermark) const
+std::optional<PreparedQcRecord> CommitLog::HighestPrepared(uint64_t slot) const
 {
     std::optional<PreparedQcRecord> highest;
     for (const auto& [key, entry] : m_prepared) {
-        if (std::get<0>(key) == epoch && std::get<1>(key) == slot && std::get<2>(key) < before_view && entry.second <= watermark &&
-            (!highest || highest->view < entry.first.view)) highest = entry.first;
+        if (key.slot != slot) continue;
+        if (!highest.has_value() || entry.record.view > highest->view) highest = entry.record;
     }
     return highest;
+}
+
+std::vector<PreparedQcRecord> CommitLog::PreparedAt(uint64_t slot) const
+{
+    std::vector<PreparedQcRecord> prepared;
+    for (const auto& [key, entry] : m_prepared) { // keyed by (epoch, slot, view): ascending view within the slot
+        if (key.slot == slot) prepared.push_back(entry.record);
+    }
+    return prepared;
 }
 
 } // namespace flowmesh2::storage

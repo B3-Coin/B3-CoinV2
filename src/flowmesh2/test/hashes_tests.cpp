@@ -81,10 +81,9 @@ const PinnedTag PINNED_TAGS[]{
     {HashTag::PROTOCOL_ACCOUNT, 27, "B3/FM2/PROTOCOL_ACCOUNT", "dd170734e9886cefee4be813658ec7f08523ea1fe1df78aec279c0d43f84f3a9"},
     {HashTag::JOURNAL, 28, "B3/FM2/JOURNAL", "61a775b2eac97901da6842c51654a3fce27ca42f621dedb21b0641a766ced621"},
     {HashTag::TEST_ASSET, 29, "B3/FM2/TEST_ASSET", "bcbd107c316a7ee9193d8f593a2a1b8345f42cbfe8cc637032b76c12fef26c05"},
-    {HashTag::SMT_KEY, 30, "B3/FM2/SMT_KEY", "9762ac0e5e09386ec89632a506aca268ff81768a17e71c24e23219b2dbdb19a8"},
-    {HashTag::SMT_LEAF, 31, "B3/FM2/SMT_LEAF", "c6d51f7e70ecb3a00722f23711feeee3a17f18693d96501831a040489fa5ac34"},
-    {HashTag::SMT_NODE, 32, "B3/FM2/SMT_NODE", "8e0626c1ec74af4736ad9bfd00dc02f32feac3c5eff8c8784ac9db58b53d9203"},
-    {HashTag::SHORT_ID_KEY, 33, "B3/FM2/SHORT_ID_KEY", "e3ae64827571d0c1a1223add7cfb465942a25d07bd1da397e66daaeda1d646e8"},
+    {HashTag::AGREEMENT, 30, "B3/FM2/AGREEMENT", "8341e1670c965b3482fbdfe1cad9c2df61706f6b350a6f41d44791c63bde1fd4"},
+    {HashTag::MESH_SESSION, 31, "B3/FM2/MESH_SESSION", "ac77e623d10d712cb5f0be8a633deb92d4f53a58c2a4695a7177e111a2b6940e"},
+    {HashTag::MESH_ENDPOINT, 32, "B3/FM2/MESH_ENDPOINT", "082120dc77caca0808446a461b9284ce1d4daa3aafd7be9c51dfb8701c151efd"},
 };
 
 bool ScannedSuffix(const std::filesystem::path& path)
@@ -165,10 +164,10 @@ BOOST_AUTO_TEST_CASE(tags_unique_prefixed_and_distinct)
 BOOST_AUTO_TEST_CASE(unknown_tags_are_refused)
 {
     BOOST_CHECK(!IsKnown(static_cast<HashTag>(0)));
-    BOOST_CHECK(!IsKnown(static_cast<HashTag>(34)));
+    BOOST_CHECK(!IsKnown(static_cast<HashTag>(33)));
     BOOST_CHECK(!IsKnown(static_cast<HashTag>(255)));
     BOOST_CHECK(TagText(static_cast<HashTag>(0)).empty());
-    BOOST_CHECK(TagText(static_cast<HashTag>(34)).empty());
+    BOOST_CHECK(TagText(static_cast<HashTag>(33)).empty());
 }
 
 BOOST_AUTO_TEST_CASE(tagged_matches_the_bip340_definition)

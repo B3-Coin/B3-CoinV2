@@ -4,11 +4,12 @@
 
 // Compile-fail control (CTest flowmesh2_negative_compile, Clang only).
 // Ignoring a [[nodiscard]] flowmesh2::Result must be a build error under the
-// fm2 flag -Werror=unused-result. Built as is it must fail with the diagnostic
-// below; built with FM2_COMPILE_FAIL_FIXED (the result is checked) it must
-// compile.
+// fm2 flags -Werror=unused-result and -Werror=unused-value (Clang up to 20
+// files the diagnostic under the first group, Apple clang 21 under the
+// second). Built as is it must fail with the diagnostic below; built with
+// FM2_COMPILE_FAIL_FIXED (the result is checked) it must compile.
 //
-// FM2_EXPECT_ERROR: ignored_result\.cpp:\d+:\d+: error: ignoring return value of .*nodiscard.*\[-Werror,-Wunused-result\]
+// FM2_EXPECT_ERROR: ignored_result\.cpp:\d+:\d+: error: ignoring return value of .*nodiscard.*\[-Werror,-Wunused-(result|value)\]
 
 #include <flowmesh2/core/result.h>
 

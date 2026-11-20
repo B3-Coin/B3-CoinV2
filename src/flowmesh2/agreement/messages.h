@@ -12,7 +12,6 @@
 #include <flowmesh2/core/seat_set.h>
 #include <flowmesh2/core/slot.h>
 #include <flowmesh2/storage/tokens.h>
-#include <flowmesh2/storage/control_types.h>
 #include <uint256.h>
 
 #include <array>
@@ -124,6 +123,7 @@ inline constexpr std::string_view PROPOSAL_EPOCH{"proposal epoch is not the head
 inline constexpr std::string_view PROPOSAL_PARENT_CERT{"parent certificate does not match the header"}; //!< (INVALID_INPUT)
 inline constexpr std::string_view PROPOSAL_BODY{"proposal body does not match the header"};             //!< (INVALID_INPUT)
 inline constexpr std::string_view VOTE_GENESIS{"vote for the genesis height"};                          //!< (INVALID_INPUT)
+inline constexpr std::string_view VOTE_PHASE_NOT_VOTE{"a VOTE message with a statement phase"};         //!< (INVALID_INPUT)
 inline constexpr std::string_view VOTE_INCLUSION_ORDER{"inclusion IDs not strictly ascending"};         //!< (INVALID_INPUT)
 inline constexpr std::string_view VOTE_INCLUSION_PHASE{"inclusion IDs on a vote that is not PREPARE"};  //!< (INVALID_INPUT)
 inline constexpr std::string_view VIEW_CHANGE_TARGET{"view change to view 0"};                          //!< (INVALID_INPUT)
@@ -145,10 +145,6 @@ enum class MessageType : uint8_t {
     VIEW_CHANGE = 3,
     NEW_VIEW = 4,
     EVIDENCE = 5,
-    CERTIFIED_PROPOSAL = 6, //!< exact final certificate and its available proposal (regtest PBFT)
-    CONTROL_REPORT = 7,
-    CONTROL_NEW_VIEW = 8,
-    OFFER = 9,
 };
 
 //! Evidence kinds. APPEND-ONLY registry; zero is never a value.
@@ -251,45 +247,7 @@ struct Evidence {
     friend bool operator==(const Evidence&, const Evidence&) = default;
 };
 
-//! A transferable final proof. Its proposal supplies the exact executable body.
-struct CertifiedProposal {
-    Proposal proposal;
-    SlotCertificate certificate;
-    friend bool operator==(const CertifiedProposal&, const CertifiedProposal&) = default;
-};
-
-//! Complete transferable preparation header/proof; body is separately available.
-struct ControlPrepared {
-    uint64_t view{0};
-    SlotHeaderV2 header;
-    SlotCertificate certificate;
-    friend bool operator==(const ControlPrepared&, const ControlPrepared&) = default;
-};
-struct ControlReport {
-    storage::ControlKey key;
-    uint64_t prepared_watermark{0}; //!< local durable commit prefix at atomic view entry
-    std::optional<ControlPrepared> prepared;
-    std::optional<CertifiedHeader> decision;
-    storage::VoteSignature signature{};
-    friend bool operator==(const ControlReport&, const ControlReport&) = default;
-};
-inline constexpr size_t MAX_CONTROL_REPORTS{REGTEST_PBFT_MAX_SEATS}; //!< at most one report per seat of a regtest PBFT (O-98)
-struct ControlNewView {
-    storage::ControlKey key;
-    uint256 selected;
-    std::vector<ControlReport> reports;
-    storage::VoteSignature signature{};
-    std::optional<Proposal> selected_proposal; //!< exact durable body; does not itself grant PREPARE permission
-    friend bool operator==(const ControlNewView&, const ControlNewView&) = default;
-};
-//! Non-voting body availability and pending-work signal. It grants no vote.
-struct OfferedProposal {
-    Proposal proposal;
-    friend bool operator==(const OfferedProposal&, const OfferedProposal&) = default;
-};
-
-using Message = std::variant<Proposal, Vote, ViewChange, NewView, Evidence, CertifiedProposal,
-                             ControlReport, ControlNewView, OfferedProposal>;
+using Message = std::variant<Proposal, Vote, ViewChange, NewView, Evidence>;
 
 MessageType TypeOf(const Message& message);
 

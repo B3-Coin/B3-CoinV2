@@ -185,6 +185,16 @@ class EvidenceTests(unittest.TestCase):
         os.remove(os.path.join(self.dir, "MANIFEST.sha256"))
         self.assert_verify_fails("MANIFEST.sha256 is missing")
 
+    def test_verify_accepts_crlf_manifest_lines(self):
+        self.make_bundle()
+        path = os.path.join(self.dir, "MANIFEST.sha256")
+        with open(path, "rb") as f:
+            manifest = f.read()
+        with open(path, "wb") as f:
+            f.write(manifest.replace(b"\n", b"\r\n"))
+        rc, out = self.verify()
+        self.assertEqual(rc, 0, out)
+
     def test_verify_fails_on_bad_manifest_entries(self):
         self.make_bundle()
         good = self.manifest_lines()

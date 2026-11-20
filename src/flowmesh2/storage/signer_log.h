@@ -61,12 +61,11 @@
  *   verify the signature: SeatSigner made it, and peers verify it.
  * - Every Append and Confirm of a fatal journal is FENCED.
  * - Create needs a SIGNER journal (ORDER_VIOLATION, LOG_ROLE) that is not
- *   fatal (FENCED), with no pending undurable records. Create(journal) is
- *   fresh-only; Create(journal, profile) rebuilds the equivocation indexes
- *   from durable history, preserving original record references/signatures.
- *   It never signs, truncates records or clears an obligation.
+ *   fatal (FENCED) and has no records yet (ORDER_VIOLATION, LOG_HAS_HISTORY
+ *   otherwise); Recover rebuilds the indexes of a journal with history
+ *   (M4-STO-01).
  *
- * Record payloads (exact codecs; recovery in M4-STO-01 reads them):
+ * Record payloads (exact codecs; Recover reads them):
  * - ACCEPTED_PROPOSAL: ProposalKey (u64 epoch | u64 slot | u64 view) |
  *   header (366) | body (SlotBody encoding, the rest).
  * - INTENT: VoteKey (57) | digest | u64 proposal_seq: 97 bytes.
@@ -76,8 +75,10 @@
  * signer uses must not be moved or destroyed while the signer lives.
  * Threading: a SignerLog is owned by one thread (the sealing thread,
  * section 4); it has no lock of its own and never holds the journal's.
- * Stubs: AppendSignedFolded (M4-STO-05, folded signing; strict is the only
- * mode), AppendViewState and AppendNewViewAccepted (M4-STO-07).
+ * View state (M4-STO-07): AppendViewState and AppendNewViewAccepted write
+ * VIEW_STATE and NEW_VIEW_ACCEPTED (codecs above); ViewState and
+ * NewViewAccepted read the index, which Recover rebuilds.
+ * Stub: AppendSignedFolded (M4-STO-05, folded signing; strict is the only mode).
  */
 namespace flowmesh2::storage {
 
@@ -89,6 +90,12 @@ inline constexpr std::string_view INTENT_DIGEST_MISMATCH{"INTENT_DIGEST_MISMATCH
 inline constexpr std::string_view VOTE_EQUIVOCATION{"VOTE_EQUIVOCATION"};               //!< (EQUIVOCATION_REFUSED)
 inline constexpr std::string_view INTENT_UNKNOWN{"INTENT_UNKNOWN"};                     //!< (VERIFY_FAILED)
 inline constexpr std::string_view SIGNED_VOTE_CONFLICT{"SIGNED_VOTE_CONFLICT"};         //!< (EQUIVOCATION_REFUSED)
+inline constexpr std::string_view VIEW_STATE_BACKWARDS{"VIEW_STATE_BACKWARDS"};         //!< (ORDER_VIOLATION) a view state at or below the current (slot, view) that is not the same record
+inline constexpr std::string_view NEW_VIEW_CONFLICT{"NEW_VIEW_CONFLICT"};               //!< (EQUIVOCATION_REFUSED) another NEW_VIEW bundle for an (epoch, slot, view) already accepted
+inline constexpr std::string_view NEW_VIEW_EMPTY_MESSAGE{"NEW_VIEW_EMPTY_MESSAGE"};     //!< (INVALID_INPUT) an accepted NEW_VIEW without its message bytes
+//! Largest NEW_VIEW message the signer log keeps. PROVISIONAL (the agreement's codec caps it lower).
+inline constexpr size_t MAX_NEW_VIEW_MESSAGE_BYTES{1024 * 1024};
+inline constexpr size_t VIEW_STATE_RECORD_BYTES{24};
 
 struct AcceptedProposalRecord {
     ProposalKey key;
@@ -128,24 +135,57 @@ struct SignedVoteRecord {
     static Result<SignedVoteRecord> Decode(std::span<const unsigned char> bytes);
 };
 
-//! Target shape of a VIEW_STATE record (M4-STO-07 owns its content).
+/** VIEW_STATE (M4-STO-07): the seat entered `view` of `slot` under `epoch`
+ * (PROTOCOL.md "persist view+1 CHANGING" and the ACTIVE entry a NEW_VIEW
+ * gives). Durable before the view-change report's intent is signed. 24 bytes:
+ * u64 epoch | u64 slot | u64 view.
+ */
 struct ViewStateRecord {
     uint64_t epoch{0};
+    uint64_t slot{0};
     uint64_t view{0};
+
+    friend bool operator==(const ViewStateRecord&, const ViewStateRecord&) = default;
+
+    std::vector<unsigned char> Encode() const;
+    static Result<ViewStateRecord> Decode(std::span<const unsigned char> bytes);
 };
 
-//! Target shape of a NEW_VIEW_ACCEPTED record (M4-STO-07 owns its content).
+/** NEW_VIEW_ACCEPTED (M4-STO-07): the exact NEW_VIEW message the seat
+ * accepted for (epoch, slot, view); a proposal of that view is accepted only
+ * against it ("an accepted NEW_VIEW is exact"). u64 epoch | u64 slot | u64
+ * view | CompactSize(len) | message (1 .. MAX_NEW_VIEW_MESSAGE_BYTES).
+ */
 struct NewViewAcceptedRecord {
     uint64_t epoch{0};
+    uint64_t slot{0};
     uint64_t view{0};
     std::vector<unsigned char> message;
+
+    friend bool operator==(const NewViewAcceptedRecord&, const NewViewAcceptedRecord&) = default;
+
+    std::vector<unsigned char> Encode() const;
+    static Result<NewViewAcceptedRecord> Decode(std::span<const unsigned char> bytes);
 };
 
 class SignerLog
 {
 public:
+    //! A log over an empty SIGNER journal; a journal with records is ORDER_VIOLATION (LOG_HAS_HISTORY): use Recover.
     static Result<SignerLog> Create(Journal& journal);
-    static Result<SignerLog> Create(Journal& journal, const ProfileParams& profile);
+    /** A log over a SIGNER journal with history (M4-STO-01): rebuilds the
+     * proposal and equivocation indexes from Journal::ReadAll, so re-appends
+     * are idempotent against the history and another digest for a VoteKey
+     * is refused exactly as before the restart. ORDER_VIOLATION (LOG_ROLE)
+     * for another role, FENCED for a fatal journal, the record decoders'
+     * errors for a payload that does not decode, VERIFY_FAILED
+     * (RECOVER_INCONSISTENT) for a history this log would never have written
+     * (an intent without its proposal or with another digest for its key, a
+     * signed vote without its intent or with another signature, two
+     * proposals for one key). Records of M4-STO-07 are NotImplemented until
+     * it lands. An empty journal recovers to the same log Create gives.
+     */
+    static Result<SignerLog> Recover(Journal& journal, const ProfileParams& profile);
 
     SignerLog(SignerLog&&) noexcept = default;
     SignerLog& operator=(SignerLog&&) noexcept = default;
@@ -157,7 +197,23 @@ public:
 
     Result<PendingProposal> AppendAcceptedProposal(const ProposalKey& key, const SlotHeaderV2& header, const SlotBody& body);
     Result<PendingIntent> AppendIntent(const VoteKey& key, const uint256& digest, const PendingProposal& proposal);
+    /** The intent of a signed STATEMENT (M4-AGR-02): a VIEW_CHANGE report, a
+     * NEW_VIEW or a HIGH_WATER statement, which have no proposal. INVALID_INPUT
+     * (VOTE_PHASE) for a vote phase (use AppendIntent). The equivocation rule
+     * is the same: one digest per VoteKey forever (one report per target
+     * view), the same digest again idempotent. The record's proposal_seq is 0.
+     * SeatSigner::Sign and AppendSignedVote then work exactly as for a vote.
+     */
+    Result<PendingIntent> AppendStatementIntent(const VoteKey& key, const uint256& digest);
     Result<PendingSignedVote> AppendSignedVote(const DurableIntent& intent, const VoteSignature& signature);
+    //! The signature this log holds for `key` (a vote or a statement), if it was signed.
+    std::optional<VoteSignature> SignedStatement(const VoteKey& key) const;
+    /** The signed record of `key` (its digest, signature and intent), if it
+     * was signed: what a restarted seat needs to rebuild and resend the
+     * statement it signed before (review of 2026-11-16, R5). Durable by
+     * construction: the log read it back from its journal.
+     */
+    std::optional<SignedVoteRecord> SignedVote(const VoteKey& key) const;
     //! Journal::Barrier of the signer journal (B-INTENT, B-VOTE).
     Result<uint64_t> Barrier() { return m_journal->Barrier(); }
     //! Journal::Confirm: B-INTENT.
@@ -167,28 +223,30 @@ public:
 
     //! True iff `intent` is an intent of this log: same instance, sequence number, key and digest.
     bool Knows(const DurableIntent& intent) const;
-    //! Exact durable retained data for restart/retransmission; never signs.
-    std::optional<PendingSignedVote> SignedAt(const VoteKey& key) const;
-    /** The durable accepted proposal of `key`, decoded under `profile`, or
-     * nullopt while it is absent or not yet durable. One map lookup and one
-     * decode: the payload is kept with the index entry, so the cost does not
-     * grow with the slots signed (it used to re-read the whole journal).
-     */
-    Result<std::optional<AcceptedProposalRecord>> AcceptedAt(const ProposalKey& key, const ProfileParams& profile) const;
-    //! Every ordinary intent/signed vote is bound to one accepted proposal.
-    //! Only views whose accepted record passed its barrier are returned.
-    std::vector<uint64_t> DurableAcceptedViewsAt(uint64_t epoch, uint64_t slot) const;
 
     //! Folded signing (sign, then one barrier). Stub: M4-STO-05.
     Result<PendingSignedVote> AppendSignedFolded(const VoteKey& key, const uint256& digest, const PendingProposal& proposal,
                                                  const VoteSignature& signature);
-    //! Durable PBFT view state. Stub: M4-STO-07.
+    /** The seat enters (slot, view) (M4-STO-07): the record's sequence
+     * number. (slot, view) moves forward only: the same record again is
+     * idempotent (its original sequence number, nothing new); any record at
+     * or below the current (slot, view) that is not the same is
+     * ORDER_VIOLATION (VIEW_STATE_BACKWARDS). FENCED on a fatal journal.
+     * The caller barriers before it signs the report of that view.
+     */
     Result<uint64_t> AppendViewState(const ViewStateRecord& record);
-    //! Durable accepted new-view message. Stub: M4-STO-07.
+    //! The current view state, if any VIEW_STATE record exists.
+    std::optional<ViewStateRecord> ViewState() const { return m_view_state; }
+    /** The exact NEW_VIEW the seat accepted for (epoch, slot, view)
+     * (M4-STO-07). The same message again is idempotent; another message for
+     * that key is EQUIVOCATION_REFUSED (NEW_VIEW_CONFLICT); an empty message
+     * or one above MAX_NEW_VIEW_MESSAGE_BYTES is INVALID_INPUT or OVERSIZE.
+     */
     Result<uint64_t> AppendNewViewAccepted(const NewViewAcceptedRecord& record);
+    //! The accepted NEW_VIEW message of (epoch, slot, view), if any.
+    std::optional<std::vector<unsigned char>> NewViewAccepted(uint64_t epoch, uint64_t slot, uint64_t view) const;
 
 private:
-    static Result<SignerLog> CreateImpl(Journal& journal, const ProfileParams* profile);
     explicit SignerLog(Journal& journal) : m_journal{&journal} {}
 
     struct ProposalEntry {
@@ -196,8 +254,6 @@ private:
         uint256 domain;
         uint256 commit_digest;
         uint64_t seq{0};
-        //! The exact ACCEPTED_PROPOSAL payload at `seq` (AcceptedAt decodes it).
-        std::vector<unsigned char> payload;
     };
     struct VoteEntry {
         uint256 digest;
@@ -206,9 +262,18 @@ private:
         uint64_t signed_seq{0};
     };
 
+    //! The journal sequence number of the record that set m_view_state.
+    struct NewViewEntry {
+        std::vector<unsigned char> message;
+        uint64_t seq{0};
+    };
+
     Journal* m_journal;
     std::map<ProposalKey, ProposalEntry> m_proposals;
     std::map<VoteKey, VoteEntry> m_votes;
+    std::optional<ViewStateRecord> m_view_state;
+    uint64_t m_view_state_seq{0};
+    std::map<ProposalKey, NewViewEntry> m_new_views; //!< by (epoch, slot, view)
 };
 
 } // namespace flowmesh2::storage

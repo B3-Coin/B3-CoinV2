@@ -4,6 +4,8 @@
 
 #include <flowmesh2/net/in_process_api.h>
 
+#include <flowmesh2/net/stream_hub.h>
+
 #include <util/check.h>
 
 #include <utility>
@@ -22,7 +24,7 @@ std::string_view ToString(RequestState state)
 
 Result<std::unique_ptr<InProcessApi>> InProcessApi::Create(const ProfileParams& profile, LaneSet& lanes, admission::Admission& admission,
                                                            const admission::ActionPool& pool, const read::ReadService& read,
-                                                           const ApiLimits& limits)
+                                                           const ApiLimits& limits, StreamHub* streams)
 {
     const Result<void> valid{Validate(profile)};
     if (!valid.has_value()) return valid.error();
@@ -34,12 +36,12 @@ Result<std::unique_ptr<InProcessApi>> InProcessApi::Create(const ProfileParams& 
     if (lanes.Limits().Of(Lane::ACTION).max_message_bytes < ActionV2::MaxEncodedSize(profile) + 1) {
         return Error{ErrorCode::INVALID_INPUT, API_ACTION_LANE_SMALL};
     }
-    return Ok(std::unique_ptr<InProcessApi>{new InProcessApi{profile, lanes, admission, pool, read, limits}});
+    return Ok(std::unique_ptr<InProcessApi>{new InProcessApi{profile, lanes, admission, pool, read, limits, streams}});
 }
 
 InProcessApi::InProcessApi(const ProfileParams& profile, LaneSet& lanes, admission::Admission& admission,
-                           const admission::ActionPool& pool, const read::ReadService& read, const ApiLimits& limits)
-    : m_profile{profile}, m_lanes{lanes}, m_admission{admission}, m_pool{pool}, m_read{read}, m_limits{limits}
+                           const admission::ActionPool& pool, const read::ReadService& read, const ApiLimits& limits, StreamHub* streams)
+    : m_profile{profile}, m_lanes{lanes}, m_admission{admission}, m_pool{pool}, m_read{read}, m_limits{limits}, m_streams{streams}
 {
 }
 
@@ -271,8 +273,6 @@ Result<ActionStatusReply> InProcessApi::GetAction(const ActionV2& original) cons
     reply.status = ApiActionStatus::UNKNOWN;
     if (pooled && pooled->status == admission::PoolStatus::INCLUDED) {
         reply.reason = API_UNKNOWN_INCLUDED_AFTER_LEASE;
-    } else if (pooled && pooled->status == admission::PoolStatus::EXCLUDED) {
-        reply.reason = API_UNKNOWN_EXCLUDED; // local and definite (M4-ADM-03), never certified
     } else if (pooled && admission::IsTerminal(pooled->status)) {
         reply.reason = API_UNKNOWN_TERMINAL_UNPROVEN;
     } else if (lease_reply) {
@@ -285,9 +285,22 @@ Result<ActionStatusReply> InProcessApi::GetAction(const ActionV2& original) cons
 
 Result<read::AccountReply> InProcessApi::GetState(const AccountId& account) const { return m_read.Account(account); }
 
-Result<StreamId> InProcessApi::Subscribe(const StreamRequest& /*request*/)
+Result<StreamId> InProcessApi::Subscribe(const StreamRequest& request)
 {
-    return NotImplemented("M5-API-02"); // TODO(rebirth:M5-API-02)
+    if (m_streams == nullptr) return Error{ErrorCode::INVALID_INPUT, STREAM_NO_HUB};
+    return m_streams->Subscribe(request);
+}
+
+Result<std::vector<StreamEvent>> InProcessApi::TakeEvents(StreamId id, size_t max)
+{
+    if (m_streams == nullptr) return Error{ErrorCode::INVALID_INPUT, STREAM_NO_HUB};
+    return m_streams->TakeEvents(id, max);
+}
+
+Result<void> InProcessApi::Unsubscribe(StreamId id)
+{
+    if (m_streams == nullptr) return Error{ErrorCode::INVALID_INPUT, STREAM_NO_HUB};
+    return m_streams->Unsubscribe(id);
 }
 
 std::optional<RequestState> InProcessApi::State(RequestId id) const

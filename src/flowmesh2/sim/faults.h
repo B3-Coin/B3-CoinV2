@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <optional>
 #include <set>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -36,12 +37,28 @@
  * - bump_authority_before_apply_at = s: the authority is bumped after slot
  *   s's DECISION is durable and before Apply, so check 3 refuses a decided
  *   slot (O-89; sim_node_tests). The walking-skeleton variants do not use it.
+ * - crash_after_decision_at = s: the node stops after slot s's DECISION is
+ *   durable and before Apply (the hook answers STORAGE_FATAL and the node
+ *   fences), which is what a kill -9 or power loss there leaves: a restart
+ *   re-executes and applies the slot (SeatNode::ApplyUnappliedTail;
+ *   review of 2026-11-16, defect 8). sim_node_tests.
  *
- * Target shapes, stub M4-SIM-02 (CheckFaultPlan returns NotImplemented
- * when any of them is set): crash and restart before a slot (needs the
- * recovery tasks M4-STO-01 and M4-STO-03), dropped and delayed seat
- * messages, partitions between seat groups and per-seat clock skew (they
- * need the multi-node mesh, M4-SIM-01).
+ * Cluster faults (M4-SIM-02, landed 2026-11-14; sim/cluster.h applies them
+ * to a cluster of more than one node, the fabric's seed being fabric_seed):
+ * - crash_before_slot = s, crash_seat = i: the driver restarts node i before
+ *   slot s (SimCluster::RestartNode: journals and chain stay, everything
+ *   else is rebuilt, M4-STO-01 recovery; a decided-but-unapplied slot is
+ *   applied on the restart after check 3, or keeps the node fenced);
+ * - DropRule{from, to, per_mille}: that fraction of the frames from one
+ *   seat to another vanishes (seeded);
+ * - DelayRule{from, to, delay_ms}: frames from one seat to another arrive
+ *   that much later (rules add up);
+ * - partition: groups of seats; a frame between seats of different groups
+ *   vanishes until partition_heal_at_ms (never, when unset); a seat in no
+ *   group is alone;
+ * - SkewRule{seat, skew_ms}: that seat's agreement sees now + skew_ms.
+ * CheckFaultPlan refuses an inconsistent plan (INVALID_INPUT): a seat twice
+ * in the partition groups, a per_mille above 1,000, crash_before_slot 0.
  */
 namespace flowmesh2::sim {
 
@@ -71,24 +88,36 @@ struct FaultPlan {
     std::optional<uint64_t> fail_commit_barrier_at;
     std::optional<uint64_t> bump_authority_at;
     std::optional<uint64_t> bump_authority_before_apply_at;
+    std::optional<uint64_t> crash_after_decision_at;
 
-    // Target shapes; any of them set is NotImplemented(M4-SIM-02).
+    // Cluster faults (M4-SIM-02; see the file comment).
     std::optional<uint64_t> crash_before_slot;
+    uint32_t crash_seat{0};
     std::vector<DropRule> drop;
     std::vector<DelayRule> delay;
     std::vector<std::set<uint32_t>> partition;
+    std::optional<uint64_t> partition_heal_at_ms;
     std::vector<SkewRule> skew;
+    uint64_t fabric_seed{1};
 };
 
-/** Ok for a plan the outline can inject; NotImplemented(M4-SIM-02) when a
- * crash, drop, delay, partition or skew fault is set. The real faults are
- * not range-checked here: a slot that never comes simply never fires.
+inline constexpr std::string_view FAULT_PLAN_INVALID{"fault plan: a seat in two partition groups, a per_mille above 1000 or a crash before slot 0"}; //!< (INVALID_INPUT)
+
+/** Ok for a consistent plan (see the file comment); INVALID_INPUT
+ * (FAULT_PLAN_INVALID) otherwise. Slots are not range-checked: a slot that
+ * never comes simply never fires.
  */
 inline Result<void> CheckFaultPlan(const FaultPlan& plan)
 {
-    if (plan.crash_before_slot.has_value() || !plan.drop.empty() || !plan.delay.empty() || !plan.partition.empty() ||
-        !plan.skew.empty()) {
-        return NotImplemented("M4-SIM-02"); // TODO(rebirth:M4-SIM-02) crash, drop, delay, partition and skew hooks
+    if (plan.crash_before_slot.has_value() && *plan.crash_before_slot == 0) return Error{ErrorCode::INVALID_INPUT, FAULT_PLAN_INVALID};
+    for (const DropRule& rule : plan.drop) {
+        if (rule.per_mille > 1000) return Error{ErrorCode::INVALID_INPUT, FAULT_PLAN_INVALID};
+    }
+    std::set<uint32_t> seen;
+    for (const std::set<uint32_t>& group : plan.partition) {
+        for (const uint32_t seat : group) {
+            if (!seen.insert(seat).second) return Error{ErrorCode::INVALID_INPUT, FAULT_PLAN_INVALID};
+        }
     }
     return Ok();
 }

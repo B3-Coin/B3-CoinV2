@@ -12,7 +12,6 @@
 #include <flowmesh2/core/slot.h>
 #include <flowmesh2/storage/durable.h>
 #include <flowmesh2/storage/journal.h>
-#include <flowmesh2/storage/snapshot_mark.h>
 #include <flowmesh2/storage/tokens.h>
 #include <uint256.h>
 
@@ -22,7 +21,6 @@
 #include <optional>
 #include <span>
 #include <string_view>
-#include <tuple>
 #include <vector>
 
 /** The commit log: decisions and applications (slice R8; ARCHITECTURE.md 7).
@@ -60,45 +58,34 @@
  *   otherwise the slot must be the successor of the last applied slot
  *   (slot 1 first), else ORDER_VIOLATION (APPLIED_OUT_OF_ORDER), the same
  *   contiguity replay requires (O-89).
- * - AppendSnapshotMark(mark) (M4-STO-03, O-95): the SNAPSHOT_MARK record
- *   of a snapshot already stored (storage/snapshot_mark.h). VERIFY_FAILED
- *   (SNAPSHOT_MARK_UNAPPLIED) unless the slot is applied in this log with
- *   that header hash and state root: only committed state is snapshotted.
- *   The same mark again is idempotent (its first sequence number). The
- *   caller makes it durable with Barrier; a mark is a restart point once
- *   durable, and SnapshotMarks lists every mark this log holds.
  * - DecisionAt(slot): the reference of the decision this log holds for the
  *   slot, if any (used by the certifier before it signs, O-89).
  * - Every Append and Confirm of a fatal journal is FENCED.
  * - Create needs a COMMIT journal (ORDER_VIOLATION, LOG_ROLE) that is not
- *   fatal (FENCED), with no pending undurable records. Create(journal) is
- *   fresh-only; Create(journal, profile) rebuilds the indexes from durable
- *   history using that profile's decoding bounds. Replay checks record
- *   bindings, not agreement signatures or state execution.
+ *   fatal (FENCED) and has no records yet (ORDER_VIOLATION, LOG_HAS_HISTORY
+ *   otherwise); Recover rebuilds the decision index of a journal with
+ *   history (M4-STO-01).
  *
  * Record payloads (exact codecs, used by replay in R9):
  * - DECISION: header (366) | CompactSize(len) | certificate (len bytes) |
  *   body (SlotBody encoding, the rest).
  * - APPLIED: u64 slot | header_hash | state_root (72 bytes).
- * - SNAPSHOT_MARK: SnapshotMark (u64 slot | header_hash | state_root, 72 bytes).
  *
  * Threading: a CommitLog is owned by one thread (the sealing thread,
  * section 4); it has no lock of its own and never holds the journal's.
- * Stub: AppendPreparedQc (M4-STO-07).
+ * Prepared proofs (M4-STO-07): AppendPreparedQc and HighestPrepared.
  */
 namespace flowmesh2::storage {
 
 inline constexpr std::string_view BODY_HEADER_MISMATCH{"BODY_HEADER_MISMATCH"};           //!< (VERIFY_FAILED)
+inline constexpr std::string_view EVIDENCE_EMPTY{"an EVIDENCE record needs the encoded evidence"}; //!< (INVALID_INPUT)
 inline constexpr std::string_view DECISION_CERT_HEADER{"DECISION_CERT_HEADER"};           //!< (VERIFY_FAILED)
 inline constexpr std::string_view DECISION_CONFLICT{"DECISION_CONFLICT"};                 //!< (EQUIVOCATION_REFUSED)
 inline constexpr std::string_view APPLIED_DECISION_UNKNOWN{"APPLIED_DECISION_UNKNOWN"};   //!< (VERIFY_FAILED)
 inline constexpr std::string_view APPLIED_ROOT_MISMATCH{"APPLIED_ROOT_MISMATCH"};         //!< (VERIFY_FAILED)
 inline constexpr std::string_view APPLIED_OUT_OF_ORDER{"APPLIED_OUT_OF_ORDER"};           //!< (ORDER_VIOLATION)
-inline constexpr std::string_view SNAPSHOT_MARK_UNAPPLIED{"SNAPSHOT_MARK_UNAPPLIED"};   //!< (VERIFY_FAILED)
-inline constexpr std::string_view LOG_PENDING_RECORDS{"LOG_PENDING_RECORDS"};           //!< (ORDER_VIOLATION)
-inline constexpr std::string_view LOG_REPLAY_PROFILE_REQUIRED{"LOG_REPLAY_PROFILE_REQUIRED"}; //!< (INVALID_INPUT)
-inline constexpr std::string_view LOG_REPLAY_SEQUENCE{"LOG_REPLAY_SEQUENCE"};           //!< (ORDER_VIOLATION)
-inline constexpr std::string_view LOG_REPLAY_CHANGED{"LOG_REPLAY_CHANGED"};             //!< (ORDER_VIOLATION)
+inline constexpr std::string_view PREPARED_CONFLICT{"PREPARED_CONFLICT"};                 //!< (EQUIVOCATION_REFUSED) two headers prepared in one (epoch, slot, view)
+inline constexpr std::string_view PREPARED_CERT_HEADER{"PREPARED_CERT_HEADER"};           //!< (VERIFY_FAILED) the prepared certificate names another header
 
 /** True iff `body` is the body of `header`: same actions_root, facts_root
  * and number of originals (action_count). The validity predicate (R7) and
@@ -132,27 +119,45 @@ struct AppliedRecord {
     static Result<AppliedRecord> Decode(std::span<const unsigned char> bytes);
 };
 
-//! Target shape of a PREPARED_QC record (M4-STO-07 owns its content).
+/** PREPARED_QC (M4-STO-07): a quorum of PREPARE signatures over
+ * `header_hash` in (epoch, slot, view), as a SlotCertificate encoding
+ * (`qc`; its signatures cover the prepare digest of that view, not the
+ * commit digest). Durable before the seat's COMMIT intent (PROTOCOL.md).
+ * u64 epoch | u64 slot | u64 view | header_hash | CompactSize(len) | qc.
+ */
 struct PreparedQcRecord {
     uint64_t epoch{0};
     uint64_t slot{0};
     uint64_t view{0};
     uint256 header_hash;
     std::vector<unsigned char> qc;
-    SlotHeaderV2 header;
-    SlotBody body;
 
-    std::vector<unsigned char> Encode() const;
-    static size_t MaxEncodedSize(const ProfileParams& profile);
-    static Result<PreparedQcRecord> Decode(std::span<const unsigned char> bytes, const ProfileParams& profile);
     friend bool operator==(const PreparedQcRecord&, const PreparedQcRecord&) = default;
+
+    static constexpr size_t MAX_ENCODED_BYTES{24 + 32 + 3 + SlotCertificate::MAX_ENCODED_BYTES};
+    std::vector<unsigned char> Encode() const;
+    static Result<PreparedQcRecord> Decode(std::span<const unsigned char> bytes);
 };
 
 class CommitLog
 {
 public:
+    //! A log over an empty COMMIT journal; a journal with records is ORDER_VIOLATION (LOG_HAS_HISTORY): use Recover.
     static Result<CommitLog> Create(Journal& journal);
-    static Result<CommitLog> Create(Journal& journal, const ProfileParams& profile);
+    /** A log over a COMMIT journal with history (M4-STO-01): rebuilds the
+     * decision index and the last applied slot from Journal::ReadAll, so
+     * DecisionAt answers for every decided slot, re-appends are idempotent,
+     * another header for a decided slot is refused and the next APPLIED must
+     * follow the last one. ORDER_VIOLATION (LOG_ROLE) for another role,
+     * FENCED for a fatal journal, the record decoders' errors, VERIFY_FAILED
+     * (RECOVER_INCONSISTENT) for a history this log would never have written
+     * (an APPLIED without its decision or with another header hash or state
+     * root, applications out of slot order, a second decision for a slot).
+     * SNAPSHOT_MARK (M4-STO-03) and PREPARED_QC (M4-STO-07) records are
+     * NotImplemented until those land. State replay from the same records
+     * is state::ReplayDecisions.
+     */
+    static Result<CommitLog> Recover(Journal& journal, const ProfileParams& profile);
 
     CommitLog(CommitLog&&) noexcept = default;
     CommitLog& operator=(CommitLog&&) noexcept = default;
@@ -161,7 +166,6 @@ public:
 
     uint64_t JournalInstance() const { return m_journal->InstanceId(); }
     bool IsFatal() const { return m_journal->IsFatal(); }
-    uint64_t DurableSeq() const { return m_journal->DurableSeq(); }
 
     Result<PendingDecision> AppendDecision(const SlotHeaderV2& header, const SlotCertificate& certificate, const SlotBody& body);
     Result<PendingApplied> AppendApplied(const ApplyReceipt& receipt);
@@ -178,55 +182,67 @@ public:
      * the certifier asks this before it signs a height (O-89).
      */
     std::optional<DecisionRef> DecisionAt(uint64_t slot) const;
+    //! The certificate the DECISION record of `slot` holds, if the slot was decided here (the next proposal's parent certificate, M4-AGR-02).
+    std::optional<SlotCertificate> CertificateAt(uint64_t slot) const;
 
-    /** The APPLIED record this log holds for `slot` as a PendingApplied
-     * (its sequence number and reference), or nullopt if the slot is not
-     * applied here. Confirm turns it into the slot's DurableApplied once the
-     * record is durable: a restart hands the read service and the pool the
-     * tokens of slots applied before the crash (M4-STO-03, O-71). It writes
-     * nothing, so it can never make APPLIED of a refused slot (O-92).
+    /** A durable PreparedQC (M4-STO-07): the record's sequence number. The
+     * qc must decode as a SlotCertificate naming the record's header (DECODE
+     * or VERIFY_FAILED PREPARED_CERT_HEADER otherwise). The same (epoch,
+     * slot, view, header) again is idempotent (the first qc kept); another
+     * header for that (epoch, slot, view) is EQUIVOCATION_REFUSED
+     * (PREPARED_CONFLICT: conflicting equal-view proofs halt). Every other
+     * proof is appended as a fact; HighestPrepared keeps the highest view per
+     * slot and never downgrades. FENCED on a fatal journal.
      */
-    std::optional<PendingApplied> AppliedAt(uint64_t slot) const;
-    //! The last applied slot (0 before the first application).
-    uint64_t LastAppliedSlot() const { return m_last_applied_slot; }
-
-    //! Append the SNAPSHOT_MARK record of `mark`; returns its sequence number. See the file comment.
-    Result<uint64_t> AppendSnapshotMark(const SnapshotMark& mark);
-    //! Every mark this log holds (appended or replayed), ascending slot.
-    std::vector<SnapshotMark> SnapshotMarks() const;
-
-    //! Durable PBFT view state. Stub: M4-STO-07.
     Result<uint64_t> AppendPreparedQc(const PreparedQcRecord& record);
+    //! The prepared proof of the highest view this log holds for `slot`, if any.
+    std::optional<PreparedQcRecord> HighestPrepared(uint64_t slot) const;
+    //! Every prepared proof this log holds for `slot`, by ascending view (a restarted seat rebuilds its signed report from them, R5).
+    std::vector<PreparedQcRecord> PreparedAt(uint64_t slot) const;
 
-    //! Already cryptographically checked by agreement; durable before a COMMIT intent.
-    //! The log checks exact canonical certificate/header binding and retains the
-    //! first proof for each (epoch, slot, view). Signature checking is the caller's.
-    Result<uint64_t> RecordVerifiedPreparedQc(const PreparedQcRecord& record);
-    std::optional<PreparedQcRecord> PreparedAt(uint64_t epoch, uint64_t slot, uint64_t view) const;
-    std::optional<uint64_t> HighestDurablePreparedViewAt(uint64_t epoch, uint64_t slot) const;
-    std::optional<PreparedQcRecord> HighestPreparedAt(uint64_t epoch, uint64_t slot, uint64_t before_view, uint64_t watermark) const;
+    /** An EVIDENCE record (M4-AGR-07): the encoded agreement evidence
+     * message, appended as a fact (the evidence store checks and verifies
+     * it; the caller barriers). INVALID_INPUT EVIDENCE_EMPTY for no bytes,
+     * FENCED on a fatal journal. EvidenceRecords() returns every EVIDENCE
+     * payload this log holds, recovered or appended, in journal order.
+     */
+    Result<uint64_t> AppendEvidence(std::span<const unsigned char> payload);
+    const std::vector<std::vector<unsigned char>>& EvidenceRecords() const { return m_evidence; }
+
+    /** The encoded DECISION record of `slot` if this log appended or
+     * recovered it; nullopt otherwise. The catch-up replies of O-101 come
+     * from memory, never from a journal read on the sealing thread, and
+     * every decision the log holds is served (it was a ring of the last 16,
+     * which left a seat further behind unable to rejoin: review of
+     * 2026-11-16, defect 2). What bounds the resident payloads is what
+     * bounds the journal: the snapshot of M4-STO-03 (PROVISIONAL until it
+     * lands; a per-segment index would be the alternative).
+     */
+    std::optional<std::vector<unsigned char>> DecisionRecordAt(uint64_t slot) const;
 
 private:
-    static Result<CommitLog> CreateImpl(Journal& journal, const ProfileParams* profile);
     explicit CommitLog(Journal& journal) : m_journal{&journal} {}
-    //! Index `mark` (record `seq`): VERIFY_FAILED (SNAPSHOT_MARK_UNAPPLIED) unless its slot is applied with its header and root.
-    Result<void> Mark(const SnapshotMark& mark, uint64_t seq);
-    //! True when `mark.slot` is applied in this log with `mark`'s header hash and state root.
-    bool IsApplied(const SnapshotMark& mark) const;
 
     struct DecisionEntry {
         uint256 header_hash;
         uint256 cert_hash; //!< of the certificate the DECISION record holds
+        SlotCertificate certificate;
         uint256 state_root;
         uint64_t seq{0};
         std::optional<uint64_t> applied_seq;
+        std::vector<unsigned char> record; //!< the encoded DECISION payload, served to catching-up seats (O-101)
+    };
+
+    struct PreparedEntry {
+        PreparedQcRecord record;
+        uint64_t seq{0};
     };
 
     Journal* m_journal;
-    std::map<std::tuple<uint64_t, uint64_t, uint64_t>, std::pair<PreparedQcRecord, uint64_t>> m_prepared;
     std::map<uint64_t, DecisionEntry> m_decisions; //!< by slot
-    std::map<uint64_t, std::pair<SnapshotMark, uint64_t>> m_marks; //!< by slot: the mark and its record's sequence number
     uint64_t m_last_applied_slot{0};               //!< 0 before the first application (the genesis height)
+    std::map<ProposalKey, PreparedEntry> m_prepared; //!< by (epoch, slot, view)
+    std::vector<std::vector<unsigned char>> m_evidence; //!< EVIDENCE payloads in journal order (M4-AGR-07)
 };
 
 } // namespace flowmesh2::storage

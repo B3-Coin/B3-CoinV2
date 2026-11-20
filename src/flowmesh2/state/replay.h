@@ -5,18 +5,13 @@
 #ifndef B3_FLOWMESH2_STATE_REPLAY_H
 #define B3_FLOWMESH2_STATE_REPLAY_H
 
-#include <flowmesh2/core/body.h>
-#include <flowmesh2/core/certificate.h>
-#include <flowmesh2/core/outcome.h>
 #include <flowmesh2/core/result.h>
 #include <flowmesh2/core/slot.h>
 #include <flowmesh2/state/candidate.h>
 #include <flowmesh2/storage/record.h>
-#include <flowmesh2/storage/snapshot_mark.h>
 #include <uint256.h>
 
 #include <cstdint>
-#include <functional>
 #include <optional>
 #include <span>
 #include <string_view>
@@ -34,19 +29,6 @@
  * lock and touches no file; installing the result into a StateOwner is
  * Restore (stub M4-STO-03).
  *
- * The base is the genesis head or, since M4-STO-03 (O-95), a committed head
- * restored from a snapshot (state::SnapshotHead). Records are always the
- * whole journal: segments are never deleted. Below a snapshot base there is
- * no state to re-execute on, so those DECISION records are checked as a
- * chain instead: heights 1, 2, ... in order, each naming the previous
- * header's hash and certificate hash as its parent (VERIFY_FAILED,
- * REPLAY_BASE_CHAIN), and the one at the base height exactly the base
- * header with the base's certificate hash (REPLAY_BASE_CHAIN). The records
- * must decide every height up to the base and apply the base (INVALID_INPUT,
- * REPLAY_BASE_UNKNOWN), so a snapshot of state that was never committed
- * cannot be a base. Above the base everything is re-executed as from
- * genesis.
- *
  * Committed versus decided (O-89): a slot is committed state only once its
  * APPLIED record is durable, because APPLIED is written only after Apply
  * passed check 3. So `head` is the head after the last APPLIED slot, which
@@ -58,8 +40,10 @@
  * (Restore, M4-STO-03).
  *
  * Rules, the first failure returned:
- * - records are the whole journal, numbered 1, 2, 3, ... (ORDER_VIOLATION,
- *   REPLAY_SEQ); Engine::Create of the base state's profile comes first;
+ * - the base is a genesis head (height 0; INVALID_INPUT,
+ *   REPLAY_BASE_NOT_GENESIS), and records are the whole journal, numbered
+ *   1, 2, 3, ... (ORDER_VIOLATION, REPLAY_SEQ); Engine::Create of the
+ *   genesis state's profile comes first;
  * - DECISION: exact decode (DecisionRecord, its DECODE/OVERSIZE errors);
  *   VERIFY_FAILED (storage::DECISION_CERT_HEADER) unless the certificate
  *   names the header. At the next height it is re-executed on the replayed
@@ -78,23 +62,8 @@
  *   an applied slot is skipped; otherwise it must name the next slot after
  *   the committed head (slot 1 first, no slot skipped; ORDER_VIOLATION,
  *   REPLAY_APPLIED_OUT_OF_ORDER), which then becomes the committed head.
- * - PREPARED_QC: exact full-value decode, binding and reexecution. It never
- *   advances either head. Cryptographic authentication is the certified
- *   StateOwner wrapper's responsibility (view0 only in this regtest slice).
- * - SNAPSHOT_MARK: exact decode (storage::SnapshotMark); ORDER_VIOLATION
- *   (REPLAY_MARK_UNAPPLIED) unless its slot is 1 or more and applied
- *   before the mark; VERIFY_FAILED (REPLAY_MARK_MISMATCH) unless header hash
- *   and state root are that slot's. It never moves either head; `marks`
- *   lists each marked slot once (the first record), ascending.
- * - Observer (M4-STO-03, O-71): ReplayDecisions(base, records, observer)
- *   calls `observer` once for every slot above the base when its APPLIED
- *   record makes it committed, in height order, with the slot's head, its
- *   certificate (of the first DECISION record), canonical body and outcomes
- *   in emission order: what the read service and the action pool were
- *   given when the slot was sealed. An observer error ends the replay and is
- *   returned. The calls happen while the replay runs, before the result is
- *   known to be valid, so a caller that builds anything from them discards
- *   it when the replay (or Restore) refuses.
+ * - SNAPSHOT_MARK: NotImplemented(M4-STO-03). PREPARED_QC:
+ *   NotImplemented(M4-STO-07).
  * - Any other type: a signer-journal type is ORDER_VIOLATION
  *   (storage::RECORD_ROLE), an unregistered one DECODE (storage::RECORD_TYPE).
  *
@@ -106,10 +75,7 @@
 namespace flowmesh2::state {
 
 // Static details (ErrorCode in parentheses).
-inline constexpr std::string_view REPLAY_BASE_UNKNOWN{"records do not decide and apply the replay base"}; //!< (INVALID_INPUT)
-inline constexpr std::string_view REPLAY_BASE_CHAIN{"decisions do not chain into the replay base"};        //!< (VERIFY_FAILED)
-inline constexpr std::string_view REPLAY_MARK_UNAPPLIED{"snapshot mark of a slot not applied"};            //!< (ORDER_VIOLATION)
-inline constexpr std::string_view REPLAY_MARK_MISMATCH{"snapshot mark differs from its slot"};             //!< (VERIFY_FAILED)
+inline constexpr std::string_view REPLAY_BASE_NOT_GENESIS{"replay base is not a genesis head"};             //!< (INVALID_INPUT)
 inline constexpr std::string_view REPLAY_SEQ{"records are not the whole journal in order"};                 //!< (ORDER_VIOLATION)
 inline constexpr std::string_view REPLAY_DECISION_BELOW_BASE{"decision at the base height"};                //!< (ORDER_VIOLATION)
 inline constexpr std::string_view REPLAY_DECISION_GAP{"decision skips a height"};                           //!< (ORDER_VIOLATION)
@@ -135,23 +101,10 @@ struct ReplayResult {
     HeadView decided_head;
     uint64_t duplicate_decisions{0}; //!< DECISION records skipped as duplicates
     uint64_t duplicate_applied{0};   //!< APPLIED records skipped as repeats
-    std::vector<storage::SnapshotMark> marks; //!< SNAPSHOT_MARK records, one per marked slot, ascending
 };
-
-//! A slot the replay just made committed (its APPLIED record): see the file comment.
-struct ReplayCommitted {
-    const HeadView& head;               //!< the committed head after the slot
-    const SlotCertificate& certificate; //!< of its first DECISION record
-    const SlotBody& body;               //!< the certified canonical body
-    std::span<const OutcomeV2> outcomes; //!< emission order
-};
-using ReplayObserver = std::function<Result<void>(const ReplayCommitted&)>;
 
 //! See the file comment.
 Result<ReplayResult> ReplayDecisions(const HeadView& genesis, std::span<const storage::JournalRecord> records);
-//! The same, calling `observer` for every slot above the base as it becomes committed (an empty observer is never called).
-Result<ReplayResult> ReplayDecisions(const HeadView& genesis, std::span<const storage::JournalRecord> records,
-                                     const ReplayObserver& observer);
 
 } // namespace flowmesh2::state
 

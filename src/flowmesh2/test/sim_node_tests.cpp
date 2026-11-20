@@ -13,12 +13,8 @@
 
 #include <flowmesh2/admission/admission.h>
 #include <flowmesh2/admission/pool.h>
-#include <flowmesh2/core/account_leaf.h>
 #include <flowmesh2/core/action.h>
-#include <flowmesh2/core/amount.h>
-#include <flowmesh2/core/facts.h>
 #include <flowmesh2/core/result.h>
-#include <flowmesh2/net/client_api.h>
 #include <flowmesh2/sim/faults.h>
 #include <flowmesh2/sim/sim_client.h>
 #include <flowmesh2/sim/sim_node.h>
@@ -26,19 +22,13 @@
 #include <flowmesh2/state/replay.h>
 #include <flowmesh2/state/state_owner.h>
 #include <flowmesh2/storage/commit_log.h>
-#include <flowmesh2/storage/file_journal.h>
-#include <flowmesh2/storage/journal.h>
 #include <flowmesh2/storage/record.h>
 #include <flowmesh2/storage/signer_log.h>
 #include <flowmesh2/test/util/require.h>
 #include <flowmesh2/test/util/slot_fixtures.h>
-#include <flowmesh2/test/util/storage_fixtures.h>
-#include <util/fs.h>
 
-#include <algorithm>
 #include <cstddef>
 #include <cstdint>
-#include <iterator>
 #include <memory>
 #include <optional>
 #include <string>
@@ -89,39 +79,6 @@ struct NodeRig {
     }
 };
 
-//! A client of the rig's node.
-SimClient ClientOf(NodeRig& rig, const std::string& name)
-{
-    const std::vector<MarketDescriptor> markets{rig.node->Markets().begin(), rig.node->Markets().end()};
-    Result<SimClient> client{SimClient::Create(name, rig.node->Profile(), rig.node->Domain(), rig.node->Seats(), markets)};
-    RequireOk(client, "SimClient::Create " + name);
-    return std::move(client).value();
-}
-
-//! Deposit facts of one block, cursors (height, 0), (height, 1), ... in order.
-struct Deposits {
-    uint32_t height{0};
-    std::vector<Fact> facts;
-
-    void Add(const AccountId& account, const AssetId& asset, Atoms amount)
-    {
-        const uint32_t index{static_cast<uint32_t>(facts.size())};
-        facts.push_back(DepositFact{FactCursor{height, index},
-                                    Outpoint{SimLabelHash("fm2/test/adm03/" + std::to_string(height) + "/" + std::to_string(index)), 0},
-                                    account, asset, amount});
-    }
-};
-
-//! Admit `bytes` and require ADMITTED; returns its ActionId.
-ActionId AdmitOk(NodeRig& rig, const Result<std::vector<unsigned char>>& bytes, std::string_view what)
-{
-    RequireOk(bytes, std::string{what} + " bytes");
-    const Result<admission::AdmissionReply> reply{rig.node->Admitter().Admit(*bytes)};
-    RequireOk(reply, std::string{what} + " Admit");
-    BOOST_REQUIRE_MESSAGE(reply->code == AdmissionCode::ADMITTED, std::string{what} + " was not ADMITTED");
-    return *reply->id;
-}
-
 template <class T>
 void RequireCodeAndDetail(const Result<T>& result, ErrorCode code, std::string_view detail, std::string_view what)
 {
@@ -129,34 +86,6 @@ void RequireCodeAndDetail(const Result<T>& result, ErrorCode code, std::string_v
     BOOST_CHECK_MESSAGE(result.error().code == code && result.error().detail == detail,
                         std::string{what} + ": got " + std::string{ToString(result.error().code)} + " '" +
                             std::string{result.error().detail} + "'");
-}
-
-/** Rewrite `records` into a new file journal under `dir`, one barrier per
- * record, in segments that hold at least two of the largest records (so it
- * rolls over). After every barrier the directory is copied: copy k stands for
- * a crash right after the barrier of record k.
- */
-std::vector<fs::path> WriteWithCrashCopies(const TestDir& root, const std::string& name, const std::vector<storage::JournalRecord>& records,
-                                           storage::JournalRole role, uint64_t instance)
-{
-    size_t largest{0};
-    for (const storage::JournalRecord& record : records) largest = std::max(largest, storage::RECORD_OVERHEAD_BYTES + record.payload.size());
-    uint64_t segment{storage::SEGMENT_PAGE_BYTES};
-    while (segment < 2 * largest + 512) segment += storage::SEGMENT_PAGE_BYTES;
-    const fs::path dir{root.Sub(name)};
-    Result<std::unique_ptr<storage::FileJournal>> created{storage::FileJournal::CreateNew(dir, role, instance, segment)};
-    RequireOk(created, name + ": FileJournal::CreateNew");
-    std::vector<fs::path> copies;
-    for (size_t i{0}; i < records.size(); ++i) {
-        RequireOk((*created)->Append(records[i].type, records[i].payload), name + ": Append");
-        RequireOk((*created)->Barrier(), name + ": Barrier");
-        const fs::path copy{root.Sub(name + "-after-" + std::to_string(i + 1))};
-        for (const auto& entry : fs::directory_iterator{dir}) {
-            fs::copy_file(entry.path(), copy / fs::u8path(entry.path().filename().string()), fs::copy_options::none);
-        }
-        copies.push_back(copy);
-    }
-    return copies;
 }
 
 } // namespace
@@ -271,347 +200,65 @@ BOOST_AUTO_TEST_CASE(an_error_after_the_head_moved_fences_the_node)
     BOOST_CHECK(reply->code == AdmissionCode::HALTED);
 }
 
-BOOST_AUTO_TEST_CASE(an_action_the_engine_refuses_is_excluded_and_the_slot_seals)
+BOOST_AUTO_TEST_CASE(a_restart_applies_a_decided_but_unapplied_slot)
 {
-    // M4-ADM-03. Bob holds MAX_LEAF_ASSETS assets, so Carol's TRANSFER of
-    // one more asset to him makes Preview fail with OVERSIZE: an O-34 error,
-    // not a certified outcome. Without the exclusion the node retried the
-    // same slot with the same actions forever and Alice's PLACE, admitted
-    // after Carol's TRANSFER, never sealed.
-    NodeRig rig;
+    // Review of 2026-11-16, defect 8: a crash between B-DECISION and B-APPLIED (a window open on every slot) left a
+    // node that could not restart: Restore answered NotImplemented for the decided-but-unapplied tail. The restart
+    // now re-executes that slot, runs check 3 under the current authority, writes APPLIED and publishes it.
+    SimNodeConfig config;
+    config.faults.crash_after_decision_at = 2;
+    NodeRig rig{config};
     RequireOk(rig.node->SealSlot(), "SealSlot 1");
-    SimClient alice{ClientOf(rig, "alice")};
-    SimClient carol{ClientOf(rig, "carol")};
-    const AccountId bob{SimClient::AccountOf("bob").value()};
-    Deposits block{SIM_BASE_HEIGHT + 2, {}};
-    for (size_t i{0}; i < MAX_LEAF_ASSETS; ++i) block.Add(bob, SimAsset("adm03-" + std::to_string(i)), 1);
-    block.Add(carol.Account(), SimAsset("adm03-extra"), 5);
-    block.Add(alice.Account(), SimAsset("rUSD"), 1'000'000);
-    RequireOk(rig.node->Chain().AppendBlock(SimBlockHash(block.height), std::move(block.facts)), "AppendBlock");
-    RequireOk(rig.node->SealSlot(), "SealSlot 2 (deposits)");
-
-    const ActionId transfer{AdmitOk(rig, carol.Transfer("t", 1, bob, SimAsset("adm03-extra"), 1, 2), "Carol's TRANSFER")};
-    const ActionId place{AdmitOk(rig, alice.Place("p", 1, SimMarketM1(), Side::BUY, TimeInForce::GTC, 250, 1, 2), "Alice's PLACE")};
-
-    const size_t events{rig.trace.Size()};
-    const Result<SealReport> third{rig.node->SealSlot()};
-    RequireOk(third, "SealSlot 3");
-    BOOST_CHECK_EQUAL(third->height, 3U);
-    BOOST_CHECK_EQUAL(third->originals, 1U);
+    RequireCodeAndDetail(rig.node->SealSlot(), ErrorCode::STORAGE_FATAL, SIM_CRASH_AFTER_DECISION, "SealSlot 2 (the crash)");
+    BOOST_REQUIRE(rig.node->Fenced());
+    BOOST_CHECK_EQUAL(rig.node->Owner().Head()->Header().height, 1U);
+    {
+        const Result<std::vector<storage::JournalRecord>> records{rig.node->CommitJournal().ReadAll()};
+        RequireOk(records, "commit ReadAll");
+        BOOST_REQUIRE_EQUAL(records->size(), 3U); // DECISION 1, APPLIED 1, DECISION 2
+        BOOST_CHECK(records->back().type == storage::RecordType::DECISION);
+    }
+    const size_t sealed_before{rig.node->Sealed().size()};
+    RequireOk(rig.node->Restart(), "Restart");
     BOOST_CHECK(!rig.node->Fenced());
-
-    // Alice's PLACE waited no slot; Carol's TRANSFER is terminal, never taken again.
-    const std::optional<admission::PoolEntryStatus> placed{rig.node->Pool().Status(place)};
-    BOOST_REQUIRE(placed.has_value());
-    BOOST_CHECK(placed->status == admission::PoolStatus::INCLUDED);
-    const std::optional<admission::PoolEntryStatus> refused{rig.node->Pool().Status(transfer)};
-    BOOST_REQUIRE(refused.has_value());
-    BOOST_CHECK_EQUAL(admission::ToString(refused->status), "EXCLUDED");
-    BOOST_CHECK(admission::IsTerminal(refused->status));
-    BOOST_CHECK_EQUAL(refused->height, 2U);
-    const std::vector<std::string> steps{rig.StepsFrom(events)};
-    BOOST_CHECK(std::count(steps.begin(), steps.end(), "pool.exclude") == 1);
-
-    // The client gets a definite answer: UNKNOWN, because nothing certified
-    // proves a refusal, with the reason that this node excluded it.
-    const Result<ActionV2> original{carol.Action("t")};
-    RequireOk(original, "carol.Action");
-    const Result<net::ActionStatusReply> answer{rig.node->Api().GetAction(*original)};
-    RequireOk(answer, "GetAction");
-    BOOST_CHECK(answer->status == net::ApiActionStatus::UNKNOWN);
-    BOOST_CHECK_EQUAL(answer->reason, "this node's proposals excluded it: the engine refused every candidate holding it");
-
-    // The next slot does not take it again; Bob's leaf still holds MAX_LEAF_ASSETS assets.
-    const size_t before{rig.trace.Size()};
-    const Result<SealReport> fourth{rig.node->SealSlot()};
-    RequireOk(fourth, "SealSlot 4");
-    BOOST_CHECK_EQUAL(fourth->originals, 0U);
-    const std::vector<std::string> later{rig.StepsFrom(before)};
-    BOOST_CHECK(std::count(later.begin(), later.end(), "pool.exclude") == 0);
-    const ledger::AccountState* bob_state{rig.node->Owner().Head()->State().engine.ledger.Find(bob)};
-    BOOST_REQUIRE(bob_state != nullptr);
-    BOOST_CHECK_EQUAL(bob_state->balances.size(), MAX_LEAF_ASSETS);
-}
-
-BOOST_AUTO_TEST_CASE(every_refused_action_is_excluded_and_the_rest_keep_their_order)
-{
-    // Two refused TRANSFERs among three valid actions: the bisection
-    // excludes each, and the slot takes the others in admission order.
-    NodeRig rig;
-    RequireOk(rig.node->SealSlot(), "SealSlot 1");
-    SimClient alice{ClientOf(rig, "alice")};
-    SimClient carol{ClientOf(rig, "carol")};
-    SimClient dave{ClientOf(rig, "dave")};
-    const AccountId bob{SimClient::AccountOf("bob").value()};
-    Deposits block{SIM_BASE_HEIGHT + 2, {}};
-    for (size_t i{0}; i < MAX_LEAF_ASSETS; ++i) block.Add(bob, SimAsset("adm03-" + std::to_string(i)), 1);
-    block.Add(carol.Account(), SimAsset("adm03-c"), 5);
-    block.Add(dave.Account(), SimAsset("adm03-d"), 5);
-    block.Add(alice.Account(), SimAsset("rUSD"), 1'000'000);
-    RequireOk(rig.node->Chain().AppendBlock(SimBlockHash(block.height), std::move(block.facts)), "AppendBlock");
-    RequireOk(rig.node->SealSlot(), "SealSlot 2 (deposits)");
-
-    const ActionId place{AdmitOk(rig, alice.Place("p", 1, SimMarketM1(), Side::BUY, TimeInForce::GTC, 250, 1, 2), "Alice's PLACE")};
-    const ActionId bad_c{AdmitOk(rig, carol.Transfer("t", 1, bob, SimAsset("adm03-c"), 1, 2), "Carol's TRANSFER")};
-    const ActionId good_c{AdmitOk(rig, alice.Transfer("t", 2, carol.Account(), SimAsset("rUSD"), 7, 2), "Alice's TRANSFER")};
-    const ActionId bad_d{AdmitOk(rig, dave.Transfer("t", 1, bob, SimAsset("adm03-d"), 1, 2), "Dave's TRANSFER")};
-    const ActionId good_d{AdmitOk(rig, carol.Transfer("u", 2, dave.Account(), SimAsset("adm03-c"), 2, 2), "Carol's second TRANSFER")};
-
-    const size_t events{rig.trace.Size()};
-    const Result<SealReport> third{rig.node->SealSlot()};
-    RequireOk(third, "SealSlot 3");
-    BOOST_CHECK_EQUAL(third->originals, 3U);
-    const std::vector<std::string> steps{rig.StepsFrom(events)};
-    BOOST_CHECK(std::count(steps.begin(), steps.end(), "pool.exclude") == 2);
-    for (const ActionId& id : {place, good_c, good_d}) {
-        BOOST_CHECK(rig.node->Pool().Status(id)->status == admission::PoolStatus::INCLUDED);
-    }
-    for (const ActionId& id : {bad_c, bad_d}) {
-        BOOST_CHECK_EQUAL(admission::ToString(rig.node->Pool().Status(id)->status), "EXCLUDED");
-    }
-    // The pool's list keeps admission order; the body holds the same three in
-    // the engine's canonical order (O-50).
-    const SealedSlot& sealed{rig.node->Sealed().back()};
-    BOOST_CHECK(sealed.taken == (std::vector<ActionId>{place, good_c, good_d}));
-    std::vector<ActionId> in_body;
-    for (const auto& original : sealed.candidate.Body().originals) {
-        const Result<ActionV2> decoded{ActionV2::Decode(original, rig.node->Profile())};
-        RequireOk(decoded, "decode a body original");
-        in_body.push_back(decoded->Id());
-    }
-    std::vector<ActionId> kept{place, good_c, good_d};
-    std::sort(in_body.begin(), in_body.end());
-    std::sort(kept.begin(), kept.end());
-    BOOST_CHECK(in_body == kept);
-}
-
-BOOST_AUTO_TEST_CASE(a_fact_error_never_excludes_an_action)
-{
-    // The exclusion blames an action only when the slot without actions is
-    // valid. Here the facts alone overflow the cumulative deposits of one
-    // asset (O-34): SealSlot returns the error as before, unfenced, and
-    // Alice's PLACE stays live.
-    NodeRig rig;
-    RequireOk(rig.node->SealSlot(), "SealSlot 1");
-    SimClient alice{ClientOf(rig, "alice")};
-    Deposits funding{SIM_BASE_HEIGHT + 2, {}};
-    funding.Add(alice.Account(), SimAsset("rUSD"), 1'000'000);
-    RequireOk(rig.node->Chain().AppendBlock(SimBlockHash(funding.height), std::move(funding.facts)), "AppendBlock funding");
-    RequireOk(rig.node->SealSlot(), "SealSlot 2 (deposit)");
-    const ActionId place{AdmitOk(rig, alice.Place("p", 1, SimMarketM1(), Side::BUY, TimeInForce::GTC, 250, 1, 2), "Alice's PLACE")};
-
-    const AccountId dave{SimClient::AccountOf("dave").value()};
-    Deposits overflow{SIM_BASE_HEIGHT + 3, {}};
-    overflow.Add(dave, SimAsset("adm03-big"), MAX_ATOMS);
-    overflow.Add(dave, SimAsset("adm03-big"), 1);
-    RequireOk(rig.node->Chain().AppendBlock(SimBlockHash(overflow.height), std::move(overflow.facts)), "AppendBlock overflow");
-
-    const size_t events{rig.trace.Size()};
-    RequireError(rig.node->SealSlot(), ErrorCode::ARITHMETIC_OVERFLOW, "SealSlot 3 (fact error)");
-    BOOST_CHECK(!rig.node->Fenced());
-    const std::optional<admission::PoolEntryStatus> status{rig.node->Pool().Status(place)};
-    BOOST_REQUIRE(status.has_value());
-    BOOST_CHECK(!admission::IsTerminal(status->status));
-    const std::vector<std::string> steps{rig.StepsFrom(events)};
-    BOOST_CHECK(std::count(steps.begin(), steps.end(), "pool.exclude") == 0);
-}
-
-BOOST_AUTO_TEST_CASE(a_commit_journal_across_segments_reopens_and_replays_after_every_barrier)
-{
-    // M4-STO-06 at node level: a simulated node's commit journal, written
-    // record by record (one barrier each, as the node does) into file
-    // segments too small for it, so it rolls over several times. After every
-    // barrier a copy of the directory stands for a crash at that point: it
-    // reopens with exactly the acknowledged records, byte-equal to the
-    // node's, and they replay. The whole journal replays to the live head.
-    NodeRig rig;
-    RequireOk(rig.node->SealSlot(), "SealSlot 1");
-    SimClient alice{ClientOf(rig, "alice")};
-    Deposits block{SIM_BASE_HEIGHT + 2, {}};
-    block.Add(alice.Account(), SimAsset("rUSD"), 1'000'000);
-    RequireOk(rig.node->Chain().AppendBlock(SimBlockHash(block.height), std::move(block.facts)), "AppendBlock");
-    for (uint64_t slot{2}; slot <= 12; ++slot) {
-        if (slot >= 3 && slot <= 7) {
-            AdmitOk(rig, alice.Place("seg-" + std::to_string(slot), slot - 2, SimMarketM1(), Side::BUY, TimeInForce::GTC, 250, 1, slot - 1),
-                    "Alice's PLACE");
-        }
-        RequireOk(rig.node->SealSlot(), "SealSlot " + std::to_string(slot));
-    }
-    const Result<std::vector<storage::JournalRecord>> live{rig.node->CommitJournal().ReadAll()};
-    RequireOk(live, "commit ReadAll");
-    BOOST_REQUIRE_GE(live->size(), 20U);
-
-    // Segments of whole pages that hold at least two of the largest records.
-    size_t largest{0};
-    for (const storage::JournalRecord& record : *live) largest = std::max(largest, storage::RECORD_OVERHEAD_BYTES + record.payload.size());
-    uint64_t segment{storage::SEGMENT_PAGE_BYTES};
-    while (segment < 2 * largest + 512) segment += storage::SEGMENT_PAGE_BYTES;
-
-    const TestDir root{"sim_commit_segments"};
-    const fs::path dir{root.Sub("journal")};
-    const uint64_t instance{rig.node->CommitJournal().InstanceId()};
-    std::vector<fs::path> crashes;
+    BOOST_CHECK_EQUAL(rig.node->Owner().Head()->Header().height, 2U);
+    BOOST_CHECK(rig.node->Read().PublishedHeight() == std::optional<uint64_t>{2});
+    BOOST_CHECK_EQUAL(rig.node->Sealed().size(), sealed_before + 1);
     {
-        Result<std::unique_ptr<storage::FileJournal>> created{
-            storage::FileJournal::CreateNew(dir, storage::JournalRole::COMMIT, instance, segment)};
-        RequireOk(created, "FileJournal::CreateNew");
-        storage::FileJournal& journal{**created};
-        for (size_t i{0}; i < live->size(); ++i) {
-            const Result<uint64_t> appended{journal.Append((*live)[i].type, (*live)[i].payload)};
-            RequireOk(appended, "Append of record " + std::to_string(i + 1));
-            BOOST_REQUIRE_EQUAL(*appended, i + 1);
-            const Result<uint64_t> barrier{journal.Barrier()};
-            RequireOk(barrier, "Barrier after record " + std::to_string(i + 1));
-            if (i % 4 == 3) RequireOk(journal.Rollover(), "Rollover after record " + std::to_string(i + 1));
-            const fs::path copy{root.Sub("after-" + std::to_string(i + 1))};
-            for (const auto& entry : fs::directory_iterator{dir}) fs::copy_file(entry.path(), copy / fs::u8path(entry.path().filename().string()), fs::copy_options::none);
-            crashes.push_back(copy);
-        }
+        const Result<std::vector<storage::JournalRecord>> records{rig.node->CommitJournal().ReadAll()};
+        RequireOk(records, "commit ReadAll after the restart");
+        BOOST_REQUIRE_EQUAL(records->size(), 4U); // ... APPLIED 2
+        BOOST_CHECK(records->back().type == storage::RecordType::APPLIED);
+        BOOST_CHECK_EQUAL(storage::AppliedRecord::Decode(records->back().payload).value().slot, 2U);
     }
-    const size_t files{static_cast<size_t>(std::distance(fs::directory_iterator{dir}, fs::directory_iterator{}))};
-    BOOST_CHECK_GE(files, 3U);
-
-    const Result<std::unique_ptr<storage::FileJournal>> reopened{storage::FileJournal::OpenExisting(dir, storage::JournalRole::COMMIT, instance)};
-    RequireOk(reopened, "OpenExisting");
-    const Result<std::vector<storage::JournalRecord>> read{(*reopened)->ReadAll()};
-    RequireOk(read, "ReadAll after reopen");
-    BOOST_CHECK(*read == *live); // sequence, type, payload and chain
-    const std::shared_ptr<const state::HeadView> head{rig.node->Owner().Head()};
-    const Result<state::ReplayResult> replay{state::ReplayDecisions(rig.node->Genesis(), *read)};
-    RequireOk(replay, "ReplayDecisions over the reopened journal");
-    BOOST_CHECK(replay->head.Header() == head->Header());
-    BOOST_CHECK(replay->head.HeaderHash() == head->HeaderHash());
-    BOOST_CHECK(replay->head.CertHash() == head->CertHash());
-    BOOST_CHECK(replay->head.State() == head->State());
-
-    for (size_t k{1}; k <= crashes.size(); ++k) {
-        const std::string what{"crash after barrier " + std::to_string(k)};
-        const Result<std::unique_ptr<storage::FileJournal>> opened{
-            storage::FileJournal::OpenExisting(crashes[k - 1], storage::JournalRole::COMMIT, instance)};
-        RequireOk(opened, what + ": OpenExisting");
-        BOOST_CHECK((*opened)->Status() == (storage::JournalStatus{k, k, false}));
-        const Result<std::vector<storage::JournalRecord>> prefix{(*opened)->ReadAll()};
-        RequireOk(prefix, what + ": ReadAll");
-        BOOST_CHECK(std::equal(prefix->begin(), prefix->end(), live->begin(), live->begin() + static_cast<std::ptrdiff_t>(k)) &&
-                    prefix->size() == k);
-        RequireOk(state::ReplayDecisions(rig.node->Genesis(), *prefix), what + ": ReplayDecisions");
-    }
+    // The node goes on from there.
+    RequireOk(rig.node->SealSlot(), "SealSlot 3");
+    BOOST_CHECK_EQUAL(rig.node->Owner().Head()->Header().height, 3U);
+    BOOST_CHECK_EQUAL(rig.SignedVotesAt(2), 1U); // slot 2 was never re-decided
 }
 
-BOOST_AUTO_TEST_CASE(logs_reopened_after_every_barrier_rebuild_their_equivocation_and_decision_indexes)
+BOOST_AUTO_TEST_CASE(a_restart_after_a_check_3_refusal_keeps_the_live_head_and_stays_fenced)
 {
-    // M4-STO-01 acceptance: a crash after any barrier of a simulated node's
-    // signer or commit journal reopens to logs whose indexes equal the ones
-    // the node held at that barrier. The expected index of a prefix is read
-    // from its durable records: the first SIGNED_VOTE and ACCEPTED_PROPOSAL
-    // of each key (the equivocation index) and the first DECISION of each
-    // slot (the decision index).
-    NodeRig rig;
+    // The other way into the same journal state: slot 2's DECISION durable, check 3 refused under a moved authority.
+    // The restart re-runs check 3, which refuses again; the head stays at slot 1, nothing is applied or published for
+    // slot 2, and the node starts fenced (O-89: the height is never re-decided with another header).
+    SimNodeConfig config;
+    config.faults.bump_authority_before_apply_at = 2;
+    NodeRig rig{config};
     RequireOk(rig.node->SealSlot(), "SealSlot 1");
-    SimClient alice{ClientOf(rig, "alice")};
-    Deposits block{SIM_BASE_HEIGHT + 2, {}};
-    block.Add(alice.Account(), SimAsset("rUSD"), 1'000'000);
-    RequireOk(rig.node->Chain().AppendBlock(SimBlockHash(block.height), std::move(block.facts)), "AppendBlock");
-    for (uint64_t slot{2}; slot <= 6; ++slot) {
-        if (slot >= 3 && slot <= 5) {
-            AdmitOk(rig, alice.Place("idx-" + std::to_string(slot), slot - 2, SimMarketM1(), Side::BUY, TimeInForce::GTC, 250, 1, slot - 1),
-                    "Alice's PLACE");
-        }
-        RequireOk(rig.node->SealSlot(), "SealSlot " + std::to_string(slot));
-    }
-    const ProfileParams& profile{rig.node->Profile()};
-    const TestDir root{"sim_index_rebuild"};
-
-    // Signer journal: SignedAt, AcceptedAt and DurableAcceptedViewsAt.
-    {
-        const Result<std::vector<storage::JournalRecord>> live{rig.node->SignerJournal().ReadAll()};
-        RequireOk(live, "signer ReadAll");
-        const uint64_t instance{rig.node->SignerJournal().InstanceId()};
-        std::vector<std::pair<uint64_t, storage::SignedVoteRecord>> votes;            // (seq, record), first per key
-        std::vector<std::pair<uint64_t, storage::AcceptedProposalRecord>> proposals;  // (seq, record), first per key
-        for (const storage::JournalRecord& record : *live) {
-            if (record.type == storage::RecordType::SIGNED_VOTE) {
-                const Result<storage::SignedVoteRecord> vote{storage::SignedVoteRecord::Decode(record.payload)};
-                RequireOk(vote, "SignedVoteRecord::Decode");
-                if (std::ranges::none_of(votes, [&](const auto& v) { return v.second.key == vote->key; })) votes.emplace_back(record.seq, *vote);
-            } else if (record.type == storage::RecordType::ACCEPTED_PROPOSAL) {
-                const Result<storage::AcceptedProposalRecord> accepted{storage::AcceptedProposalRecord::Decode(record.payload, profile)};
-                RequireOk(accepted, "AcceptedProposalRecord::Decode");
-                if (std::ranges::none_of(proposals, [&](const auto& p) { return p.second.key == accepted->key; })) {
-                    proposals.emplace_back(record.seq, *accepted);
-                }
-            }
-        }
-        BOOST_REQUIRE_GE(votes.size(), 6U);
-        BOOST_REQUIRE_GE(proposals.size(), 3U);
-        const std::vector<fs::path> copies{WriteWithCrashCopies(root, "signer", *live, storage::JournalRole::SIGNER, instance)};
-        for (size_t k{1}; k <= copies.size(); ++k) {
-            const std::string what{"signer crash after barrier " + std::to_string(k)};
-            Result<std::unique_ptr<storage::FileJournal>> journal{
-                storage::FileJournal::OpenExisting(copies[k - 1], storage::JournalRole::SIGNER, instance)};
-            RequireOk(journal, what + ": OpenExisting");
-            const Result<storage::SignerLog> log{storage::SignerLog::Create(**journal, profile)};
-            RequireOk(log, what + ": SignerLog::Create");
-            for (const auto& [seq, vote] : votes) {
-                const std::optional<storage::PendingSignedVote> signed_at{log->SignedAt(vote.key)};
-                if (seq > k) {
-                    BOOST_CHECK_MESSAGE(!signed_at, what + ": a vote after the crash point is known");
-                    continue;
-                }
-                BOOST_REQUIRE_MESSAGE(signed_at, what + ": a durable signed vote is missing");
-                BOOST_CHECK_EQUAL(signed_at->Seq(), seq);
-                BOOST_CHECK_EQUAL(signed_at->JournalInstance(), instance);
-                BOOST_CHECK(signed_at->Key() == (storage::SignedVoteRef{vote.key, vote.digest, vote.signature}));
-            }
-            for (const auto& [seq, accepted] : proposals) {
-                const Result<std::optional<storage::AcceptedProposalRecord>> at{log->AcceptedAt(accepted.key, profile)};
-                RequireOk(at, what + ": AcceptedAt");
-                BOOST_CHECK_MESSAGE(at->has_value() == (seq <= k), what + ": accepted proposal presence");
-                if (*at) BOOST_CHECK(**at == accepted);
-                std::vector<uint64_t> expected;
-                for (const auto& [other_seq, other] : proposals) {
-                    if (other_seq <= k && other.key.epoch == accepted.key.epoch && other.key.slot == accepted.key.slot) expected.push_back(other.key.view);
-                }
-                std::vector<uint64_t> views{log->DurableAcceptedViewsAt(accepted.key.epoch, accepted.key.slot)};
-                std::ranges::sort(views);
-                std::ranges::sort(expected);
-                BOOST_CHECK_MESSAGE(views == expected, what + ": DurableAcceptedViewsAt");
-            }
-        }
-    }
-
-    // Commit journal: DecisionAt.
-    {
-        const Result<std::vector<storage::JournalRecord>> live{rig.node->CommitJournal().ReadAll()};
-        RequireOk(live, "commit ReadAll");
-        const uint64_t instance{rig.node->CommitJournal().InstanceId()};
-        std::vector<std::pair<uint64_t, storage::DecisionRef>> decisions; // (seq, reference), first per slot
-        for (const storage::JournalRecord& record : *live) {
-            if (record.type != storage::RecordType::DECISION) continue;
-            const Result<storage::DecisionRecord> decision{storage::DecisionRecord::Decode(record.payload, profile)};
-            RequireOk(decision, "DecisionRecord::Decode");
-            if (std::ranges::none_of(decisions, [&](const auto& d) { return d.second.slot == decision->header.height; })) {
-                decisions.emplace_back(record.seq, storage::DecisionRef{decision->header.height, decision->header.Hash(), decision->certificate.Hash()});
-            }
-        }
-        BOOST_REQUIRE_EQUAL(decisions.size(), 6U);
-        const std::vector<fs::path> copies{WriteWithCrashCopies(root, "commit", *live, storage::JournalRole::COMMIT, instance)};
-        for (size_t k{1}; k <= copies.size(); ++k) {
-            const std::string what{"commit crash after barrier " + std::to_string(k)};
-            Result<std::unique_ptr<storage::FileJournal>> journal{
-                storage::FileJournal::OpenExisting(copies[k - 1], storage::JournalRole::COMMIT, instance)};
-            RequireOk(journal, what + ": OpenExisting");
-            const Result<storage::CommitLog> log{storage::CommitLog::Create(**journal, profile)};
-            RequireOk(log, what + ": CommitLog::Create");
-            BOOST_CHECK_EQUAL(log->DurableSeq(), k);
-            for (const auto& [seq, reference] : decisions) {
-                const std::optional<storage::DecisionRef> at{log->DecisionAt(reference.slot)};
-                BOOST_CHECK_MESSAGE(at.has_value() == (seq <= k), what + ": decision presence at slot " + std::to_string(reference.slot));
-                if (at) BOOST_CHECK(*at == reference);
-            }
-            BOOST_CHECK(!log->DecisionAt(7));
-        }
-    }
+    RequireCodeAndDetail(rig.node->SealSlot(), ErrorCode::AUTHORITY_CHANGED, state::AUTHORITY_SUPERSEDED, "SealSlot 2 (check 3)");
+    BOOST_REQUIRE(rig.node->Fenced());
+    RequireOk(rig.node->Restart(), "Restart");
+    BOOST_CHECK(rig.node->Fenced());
+    BOOST_CHECK_EQUAL(rig.node->Owner().Head()->Header().height, 1U);
+    // The read service is rebuilt empty on every restart and publishes from the next applied slot on (M4-STO-01); nothing
+    // was applied here, so nothing is published, and slot 2 in particular never was.
+    BOOST_CHECK(!rig.node->Read().PublishedHeight().has_value());
+    const Result<std::vector<storage::JournalRecord>> records{rig.node->CommitJournal().ReadAll()};
+    RequireOk(records, "commit ReadAll");
+    BOOST_CHECK_EQUAL(records->size(), 3U); // no APPLIED 2
+    RequireCodeAndDetail(rig.node->SealSlot(), ErrorCode::FENCED, SIM_FENCED, "SealSlot after the restart");
+    BOOST_CHECK_EQUAL(rig.SignedVotesAt(2), 1U);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

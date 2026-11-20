@@ -274,6 +274,10 @@ def verify_bundle(directory, require_expectations):
     if content and not content.endswith("\n"):
         problems.append(f"{MANIFEST} does not end with a newline")
     for number, line in enumerate(content.split("\n")[:-1] if content else [], start=1):
+        # Accept manifests exchanged with Windows tools while keeping the
+        # record syntax strict: only the CR immediately before LF is removed.
+        if line.endswith("\r"):
+            line = line[:-1]
         m = MANIFEST_LINE.match(line)
         if not m:
             problems.append(f"{MANIFEST}:{number}: malformed line {line!r}")

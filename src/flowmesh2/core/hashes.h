@@ -61,10 +61,9 @@ enum class HashTag : uint8_t {
     PROTOCOL_ACCOUNT = 27, //!< seat pool and treasury accounts (R5)
     JOURNAL = 28,          //!< first chain value of a journal (R8)
     TEST_ASSET = 29,       //!< synthetic test and simulator assets only
-    SMT_KEY = 30,          //!< commitment v1 path of a component key (M2-LED-02)
-    SMT_LEAF = 31,         //!< commitment v1 sparse Merkle leaf (M2-LED-02)
-    SMT_NODE = 32,         //!< commitment v1 sparse Merkle inner node (M2-LED-02)
-    SHORT_ID_KEY = 33,     //!< SipHash keys of relay short IDs (M4-NET-02)
+    AGREEMENT = 30,        //!< agreement statements and seeds: u8 kind first (agreement/digests.h; M4-AGR-02)
+    MESH_SESSION = 31,     //!< seat-mesh HELLO: the session id and the connection's fields (netio/mesh_handshake.h; M4-NET-01)
+    MESH_ENDPOINT = 32,    //!< seat endpoint record signed by the seat key (net/tcp_mesh.h; M4-NET-01)
 };
 
 //! The prefix of every tag text.

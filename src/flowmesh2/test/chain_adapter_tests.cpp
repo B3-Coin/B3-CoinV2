@@ -241,13 +241,4 @@ BOOST_AUTO_TEST_CASE(b3d_trusted_facts_adapter_refuses_real_networks)
     RequireStub(chain::B3dTrustedFactsAdapter::Create(TestNetwork(), chain::B3dAdapterConfig{}), "MB1-ADP-06");
 }
 
-BOOST_AUTO_TEST_CASE(b3d_finalized_adapter_is_a_stub)
-{
-    for (const ChainType chain_type : {ChainType::MAIN, ChainType::REGTEST}) {
-        NetworkId network{TestNetwork()};
-        network.chain = chain_type;
-        RequireStub(chain::B3dFinalizedAdapter::Create(network, chain::B3dAdapterConfig{30}), "M7-ADP-01");
-    }
-}
-
 BOOST_AUTO_TEST_SUITE_END()

@@ -47,8 +47,6 @@ constexpr bool Unforgeable()
            !std::is_convertible_v<uint64_t, Token>;
 }
 
-static_assert(Unforgeable<DurableControlIntent>());
-static_assert(Unforgeable<DurableSignedControl>());
 static_assert(Unforgeable<DurableIntent>());
 static_assert(Unforgeable<DurableSignedVote>());
 static_assert(Unforgeable<DurableDecision>());
@@ -71,8 +69,6 @@ constexpr bool PendingUnforgeable()
     return !std::is_default_constructible_v<P> && std::is_copy_constructible_v<P> &&
            !std::is_constructible_v<P, uint64_t, uint64_t, const typename P::Ref&>;
 }
-static_assert(PendingUnforgeable<PendingControlIntent>());
-static_assert(PendingUnforgeable<PendingSignedControl>());
 static_assert(PendingUnforgeable<PendingProposal>());
 static_assert(PendingUnforgeable<PendingIntent>());
 static_assert(PendingUnforgeable<PendingSignedVote>());
@@ -84,7 +80,7 @@ static_assert(HasDurableKind(RecordType::INTENT) && HasDurableKind(RecordType::S
               HasDurableKind(RecordType::DECISION) && HasDurableKind(RecordType::APPLIED));
 static_assert(!HasDurableKind(RecordType::ACCEPTED_PROPOSAL) && !HasDurableKind(RecordType::SNAPSHOT_MARK) &&
               !HasDurableKind(RecordType::VIEW_STATE) && !HasDurableKind(RecordType::NEW_VIEW_ACCEPTED) &&
-              !HasDurableKind(RecordType::PREPARED_QC));
+              !HasDurableKind(RecordType::PREPARED_QC) && !HasDurableKind(RecordType::EVIDENCE));
 
 //! A commit log over a fresh memory journal.
 struct CommitFixture {

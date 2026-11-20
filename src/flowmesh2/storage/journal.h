@@ -55,8 +55,8 @@
  *   the pending record's reference, which the logs built from the record
  *   they appended. Two journals of the SAME role with the same instance id
  *   cannot be told apart here; giving each journal of a role its own
- *   instance id is the deployer's (the segment header that names role and
- *   instance is M4-STO-01's).
+ *   instance id is the deployer's (O-94: the segments carry no header, the
+ *   first record's chain binds role and instance on reopen).
  *
  * After a fatal error Append is FENCED, Barrier is STORAGE_FATAL and Confirm
  * is refused, so no new token can be minted; the node fences admission and
@@ -90,6 +90,8 @@ inline constexpr std::string_view CONFIRM_ROLE{"CONFIRM_ROLE"};                 
 // Shared by the logs over a journal (SignerLog, CommitLog).
 inline constexpr std::string_view LOG_ROLE{"LOG_ROLE"};                                    //!< (ORDER_VIOLATION) journal of the wrong role
 inline constexpr std::string_view TOKEN_OTHER_LOG{"TOKEN_OTHER_LOG"};                      //!< (VERIFY_FAILED) pending or token not of this log
+inline constexpr std::string_view LOG_HAS_HISTORY{"LOG_HAS_HISTORY"};                      //!< (ORDER_VIOLATION) Create on a journal with records: use Recover (M4-STO-01)
+inline constexpr std::string_view RECOVER_INCONSISTENT{"RECOVER_INCONSISTENT"};            //!< (VERIFY_FAILED) the journal's records contradict the log's own rules
 
 /** Sees every accepted append and every barrier of a journal, in order.
  * Callbacks run on the calling thread without the journal lock, so they may
@@ -135,7 +137,7 @@ public:
     uint64_t DurableSeq() const EXCLUSIVE_LOCKS_REQUIRED(!m_mutex) { return Status().durable_seq; }
     bool IsFatal() const EXCLUSIVE_LOCKS_REQUIRED(!m_mutex) { return Status().fatal; }
 
-    //! The durable records, in order; unbarriered appends are excluded.
+    //! The durable records, in order.
     virtual Result<std::vector<JournalRecord>> ReadAll() const = 0;
 
     //! Mint the durability token of a pending record; see the file comment.
@@ -163,22 +165,38 @@ protected:
         friend class FileJournal;
     };
 
-    //! `recovered` is a fully validated, committed image scanned by FileJournal before publication.
-    Journal(ImplKey, JournalRole role, uint64_t instance_id, BarrierObserver* observer, const ScanResult* recovered = nullptr);
+    Journal(ImplKey, JournalRole role, uint64_t instance_id, BarrierObserver* observer);
 
-    //! Immutable byte prefix covered by a successfully completed barrier; no lock across I/O.
-    uint64_t DurableImageSize() const EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+    /** What a reopen recovered from disk (FileJournal::OpenExisting,
+     * M4-STO-01): `records` records scanned clean, so they are appended and
+     * durable; the chain continues from `last_chain`; the next record goes at
+     * image byte `image_end`.
+     */
+    struct RecoveredState {
+        uint64_t records{0};
+        uint256 last_chain;
+        uint64_t image_end{0};
+    };
+    Journal(ImplKey, JournalRole role, uint64_t instance_id, BarrierObserver* observer, const RecoveredState& recovered);
 
     /** Called with the journal lock held, before a framed record of `size`
      * bytes is queued at byte `offset` of the journal image; `append_number`
      * counts the Append calls that got this far (1-based). A pure check of
-     * the implementation's limits: no I/O, no lock, no callback. Returns the
-     * number of zero bytes to queue before the record (the file journal's
-     * segment padding, M4-STO-06; 0 otherwise), so the record starts at
-     * offset + padding. Any error refuses the append and consumes nothing;
-     * STORAGE_FATAL also makes the journal fatal.
+     * the implementation's limits: no I/O, no lock, no callback. Ok carries
+     * the image offset the record is placed at: `offset` itself, or a later
+     * one when the implementation cannot hold the record at `offset` (the
+     * file journal moves a record that would not fit in the rest of its
+     * segment to the start of the next one, M4-STO-06); the bytes skipped
+     * are written as zeros, which is what a pre-zeroed segment's tail reads
+     * as. Any error refuses the append and consumes nothing; STORAGE_FATAL
+     * also makes the journal fatal.
      */
-    virtual Result<uint64_t> AdmitAppend(uint64_t append_number, uint64_t offset, size_t size) const = 0;
+    virtual Result<uint64_t> AdmitAppend(uint64_t append_number, uint64_t offset, size_t size) = 0;
+
+    //! Make the journal fatal from an implementation's own operation (FileJournal::Rollover).
+    void SetFatal() EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
+    //! Image offset just past everything appended so far (the next record's offset, before placement).
+    uint64_t ImageEnd() const EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
 
     /** Called by Barrier WITHOUT the journal lock: write `bytes` at byte
      * `offset` of the journal image and make the image durable up to
@@ -198,7 +216,6 @@ private:
     uint256 m_chain GUARDED_BY(m_mutex);
     uint64_t m_appended_seq GUARDED_BY(m_mutex){0};
     uint64_t m_durable_seq GUARDED_BY(m_mutex){0};
-    uint64_t m_durable_offset GUARDED_BY(m_mutex){0};
     bool m_fatal GUARDED_BY(m_mutex){false};
     uint64_t m_append_calls GUARDED_BY(m_mutex){0};
     uint64_t m_barrier_calls GUARDED_BY(m_mutex){0};
