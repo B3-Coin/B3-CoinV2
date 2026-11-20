@@ -3,10 +3,12 @@
 //! seat answers, in the trusted core. See hive/README.md.
 
 pub mod bytes;
+pub mod client;
 pub mod crypto;
 pub mod genesis;
 pub mod hash;
 pub mod http;
+pub mod outbox;
 pub mod reply;
 pub mod types;
 pub mod verify;
