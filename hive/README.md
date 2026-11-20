@@ -142,8 +142,13 @@ the same market and the same approval window.
 The wording of both views and of the approval window is a set of pure
 functions (`web/src/fm2words.ts`) with their own tests: what a form's
 button says and why it is off, what an order would do right now, the
-question the approval window asks, and the sentence for every way a
-request can end.
+order form's warnings about how far an order reaches, the question the
+approval window asks, and the sentence for every way a request can end.
+
+In a short window, the default 1100 by 720 among them, the Simple card
+closes up so that its button stays in sight under a hint of three lines.
+Under the warning, which is longer, the button is below the fold and the
+page scrolls to it.
 
 **Units.** Amounts are in the asset's own unit and prices are for one whole
 unit of the base asset (`101 000 rUSD per B3`), on the page, in the approval
