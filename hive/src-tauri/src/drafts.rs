@@ -88,27 +88,11 @@ pub enum Request {
     /// Revoke this wallet's bound BLS finality key (revokefinalitykey): the
     /// validator leaves the set at the next epoch boundary.
     RevokeFinality { chain: String, wallet: String },
-    /// Place a FlowMesh limit order or ladder, signed exactly as drafted.
-    TradeOrder { order: crate::flowmesh::OrderDraft },
-    /// Cancel this wallet's open FlowMesh order on one side.
-    TradeCancel {
-        cancel: crate::flowmesh::CancelDraft,
-    },
-    /// Send B3 or the token into a FlowMesh market's vault (flowmeshdeposit).
-    TradeDeposit {
-        deposit: crate::flowmesh::DepositDraft,
-    },
-    /// Request a FlowMesh payout to an address.
-    TradeWithdraw {
-        withdraw: crate::flowmesh::WithdrawDraft,
-    },
-    /// Publish the vault transaction that pays a certified withdrawal out.
-    TradePayout {
-        payout: crate::flowmesh::PayoutDraft,
-    },
-    /// Publish the checkpoint a certified withdrawal waits for.
-    TradeCheckpoint {
-        checkpoint: crate::flowmesh::CheckpointDraft,
+    /// A FlowMesh V2 action (an order, a cancellation or a transfer),
+    /// signed with the network's own key exactly as drafted. It involves no
+    /// wallet and no node.
+    Fm2 {
+        action: Box<crate::fm2::view::ActionDraft>,
     },
 }
 
@@ -122,19 +106,15 @@ impl Request {
             Request::Stake { wallet, .. }
             | Request::BindFinality { wallet, .. }
             | Request::RevokeFinality { wallet, .. } => wallet,
-            Request::TradeOrder { order } => &order.wallet,
-            Request::TradeCancel { cancel } => &cancel.wallet,
-            Request::TradeDeposit { deposit } => &deposit.wallet,
-            Request::TradeWithdraw { withdraw } => &withdraw.wallet,
-            Request::TradePayout { payout } => &payout.wallet,
-            Request::TradeCheckpoint { checkpoint } => &checkpoint.wallet,
+            Request::Fm2 { .. } => "",
         }
     }
 
     /// Approving needs the wallet's keys, so a locked wallet's passphrase.
-    /// Broadcasting a PSBT signed elsewhere does not.
+    /// Broadcasting a PSBT signed elsewhere does not, and neither does a
+    /// FlowMesh action, which no wallet signs.
     pub fn needs_keys(&self) -> bool {
-        !matches!(self, Request::SendPsbt { .. })
+        !matches!(self, Request::SendPsbt { .. } | Request::Fm2 { .. })
     }
 
     /// The coins a payment holds back; the node picks a stake's coins only

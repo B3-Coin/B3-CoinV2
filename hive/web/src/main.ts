@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { amountNode, amountText, amountUnits, bannerTone, count, el, formatAmount, icon, initTheme, isMasked, measure, setMasked, shorten, sumAmounts, toggleTheme, type Theme } from "../shared/ui";
-import { startTrade, stopTrade, tradeMaskChanged, tradeWalletChanged, tradeDecided, type TradeOutcome } from "./trade";
+import { startTrade, stopTrade, tradeMaskChanged, tradeDecided, type TradeOutcome } from "./trade";
 import { pickAddress, sortOwn } from "./picker";
 import { single } from "./single";
 import { tabKeys, trapDialog } from "./a11y";
@@ -125,8 +125,8 @@ type DraftResult =
   | { outcome: "signed"; id: string; psbt: string; complete: boolean }
   | { outcome: "rejected"; id: string }
   | { outcome: "failed"; id: string; error: string }
-  // FlowMesh orders, cancellations, deposits and payouts; the Trade page
-  // handles its own.
+  // A FlowMesh V2 order, cancellation or transfer; the Trade page handles
+  // its own.
   | TradeOutcome;
 
 function showThemeIcon(theme: Theme): void {
@@ -148,7 +148,7 @@ const VIEWS = {
   activity: { title: "Activity", sub: "Your wallet's transactions" },
   book: { title: "Address book", sub: "Addresses you pay, with their labels" },
   stake: { title: "Stake", sub: "Secure B3 with this wallet's validator" },
-  trade: { title: "Trade", sub: "FlowMesh token markets, settled in B3" },
+  trade: { title: "Trade", sub: "FlowMesh V2 markets on a regtest test network" },
   wallets: { title: "Wallets", sub: "Open, create, switch and back up wallets" },
   network: { title: "Network", sub: "Your node and its peers" },
   settings: { title: "Settings", sub: "How your node runs and connects" },
@@ -564,8 +564,8 @@ const isUnused = (a: Receiving) => !a.change && a.transactions === 0 && a.coins 
 // What Receive shows first: an unused address without a label, since a
 // labelled one was likely made for someone; else any unused one; else the
 // first receiving address.
-/** Labels Hive gives addresses it makes for one purpose (flowmesh.rs
- *  WITHDRAWAL_LABEL): fine to receive on, but not offered by default. */
+/** Labels B3 Hive gave addresses it made for one purpose (FlowMesh V1
+ *  withdrawals): fine to receive on, but not offered by default. */
 const PURPOSE_LABELS = new Set(["FlowMesh withdrawal"]);
 
 function defaultReceiving(): Receiving | null {
@@ -1008,7 +1008,6 @@ async function manageWallet(action: WalletAction): Promise<boolean> {
     void refreshRecent();
     void refreshBook();
     void refreshCoins();
-    tradeWalletChanged();
     // Another wallet has other addresses.
     receiveShown = null;
     receiveRequest = null;

@@ -616,85 +616,33 @@
         <main class="view view--data" id="view-trade" hidden>
           <div class="stack tr-page">
             <div class="banner banner-danger" id="tr-error" role="alert" hidden></div>
-            <div class="card" id="tr-empty" hidden>
-              <div class="empty">
-                <strong>No FlowMesh market is available</strong>
-                <p class="t-sm muted">Markets appear here once FlowMesh is active on the chain and a token/B3 market is established. This node also needs a trading endpoint, or its own FlowMesh engine.</p>
-                <button class="btn btn-secondary mt-2" type="button" id="tr-demo-start-empty">Show a demo market</button>
-              </div>
-            </div>
-            <div class="card" id="tr-demo-offer" hidden>
-              <div class="card-pad row">
-                <span class="t-sm muted">See how a market page looks and works with made-up numbers. Nothing in the demo is real and nothing can be sent from it.</span>
-                <button class="btn btn-secondary" type="button" id="tr-demo-start">Show a demo market</button>
-              </div>
-            </div>
-            <div class="banner banner-warning tr-demo" id="tr-demo" role="status" hidden>
-              <span><strong>Demo market.</strong> These numbers are made up and move on their own. FlowMesh has no market on mainnet yet; this shows how a market page works. Nothing here is real and nothing can be sent.</span>
-              <button class="btn btn-secondary btn-sm" type="button" id="tr-demo-leave">Leave the demo</button>
-            </div>
-            <div class="card" id="v2-card">
+            <div class="card" id="tr-connect" hidden>
               <div class="card-head">
-                <h2 class="row"><svg class="i" aria-hidden="true"><use href="/icons.svg#i-key" /></svg>FlowMesh V2 regtest API</h2>
-                <span class="badge" id="v2-badge">Not connected</span>
+                <h2 class="row"><svg class="i" aria-hidden="true"><use href="/icons.svg#i-key" /></svg>Connect to FlowMesh V2</h2>
+                <span class="badge badge-warning">Regtest only</span>
               </div>
               <div class="card-pad stack">
-                <p class="t-sm muted">Read-only. This reads a FlowMesh V2 regtest operator on this machine through its HTTPS API. It is not a mainnet market. The operator checks its own certificate and proofs; B3 Hive shows what the operator reports and does not check them itself yet. Nothing can be sent from here.</p>
-                <form class="stack" id="v2-form" autocomplete="off">
+                <p class="t-sm muted">FlowMesh V2 is the new trading layer. It runs on regtest test networks only; nothing here is a mainnet market and no real B3 moves. B3 Hive connects to the network's seats on this computer and checks what they answer itself. It needs two files from whoever runs the network: the genesis document, which names the seats, assets and markets, and the pins file, which names the key each seat's connection must present.</p>
+                <form class="stack" id="tr-connect-form" autocomplete="off" novalidate>
                   <div class="field">
-                    <label for="v2-url">API address</label>
-                    <input class="input input-mono" id="v2-url" spellcheck="false" placeholder="https://127.0.0.1:port" />
+                    <label for="tr-genesis">Genesis document</label>
+                    <div class="pick-field">
+                      <input class="input input-mono" id="tr-genesis" spellcheck="false" placeholder="…/genesis.json" />
+                      <button class="btn btn-secondary" type="button" id="tr-genesis-pick">Browse</button>
+                    </div>
                   </div>
                   <div class="field">
-                    <label for="v2-cert">Certificate file</label>
-                    <input class="input input-mono" id="v2-cert" spellcheck="false" placeholder="…/public-api/public-api.crt" />
-                  </div>
-                  <div class="field">
-                    <label for="v2-pin">Certificate SHA-256</label>
-                    <input class="input input-mono" id="v2-pin" spellcheck="false" placeholder="64 hexadecimal characters" />
+                    <label for="tr-pins">Pins file</label>
+                    <div class="pick-field">
+                      <input class="input input-mono" id="tr-pins" spellcheck="false" placeholder="…/pins.json" />
+                      <button class="btn btn-secondary" type="button" id="tr-pins-pick">Browse</button>
+                    </div>
                   </div>
                   <div class="btn-row">
-                    <button class="btn btn-secondary" type="submit" id="v2-connect">Connect</button>
-                    <button class="btn btn-secondary" type="button" id="v2-disconnect" hidden>Disconnect</button>
+                    <button class="btn btn-primary" type="submit" id="tr-connect-go">Connect</button>
                   </div>
                 </form>
-                <div class="banner banner-danger" id="v2-error" role="alert" hidden></div>
-              </div>
-              <div id="v2-view" hidden>
-                <div class="card-pad">
-                  <p class="t-sm tnum" id="v2-status"></p>
-                  <p class="t-sm muted tnum" id="v2-live"></p>
-                </div>
-                <div class="table-wrap">
-                  <table class="tbl tbl-compact">
-                    <thead><tr><th>Market</th><th>Base</th><th>Quote</th><th class="num" title="Base atoms in one lot">Lot (atoms)</th><th class="num" title="Quote atoms in one price tick">Tick (atoms)</th></tr></thead>
-                    <tbody id="v2-markets"></tbody>
-                  </table>
-                </div>
-                <p class="card-pad t-sm muted">The V2 API serves no order book, clearings or trades, so none are shown. Its routes are status, totals, account and withdrawal proofs, the certified-state stream and signed submission.</p>
-                <div class="table-wrap">
-                  <table class="tbl tbl-compact">
-                    <thead><tr><th>Asset</th><th class="num">Deposits</th><th class="num">Available</th><th class="num">Reserved</th><th class="num">Pending</th><th class="num">Fees held</th><th class="num">Liabilities</th></tr></thead>
-                    <tbody id="v2-totals"></tbody>
-                  </table>
-                </div>
-                <p class="card-pad t-sm muted tnum" id="v2-totals-note"></p>
-                <form class="card-pad stack" id="v2-account-form" autocomplete="off">
-                  <div class="field">
-                    <label for="v2-account">Account</label>
-                    <input class="input input-mono" id="v2-account" spellcheck="false" placeholder="64 hexadecimal characters" />
-                  </div>
-                  <div class="btn-row">
-                    <button class="btn btn-secondary" type="submit">Look up</button>
-                  </div>
-                  <p class="t-sm tnum" id="v2-account-status"></p>
-                </form>
-                <div class="table-wrap" id="v2-balances-wrap" hidden>
-                  <table class="tbl tbl-compact">
-                    <thead><tr><th>Asset</th><th class="num">Available</th><th class="num">Reserved</th></tr></thead>
-                    <tbody id="v2-balances"></tbody>
-                  </table>
-                </div>
+                <div class="banner banner-danger" id="tr-connect-error" role="alert" hidden></div>
               </div>
             </div>
             <div class="card tr-head" id="tr-head" hidden>
@@ -702,20 +650,24 @@
                 <div class="tr-pair">
                   <label class="sr-only" for="tr-market">Market</label>
                   <select class="select select-auto tr-market" id="tr-market"></select>
-                  <span class="badge" id="tr-state"></span>
-                  <span class="badge badge-warning" id="tr-test" hidden title="The issuer marked this token as an unbacked test asset">Test asset</span>
+                  <span class="badge badge-warning" title="A regtest test network. Nothing here is a mainnet market.">Regtest</span>
+                  <span class="badge" id="tr-live"></span>
                 </div>
-                <div class="tr-lastbox" title="The last certified clearing price, in B3 per token">
+                <div class="tr-lastbox" title="The price of the last trade a seat reported since this page connected. A seat's report, not certified.">
                   <strong class="tr-last tnum" id="tr-last">—</strong>
-                  <span class="tr-change tnum" id="tr-change" title="Change from the previous certified clearing"></span>
+                  <span class="tr-change tnum" id="tr-change"></span>
                 </div>
                 <div class="tr-stats">
-                  <div><span class="t-xs muted">Range</span><strong class="tnum" id="tr-range" title="Lowest and highest certified clearing in the retained history">—</strong></div>
-                  <div><span class="t-xs muted" title="What the next auction would do with the standing orders alone. Not certified; queued orders are not included.">Next auction</span><strong class="tnum" id="tr-next">—</strong></div>
-                  <div><span class="t-xs muted">Microblock</span><strong class="tnum" id="tr-seq">—</strong></div>
-                  <div><span class="t-xs muted" title="Validator seats and the signatures a certificate needs. Seats do not prove the validators are online.">Seats / quorum</span><strong class="tnum" id="tr-quorum">—</strong></div>
+                  <div><span class="t-xs muted">Best bid</span><strong class="tnum tr-up" id="tr-best-bid">—</strong></div>
+                  <div><span class="t-xs muted">Best ask</span><strong class="tnum tr-down" id="tr-best-ask">—</strong></div>
+                  <div><span class="t-xs muted" title="Orders are for whole lots of the base asset.">One lot</span><strong class="tnum" id="tr-lot">—</strong></div>
+                  <div><span class="t-xs muted" title="Prices are for one lot, in whole ticks of the quote asset.">One tick</span><strong class="tnum" id="tr-tick">—</strong></div>
+                  <div><span class="t-xs muted" title="The newest slot whose certificate B3 Hive checked: signed by a quorum of the genesis seats.">Certified slot</span><strong class="tnum" id="tr-slot">—</strong></div>
+                  <div><span class="t-xs muted" title="Seats that answered just now, of the seats in the genesis document, and how many must sign a slot.">Seats / quorum</span><strong class="tnum" id="tr-quorum">—</strong></div>
                 </div>
+                <button class="btn btn-secondary btn-sm" type="button" id="tr-disconnect">Disconnect</button>
               </div>
+              <div class="tr-seats" id="tr-seats"></div>
               <div class="tr-source t-xs muted" id="tr-source"></div>
               <details class="disc disc--boxed tr-glossary" id="tr-glossary">
                 <summary>
@@ -723,28 +675,36 @@
                   <span>What these words mean</span>
                 </summary>
                 <dl class="disc-body tr-terms t-sm">
-                  <dt>Auction</dt>
-                  <dd>Orders are not matched one by one. Each round collects the standing orders and clears them all at one price.</dd>
-                  <dt>Microblock</dt>
-                  <dd>One numbered entry in a market's log, holding one auction's result. Its number orders events; it carries no certified time.</dd>
+                  <dt>Seat</dt>
+                  <dd>One of the network's validators. The genesis document lists them; a result counts once a quorum of them signed it.</dd>
+                  <dt>Slot</dt>
+                  <dd>One numbered step of the network, about a second long. Each slot orders the actions it includes and has one certificate.</dd>
                   <dt>Certified</dt>
-                  <dd>Signed by enough of the market's validators (the quorum). Only certified results move funds.</dd>
-                  <dt>Seats / quorum</dt>
-                  <dd>How many validators the market has, and how many must sign a result.</dd>
-                  <dt>Account sequence (Seq.)</dt>
-                  <dd>A counter in each request this wallet signs, so no request can be replayed or reordered.</dd>
-                  <dt>Verified by</dt>
-                  <dd>Who checked the market data before you signed: your own node's engine, or a remote trading endpoint you trust to report it.</dd>
-                  <dt>Payout</dt>
-                  <dd>A certified withdrawal, paid to its address by a B3 transaction this wallet publishes.</dd>
+                  <dd>Signed by a quorum of the seats, and checked by B3 Hive against the genesis document. Balances, and the result of each of your orders, are shown only once certified.</dd>
+                  <dt>A seat's report</dt>
+                  <dd>The order book and the list of trades come from one seat's live feed, which carries no proof. They are shown as that seat reports them.</dd>
+                  <dt>Lot and tick</dt>
+                  <dd>Orders are for whole lots of the base asset, at a price for one lot in whole ticks of the quote asset.</dd>
+                  <dt>Admitted</dt>
+                  <dd>A seat took your signed action into its waiting pool. It is not included yet, and included is not the same as filled.</dd>
+                  <dt>Window</dt>
+                  <dd>How many slots a signed action stays valid. After that the seats can prove it expired, and it can never happen.</dd>
                 </dl>
               </details>
+            </div>
+            <div class="card" id="tr-nokey" hidden>
+              <div class="card-pad stack">
+                <strong>This network has no account in B3 Hive yet</strong>
+                <p class="t-sm muted">An account is a key that signs your orders. B3 Hive creates one for this network and keeps it in its own settings folder. The key file is not encrypted: FlowMesh V2 is a test network, and this key should never hold anything of value. You can look at the book and the trades without one.</p>
+                <div class="btn-row"><button class="btn btn-primary" type="button" id="tr-key-create">Create an account</button></div>
+                <div class="banner banner-danger" id="tr-key-error" role="alert" hidden></div>
+              </div>
             </div>
             <div class="tr-grid" id="tr-body" hidden>
               <section class="card tr-book-card" aria-label="Order book">
                 <div class="card-head tr-card-head">
                   <h2 class="tr-h">Order book</h2>
-                  <span class="badge badge-warning" id="tr-book-stale" hidden title="No verified update for over 3 seconds">Stale</span>
+                  <span class="badge badge-warning" id="tr-book-stale" hidden title="The book's feed is not live right now">Not live</span>
                   <div class="tr-seg" role="group" aria-label="Book sides">
                     <button class="tr-seg-btn" type="button" id="tr-show-both" aria-pressed="true" title="Bids and asks"><span class="tr-ico tr-ico-both" aria-hidden="true"></span><span class="sr-only">Both sides</span></button>
                     <button class="tr-seg-btn" type="button" id="tr-show-bids" aria-pressed="false" title="Bids only"><span class="tr-ico tr-ico-bids" aria-hidden="true"></span><span class="sr-only">Bids only</span></button>
@@ -752,7 +712,7 @@
                   </div>
                 </div>
                 <div class="tr-book" id="tr-book" data-show="both">
-                  <div class="tr-book-row tr-book-labels t-xs muted"><span>Price (B3)</span><span class="num" id="tr-book-size">Size</span><span class="num">Total</span></div>
+                  <div class="tr-book-row tr-book-labels t-xs muted"><span id="tr-book-price">Price</span><span class="num">Lots</span><span class="num">Total</span></div>
                   <div class="tr-asks" id="tr-asks"></div>
                   <div class="tr-mid">
                     <strong class="tr-mid-last tnum" id="tr-mid-last">—</strong>
@@ -760,171 +720,123 @@
                   </div>
                   <div class="tr-bids" id="tr-bids"></div>
                 </div>
-                <p class="tr-note t-xs muted" id="tr-book-note">Levels of every verified standing order, computed by your node. Not certified; queued orders are not included. Choose a level to use its price; in the ticket, the arrow keys step a price or an amount.</p>
+                <p class="tr-note t-xs muted" id="tr-book-note"></p>
               </section>
 
               <section class="card tr-chart-card" aria-label="Chart">
-                  <div class="card-head tr-card-head">
-                    <div class="tr-texttabs" role="tablist" aria-label="Chart">
-                      <button class="tr-texttab" type="button" role="tab" id="tr-view-price" aria-selected="true">Price</button>
-                      <button class="tr-texttab" type="button" role="tab" id="tr-view-depth" aria-selected="false">Depth</button>
-                    </div>
-                    <span class="t-xs muted" id="tr-chart-caption" title="Each point is a certified auction that matched. Microblocks carry no execution time, so the axis is the microblock sequence.">Certified clearings by microblock</span>
+                <div class="card-head tr-card-head">
+                  <div class="tr-texttabs" role="tablist" aria-label="Chart">
+                    <button class="tr-texttab" type="button" role="tab" id="tr-view-price" aria-selected="true">Price</button>
+                    <button class="tr-texttab" type="button" role="tab" id="tr-view-depth" aria-selected="false">Depth</button>
                   </div>
-                  <div class="tr-chart" id="tr-chart-box">
-                    <svg id="tr-chart" viewBox="0 0 600 260" preserveAspectRatio="none" role="img" aria-label="Clearing prices"></svg>
-                    <svg id="tr-depth" viewBox="0 0 600 260" preserveAspectRatio="none" role="img" aria-label="Book depth" hidden></svg>
-                    <span class="tr-axis tr-axis-top t-xs muted tnum" id="tr-chart-high"></span>
-                    <span class="tr-axis tr-axis-bottom t-xs muted tnum" id="tr-chart-low"></span>
-                    <span class="tr-lasttag tnum" id="tr-lasttag" hidden></span>
-                    <div class="tr-cross" id="tr-cross" hidden></div>
-                    <div class="tr-tip t-xs tnum" id="tr-tip" hidden></div>
-                    <p class="tr-chart-empty t-sm muted" id="tr-chart-empty">No auction has matched yet in the retained history.</p>
-                  </div>
-                  <div class="between t-xs muted tnum tr-chart-foot"><span id="tr-chart-first"></span><span id="tr-chart-mid"></span><span id="tr-chart-last"></span></div>
-                </section>
+                  <span class="t-xs muted" id="tr-chart-caption"></span>
+                </div>
+                <div class="tr-chart" id="tr-chart-box">
+                  <svg id="tr-chart" viewBox="0 0 600 260" preserveAspectRatio="none" role="img" aria-label="Trade prices"></svg>
+                  <svg id="tr-depth" viewBox="0 0 600 260" preserveAspectRatio="none" role="img" aria-label="Book depth" hidden></svg>
+                  <span class="tr-axis tr-axis-top t-xs muted tnum" id="tr-chart-high"></span>
+                  <span class="tr-axis tr-axis-bottom t-xs muted tnum" id="tr-chart-low"></span>
+                  <span class="tr-lasttag tnum" id="tr-lasttag" hidden></span>
+                  <p class="tr-chart-empty t-sm muted" id="tr-chart-empty"></p>
+                </div>
+                <div class="between t-xs muted tnum tr-chart-foot"><span id="tr-chart-first"></span><span id="tr-chart-mid"></span><span id="tr-chart-last"></span></div>
+              </section>
 
-                <section class="card tr-panel" aria-label="Orders, trades, requests and funds">
-                  <div class="card-head tr-card-head">
-                    <div class="tr-texttabs" role="tablist" aria-label="Orders and trades">
-                      <button class="tr-texttab" type="button" role="tab" id="tr-tab-orders" aria-selected="true" aria-controls="tr-orders">Open orders <span class="tr-count" id="tr-orders-count" hidden></span></button>
-                      <button class="tr-texttab" type="button" role="tab" id="tr-tab-trades" aria-selected="false" aria-controls="tr-trades">Trades</button>
-                      <button class="tr-texttab" type="button" role="tab" id="tr-tab-requests" aria-selected="false" aria-controls="tr-requests">Requests <span class="tr-count tr-count-warn" id="tr-requests-count" hidden></span></button>
-                      <button class="tr-texttab" type="button" role="tab" id="tr-tab-funds" aria-selected="false" aria-controls="tr-funds">Funds</button>
-                    </div>
+              <section class="card tr-panel" aria-label="Orders, trades, activity and transfers">
+                <div class="card-head tr-card-head">
+                  <div class="tr-texttabs" role="tablist" aria-label="Orders and trades">
+                    <button class="tr-texttab" type="button" role="tab" id="tr-tab-orders" aria-selected="true" aria-controls="tr-orders">Open orders <span class="tr-count" id="tr-orders-count" hidden></span></button>
+                    <button class="tr-texttab" type="button" role="tab" id="tr-tab-trades" aria-selected="false" aria-controls="tr-trades">Trades</button>
+                    <button class="tr-texttab" type="button" role="tab" id="tr-tab-activity" aria-selected="false" aria-controls="tr-activity">Activity <span class="tr-count tr-count-warn" id="tr-activity-count" hidden></span></button>
+                    <button class="tr-texttab" type="button" role="tab" id="tr-tab-transfer" aria-selected="false" aria-controls="tr-transfer">Transfer</button>
                   </div>
-                  <div id="tr-orders" role="tabpanel" aria-labelledby="tr-tab-orders">
-                    <div class="table-wrap">
-                      <table class="tbl tbl-compact">
-                        <thead><tr><th>Side</th><th class="num">Limit (B3)</th><th class="num">Remaining</th><th class="num">Filled</th><th class="num">Reserved</th></tr></thead>
-                        <tbody id="tr-orders-rows"></tbody>
-                      </table>
-                    </div>
-                    <div class="card-pad stack">
-                      <div class="btn-row" id="tr-cancels" hidden>
-                        <button class="btn btn-secondary btn-sm" type="button" id="tr-cancel-bid">Cancel buy order</button>
-                        <button class="btn btn-secondary btn-sm" type="button" id="tr-cancel-ask">Cancel sell order</button>
-                      </div>
-                      <p class="t-sm muted" id="tr-orders-note"></p>
-                    </div>
+                </div>
+                <div id="tr-orders" role="tabpanel" aria-labelledby="tr-tab-orders">
+                  <div class="banner banner-warning tr-inline-banner" id="tr-orders-mismatch" role="status" hidden></div>
+                  <div class="table-wrap">
+                    <table class="tbl tbl-compact">
+                      <thead><tr><th>Market</th><th>Side</th><th class="num">Price</th><th class="num" title="Lots still open, of the lots the order was placed for">Lots left</th><th class="num">Value left</th><th class="num" title="The certified slot that put the order in the book">Slot</th><th><span class="sr-only">Action</span></th></tr></thead>
+                      <tbody id="tr-orders-rows"></tbody>
+                    </table>
                   </div>
-                  <div id="tr-trades" role="tabpanel" aria-labelledby="tr-tab-trades" hidden>
-                    <div class="table-wrap">
-                      <table class="tbl tbl-compact">
-                        <thead><tr><th class="num">Price (B3)</th><th class="num">Size</th><th class="num">Value (B3)</th><th title="When the serving node applied the auction, by its own clock. Microblocks carry no certified time.">Observed</th><th class="num" title="Your fill in this auction. A dash means unknown, not none.">Yours</th><th class="num">Microblock</th></tr></thead>
-                        <tbody id="tr-trades-rows"></tbody>
-                      </table>
+                  <div class="card-pad stack">
+                    <div class="btn-row" id="tr-orders-actions" hidden>
+                      <button class="btn btn-secondary btn-sm" type="button" id="tr-cancel-all">Cancel all orders</button>
                     </div>
-                    <p class="card-pad t-sm muted" id="tr-trades-empty" hidden>No auction has matched in the retained history.</p>
+                    <p class="t-sm muted" id="tr-orders-note"></p>
                   </div>
-                  <div id="tr-requests" role="tabpanel" aria-labelledby="tr-tab-requests" hidden>
-                    <div class="table-wrap">
-                      <table class="tbl tbl-compact">
-                        <thead><tr><th>Sent</th><th>Request</th><th class="num" title="The account sequence it was signed with">Seq.</th><th>Status</th><th>Outcome</th><th><span class="sr-only">Action</span></th></tr></thead>
-                        <tbody id="tr-requests-rows"></tbody>
-                      </table>
+                </div>
+                <div id="tr-trades" role="tabpanel" aria-labelledby="tr-tab-trades" hidden>
+                  <div class="table-wrap">
+                    <table class="tbl tbl-compact">
+                      <thead><tr><th title="When this page received it, by this computer's clock. A slot carries no time.">Seen</th><th title="The side that took the resting order">Taker</th><th class="num">Price</th><th class="num">Lots</th><th class="num">Value</th><th>Yours</th><th class="num">Slot</th></tr></thead>
+                      <tbody id="tr-trades-rows"></tbody>
+                    </table>
+                  </div>
+                  <p class="card-pad t-sm muted" id="tr-trades-note"></p>
+                </div>
+                <div id="tr-activity" role="tabpanel" aria-labelledby="tr-tab-activity" hidden>
+                  <div class="table-wrap">
+                    <table class="tbl tbl-compact">
+                      <thead><tr><th>Signed</th><th>Action</th><th class="num" title="The account's counter in this action, so it can happen once only">Nonce</th><th>Status</th><th>Result</th><th><span class="sr-only">Action</span></th></tr></thead>
+                      <tbody id="tr-activity-rows"></tbody>
+                    </table>
+                  </div>
+                  <div class="card-pad stack">
+                    <div class="btn-row"><button class="btn btn-secondary btn-sm" type="button" id="tr-activity-refresh">Ask the seats again</button></div>
+                    <p class="t-sm muted" id="tr-activity-note">Everything this account signed from B3 Hive, from its own record on this computer. Each action was signed once and stored before it was sent. A result is shown only once a certified slot holds it and B3 Hive checked the proof; until then the row shows what the seats last said.</p>
+                  </div>
+                </div>
+                <div id="tr-transfer" role="tabpanel" aria-labelledby="tr-tab-transfer" hidden>
+                  <form class="card-pad stack tr-transfer-form" id="tr-transfer-form" novalidate autocomplete="off">
+                    <div class="field">
+                      <label for="tr-transfer-to">To account</label>
+                      <input class="input input-mono" id="tr-transfer-to" spellcheck="false" placeholder="64 hexadecimal characters" aria-describedby="tr-transfer-error" />
                     </div>
-                    <p class="card-pad t-sm muted" id="tr-requests-note">Orders and cancellations this wallet signed in this market, from your node's own record. Accepted means queued; certified means a quorum certified the result, which may or may not include a fill. Seq. is the account sequence the request was signed with.</p>
-                  </div>
-                  <div id="tr-funds" role="tabpanel" aria-labelledby="tr-tab-funds" hidden>
-                    <div class="card-pad tr-funding">
-                      <div class="stack">
-                        <div class="tabs" role="tablist" aria-label="Move funds">
-                          <button class="tab" type="button" role="tab" id="tr-fund-in" aria-selected="true">Deposit</button>
-                          <button class="tab" type="button" role="tab" id="tr-fund-out" aria-selected="false">Withdraw</button>
-                        </div>
-                        <form class="stack" id="tr-fund-form" novalidate>
-                          <div class="field">
-                            <label for="tr-fund-asset">Asset</label>
-                            <select class="select" id="tr-fund-asset"><option value="b3">B3</option><option value="token" id="tr-fund-token">Token</option></select>
-                          </div>
-                          <div class="field">
-                            <label for="tr-fund-amount">Amount</label>
-                            <input class="input tnum" id="tr-fund-amount" aria-describedby="tr-fund-error" inputmode="decimal" autocomplete="off" spellcheck="false" />
-                          </div>
-                          <div class="field" id="tr-fund-to-field" hidden>
-                            <label for="tr-fund-to">Pay to</label>
-                            <div class="pick-field">
-                              <input class="input input-mono" id="tr-fund-to" placeholder="Empty: a new address here" autocomplete="off" spellcheck="false" />
-                              <button class="btn btn-secondary" type="button" id="tr-fund-pick" aria-label="Choose an address" title="Choose an address">
-                                <svg class="i-sm" aria-hidden="true"><use href="/icons.svg#i-book" /></svg>
-                              </button>
-                            </div>
-                          </div>
-                          <p class="t-xs muted" id="tr-fund-help"></p>
-                          <p class="t-sm tr-form-error" id="tr-fund-error" aria-live="polite" hidden></p>
-                          <div class="banner" id="tr-fund-result" role="status" hidden></div>
-                          <button class="btn btn-primary btn-block" type="submit" id="tr-fund-review">Review deposit</button>
-                          <p class="t-xs muted" id="tr-fund-gate" hidden></p>
-                        </form>
-                      </div>
-                      <div class="stack" id="tr-deposits" hidden>
-                        <h3 class="t-sm">Your deposits to this market</h3>
-                        <div class="details" id="tr-deposit-rows"></div>
-                        <p class="t-xs muted">A deposit counts once it has 31 confirmations and the market admits it. If admission is slow, ask again for the same deposit; do not deposit again.</p>
-                      </div>
-                      <div class="stack" id="tr-payouts" hidden>
-                        <h3 class="t-sm">Withdrawal payouts</h3>
-                        <div class="details" id="tr-payout-rows"></div>
-                        <form class="stack" id="tr-payout-ask" hidden>
-                          <label for="tr-payout-to">Address you withdrew to</label>
-                          <div class="pick-field">
-                            <input class="input input-mono" id="tr-payout-to" autocomplete="off" spellcheck="false" required />
-                            <button class="btn btn-secondary" type="button" id="tr-payout-pick" aria-label="Choose an address" title="Choose an address">
-                              <svg class="i-sm" aria-hidden="true"><use href="/icons.svg#i-book" /></svg>
-                            </button>
-                          </div>
-                          <div class="row gap-2">
-                            <button class="btn btn-primary btn-sm" type="submit">Review payout</button>
-                            <button class="btn btn-ghost btn-sm" type="button" id="tr-payout-cancel">Cancel</button>
-                          </div>
-                        </form>
-                        <p class="t-xs muted">A certified withdrawal is paid once its payout transaction is published, which is possible after the market's checkpoint for it confirms on the B3 chain. Anyone may publish a checkpoint; if none comes, publish it here. Only the address the withdrawal names can be paid, so publish your own payout. This wallet pays each network fee.</p>
-                      </div>
+                    <div class="field">
+                      <label for="tr-transfer-asset">Asset</label>
+                      <select class="select" id="tr-transfer-asset"></select>
                     </div>
-                  </div>
-                </section>
+                    <div class="field">
+                      <label for="tr-transfer-amount" id="tr-transfer-amount-label">Amount</label>
+                      <input class="input tnum" id="tr-transfer-amount" inputmode="decimal" spellcheck="false" aria-describedby="tr-transfer-error" />
+                      <span class="help tnum" id="tr-transfer-avbl"></span>
+                    </div>
+                    <p class="t-sm tr-form-error" id="tr-transfer-error" aria-live="polite" hidden></p>
+                    <div class="banner" id="tr-transfer-result" role="status" hidden></div>
+                    <div class="btn-row"><button class="btn btn-primary" type="submit" id="tr-transfer-review">Review transfer</button></div>
+                    <p class="t-xs muted">A transfer moves a balance to another FlowMesh account on this network. It stays inside FlowMesh, has no fee, and cannot be taken back once certified. The recipient account must already exist.</p>
+                  </form>
+                </div>
+              </section>
 
               <div class="tr-side">
-                <section class="card tr-ticket" id="tr-ticket" data-side="bid" data-type="limit" aria-label="Place an order">
+                <section class="card tr-ticket" id="tr-ticket" data-side="bid" aria-label="Place an order">
                   <div class="tr-sides" role="tablist" aria-label="Order side">
                     <button class="tr-side-btn tr-side-buy" type="button" role="tab" id="tr-buy" aria-selected="true">Buy</button>
                     <button class="tr-side-btn tr-side-sell" type="button" role="tab" id="tr-sell" aria-selected="false">Sell</button>
                   </div>
-                  <form class="tr-form" id="tr-form" novalidate>
+                  <form class="tr-form" id="tr-form" novalidate autocomplete="off">
                     <div class="tr-texttabs tr-types" role="tablist" aria-label="Order type">
-                      <button class="tr-texttab" type="button" role="tab" id="tr-type-limit" aria-selected="true" title="One limit price">Limit</button>
-                      <button class="tr-texttab" type="button" role="tab" id="tr-type-ladder" aria-selected="false" title="Up to 4 prices in one order. It replaces this side, and its prices cannot be cancelled one by one.">Ladder</button>
+                      <button class="tr-texttab" type="button" role="tab" id="tr-type-gtc" aria-selected="true" title="Fills what it can at your price or better; the rest waits in the book until it fills or you cancel it.">Limit</button>
+                      <button class="tr-texttab" type="button" role="tab" id="tr-type-ioc" aria-selected="false" title="Fills what it can at your price or better at once; the rest is dropped.">Immediate</button>
+                      <button class="tr-texttab" type="button" role="tab" id="tr-type-post_only" aria-selected="false" title="Only ever waits in the book. It is rejected if it could fill at once.">Post only</button>
                     </div>
                     <div class="tr-avbl t-xs"><span class="muted">Available</span><span class="tnum" id="tr-avbl">—</span></div>
                     <div class="tr-steps">
-                      <div class="tr-step" id="tr-step-0">
-                        <div class="tr-in">
-                          <label class="tr-in-label" for="tr-price-0" data-tr-price>Price</label>
-                          <button class="tr-stepper" type="button" data-for="tr-price-0" data-dir="-1" tabindex="-1" aria-label="Lower price by one step">−</button>
-                          <input class="tr-in-field tnum" id="tr-price-0" aria-describedby="tr-form-error" inputmode="decimal" autocomplete="off" spellcheck="false" />
-                          <button class="tr-stepper" type="button" data-for="tr-price-0" data-dir="1" tabindex="-1" aria-label="Raise price by one step">+</button>
-                          <span class="tr-in-unit">B3</span>
-                        </div>
-                        <div class="tr-in">
-                          <label class="tr-in-label" for="tr-qty-0" data-tr-qty>Amount</label>
-                          <button class="tr-stepper" type="button" data-for="tr-qty-0" data-dir="-1" tabindex="-1" aria-label="Lower amount by one step">−</button>
-                          <input class="tr-in-field tnum" id="tr-qty-0" aria-describedby="tr-form-error" inputmode="decimal" autocomplete="off" spellcheck="false" />
-                          <button class="tr-stepper" type="button" data-for="tr-qty-0" data-dir="1" tabindex="-1" aria-label="Raise amount by one step">+</button>
-                          <span class="tr-in-unit" data-tr-unit>Token</span>
-                        </div>
+                      <div class="tr-in">
+                        <label class="tr-in-label" for="tr-price">Price</label>
+                        <button class="tr-stepper" type="button" data-for="tr-price" data-dir="-1" tabindex="-1" aria-label="Lower the price by one tick">−</button>
+                        <input class="tr-in-field tnum" id="tr-price" aria-describedby="tr-form-error" inputmode="decimal" spellcheck="false" />
+                        <button class="tr-stepper" type="button" data-for="tr-price" data-dir="1" tabindex="-1" aria-label="Raise the price by one tick">+</button>
+                        <span class="tr-in-unit" id="tr-price-unit"></span>
                       </div>
-                      <div class="tr-step" id="tr-step-1" hidden>
-                        <div class="tr-in"><label class="tr-in-label" for="tr-price-1" data-tr-price>Price 2</label><input class="tr-in-field tnum" id="tr-price-1" aria-describedby="tr-form-error" inputmode="decimal" autocomplete="off" spellcheck="false" /><span class="tr-in-unit">B3</span></div>
-                        <div class="tr-in"><label class="tr-in-label" for="tr-qty-1" data-tr-qty>Amount 2</label><input class="tr-in-field tnum" id="tr-qty-1" aria-describedby="tr-form-error" inputmode="decimal" autocomplete="off" spellcheck="false" /><span class="tr-in-unit" data-tr-unit>Token</span></div>
-                      </div>
-                      <div class="tr-step" id="tr-step-2" hidden>
-                        <div class="tr-in"><label class="tr-in-label" for="tr-price-2" data-tr-price>Price 3</label><input class="tr-in-field tnum" id="tr-price-2" aria-describedby="tr-form-error" inputmode="decimal" autocomplete="off" spellcheck="false" /><span class="tr-in-unit">B3</span></div>
-                        <div class="tr-in"><label class="tr-in-label" for="tr-qty-2" data-tr-qty>Amount 3</label><input class="tr-in-field tnum" id="tr-qty-2" aria-describedby="tr-form-error" inputmode="decimal" autocomplete="off" spellcheck="false" /><span class="tr-in-unit" data-tr-unit>Token</span></div>
-                      </div>
-                      <div class="tr-step" id="tr-step-3" hidden>
-                        <div class="tr-in"><label class="tr-in-label" for="tr-price-3" data-tr-price>Price 4</label><input class="tr-in-field tnum" id="tr-price-3" aria-describedby="tr-form-error" inputmode="decimal" autocomplete="off" spellcheck="false" /><span class="tr-in-unit">B3</span></div>
-                        <div class="tr-in"><label class="tr-in-label" for="tr-qty-3" data-tr-qty>Amount 4</label><input class="tr-in-field tnum" id="tr-qty-3" aria-describedby="tr-form-error" inputmode="decimal" autocomplete="off" spellcheck="false" /><span class="tr-in-unit" data-tr-unit>Token</span></div>
+                      <div class="tr-in">
+                        <label class="tr-in-label" for="tr-lots">Amount</label>
+                        <button class="tr-stepper" type="button" data-for="tr-lots" data-dir="-1" tabindex="-1" aria-label="One lot less">−</button>
+                        <input class="tr-in-field tnum" id="tr-lots" aria-describedby="tr-form-error" inputmode="numeric" spellcheck="false" />
+                        <button class="tr-stepper" type="button" data-for="tr-lots" data-dir="1" tabindex="-1" aria-label="One lot more">+</button>
+                        <span class="tr-in-unit">lots</span>
                       </div>
                     </div>
                     <div class="tr-slider" id="tr-slider">
@@ -939,8 +851,9 @@
                       <output class="tr-pct-out t-xs tnum" id="tr-pct-out" for="tr-pct">0%</output>
                     </div>
                     <div class="tr-sum" id="tr-summary">
-                      <div class="tr-sum-row"><span class="muted" id="tr-total-label">Total</span><span class="tnum" id="tr-total">—</span></div>
-                      <div class="tr-sum-row" id="tr-replaces-row" hidden><span class="muted">Replaces</span><span class="tnum" id="tr-replaces"></span></div>
+                      <div class="tr-sum-row"><span class="muted" id="tr-base-label">You buy</span><span class="tnum" id="tr-base">—</span></div>
+                      <div class="tr-sum-row"><span class="muted" id="tr-quote-label">You pay at most</span><span class="tnum" id="tr-quote">—</span></div>
+                      <div class="tr-sum-row" id="tr-fee-row" hidden><span class="muted" id="tr-fee-label">Fee</span><span class="tnum" id="tr-fee">—</span></div>
                     </div>
                     <p class="t-xs tr-form-error" id="tr-form-error" aria-live="polite" hidden></p>
                     <button class="btn btn-block tr-go" type="submit" id="tr-review">Buy</button>
@@ -950,28 +863,28 @@
                   </form>
                 </section>
 
-                <section class="card tr-assets" aria-label="Trading balance">
+                <section class="card tr-assets" aria-label="Trading account">
                   <div class="card-head tr-card-head">
-                    <h2 class="tr-h">Assets</h2>
-                    <span class="t-xs muted" title="FlowMesh holds this balance, not your wallet. The validators certify it, which is not the same as settled on the B3 chain.">Certified trading balance</span>
+                    <h2 class="tr-h">Account</h2>
+                    <span class="t-xs muted" id="tr-account-proof"></span>
                   </div>
-                  <div class="tr-asset-list" id="tr-balance">
-                    <div class="tr-asset">
-                      <span class="tr-asset-name">B3</span>
-                      <span class="tr-asset-free tnum" id="tr-b3-free">—</span>
-                      <span class="tr-asset-held t-xs muted"><span>In orders</span> <span class="tnum" id="tr-b3-held">—</span></span>
+                  <div class="tr-account-id">
+                    <code class="t-xs" id="tr-account-id"></code>
+                    <button class="btn btn-ghost btn-sm" type="button" id="tr-account-copy">Copy</button>
+                  </div>
+                  <div class="tr-asset-list" id="tr-balances"></div>
+                  <p class="tr-note t-sm muted" id="tr-account-note" hidden></p>
+                  <details class="disc tr-fund-help">
+                    <summary>
+                      <svg class="i-sm caret" aria-hidden="true"><use href="/icons.svg#i-chevron-right" /></svg>
+                      <span>Deposit and withdraw</span>
+                    </summary>
+                    <div class="disc-body stack t-sm">
+                      <p class="muted">On this test network, balances come from the operator's test chain. Whoever runs the network credits an account with the node tool, naming this account:</p>
+                      <code class="tr-cmd t-xs" id="tr-faucet"></code>
+                      <p class="muted">Withdrawing to the B3 chain is not part of this network's rules yet, so B3 Hive does not offer it.</p>
                     </div>
-                    <div class="tr-asset">
-                      <span class="tr-asset-name" id="tr-base-free-label">Token</span>
-                      <span class="tr-asset-free tnum" id="tr-base-free">—</span>
-                      <span class="tr-asset-held t-xs muted"><span id="tr-base-held-label">In orders</span> <span class="tnum" id="tr-base-held">—</span></span>
-                    </div>
-                  </div>
-                  <p class="tr-note t-sm muted" id="tr-no-account" hidden>This wallet has no trading account in this market yet. The first deposit creates it.</p>
-                  <div class="tr-asset-actions">
-                    <button class="btn btn-secondary btn-sm" type="button" id="tr-go-deposit">Deposit</button>
-                    <button class="btn btn-secondary btn-sm" type="button" id="tr-go-withdraw">Withdraw</button>
-                  </div>
+                  </details>
                 </section>
               </div>
             </div>

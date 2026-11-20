@@ -9,7 +9,6 @@ pub mod chain;
 pub mod cli;
 pub mod console;
 pub mod drafts;
-pub mod flowmesh;
 pub mod fm2;
 pub mod folder;
 pub mod history;
@@ -21,12 +20,12 @@ pub mod receive;
 pub mod rpc;
 pub mod settings;
 pub mod stake;
+mod trade;
 pub mod update;
-pub mod v2api;
 pub mod wallet;
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -62,9 +61,6 @@ pub struct Core {
     /// about the finality key; closing again does not wait for the answer.
     close_pending: AtomicBool,
     drafts: Mutex<DraftStore>,
-    /// FlowMesh requests the user acknowledged as uncertain, so new ones may
-    /// be drafted. Acknowledging never retries or cancels them.
-    trade_acknowledged: Acknowledged,
     /// The wallet picked in the main window; the pages fall back to the first
     /// loaded wallet when it is not loaded.
     wallet: Mutex<Option<String>>,
@@ -82,17 +78,8 @@ pub struct Core {
     history: history::Cache,
     updates: Updates,
     setup: Setup,
-    /// The FlowMesh V2 regtest API the Trade page reads, for this session only.
-    v2: V2State,
-}
-
-/// The FlowMesh V2 regtest API connection (v2api.rs) and its event watch.
-/// Each connect, disconnect or new watch bumps `generation`, which ends the
-/// watch thread that was started under an older one.
-#[derive(Default)]
-struct V2State {
-    endpoint: Mutex<Option<Arc<v2api::Endpoint>>>,
-    generation: Arc<AtomicU64>,
+    /// The Trade page's connection to a FlowMesh V2 network.
+    fm2: trade::Fm2State,
 }
 
 /// The setup wizard's state: the explorer's last offers, and the bootstrap
@@ -164,38 +151,6 @@ pub enum PassResult {
     },
 }
 
-/// FlowMesh requests acknowledged as uncertain, each with the wallet that
-/// signed it, newest last. Only the newest ACKNOWLEDGED_KEPT are kept: one
-/// is added per click, and an old one dropped only blocks again if it is
-/// somehow still open, when it can be acknowledged again.
-#[derive(Default)]
-struct Acknowledged(Mutex<Vec<(String, String)>>);
-
-const ACKNOWLEDGED_KEPT: usize = 256;
-
-impl Acknowledged {
-    /// The action ids acknowledged for `wallet`.
-    fn of(&self, wallet: &str) -> Vec<String> {
-        let list = self.0.lock().unwrap();
-        list.iter()
-            .filter(|(w, _)| w == wallet)
-            .map(|(_, action)| action.clone())
-            .collect()
-    }
-
-    fn add(&self, wallet: &str, action_id: String) {
-        let mut list = self.0.lock().unwrap();
-        if list.iter().any(|(w, a)| w == wallet && *a == action_id) {
-            return;
-        }
-        list.push((wallet.to_owned(), action_id));
-        if list.len() > ACKNOWLEDGED_KEPT {
-            let excess = list.len() - ACKNOWLEDGED_KEPT;
-            list.drain(..excess);
-        }
-    }
-}
-
 /// Sent to the main window when a draft is decided.
 #[derive(Clone, Serialize)]
 #[serde(tag = "outcome", rename_all = "lowercase")]
@@ -210,22 +165,11 @@ pub enum DraftResult {
         psbt: String,
         complete: bool,
     },
-    /// A FlowMesh order or cancellation was submitted: accepted is not
-    /// certified, and certified is not a fill.
-    Traded {
+    /// A FlowMesh action was signed, stored and posted to the seats. A seat
+    /// admitting it is not a slot including it, and included is not filled.
+    Fm2 {
         id: String,
-        receipt: flowmesh::Receipt,
-    },
-    /// A FlowMesh deposit was broadcast; it counts once confirmed and
-    /// admitted.
-    Deposited {
-        id: String,
-        deposit: flowmesh::Deposited,
-    },
-    /// A withdrawal's payout, or the checkpoint it waits for, was broadcast.
-    Published {
-        id: String,
-        payout: flowmesh::Published,
+        sent: fm2::view::Sent,
     },
     Rejected {
         id: String,
@@ -506,491 +450,6 @@ async fn book_save(
         // Activity shows labels.
         core.history.clear();
         book::save(client, &name, &address, &label)
-    })
-    .await
-}
-
-/// The FlowMesh markets the node knows.
-#[tauri::command]
-async fn trade_markets(
-    window: Window,
-    core: State<'_, Arc<Core>>,
-) -> Result<Vec<flowmesh::MarketSummary>, String> {
-    require_window(&window, MAIN)?;
-    let core = Arc::clone(&core);
-    blocking(move || {
-        let node = core.node();
-        let (client, name) = page_wallet(&core, &node)?;
-        flowmesh::markets(client, &name).map_err(|e| e.to_string())
-    })
-    .await
-}
-
-/// Connects the Trade page to a FlowMesh V2 regtest API on this machine:
-/// the address, its certificate file and the certificate's SHA-256 pin, as
-/// the operator publishes them. Read-only; nothing is kept after B3 Hive
-/// closes.
-#[tauri::command]
-async fn v2_connect(
-    window: Window,
-    core: State<'_, Arc<Core>>,
-    url: String,
-    certificate: String,
-    certificate_sha256: String,
-) -> Result<v2api::Info, String> {
-    require_window(&window, MAIN)?;
-    let core = Arc::clone(&core);
-    blocking(move || {
-        let endpoint = v2api::Endpoint::new(
-            &url,
-            std::path::Path::new(&certificate),
-            &certificate_sha256,
-        )?;
-        let info = endpoint.info()?;
-        core.v2.generation.fetch_add(1, Ordering::SeqCst);
-        *core.v2.endpoint.lock().unwrap() = Some(Arc::new(endpoint));
-        Ok(info)
-    })
-    .await
-}
-
-#[tauri::command]
-fn v2_disconnect(window: Window, core: State<'_, Arc<Core>>) -> Result<(), String> {
-    require_window(&window, MAIN)?;
-    core.v2.generation.fetch_add(1, Ordering::SeqCst);
-    *core.v2.endpoint.lock().unwrap() = None;
-    Ok(())
-}
-
-fn v2_endpoint(core: &Core) -> Result<Arc<v2api::Endpoint>, String> {
-    core.v2
-        .endpoint
-        .lock()
-        .unwrap()
-        .clone()
-        .ok_or_else(|| "B3 Hive is not connected to a FlowMesh V2 API.".to_owned())
-}
-
-#[tauri::command]
-async fn v2_info(window: Window, core: State<'_, Arc<Core>>) -> Result<v2api::Info, String> {
-    require_window(&window, MAIN)?;
-    let endpoint = v2_endpoint(&core)?;
-    blocking(move || endpoint.info()).await
-}
-
-#[tauri::command]
-async fn v2_totals(window: Window, core: State<'_, Arc<Core>>) -> Result<v2api::Totals, String> {
-    require_window(&window, MAIN)?;
-    let endpoint = v2_endpoint(&core)?;
-    blocking(move || endpoint.totals()).await
-}
-
-#[tauri::command]
-async fn v2_account(
-    window: Window,
-    core: State<'_, Arc<Core>>,
-    account: String,
-) -> Result<v2api::Account, String> {
-    require_window(&window, MAIN)?;
-    let endpoint = v2_endpoint(&core)?;
-    blocking(move || endpoint.account(&account)).await
-}
-
-#[derive(Clone, Serialize)]
-struct V2Event {
-    height: u64,
-    totals: Option<v2api::Totals>,
-    error: Option<String>,
-}
-
-/// Follows the API's certified-state events from `after`, sending each to
-/// the main window as `v2-certified-state`. The API closes a stream after a
-/// few seconds; the watch reopens it from the last height until the page
-/// connects elsewhere, disconnects or starts a new watch.
-#[tauri::command]
-fn v2_watch(
-    app: AppHandle,
-    window: Window,
-    core: State<'_, Arc<Core>>,
-    after: u64,
-) -> Result<(), String> {
-    require_window(&window, MAIN)?;
-    let endpoint = v2_endpoint(&core)?;
-    let generation = Arc::clone(&core.v2.generation);
-    let mine = generation.fetch_add(1, Ordering::SeqCst) + 1;
-    thread::spawn(move || {
-        let current = || generation.load(Ordering::SeqCst) == mine;
-        let mut cursor = after;
-        while current() {
-            let result = endpoint.events(cursor, |height, totals| {
-                if current() {
-                    let _ = app.emit_to(
-                        MAIN,
-                        "v2-certified-state",
-                        V2Event {
-                            height,
-                            totals: Some(totals),
-                            error: None,
-                        },
-                    );
-                }
-                current()
-            });
-            match result {
-                Ok(last) => cursor = last,
-                Err(error) => {
-                    if current() {
-                        let _ = app.emit_to(
-                            MAIN,
-                            "v2-certified-state",
-                            V2Event {
-                                height: cursor,
-                                totals: None,
-                                error: Some(error),
-                            },
-                        );
-                    }
-                    // A refused or failed stream is retried, but not in a
-                    // tight loop.
-                    for _ in 0..20 {
-                        if !current() {
-                            break;
-                        }
-                        thread::sleep(Duration::from_millis(100));
-                    }
-                }
-            }
-        }
-    });
-    Ok(())
-}
-
-/// The Trade page was left: the watch ends; the connection stays.
-#[tauri::command]
-fn v2_unwatch(window: Window, core: State<'_, Arc<Core>>) -> Result<(), String> {
-    require_window(&window, MAIN)?;
-    core.v2.generation.fetch_add(1, Ordering::SeqCst);
-    Ok(())
-}
-
-/// One market's verified view for the page wallet. With `known_head` and
-/// `watch` it is a live read: the node waits up to 1.5 s for the head to
-/// move and leaves the heavy parts out when it has not.
-#[tauri::command]
-async fn trade_market(
-    window: Window,
-    core: State<'_, Arc<Core>>,
-    market_id: String,
-    known_head: Option<String>,
-    watch: bool,
-    ticks_after: Option<u64>,
-) -> Result<flowmesh::MarketView, String> {
-    require_window(&window, MAIN)?;
-    let core = Arc::clone(&core);
-    blocking(move || {
-        let node = core.node();
-        let (client, name) = page_wallet(&core, &node)?;
-        let query = flowmesh::Query {
-            known_head,
-            watch,
-            ticks_after,
-        };
-        flowmesh::market(client, &name, &market_id, &query)
-    })
-    .await
-}
-
-/// Drafts a FlowMesh limit order (one step) or ladder (up to four) for the
-/// approval window, after checking it against the market as it is now. The
-/// page only learns the draft id.
-#[tauri::command]
-async fn trade_order_draft(
-    window: Window,
-    app: AppHandle,
-    core: State<'_, Arc<Core>>,
-    market_id: String,
-    side: String,
-    steps: Vec<flowmesh::Point>,
-) -> Result<String, String> {
-    require_window(&window, MAIN)?;
-    let core = Arc::clone(&core);
-    let id = blocking(move || {
-        let node = core.node();
-        let (client, name) = page_wallet(&core, &node)?;
-        let acknowledged = core.trade_acknowledged.of(&name);
-        let chain = node.chain().unwrap_or_default();
-        let order = flowmesh::prepare_order(
-            client,
-            &chain,
-            &name,
-            &market_id,
-            &side,
-            &steps,
-            &acknowledged,
-        )?;
-        core.drafts
-            .lock()
-            .unwrap()
-            .insert(Request::TradeOrder { order })
-            .map_err(|e| e.to_string())
-    })
-    .await?;
-    open_approval(&app).map_err(|e| e.to_string())?;
-    Ok(id)
-}
-
-/// Drafts cancelling the page wallet's open order on one side.
-#[tauri::command]
-async fn trade_cancel_draft(
-    window: Window,
-    app: AppHandle,
-    core: State<'_, Arc<Core>>,
-    market_id: String,
-    side: String,
-) -> Result<String, String> {
-    require_window(&window, MAIN)?;
-    let core = Arc::clone(&core);
-    let id = blocking(move || {
-        let node = core.node();
-        let (client, name) = page_wallet(&core, &node)?;
-        let acknowledged = core.trade_acknowledged.of(&name);
-        let chain = node.chain().unwrap_or_default();
-        let cancel =
-            flowmesh::prepare_cancel(client, &chain, &name, &market_id, &side, &acknowledged)?;
-        core.drafts
-            .lock()
-            .unwrap()
-            .insert(Request::TradeCancel { cancel })
-            .map_err(|e| e.to_string())
-    })
-    .await?;
-    open_approval(&app).map_err(|e| e.to_string())?;
-    Ok(id)
-}
-
-/// Drafts a deposit of B3 atoms or token base units into a market's vault.
-#[tauri::command]
-async fn trade_deposit_draft(
-    window: Window,
-    app: AppHandle,
-    core: State<'_, Arc<Core>>,
-    market_id: String,
-    asset: flowmesh::Asset,
-    amount: String,
-) -> Result<String, String> {
-    require_window(&window, MAIN)?;
-    let core = Arc::clone(&core);
-    let id = blocking(move || {
-        let node = core.node();
-        let (client, name) = page_wallet(&core, &node)?;
-        let chain = node.chain().unwrap_or_default();
-        let deposit = flowmesh::prepare_deposit(client, &chain, &name, &market_id, asset, &amount)?;
-        core.drafts
-            .lock()
-            .unwrap()
-            .insert(Request::TradeDeposit { deposit })
-            .map_err(|e| e.to_string())
-    })
-    .await?;
-    open_approval(&app).map_err(|e| e.to_string())?;
-    Ok(id)
-}
-
-/// Drafts a withdrawal of B3 atoms or token base units to `destination`, or
-/// to a new address of this wallet when it is empty.
-#[tauri::command]
-async fn trade_withdraw_draft(
-    window: Window,
-    app: AppHandle,
-    core: State<'_, Arc<Core>>,
-    market_id: String,
-    asset: flowmesh::Asset,
-    amount: String,
-    destination: String,
-) -> Result<String, String> {
-    require_window(&window, MAIN)?;
-    let core = Arc::clone(&core);
-    let id = blocking(move || {
-        let node = core.node();
-        let (client, name) = page_wallet(&core, &node)?;
-        let acknowledged = core.trade_acknowledged.of(&name);
-        let chain = node.chain().unwrap_or_default();
-        let withdraw = flowmesh::prepare_withdraw(
-            client,
-            &chain,
-            &name,
-            &market_id,
-            &flowmesh::Withdrawal {
-                asset,
-                amount: &amount,
-                destination: &destination,
-            },
-            &acknowledged,
-        )?;
-        core.drafts
-            .lock()
-            .unwrap()
-            .insert(Request::TradeWithdraw { withdraw })
-            .map_err(|e| e.to_string())
-    })
-    .await?;
-    open_approval(&app).map_err(|e| e.to_string())?;
-    Ok(id)
-}
-
-/// The page wallet's certified withdrawals in a market whose payouts wait
-/// to be published, and the checkpoint the others wait for.
-#[tauri::command]
-async fn trade_payouts(
-    window: Window,
-    core: State<'_, Arc<Core>>,
-    market_id: String,
-) -> Result<flowmesh::Payouts, String> {
-    require_window(&window, MAIN)?;
-    let core = Arc::clone(&core);
-    blocking(move || {
-        let node = core.node();
-        let (client, name) = page_wallet(&core, &node)?;
-        flowmesh::payouts(client, &name, &market_id)
-    })
-    .await
-}
-
-/// Drafts publishing a certified withdrawal's payout to `destination`,
-/// which must be the exact address the withdrawal named.
-#[tauri::command]
-async fn trade_payout_draft(
-    window: Window,
-    app: AppHandle,
-    core: State<'_, Arc<Core>>,
-    market_id: String,
-    effect_id: String,
-    destination: String,
-) -> Result<String, String> {
-    require_window(&window, MAIN)?;
-    let core = Arc::clone(&core);
-    let id = blocking(move || {
-        let node = core.node();
-        let (client, name) = page_wallet(&core, &node)?;
-        let chain = node.chain().unwrap_or_default();
-        let payout =
-            flowmesh::prepare_payout(client, &chain, &name, &market_id, &effect_id, &destination)?;
-        core.drafts
-            .lock()
-            .unwrap()
-            .insert(Request::TradePayout { payout })
-            .map_err(|e| e.to_string())
-    })
-    .await?;
-    open_approval(&app).map_err(|e| e.to_string())?;
-    Ok(id)
-}
-
-/// Drafts publishing the checkpoint the page wallet's withdrawals wait for.
-#[tauri::command]
-async fn trade_checkpoint_draft(
-    window: Window,
-    app: AppHandle,
-    core: State<'_, Arc<Core>>,
-    market_id: String,
-) -> Result<String, String> {
-    require_window(&window, MAIN)?;
-    let core = Arc::clone(&core);
-    let id = blocking(move || {
-        let node = core.node();
-        let (client, name) = page_wallet(&core, &node)?;
-        let chain = node.chain().unwrap_or_default();
-        let checkpoint = flowmesh::prepare_checkpoint(client, &chain, &name, &market_id)?;
-        core.drafts
-            .lock()
-            .unwrap()
-            .insert(Request::TradeCheckpoint { checkpoint })
-            .map_err(|e| e.to_string())
-    })
-    .await?;
-    open_approval(&app).map_err(|e| e.to_string())?;
-    Ok(id)
-}
-
-/// The page wallet's vault deposits into one market, from its own
-/// transaction history.
-#[tauri::command]
-async fn trade_deposits(
-    window: Window,
-    core: State<'_, Arc<Core>>,
-    market_id: String,
-) -> Result<Vec<flowmesh::Deposit>, String> {
-    require_window(&window, MAIN)?;
-    let core = Arc::clone(&core);
-    blocking(move || {
-        let node = core.node();
-        let (client, name) = page_wallet(&core, &node)?;
-        let markets = flowmesh::markets(client, &name).map_err(|e| e.to_string())?;
-        let market = markets
-            .iter()
-            .find(|m| m.market_id == market_id)
-            .ok_or("That market is not available.")?;
-        flowmesh::deposits(client, &name, &market.vault_id).map_err(|e| e.to_string())
-    })
-    .await
-}
-
-/// Asks a market to admit one of the page wallet's confirmed deposits.
-/// Nothing is signed and no coins move, so it needs no approval.
-#[tauri::command]
-async fn trade_admit(
-    window: Window,
-    core: State<'_, Arc<Core>>,
-    market_id: String,
-    txid: String,
-    vout: u64,
-) -> Result<flowmesh::Receipt, String> {
-    require_window(&window, MAIN)?;
-    let core = Arc::clone(&core);
-    blocking(move || {
-        let node = core.node();
-        let (client, name) = page_wallet(&core, &node)?;
-        flowmesh::admit(client, &name, &market_id, &txid, vout)
-    })
-    .await
-}
-
-/// The page wallet's FlowMesh requests in a market, newest first, from the
-/// node's local record; no endpoint is asked.
-#[tauri::command]
-async fn trade_requests(
-    window: Window,
-    core: State<'_, Arc<Core>>,
-    market_id: String,
-) -> Result<Vec<flowmesh::Request>, String> {
-    require_window(&window, MAIN)?;
-    let core = Arc::clone(&core);
-    blocking(move || {
-        let node = core.node();
-        let (client, name) = page_wallet(&core, &node)?;
-        let acknowledged = core.trade_acknowledged.of(&name);
-        flowmesh::requests_view(client, &name, &market_id, &acknowledged)
-    })
-    .await
-}
-
-/// Lets new requests be drafted past an uncertain one. It is not retried,
-/// cancelled or proven to have failed: it may still be certified later.
-#[tauri::command]
-async fn trade_acknowledge(
-    window: Window,
-    core: State<'_, Arc<Core>>,
-    market_id: String,
-    action_id: String,
-) -> Result<(), String> {
-    require_window(&window, MAIN)?;
-    let core = Arc::clone(&core);
-    blocking(move || {
-        let node = core.node();
-        let (client, name) = page_wallet(&core, &node)?;
-        flowmesh::can_acknowledge(client, &name, &market_id, &action_id)?;
-        core.trade_acknowledged.add(&name, action_id);
-        Ok(())
     })
     .await
 }
@@ -2282,9 +1741,7 @@ fn draft_view(client: Option<&rpc::Client>, draft: drafts::Draft) -> DraftView {
 enum Done {
     Sent(String),
     Signed { psbt: String, complete: bool },
-    Traded(flowmesh::Receipt),
-    Deposited(flowmesh::Deposited),
-    Published(flowmesh::Published),
+    Fm2(fm2::view::Sent),
 }
 
 /// Carries out an approved request.
@@ -2294,38 +1751,6 @@ fn execute(client: &rpc::Client, request: Request) -> Result<Done, String> {
             .map(|(psbt, complete)| Done::Signed { psbt, complete }),
         Request::SendPsbt { summary, loaded } => {
             psbt::send(client, &summary, &loaded).map(Done::Sent)
-        }
-        Request::TradeOrder { order } => {
-            flowmesh::recheck(client, &order.wallet, &order.market_id, order.sequence)?;
-            flowmesh::submit(client, &order.wallet, flowmesh::order_call(&order)?).map(Done::Traded)
-        }
-        Request::TradeWithdraw { withdraw } => {
-            flowmesh::recheck(
-                client,
-                &withdraw.wallet,
-                &withdraw.market_id,
-                withdraw.sequence,
-            )?;
-            flowmesh::submit(
-                client,
-                &withdraw.wallet,
-                flowmesh::withdraw_call(&withdraw)?,
-            )
-            .map(Done::Traded)
-        }
-        Request::TradeDeposit { deposit } => {
-            flowmesh::deposit(client, &deposit).map(Done::Deposited)
-        }
-        Request::TradePayout { payout } => {
-            flowmesh::publish_payout(client, &payout).map(Done::Published)
-        }
-        Request::TradeCheckpoint { checkpoint } => {
-            flowmesh::publish_checkpoint(client, &checkpoint).map(Done::Published)
-        }
-        Request::TradeCancel { cancel } => {
-            flowmesh::recheck(client, &cancel.wallet, &cancel.market_id, cancel.sequence)?;
-            flowmesh::submit(client, &cancel.wallet, flowmesh::cancel_call(&cancel))
-                .map(Done::Traded)
         }
         request => execute_sent(client, request).map(Done::Sent),
     }
@@ -2349,14 +1774,8 @@ fn execute_sent(client: &rpc::Client, request: Request) -> Result<String, String
         Request::Stake { wallet, amount, .. } => stake::create(client, &wallet, &amount),
         Request::BindFinality { wallet, .. } => stake::bind(client, &wallet),
         Request::RevokeFinality { wallet, .. } => stake::revoke(client, &wallet),
-        Request::SignPsbt { .. }
-        | Request::SendPsbt { .. }
-        | Request::TradeOrder { .. }
-        | Request::TradeCancel { .. }
-        | Request::TradeDeposit { .. }
-        | Request::TradeWithdraw { .. }
-        | Request::TradePayout { .. }
-        | Request::TradeCheckpoint { .. } => unreachable!("handled by execute"),
+        Request::SignPsbt { .. } | Request::SendPsbt { .. } => unreachable!("handled by execute"),
+        Request::Fm2 { .. } => unreachable!("handled before the node is asked"),
     }
 }
 
@@ -2402,6 +1821,22 @@ async fn approval_decide(
         let id2 = id.clone();
         let app2 = app.clone();
         let outcome: Outcome = blocking(move || {
+            // A FlowMesh action needs neither the node nor a wallet: it is
+            // signed with the network's own key and goes to the seats.
+            let fm2_draft = matches!(
+                core2.drafts.lock().unwrap().get(&id2).map(|d| d.request),
+                Some(Request::Fm2 { .. })
+            );
+            if fm2_draft {
+                // From here on the draft is consumed, whatever happens.
+                let taken = core2.drafts.lock().unwrap().take(&id2);
+                return Ok(match taken.map(|draft| draft.request) {
+                    Some(Request::Fm2 { action }) => {
+                        trade::execute(&app2, &core2, *action).map(Done::Fm2)
+                    }
+                    _ => Err("This request was already decided.".to_owned()),
+                });
+            }
             let node = core2.node();
             let client = node.client().ok_or("The node is not ready.")?;
             let waiting = core2
@@ -2451,17 +1886,9 @@ async fn approval_decide(
                 psbt,
                 complete,
             },
-            Ok(Done::Traded(receipt)) => DraftResult::Traded {
+            Ok(Done::Fm2(sent)) => DraftResult::Fm2 {
                 id: id.clone(),
-                receipt,
-            },
-            Ok(Done::Deposited(deposit)) => DraftResult::Deposited {
-                id: id.clone(),
-                deposit,
-            },
-            Ok(Done::Published(payout)) => DraftResult::Published {
-                id: id.clone(),
-                payout,
+                sent,
             },
             Err(error) => DraftResult::Failed {
                 id: id.clone(),
@@ -2915,6 +2342,7 @@ fn close_question(core: &Core) -> Option<stake::CloseAsk> {
 
 fn shutdown(app: &AppHandle, core: &Core) {
     core.setup.stop();
+    core.fm2.shutdown();
     let node = core.node.lock().unwrap();
     if node.child_running() {
         hive_log(app, "node: stop requested by the app closing");
@@ -2955,7 +2383,6 @@ pub fn run() {
                 exiting: AtomicBool::new(false),
                 close_pending: AtomicBool::new(false),
                 drafts: Mutex::new(DraftStore::default()),
-                trade_acknowledged: Acknowledged::default(),
                 wallet: Mutex::new(None),
                 passphrase: Mutex::new(None),
                 prefs: Mutex::new(prefs_file.as_deref().map(prefs::read).unwrap_or_default()),
@@ -2965,7 +2392,7 @@ pub fn run() {
                 history: history::Cache::default(),
                 updates,
                 setup: Setup::default(),
-                v2: V2State::default(),
+                fm2: trade::Fm2State::default(),
             }));
             Ok(())
         })
@@ -3051,26 +2478,22 @@ pub fn run() {
             book_list,
             book_save,
             stake_status,
-            trade_markets,
-            trade_market,
-            v2_connect,
-            v2_disconnect,
-            v2_info,
-            v2_totals,
-            v2_account,
-            v2_watch,
-            v2_unwatch,
-            trade_order_draft,
-            trade_cancel_draft,
-            trade_requests,
-            trade_acknowledge,
-            trade_deposit_draft,
-            trade_withdraw_draft,
-            trade_payouts,
-            trade_payout_draft,
-            trade_checkpoint_draft,
-            trade_deposits,
-            trade_admit,
+            trade::fm2_last,
+            trade::fm2_pick,
+            trade::fm2_connect,
+            trade::fm2_disconnect,
+            trade::fm2_info,
+            trade::fm2_key_create,
+            trade::fm2_health,
+            trade::fm2_account,
+            trade::fm2_watch,
+            trade::fm2_unwatch,
+            trade::fm2_refresh,
+            trade::fm2_resend,
+            trade::fm2_place_draft,
+            trade::fm2_cancel_draft,
+            trade::fm2_cancel_all_draft,
+            trade::fm2_transfer_draft,
             stake_draft,
             release_draft,
             wallet_restore,
@@ -3143,23 +2566,6 @@ mod tests {
     use super::*;
     use std::path::Path;
 
-    #[test]
-    fn acknowledgements_are_per_wallet_and_bounded() {
-        let ack = Acknowledged::default();
-        ack.add("a", "x".into());
-        ack.add("a", "x".into());
-        ack.add("b", "y".into());
-        assert_eq!(ack.of("a"), vec!["x".to_owned()]);
-        assert_eq!(ack.of("b"), vec!["y".to_owned()]);
-        for i in 0..ACKNOWLEDGED_KEPT {
-            ack.add("a", format!("n{i}"));
-        }
-        let a = ack.of("a");
-        assert_eq!(a.len(), ACKNOWLEDGED_KEPT);
-        assert!(!a.contains(&"x".to_owned()), "the oldest goes first");
-        assert!(ack.of("b").is_empty());
-    }
-
     /// Every command checks the window that calls it, as require_window's
     /// comment promises; only the theme is read by every window.
     #[test]
@@ -3167,7 +2573,9 @@ mod tests {
         let source = include_str!("lib.rs");
         // The commands, not this test, which names the attribute too.
         let source = &source[..source.find("#[cfg(test)]").unwrap()];
+        let source = format!("{source}{}", include_str!("trade.rs"));
         let mut checked = 0;
+        let mut opening = 0;
         for command in source.split("#[tauri::command]").skip(1) {
             let name = command
                 .split("fn ")
@@ -3188,9 +2596,24 @@ mod tests {
                 body.contains("require_window(&window, "),
                 "{name} does not check which window calls it"
             );
+            // A command that is not async runs on the main thread, and a
+            // window opened from there never loads on Windows: the app
+            // hangs. Every draft opens the approval window.
+            if body.contains("open_approval(") || body.contains("offer(") {
+                let declared = command.split("fn ").next().unwrap_or_default();
+                assert!(
+                    declared.contains("async"),
+                    "{name} opens a window but is not async"
+                );
+                opening += 1;
+            }
             checked += 1;
         }
         assert!(checked > 60, "the scan found only {checked} commands");
+        assert!(
+            opening >= 10,
+            "the scan found only {opening} commands that open the approval window"
+        );
     }
 
     #[test]

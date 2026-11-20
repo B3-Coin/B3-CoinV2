@@ -78,20 +78,6 @@ const PAGE_METHODS: &[&str] = &[
     "decoderawtransaction",
     "sendrawtransaction",
     "generatetoaddress",
-    "listflowmeshmarkets",
-    "getflowmeshmarketdata",
-    "listflowmeshactions",
-    "submitflowmeshorder",
-    "submitflowmeshladder",
-    "cancelflowmeshorder",
-    "flowmeshdeposit",
-    "gettxout",
-    "submitflowmeshdeposit",
-    "requestflowmeshwithdrawal",
-    "listflowmeshvaultoperations",
-    "createflowmeshvaulttx",
-    "createflowmeshcheckpoint",
-    "getflowmeshbalance",
 ];
 
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -719,7 +705,6 @@ mod tests {
         let sources = [
             include_str!("book.rs"),
             include_str!("chain.rs"),
-            include_str!("flowmesh.rs"),
             include_str!("history.rs"),
             include_str!("lib.rs"),
             include_str!("passphrase.rs"),

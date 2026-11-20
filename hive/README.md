@@ -18,10 +18,9 @@ not a release.
   (`PAGE_METHODS`); the console window gets a second login with full
   access. `drafts.rs` holds every request that moves value until the
   approval window decides it, so a page can never send on its own. `stake.rs`,
-  `flowmesh.rs`, `wallet.rs`, `receive.rs`, `psbt.rs`, `settings.rs`,
-  `folder.rs`, `cli.rs`, `update.rs` and `bootstrap.rs` each cover one page
-  or one job. `v2api.rs` reads a FlowMesh V2 regtest operator's HTTPS API
-  for the Trade page (below).
+  `wallet.rs`, `receive.rs`, `psbt.rs`, `settings.rs`, `folder.rs`, `cli.rs`,
+  `update.rs` and `bootstrap.rs` each cover one page or one job. `fm2/` is
+  the FlowMesh V2 client and `trade.rs` the Trade page's commands (below).
 - **Windows the core opens**: the approval window shows exactly what a
   request does and sends it only when approved (a locked wallet unlocks for
   that one request and locks again); the passphrase window unlocks a wallet
@@ -69,32 +68,69 @@ wallet stakes with a bound finality key, closing asks whether to revoke the
 key first, because an offline validator still counts toward the finality
 quorum.
 
-## The FlowMesh V2 regtest card
+## Trading on FlowMesh V2
 
-The Trade page has a read-only card for a FlowMesh V2 regtest operator's
-HTTPS API (`contrib/flowmesh2/regtest/https_api.py`). Give it the API
-address, the certificate file and the certificate's SHA-256 pin, as the
-operator writes them. Only `https://127.0.0.1:<port>` and
-`https://[::1]:<port>` are accepted. The certificate file must hash to the
-pin, and it is the only certificate the TLS session trusts.
+The Trade page is a client of FlowMesh V2 (`src/flowmesh2`), the trading
+layer that replaces FlowMesh V1. FlowMesh V2 runs on regtest networks only,
+and the page says so everywhere: nothing on it is a mainnet market. It needs
+no running B3 node and no wallet.
 
-The card shows the operator's status, its markets with their lot and tick
-sizes, the per-asset totals and one account's balances. The certified-state
-stream keeps the totals live, and data older than 3 s is marked stale. The
-V2 API has no order book, clearing or trade route, so the card shows none
-of them; the V1 book above is unchanged. The operator checks its own
-certificate and proofs; B3 Hive does not check them itself yet, and the card
-says so. Nothing is kept after B3 Hive closes.
+**Connecting.** The page asks for two files from whoever runs the network:
+the genesis document (`fm2-genesis/1`: seats, assets, markets) and the pins
+file (the SHA-256 of each seat's certificate key, as `fm2-cli --pins` takes
+it). Both are trust inputs; nothing is taken from a seat. Seats must be on
+this computer (loopback addresses). Each connection is TLS 1.3 and trusts
+exactly its seat's pinned key.
 
-Signing is not built: `/v1/submit` takes a signed V2 action frame, and B3
-Hive has no V2 signer and no crate that could make one (see the open
-questions below).
+**The account.** B3 Hive creates one key per network and keeps it, with the
+outbox, in its config folder under `fm2/<network>/`. The key file is plain
+hex, as `fm2-cli` writes it, and is not encrypted: this is a test network.
+Never share a key between B3 Hive and `fm2-cli`; each keeps its own record
+of the nonces it signed.
 
-To try it without an operator, `scripts/v2-api-fixture.py DIR [SECONDS]`
-serves the real gateway code with made-up replies and writes the address,
-certificate and pin to `DIR/fixture.json`.
-`HIVE_V2_API_FIXTURE=DIR/fixture.json cargo test v2api` runs the client
-against it.
+**What is checked.** The core checks every answer against the genesis
+document before the page sees it (`fm2/verify.rs`, the rules of
+`src/flowmesh2/cli/trust.cpp`):
+
+- a slot counts only with a certificate signed by a quorum of the genesis
+  seats, over a header of this network and these rules;
+- balances are shown only from an account leaf that proves into such a
+  slot's state;
+- the result of an order, a cancellation or a transfer is shown only once
+  its outcome proves into such a slot, and each fill is recomputed;
+- "expired" is shown only with the proof that no slot can include the
+  action any more.
+
+The order book and the trade list come from one seat's live feed, which
+carries no proof. They are labelled as that seat's report. FlowMesh V2
+serves no price history, so the chart and the trade list start when the page
+connects.
+
+**Sending.** An order (limit, immediate-or-cancel, post-only), a
+cancellation, cancel-all and a transfer are drafted by the core and shown in
+the approval window; nothing is signed before approval. An approved action
+is signed once, written to the outbox on disk, and then posted to every
+seat. After a crash or a lost connection the same bytes are posted again; a
+second signature is never made. The Activity tab is the outbox: each row
+shows what the seats last said until a certified result arrives.
+
+**Open orders.** FlowMesh V2 has no query for an account's orders. The page
+rebuilds them from the account's certified results and the fills a seat
+reported since, and checks the list against the certified account (its count
+of open orders and its reserved balances). When they disagree, for example
+after a fill while B3 Hive was closed, the page says so.
+
+**Not offered.** Withdrawals (the regtest rules refuse them), market orders
+(the engine has none) and decimals for assets other than B3 (the genesis
+document names none, so those amounts are shown in atoms).
+
+To try it, start a regtest cluster with the node tools (`fm2-keygen`,
+`fm2-devchain`, `fm2d`; see `src/flowmesh2/README.md`), connect with its
+`genesis.json` and a pins file, create the account, and credit it with
+`fm2-devchain ... deposit <account> <asset> <atoms>`.
+
+The signing and certificate code is the node's own: `build.rs` compiles
+`src/secp256k1` and `src/blst` from this repository into the core.
 
 ## Building
 
@@ -133,11 +169,17 @@ Linux and Windows packages as unsigned artifacts.
 ## Tests
 
 - `cd src-tauri && cargo test`: unit tests of the core (RPC parsing, drafts,
-  command-line parsing, settings, the stake and FlowMesh logic). One of them
-  scans the sources and fails when a page calls an RPC the whitelist does not
-  allow.
+  command-line parsing, settings, the stake logic, and the FlowMesh V2
+  client: codecs, proof checks against replies captured from a real cluster,
+  the outbox). One of them scans the sources and fails when a page calls an
+  RPC the whitelist does not allow.
 - `npm test`: the pages' pure functions (number formatting, the trading
-  formats, the staking outlook, the V2 card's text).
+  formats, the staking outlook).
+- `HIVE_FM2_CLUSTER=DIR cargo test --test fm2_live -- --ignored --nocapture`:
+  the FlowMesh V2 client against a running `fm2d` cluster whose
+  `genesis.json` and `pins.json` are in `DIR`. It creates an account, waits
+  for a deposit to it, then buys, rests and cancels an order, transfers,
+  proves an unsent action expired and reopens its outbox.
 - `B3_HIVE_B3COIND=/path/to/b3coind cargo test --test node_regtest -- --ignored --test-threads=1`:
   the core against a real regtest node, no peers: start and stop, the page
   login's limits, drafted sends submitted exactly once, wallets, passphrases,
@@ -150,9 +192,9 @@ Linux and Windows packages as unsigned artifacts.
   to the user. The packaged builds are unsigned.
 - Automation (autostake, scheduled consolidation) is left out on purpose.
 - Remote access is not supported: the app targets the user's own machine.
-- The Trade page follows FlowMesh V1 as it is; the demo market shows how a
-  market page works while mainnet has none. The FlowMesh V2 card is
-  read-only and regtest-only.
+- The Trade page trades on FlowMesh V2 regtest networks only, with seats on
+  this computer. FlowMesh V1 is retired and the page no longer speaks it.
+  The trading key is not encrypted.
 - The Receive page makes labelled addresses and payment links, but has no
   list of past requests: the node has no RPC for Qt's requested-payments
   history.
@@ -166,8 +208,11 @@ These are not decided here. Each needs a ruling from the project owners.
   packages, and which of them are tested before a release.
 - **Front-end framework and dependency policy**: whether the pages stay
   plain TypeScript, and which new Rust crates or npm packages may be added.
-  A FlowMesh V2 signer (BIP340 over the V2 action frame) needs a
-  secp256k1 crate or a node RPC that signs frames.
+  The FlowMesh V2 client builds the repository's own secp256k1 and blst
+  instead of adding crates for them.
+- **The trading key**: FlowMesh V2 accounts are plain keys with no link to
+  a B3 wallet. Before any network of value, the key needs encryption and a
+  backup story, or a derivation from the wallet.
 - **First translation languages**: the app is English only.
 - **Remote access**: whether B3 Hive may reach a node or a FlowMesh API on
   another machine, and how that connection is authenticated.
