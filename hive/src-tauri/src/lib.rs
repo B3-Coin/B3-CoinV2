@@ -1349,6 +1349,38 @@ fn set_ui_mask(window: Window, core: State<'_, Arc<Core>>, mask: bool) -> Result
     Ok(())
 }
 
+/// Whether the Trade page opens in its Pro view.
+#[tauri::command]
+fn ui_trade_pro(window: Window, core: State<'_, Arc<Core>>) -> Result<bool, String> {
+    require_window(&window, MAIN)?;
+    Ok(core.prefs.lock().unwrap().trade_pro)
+}
+
+#[tauri::command]
+fn set_ui_trade_pro(window: Window, core: State<'_, Arc<Core>>, pro: bool) -> Result<(), String> {
+    require_window(&window, MAIN)?;
+    let mut prefs = core.prefs.lock().unwrap();
+    prefs.trade_pro = pro;
+    save_prefs(&core, &prefs);
+    Ok(())
+}
+
+/// Brings the approval window forward again while a draft waits in it, for
+/// a user who lost sight of it. False when nothing waits.
+#[tauri::command]
+async fn approval_show(
+    app: AppHandle,
+    window: Window,
+    core: State<'_, Arc<Core>>,
+) -> Result<bool, String> {
+    require_window(&window, MAIN)?;
+    if core.drafts.lock().unwrap().oldest().is_none() {
+        return Ok(false);
+    }
+    open_approval(&app).map_err(|e| e.to_string())?;
+    Ok(true)
+}
+
 // ---- node settings (main window) --------------------------------------------
 
 #[derive(Serialize)]
@@ -2480,6 +2512,7 @@ pub fn run() {
             stake_status,
             trade::fm2_last,
             trade::fm2_pick,
+            trade::fm2_locate,
             trade::fm2_connect,
             trade::fm2_disconnect,
             trade::fm2_info,
@@ -2512,6 +2545,9 @@ pub fn run() {
             set_ui_theme,
             ui_mask,
             set_ui_mask,
+            ui_trade_pro,
+            set_ui_trade_pro,
+            approval_show,
             update_status,
             update_check,
             update_download,

@@ -1,7 +1,7 @@
-//! The main window's display choices: the theme and whether amounts are
-//! hidden. The windows are incognito, so their own storage is gone when B3
-//! Hive closes; these are kept in B3 Hive's config folder instead. Nothing
-//! else is stored here.
+//! The main window's display choices: the theme, whether amounts are
+//! hidden, and which view the Trade page opens in. The windows are
+//! incognito, so their own storage is gone when B3 Hive closes; these are
+//! kept in B3 Hive's config folder instead. Nothing else is stored here.
 
 use std::path::{Path, PathBuf};
 
@@ -17,6 +17,9 @@ pub struct Prefs {
     /// Qt's "Mask values".
     #[serde(default)]
     pub mask: bool,
+    /// The Trade page opens in its Pro view; in its Simple view otherwise.
+    #[serde(default)]
+    pub trade_pro: bool,
 }
 
 pub fn path(config_dir: &Path) -> PathBuf {
@@ -60,12 +63,18 @@ mod tests {
             &Prefs {
                 theme: Some(Theme::Light),
                 mask: true,
+                trade_pro: true,
             },
         )
         .unwrap();
         let back = read(&file);
         assert!(matches!(back.theme, Some(Theme::Light)));
         assert!(back.mask);
+        assert!(back.trade_pro);
+        // A file written before the Trade page had two views.
+        std::fs::write(&file, r#"{"theme":"dark","mask":true}"#).unwrap();
+        assert!(read(&file).mask);
+        assert!(!read(&file).trade_pro);
         std::fs::write(&file, "not json").unwrap();
         assert!(!read(&file).mask);
         let _ = std::fs::remove_dir_all(&dir);

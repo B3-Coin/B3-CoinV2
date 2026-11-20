@@ -81,7 +81,7 @@ impl Fm2State {
 // --------------------------------------------------------------- connection
 
 /// The files of the last connection, to offer them again.
-#[derive(Clone, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub(crate) struct LastFiles {
     genesis: String,
     pins: String,
@@ -98,7 +98,12 @@ fn fm2_dir(app: &AppHandle) -> Result<PathBuf, String> {
 fn read_small(path: &str, what: &str) -> Result<String, String> {
     let path = Path::new(path.trim());
     let size = std::fs::metadata(path)
-        .map_err(|e| format!("Cannot read the {what} {}: {e}", path.display()))?
+        .map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => {
+                format!("There is no {what} at {} any more.", path.display())
+            }
+            _ => format!("Cannot read the {what} {}: {e}", path.display()),
+        })?
         .len();
     if size > MAX_GENESIS_BYTES {
         return Err(format!("{} is too large to be a {what}.", path.display()));
@@ -117,7 +122,8 @@ pub(crate) fn fm2_last(app: AppHandle, window: Window) -> Result<Option<LastFile
         .and_then(|bytes| serde_json::from_slice(&bytes).ok()))
 }
 
-/// Asks for a genesis document or a pins file with the native picker.
+/// Asks for a network's folder, or for a genesis document or a pins file,
+/// with the native picker.
 #[tauri::command]
 pub(crate) async fn fm2_pick(
     app: AppHandle,
@@ -128,24 +134,58 @@ pub(crate) async fn fm2_pick(
     blocking(move || {
         use tauri_plugin_dialog::DialogExt;
         let title = match what.as_str() {
+            "folder" => "Choose the test network's folder",
             "genesis" => "Choose the network's genesis document",
-            "pins" => "Choose the seats' pins file",
+            "pins" => "Choose the network's pins file",
             _ => return Err("Unknown file.".to_owned()),
         };
-        let mut dialog = app
-            .dialog()
-            .file()
-            .set_title(title)
-            .add_filter("JSON files", &["json"]);
+        let mut dialog = app.dialog().file().set_title(title);
         if let Some(main) = app.get_webview_window(MAIN) {
             dialog = dialog.set_parent(&main);
         }
-        Ok(dialog
-            .blocking_pick_file()
+        let picked = if what == "folder" {
+            dialog.blocking_pick_folder()
+        } else {
+            dialog
+                .add_filter("JSON files", &["json"])
+                .blocking_pick_file()
+        };
+        Ok(picked
             .and_then(|file| file.into_path().ok())
             .map(|path| path.display().to_string()))
     })
     .await
+}
+
+/// The two trust files in a network's folder. An operator keeps them side
+/// by side under these names (src/flowmesh2/README.md), so one folder is
+/// all the user has to choose.
+fn locate(folder: &Path) -> Result<LastFiles, String> {
+    let find = |name: &str| {
+        let path = folder.join(name);
+        path.is_file().then(|| path.display().to_string())
+    };
+    match (find("genesis.json"), find("pins.json")) {
+        (Some(genesis), Some(pins)) => Ok(LastFiles { genesis, pins }),
+        (None, None) => Err(format!(
+            "{} holds neither genesis.json nor pins.json. Choose the folder you got from whoever runs the network.",
+            folder.display()
+        )),
+        (None, Some(_)) => Err(format!(
+            "{} has a pins.json but no genesis.json. Ask whoever runs the network for both files.",
+            folder.display()
+        )),
+        (Some(_), None) => Err(format!(
+            "{} has a genesis.json but no pins.json. Ask whoever runs the network for both files.",
+            folder.display()
+        )),
+    }
+}
+
+#[tauri::command]
+pub(crate) fn fm2_locate(window: Window, folder: String) -> Result<LastFiles, String> {
+    require_window(&window, MAIN)?;
+    locate(Path::new(folder.trim()))
 }
 
 /// Connects to the network of a genesis document, with the seats' pins.
@@ -781,4 +821,29 @@ pub(crate) fn execute(
     let (app, live) = (app.clone(), Arc::clone(&live));
     thread::spawn(move || settle_pass(&app, &live, false));
     Ok(sent)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_network_folder_must_hold_both_files() {
+        let dir = std::env::temp_dir().join(format!("hive-fm2-locate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(locate(&dir).unwrap_err().contains("neither"));
+        std::fs::write(dir.join("genesis.json"), "{}").unwrap();
+        assert!(locate(&dir).unwrap_err().contains("no pins.json"));
+        std::fs::write(dir.join("pins.json"), "{}").unwrap();
+        let found = locate(&dir).unwrap();
+        assert!(found.genesis.ends_with("genesis.json"));
+        assert!(found.pins.ends_with("pins.json"));
+        std::fs::remove_file(dir.join("genesis.json")).unwrap();
+        assert!(locate(&dir).unwrap_err().contains("no genesis.json"));
+        // A folder of that name is not the file.
+        std::fs::create_dir(dir.join("genesis.json")).unwrap();
+        assert!(locate(&dir).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
